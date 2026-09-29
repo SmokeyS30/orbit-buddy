@@ -1,0 +1,25 @@
+.tabs .tab {
+  flex: 1 0 auto;
+}
+
+.file-picker {
+  display: block;
+  padding: 12px;
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.file-picker input {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+}
+
+@media (max-width: 760px) {
+  .tabs .tab {
+    min-width: max-content;
+    padding-inline: 14px;
+  }
+}

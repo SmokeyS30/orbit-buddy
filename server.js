@@ -2,218 +2,137 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { openDatabase } from './src/database.js';
 import { createModelClient } from './src/model.js';
+import { createPushService } from './src/push.js';
+import { createConnectorService } from './src/connectors.js';
+import { writeAutomatedBackup } from './src/backups.js';
+import {
+  clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
+  makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
+} from './src/security.js';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const publicRoot = path.join(root, 'public');
-const mimeTypes = {
-  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8',
-  '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json'
-};
+const mime = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.webmanifest':'application/manifest+json' };
+const now = () => new Date().toISOString();
 
-function secureEqual(actual, expected) {
-  const left = Buffer.from(actual || '');
-  const right = Buffer.from(expected || '');
-  return left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
-}
+function json(res,status,body,headers={}) { res.writeHead(status,{ 'Content-Type':'application/json; charset=utf-8',...headers }); res.end(JSON.stringify(body)); }
+function cleanText(value,max,field) { if(typeof value!=='string'||!value.trim()) throw Object.assign(new Error(`${field} is required.`),{status:400}); return value.trim().slice(0,max); }
+function safeEmail(value) { const email=String(value||'').trim().toLowerCase(); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254) throw Object.assign(new Error('A valid email is required.'),{status:400}); return email; }
+async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} }
+function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
+function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
 
-function json(res, status, body) {
-  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-  res.end(JSON.stringify(body));
-}
+export function createOrbitServer(options={}) {
+  const env=options.env||process.env;
+  const buddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
+  const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
+  const db=openDatabase(options.dbPath||path.join(dataDir,'orbit.sqlite'));
+  const model=createModelClient(env);
+  const encryptionKey=readEncryptionKey(env.CONNECTOR_ENCRYPTION_KEY);
+  const push=createPushService(env,db);
+  const connectors=createConnectorService(env,db,encryptionKey);
+  const production=env.NODE_ENV==='production';
+  const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
+  if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
-async function readJson(req) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > 256 * 1024) throw Object.assign(new Error('Request body is too large.'), { status: 413 });
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-  catch { throw Object.assign(new Error('Request body must be valid JSON.'), { status: 400 }); }
-}
+  const requestLog=new Map();
+  function rateLimited(req,limit=240){const key=req.socket.remoteAddress||'unknown';const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  const paused=()=>db.getSetting('system_paused','false')==='true';
+  const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
 
-function cleanText(value, max, field) {
-  if (typeof value !== 'string' || !value.trim()) throw Object.assign(new Error(`${field} is required.`), { status: 400 });
-  return value.trim().slice(0, max);
-}
+  function originFor(req){if(publicBase)return publicBase;const protocol=req.headers['x-forwarded-proto']==='https'?'https':production?'https':'http';return `${protocol}://${req.headers.host}`;}
+  function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session;if(!token)return null;return db.getSession(hashToken(token));}
+  function automationUser(req){const token=req.headers.authorization?.match(/^Bearer\s+(orbit_[A-Za-z0-9_-]+)$/)?.[1];if(!token)return null;const row=db.getAutomationToken(hashToken(token));if(!row)return null;const user=db.getUserById(row.user_id);return user&&!user.disabled?{...user,automation:true,scopes:row.scopes}:null;}
+  function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled)return{...session,automation:false};return automationUser(req);}
+  function requireCsrf(req,user){if(user.automation)return; if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
+  function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
+  function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production}));return csrf;}
+  function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role};}
 
-function nextRun(recurrence, previous) {
-  if (recurrence === 'none') return null;
-  const date = previous ? new Date(previous) : new Date();
-  date.setUTCDate(date.getUTCDate() + (recurrence === 'weekly' ? 7 : 1));
-  while (date <= new Date()) date.setUTCDate(date.getUTCDate() + (recurrence === 'weekly' ? 7 : 1));
-  return date.toISOString();
-}
+  let workerBusy=false;
+  async function runDueTasks(){if(workerBusy||paused())return;workerBusy=true;try{for(const task of db.dueTasks()){db.setTaskStatus(task.user_id,task.id,'running');db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);try{const result=await model.respond({buddyName,message:task.prompt,memories:db.listMemories(task.user_id),history:[],taskMode:true});const following=nextRun(task.recurrence,task.schedule_at);db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);await push.notify(task.user_id,`${buddyName} finished a task`,task.title,{view:'tasks',taskId:task.id});}catch(error){db.completeTask(task.user_id,task.id,'Task failed safely.','failed',null);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyName} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}}}finally{workerBusy=false;}}
 
-export function createOrbitServer(options = {}) {
-  const env = options.env || process.env;
-  const buddyName = env.BUDDY_NAME?.trim().slice(0, 40) || 'Orbit';
-  const dataDir = path.resolve(options.dataDir || env.DATA_DIR || path.join(root, 'data'));
-  const db = openDatabase(options.dbPath || path.join(dataDir, 'orbit.sqlite'));
-  const model = createModelClient(env);
-  let accessToken = env.BUDDY_ACCESS_TOKEN?.trim();
-  if (!accessToken) {
-    if (env.NODE_ENV === 'production') throw new Error('BUDDY_ACCESS_TOKEN is required in production.');
-    accessToken = randomBytes(24).toString('hex');
-  }
-  if (env.NODE_ENV === 'production' && accessToken.length < 24) {
-    throw new Error('BUDDY_ACCESS_TOKEN must contain at least 24 characters in production.');
-  }
+  let backupBusy=false;
+  async function runBackups(){if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;const today=new Date().toISOString().slice(0,10);if(db.getSetting('last_automatic_backup')===today)return;backupBusy=true;try{for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,passphrase:env.BACKUP_ENCRYPTION_KEY});db.setSetting('last_automatic_backup',today);}finally{backupBusy=false;}}
 
-  const attempts = new Map();
-  const limited = (req) => {
-    const key = req.socket.remoteAddress || 'unknown';
-    const timestamp = Date.now();
-    const recent = (attempts.get(key) || []).filter((time) => timestamp - time < 60_000);
-    recent.push(timestamp);
-    attempts.set(key, recent);
-    return recent.length > 120;
-  };
+  const server=http.createServer(async(req,res)=>{
+    res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
+    res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+    if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
+    if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
+    const url=new URL(req.url,'http://localhost');
+    if(url.pathname==='/healthz')return json(res,200,{ok:true,service:'orbit-buddy',paused:paused()});
 
-  let workerBusy = false;
-  async function runDueTasks() {
-    if (workerBusy) return;
-    workerBusy = true;
     try {
-      for (const task of db.dueTasks()) {
-        db.setTaskStatus(task.id, 'running');
-        db.addEvent('task_started', `Started “${task.title}”.`);
-        try {
-          const result = await model.respond({
-            buddyName, message: task.prompt, memories: db.listMemories(), history: [], taskMode: true
-          });
-          const following = nextRun(task.recurrence, task.schedule_at);
-          db.completeTask(task.id, result, following ? 'scheduled' : 'completed', following);
-          db.addEvent('task_completed', `Completed “${task.title}”.`);
-        } catch (error) {
-          db.completeTask(task.id, error.message, 'failed', null);
-          db.addEvent('task_failed', `Could not complete “${task.title}”.`, error.message);
-        }
+      if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:db.countUsers()===0||Boolean(env.ORBIT_INVITE_CODE)});
+      if(req.method==='POST'&&url.pathname==='/api/auth/register'){
+        if(rateLimited(req,30))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
+        const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
+        if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
+        const password=await hashPassword(body.password);const count=db.countUsers();
+        if(count>0&&(!env.ORBIT_INVITE_CODE||body.inviteCode!==env.ORBIT_INVITE_CODE))throw Object.assign(new Error('Registration requires a valid invite code.'),{status:403});
+        if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
+        const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
+        if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const csrf=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
+        return json(res,201,{user:publicUser(user),csrf,recoveryCodes:codes});
       }
-    } finally { workerBusy = false; }
-  }
-
-  const server = http.createServer(async (req, res) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
-
-    if (limited(req)) return json(res, 429, { error: 'Too many requests. Try again shortly.' });
-    const url = new URL(req.url, 'http://localhost');
-    if (url.pathname === '/healthz') return json(res, 200, { ok: true, service: 'orbit-buddy' });
-
-    if (url.pathname.startsWith('/api/')) {
-      const bearer = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
-      if (!secureEqual(bearer, accessToken)) return json(res, 401, { error: 'Authentication required.' });
-      try {
-        if (req.method === 'GET' && url.pathname === '/api/status') {
-          return json(res, 200, { buddyName, model: model.model, modelConfigured: model.configured, version: '0.1.0' });
-        }
-        if (req.method === 'GET' && url.pathname === '/api/snapshot') {
-          return json(res, 200, {
-            messages: db.listMessages(), memories: db.listMemories(),
-            tasks: db.listTasks(), events: db.listEvents()
-          });
-        }
-        if (req.method === 'POST' && url.pathname === '/api/chat') {
-          const body = await readJson(req);
-          const message = cleanText(body.message, 6000, 'message');
-          const history = db.listMessages(20);
-          db.addMessage('user', message);
-          const answer = await model.respond({
-            buddyName, message, memories: db.listMemories(), history
-          });
-          const saved = db.addMessage('assistant', answer);
-          db.addEvent('chat', 'Orbit replied to a message.');
-          return json(res, 201, saved);
-        }
-        if (req.method === 'POST' && url.pathname === '/api/memories') {
-          const body = await readJson(req);
-          const memory = db.addMemory(cleanText(body.content, 2000, 'content'));
-          db.addEvent('memory_added', 'Saved a user-approved memory.');
-          return json(res, 201, memory);
-        }
-        const memoryMatch = url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);
-        if (req.method === 'DELETE' && memoryMatch) {
-          const removed = db.deleteMemory(memoryMatch[1]);
-          if (!removed) return json(res, 404, { error: 'Memory not found.' });
-          db.addEvent('memory_deleted', 'Deleted a memory.');
-          return json(res, 200, { ok: true });
-        }
-        if (req.method === 'POST' && url.pathname === '/api/tasks') {
-          const body = await readJson(req);
-          const risk = body.risk === 'external' ? 'external' : 'internal';
-          const recurrence = ['daily', 'weekly'].includes(body.recurrence) ? body.recurrence : 'none';
-          let scheduleAt = null;
-          if (body.scheduleAt) {
-            const date = new Date(body.scheduleAt);
-            if (Number.isNaN(date.valueOf())) throw Object.assign(new Error('scheduleAt must be a valid date.'), { status: 400 });
-            scheduleAt = date.toISOString();
-          }
-          const task = db.addTask({
-            title: cleanText(body.title, 120, 'title'),
-            prompt: cleanText(body.prompt, 6000, 'prompt'), risk, scheduleAt, recurrence
-          });
-          db.addEvent('task_created', `Created “${task.title}”.`, risk === 'external' ? 'Waiting for approval.' : null);
-          return json(res, 201, task);
-        }
-        const taskMatch = url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/(approve|cancel)$/);
-        if (req.method === 'POST' && taskMatch) {
-          const task = db.getTask(taskMatch[1]);
-          if (!task) return json(res, 404, { error: 'Task not found.' });
-          const action = taskMatch[2];
-          const status = action === 'approve' ? (task.schedule_at ? 'scheduled' : 'queued') : 'cancelled';
-          db.setTaskStatus(task.id, status);
-          db.addEvent(`task_${action}d`, `${action === 'approve' ? 'Approved' : 'Cancelled'} “${task.title}”.`);
-          if (action === 'approve') setImmediate(runDueTasks);
-          return json(res, 200, { ...task, status });
-        }
-        return json(res, 404, { error: 'API route not found.' });
-      } catch (error) {
-        return json(res, error.status || 500, { error: error.status ? error.message : 'Request failed safely.' });
+      if(req.method==='POST'&&url.pathname==='/api/auth/login'){
+        if(rateLimited(req,40))throw Object.assign(new Error('Too many login attempts.'),{status:429});
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&await verifyPassword(body.password,user.password_hash,user.password_salt);
+        if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const csrf=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf});
       }
-    }
+      if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
+        if(rateLimited(req,25))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const recovered=user&&db.consumeRecoveryCode(hashToken(String(body.recoveryCode||'').trim().toUpperCase()));
+        if(!recovered||recovered.user_id!==user.id)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});const password=await hashPassword(body.newPassword);db.updatePassword(user.id,password.hash,password.salt);db.deleteUserSessions(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
+      }
 
-    if (!['GET', 'HEAD'].includes(req.method)) return json(res, 405, { error: 'Method not allowed.' });
-    const requestPath = url.pathname === '/' ? '/index.html' : url.pathname;
-    const resolved = path.resolve(publicRoot, `.${decodeURIComponent(requestPath)}`);
-    if (!resolved.startsWith(`${publicRoot}${path.sep}`)) return json(res, 404, { error: 'Not found.' });
-    try {
-      const stat = fs.statSync(resolved);
-      if (!stat.isFile()) throw new Error('Not a file');
-      res.writeHead(200, {
-        'Content-Type': mimeTypes[path.extname(resolved)] || 'application/octet-stream',
-        'Cache-Control': path.basename(resolved) === 'index.html' ? 'no-cache' : 'public, max-age=3600'
-      });
-      if (req.method === 'HEAD') return res.end();
-      fs.createReadStream(resolved).pipe(res);
-    } catch { json(res, 404, { error: 'Not found.' }); }
+      const callback=url.pathname.match(/^\/api\/connectors\/(github|google|slack)\/callback$/);
+      if(req.method==='GET'&&callback){const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
+
+      if(url.pathname.startsWith('/api/')){
+        const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
+        if(req.method==='GET'&&url.pathname==='/api/auth/me')return json(res,200,{user:publicUser(user),csrf:user.csrf_token||null});
+        if(req.method==='POST'&&url.pathname==='/api/auth/logout'){if(!user.automation){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production}));}return json(res,200,{ok:true});}
+        if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName,model:model.model,modelConfigured:model.configured,version:'0.2.0',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
+        if(req.method==='GET'&&url.pathname==='/api/snapshot')return json(res,200,{messages:db.listMessages(user.user_id||user.id),memories:db.listMemories(user.user_id||user.id),tasks:db.listTasks(user.user_id||user.id),events:db.listEvents(user.user_id||user.id),artifacts:db.listArtifacts(user.user_id||user.id),connectors:db.listConnectors(user.user_id||user.id),automationTokens:db.listAutomationTokens(user.user_id||user.id)});
+        const userId=user.user_id||user.id;
+        if(req.method==='POST'&&url.pathname==='/api/chat'){if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});const body=await readJson(req);const message=cleanText(body.message,6000,'message');const history=db.listMessages(userId,20);db.addMessage(userId,'user',message);const answer=await model.respond({buddyName,message,memories:db.listMemories(userId),history});const saved=db.addMessage(userId,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');return json(res,201,saved);}
+        if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'));db.addEvent(userId,'memory_added','Saved a user-approved memory.');return json(res,201,memory);}
+        const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/tasks'){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});const body=await readJson(req);const risk=body.risk==='external'?'external':'internal';const recurrence=['daily','weekly'].includes(body.recurrence)?body.recurrence:'none';let scheduleAt=null;if(body.scheduleAt){const date=new Date(body.scheduleAt);if(Number.isNaN(date.valueOf()))throw Object.assign(new Error('scheduleAt must be valid.'),{status:400});scheduleAt=date.toISOString();}const task=db.addTask(userId,{title:cleanText(body.title,120,'title'),prompt:cleanText(body.prompt,6000,'prompt'),risk,scheduleAt,recurrence});db.addEvent(userId,'task_created',`Created “${task.title}”.`,risk==='external'?'Waiting for approval.':null);setImmediate(runDueTasks);return json(res,201,task);}
+        const taskMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/(approve|cancel)$/);if(req.method==='POST'&&taskMatch){const task=db.getTask(userId,taskMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});const action=taskMatch[2];const status=action==='approve'?(task.schedule_at?'scheduled':'queued'):'cancelled';db.setTaskStatus(userId,task.id,status);db.addEvent(userId,`task_${action}d`,`${action==='approve'?'Approved':'Cancelled'} “${task.title}”.`);if(action==='approve')setImmediate(runDueTasks);return json(res,200,{...task,status});}
+        const artifactMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='GET'&&artifactMatch){const artifact=db.getArtifact(userId,artifactMatch[1]);if(!artifact)throw Object.assign(new Error('Artifact not found.'),{status:404});res.writeHead(200,{'Content-Type':artifact.mime_type,'Content-Disposition':`attachment; filename="${artifact.name.replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(artifact.content);}
+        if(req.method==='GET'&&url.pathname==='/api/push/public-key')return json(res,200,{configured:push.configured,publicKey:push.publicKey});
+        if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/push/unsubscribe'){const body=await readJson(req);db.deletePush(userId,String(body.endpoint||''));return json(res,200,{ok:true});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|google|slack)\/begin$/);if(req.method==='POST'&&connectBegin){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
+        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|google|slack)$/);if(req.method==='DELETE'&&connectorMatch){db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
+        const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|google|slack)\/preview$/);if(req.method==='GET'&&connectorPreview){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
+        if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
+        if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const payload=await encryptPortable(db.exportUser(userId),body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
+        if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,12*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);db.restoreUser(userId,bundle);db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
+        if(req.method==='POST'&&url.pathname==='/api/automation-tokens'){const body=await readJson(req);const token=`orbit_${randomToken(32)}`;const saved=db.addAutomationToken(userId,{label:cleanText(body.label,80,'label'),tokenHash:hashToken(token),scopes:'tasks:create'});db.addEvent(userId,'automation_token_created',`Created automation token “${saved.label}”.`);return json(res,201,{...saved,token});}
+        const autoMatch=url.pathname.match(/^\/api\/automation-tokens\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&autoMatch){db.revokeAutomationToken(userId,autoMatch[1]);return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/automation/tasks'){if(!user.automation||!user.scopes.split(/\s+/).includes('tasks:create'))throw Object.assign(new Error('Automation token lacks tasks:create.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});const body=await readJson(req);const task=db.addTask(userId,{title:cleanText(body.title,120,'title'),prompt:cleanText(body.prompt,6000,'prompt'),risk:'internal',scheduleAt:body.scheduleAt?new Date(body.scheduleAt).toISOString():null,recurrence:'none'});db.addEvent(userId,'automation_task_created',`Automation created “${task.title}”.`);setImmediate(runDueTasks);return json(res,201,task);}
+        if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyName} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
+        return json(res,404,{error:'API route not found.'});
+      }
+    } catch(error) { return json(res,error.status||500,{error:error.status?error.message:'Request failed safely.'}); }
+
+    if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});const requestPath=url.pathname==='/'?'/index.html':url.pathname;let resolved;try{resolved=path.resolve(publicRoot,`.${decodeURIComponent(requestPath)}`);}catch{return json(res,404,{error:'Not found.'});}if(!resolved.startsWith(`${publicRoot}${path.sep}`))return json(res,404,{error:'Not found.'});
+    try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':path.basename(resolved)==='index.html'?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
   });
 
-  const intervalMs = Math.max(Number(env.TASK_POLL_MS) || 15_000, 5_000);
-  let timer;
-  return {
-    server, accessToken, db,
-    startWorker() { timer = setInterval(runDueTasks, intervalMs); timer.unref(); setImmediate(runDueTasks); },
-    async close() { if (timer) clearInterval(timer); await new Promise((resolve) => server.close(resolve)); db.close(); }
+  const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
+  return {server,db,runDueTasks,
+    startWorker(){workerTimer=setInterval(runDueTasks,workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(runDueTasks);setImmediate(runBackups);},
+    async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const app = createOrbitServer();
-  const port = Number(process.env.PORT) || 3000;
-  const host = process.env.HOST || '127.0.0.1';
-  app.server.listen(port, host, () => {
-    app.startWorker();
-    console.log(`Orbit Buddy is ready at http://${host}:${port}`);
-    if (!process.env.BUDDY_ACCESS_TOKEN) console.log(`Development access token: ${app.accessToken}`);
-  });
-}
+if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createOrbitServer();const port=Number(process.env.PORT)||3000;const host=process.env.HOST||'127.0.0.1';app.server.listen(port,host,()=>{app.startWorker();console.log(`Orbit Buddy is ready at http://${host}:${port}`);});}
