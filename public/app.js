@@ -1,142 +1,42 @@
-const state = { token: sessionStorage.getItem('orbit-token') || '', snapshot: null, status: null };
-const $ = (selector) => document.querySelector(selector);
-const $$ = (selector) => [...document.querySelectorAll(selector)];
+const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
+const $=(selector)=>document.querySelector(selector);const $$=(selector)=>[...document.querySelectorAll(selector)];
+async function api(url,options={}){const headers={...(options.body?{'Content-Type':'application/json'}:{}),...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{}),...(options.headers||{})};const response=await fetch(url,{credentials:'same-origin',...options,headers});const type=response.headers.get('content-type')||'';const body=type.includes('json')?await response.json().catch(()=>({})):null;if(response.status===401)throw Object.assign(new Error(body?.error||'Authentication required.'),{auth:true});if(!response.ok)throw new Error(body?.error||`Request failed (${response.status}).`);return body??response;}
+function toast(message){const el=$('#toast');el.textContent=message;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2800);}
+function formatDate(value){if(!value)return'Ready now';return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(value));}
+function empty(root,text){const p=document.createElement('p');p.className='empty';p.textContent=text;root.append(p);}
+function button(label,className,handler){const value=document.createElement('button');value.type='button';value.className=className;value.textContent=label;value.addEventListener('click',handler);return value;}
+function showCodes(codes){$('#codes-output').textContent=codes.join('\n');$('#codes-dialog').showModal();}
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.token}`, ...(options.headers || {}) }
-  });
-  const body = await response.json().catch(() => ({}));
-  if (response.status === 401) throw Object.assign(new Error('Authentication required.'), { auth: true });
-  if (!response.ok) throw new Error(body.error || `Request failed (${response.status}).`);
-  return body;
-}
+function renderMessages(items){const root=$('#messages');root.replaceChildren();if(!items.length)return empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className=`message ${item.role}`;el.textContent=item.content;root.append(el);}root.scrollTop=root.scrollHeight;}
+function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$('#task-count').textContent=String(items.filter((task)=>!['completed','cancelled','failed'].includes(task.status)).length);if(!items.length)return empty(root,'No tasks yet. Give Orbit one clear outcome to prepare.');for(const task of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=task.title;const prompt=document.createElement('p');prompt.textContent=task.prompt;wrap.append(h,prompt);const status=document.createElement('span');status.className=`badge ${task.status}`;status.textContent=task.status.replaceAll('_',' ');head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';for(const value of [task.risk==='external'?'approval gated':'think only',task.recurrence,formatDate(task.schedule_at)]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}card.append(meta);if(task.result){const result=document.createElement('p');result.className='result';result.textContent=task.result;card.append(result);}if(task.status==='waiting_approval'){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve plan','primary',()=>taskAction(task.id,'approve')),button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}else if(!['completed','failed','cancelled'].includes(task.status)){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}root.append(card);}}
+function renderMemories(items){const root=$('#memory-list');root.replaceChildren();if(!items.length)return empty(root,'Nothing saved. Orbit only remembers what you add here.');for(const memory of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const text=document.createElement('p');text.textContent=memory.content;head.append(text,button('Delete','danger',()=>deleteMemory(memory.id)));card.append(head);root.append(card);}}
+function renderActivity(items){const root=$('#activity-list');root.replaceChildren();if(!items.length)return empty(root,'Activity will appear here.');for(const event of items){const el=document.createElement('div');el.className='timeline-item';const p=document.createElement('p');p.textContent=event.message;const time=document.createElement('time');time.dateTime=event.created_at;time.textContent=formatDate(event.created_at);el.append(p,time);root.append(el);}}
+function renderFiles(items){const root=$('#files-list');root.replaceChildren();if(!items.length)return empty(root,'Completed task files will appear here.');for(const file of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=file.name;const p=document.createElement('p');p.textContent=`${Math.max(1,Math.round(file.size_bytes/1024))} KB · ${formatDate(file.created_at)}`;wrap.append(h,p);const link=document.createElement('a');link.className='primary link-button';link.href=`/api/artifacts/${file.id}`;link.textContent='Download';head.append(wrap,link);card.append(head);root.append(card);}}
+function renderConnections(){const root=$('#connections-list');root.replaceChildren();const connected=new Map((state.snapshot.connectors||[]).map((item)=>[item.provider,item]));for(const provider of state.status.connectors||[]){const card=document.createElement('article');card.className='panel connector-card';const h=document.createElement('h2');h.textContent=provider.label;const p=document.createElement('p');p.className='muted';const live=connected.has(provider.id);p.textContent=live?'Connected with encrypted credentials.':provider.configured?'Ready to connect.':'Server administrator must configure OAuth credentials.';card.append(h,p);if(live){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Preview access','ghost',()=>previewConnector(provider.id)),button('Disconnect','danger',()=>disconnectConnector(provider.id)));card.append(actions);}else{const connect=button('Connect','primary',()=>beginConnector(provider.id));connect.disabled=!provider.configured;card.append(connect);}root.append(card);}renderAutomation();}
+function renderAutomation(){const root=$('#automation-list');root.replaceChildren();for(const item of state.snapshot.automationTokens||[]){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=item.label;const p=document.createElement('p');p.textContent=item.revoked_at?'Revoked':`Created ${formatDate(item.created_at)}${item.last_used_at?` · last used ${formatDate(item.last_used_at)}`:''}`;wrap.append(h,p);head.append(wrap);if(!item.revoked_at)head.append(button('Revoke','danger',()=>revokeAutomation(item.id)));card.append(head);root.append(card);}}
+function render(){if(!state.snapshot)return;renderMessages(state.snapshot.messages);renderTasks(state.snapshot.tasks);renderFiles(state.snapshot.artifacts||[]);renderMemories(state.snapshot.memories);renderActivity(state.snapshot.events);renderConnections();const paused=state.status.paused;$('#pause-banner').classList.toggle('hidden',!paused);$('#pause-button').classList.toggle('hidden',paused);$('#resume-button').classList.toggle('hidden',!paused);$('#chat-input').disabled=paused;}
+async function refresh(){state.status=await api('/api/status');state.snapshot=await api('/api/snapshot');$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);$('#model-pill').textContent=state.status.modelConfigured?state.status.model:'Demo mode · add an API key';render();}
+async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');await refresh();$('#auth-dialog').close();}catch(error){if(error.auth){state.setup=await fetch('/api/auth/setup-status').then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');$('#auth-dialog').showModal();}else toast(error.message);}}
+function setAuthMode(mode){$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':'Your account keeps your work separate and protected.';$('#name-label').classList.toggle('hidden',!register);$('#invite-label').classList.toggle('hidden',!register||state.setup?.needsOwner);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover);$('#auth-password').required=!recover;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':'Sign in';$('#auth-error').textContent='';}
+async function taskAction(id,action){try{await api(`/api/tasks/${id}/${action}`,{method:'POST'});await refresh();toast(action==='approve'?'Task approved.':'Task cancelled.');}catch(error){toast(error.message);}}
+async function deleteMemory(id){try{await api(`/api/memories/${id}`,{method:'DELETE'});await refresh();toast('Memory deleted.');}catch(error){toast(error.message);}}
+async function beginConnector(provider){try{const result=await api(`/api/connectors/${provider}/begin`,{method:'POST'});location.href=result.url;}catch(error){toast(error.message);}}
+async function disconnectConnector(provider){try{await api(`/api/connectors/${provider}`,{method:'DELETE'});await refresh();toast('Connector disconnected.');}catch(error){toast(error.message);}}
+async function previewConnector(provider){try{const result=await api(`/api/connectors/${provider}/preview`);const summary=result.items.slice(0,5).map((item)=>item.name||item.start||'Item').join(' · ');toast(summary||'Connected, with no recent items.');}catch(error){toast(error.message);}}
+async function revokeAutomation(id){try{await api(`/api/automation-tokens/${id}`,{method:'DELETE'});await refresh();toast('Automation token revoked.');}catch(error){toast(error.message);}}
 
-function toast(message) {
-  const element = $('#toast'); element.textContent = message; element.classList.add('show');
-  clearTimeout(toast.timer); toast.timer = setTimeout(() => element.classList.remove('show'), 2600);
-}
-
-function formatDate(value) {
-  if (!value) return 'Ready now';
-  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
-}
-
-function renderMessages(messages) {
-  const root = $('#messages'); root.replaceChildren();
-  if (!messages.length) {
-    const empty = document.createElement('p'); empty.className = 'empty';
-    empty.textContent = 'Start with a question, a decision, or something you want to make progress on.'; root.append(empty); return;
-  }
-  for (const item of messages) {
-    const message = document.createElement('div'); message.className = `message ${item.role}`; message.textContent = item.content; root.append(message);
-  }
-  root.scrollTop = root.scrollHeight;
-}
-
-function makeButton(label, className, onClick) {
-  const button = document.createElement('button'); button.type = 'button'; button.className = className; button.textContent = label; button.addEventListener('click', onClick); return button;
-}
-
-function renderTasks(tasks) {
-  const root = $('#tasks-list'); root.replaceChildren();
-  const active = tasks.filter((task) => !['completed', 'cancelled'].includes(task.status)).length;
-  $('#task-count').textContent = String(active);
-  if (!tasks.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'No tasks yet. Give Orbit one clear outcome to prepare.'; root.append(empty); return; }
-  for (const task of tasks) {
-    const card = document.createElement('article'); card.className = 'item-card';
-    const header = document.createElement('header'); const titleWrap = document.createElement('div');
-    const title = document.createElement('h3'); title.textContent = task.title;
-    const prompt = document.createElement('p'); prompt.textContent = task.prompt; titleWrap.append(title, prompt);
-    const status = document.createElement('span'); status.className = `badge ${task.status}`; status.textContent = task.status.replaceAll('_', ' '); header.append(titleWrap, status); card.append(header);
-    const meta = document.createElement('div'); meta.className = 'meta';
-    for (const text of [task.risk === 'external' ? 'approval gated' : 'think only', task.recurrence, formatDate(task.schedule_at)]) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = text; meta.append(badge); }
-    card.append(meta);
-    if (task.result) { const result = document.createElement('p'); result.className = 'result'; result.textContent = task.result; card.append(result); }
-    if (task.status === 'waiting_approval') {
-      const actions = document.createElement('div'); actions.className = 'mini-actions';
-      actions.append(makeButton('Approve plan', 'primary', () => taskAction(task.id, 'approve')), makeButton('Cancel', 'danger', () => taskAction(task.id, 'cancel'))); card.append(actions);
-    } else if (!['completed', 'failed', 'cancelled'].includes(task.status)) {
-      const actions = document.createElement('div'); actions.className = 'mini-actions'; actions.append(makeButton('Cancel', 'danger', () => taskAction(task.id, 'cancel'))); card.append(actions);
-    }
-    root.append(card);
-  }
-}
-
-function renderMemories(memories) {
-  const root = $('#memory-list'); root.replaceChildren();
-  if (!memories.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'Nothing saved. Orbit only remembers what you add here.'; root.append(empty); return; }
-  for (const memory of memories) {
-    const card = document.createElement('article'); card.className = 'item-card'; const header = document.createElement('header');
-    const text = document.createElement('p'); text.textContent = memory.content;
-    header.append(text, makeButton('Delete', 'danger', () => deleteMemory(memory.id))); card.append(header); root.append(card);
-  }
-}
-
-function renderActivity(events) {
-  const root = $('#activity-list'); root.replaceChildren();
-  if (!events.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'Activity will appear here.'; root.append(empty); return; }
-  for (const event of events) {
-    const item = document.createElement('div'); item.className = 'timeline-item'; const message = document.createElement('p'); message.textContent = event.message;
-    const time = document.createElement('time'); time.dateTime = event.created_at; time.textContent = formatDate(event.created_at); item.append(message, time); root.append(item);
-  }
-}
-
-function render() {
-  if (!state.snapshot) return;
-  renderMessages(state.snapshot.messages); renderTasks(state.snapshot.tasks); renderMemories(state.snapshot.memories); renderActivity(state.snapshot.events);
-}
-
-async function refresh() {
-  state.snapshot = await api('/api/snapshot'); render();
-}
-
-async function connect() {
-  try {
-    state.status = await api('/api/status'); await refresh();
-    $('#brand-name').textContent = state.status.buddyName; $('#status-text').textContent = 'Online'; $('.status').classList.add('online');
-    $('#model-pill').textContent = state.status.modelConfigured ? state.status.model : 'Demo mode · add an API key';
-    $('#login-dialog').close();
-  } catch (error) { if (error.auth) $('#login-dialog').showModal(); else toast(error.message); throw error; }
-}
-
-async function taskAction(id, action) { try { await api(`/api/tasks/${id}/${action}`, { method: 'POST' }); await refresh(); toast(action === 'approve' ? 'Task approved.' : 'Task cancelled.'); } catch (error) { toast(error.message); } }
-async function deleteMemory(id) { try { await api(`/api/memories/${id}`, { method: 'DELETE' }); await refresh(); toast('Memory deleted.'); } catch (error) { toast(error.message); } }
-
-$$('.tab').forEach((button) => button.addEventListener('click', () => {
-  $$('.tab').forEach((item) => item.classList.toggle('active', item === button));
-  $$('.view').forEach((view) => view.classList.toggle('active', view.id === button.dataset.view));
-  location.hash = button.dataset.view;
-}));
-
-$('#login-form').addEventListener('submit', async (event) => {
-  event.preventDefault(); state.token = $('#token-input').value; sessionStorage.setItem('orbit-token', state.token); $('#login-error').textContent = '';
-  try { await connect(); } catch (error) { $('#login-error').textContent = error.auth ? 'That access token was not accepted.' : error.message; }
-});
-
-$('#chat-form').addEventListener('submit', async (event) => {
-  event.preventDefault(); const button = event.submitter; const input = $('#chat-input'); const message = input.value.trim(); if (!message) return;
-  button.disabled = true; input.disabled = true;
-  try { await api('/api/chat', { method: 'POST', body: JSON.stringify({ message }) }); input.value = ''; await refresh(); }
-  catch (error) { toast(error.message); } finally { button.disabled = false; input.disabled = false; input.focus(); }
-});
-
-$('#new-task-button').addEventListener('click', () => $('#task-form').classList.remove('hidden'));
-$('#cancel-task').addEventListener('click', () => $('#task-form').classList.add('hidden'));
-$('#task-form').addEventListener('submit', async (event) => {
-  event.preventDefault(); const dateValue = $('#task-date').value;
-  const body = { title: $('#task-title').value, prompt: $('#task-prompt').value, recurrence: $('#task-recurrence').value, risk: $('#task-risk').value, scheduleAt: dateValue ? new Date(dateValue).toISOString() : null };
-  try { await api('/api/tasks', { method: 'POST', body: JSON.stringify(body) }); event.target.reset(); event.target.classList.add('hidden'); await refresh(); toast('Task created.'); }
-  catch (error) { toast(error.message); }
-});
-
-$('#memory-form').addEventListener('submit', async (event) => {
-  event.preventDefault(); const input = $('#memory-input');
-  try { await api('/api/memories', { method: 'POST', body: JSON.stringify({ content: input.value }) }); input.value = ''; await refresh(); toast('Memory saved.'); }
-  catch (error) { toast(error.message); }
-});
-
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-connect().catch(() => {});
-setInterval(() => { if (state.token && !$('#login-dialog').open) refresh().catch(() => {}); }, 5000);
+$$('.tab').forEach((tab)=>tab.addEventListener('click',()=>{$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===tab.dataset.view));location.hash=tab.dataset.view;}));
+$('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='recover'){const response=await fetch('/api/auth/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value,inviteCode:$('#auth-invite').value}:{email:$('#auth-email').value,password:$('#auth-password').value};const response=await fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;if(body.recoveryCodes)showCodes(body.recoveryCodes);await connect();}catch(error){$('#auth-error').textContent=error.message;}});
+$('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-register').addEventListener('click',()=>setAuthMode('register'));$('#show-recover').addEventListener('click',()=>setAuthMode('recover'));
+$('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));$('#close-secret').addEventListener('click',()=>$('#secret-dialog').close());$('#copy-secret').addEventListener('click',()=>navigator.clipboard.writeText($('#secret-output').textContent).then(()=>toast('Token copied.')));
+$('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload();});
+$('#chat-form').addEventListener('submit',async(event)=>{event.preventDefault();const submit=event.submitter;const input=$('#chat-input');submit.disabled=true;try{await api('/api/chat',{method:'POST',body:JSON.stringify({message:input.value})});input.value='';await refresh();}catch(error){toast(error.message);}finally{submit.disabled=false;}});
+$('#new-task-button').addEventListener('click',()=>$('#task-form').classList.remove('hidden'));$('#cancel-task').addEventListener('click',()=>$('#task-form').classList.add('hidden'));$('#task-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const date=$('#task-date').value;await api('/api/tasks',{method:'POST',body:JSON.stringify({title:$('#task-title').value,prompt:$('#task-prompt').value,recurrence:$('#task-recurrence').value,risk:$('#task-risk').value,scheduleAt:date?new Date(date).toISOString():null})});event.target.reset();event.target.classList.add('hidden');await refresh();toast('Task created.');}catch(error){toast(error.message);}});
+$('#memory-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/memories',{method:'POST',body:JSON.stringify({content:$('#memory-input').value})});event.target.reset();await refresh();toast('Memory saved.');}catch(error){toast(error.message);}});
+$('#automation-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const result=await api('/api/automation-tokens',{method:'POST',body:JSON.stringify({label:$('#automation-label').value})});$('#secret-output').textContent=result.token;$('#secret-dialog').showModal();event.target.reset();await refresh();}catch(error){toast(error.message);}});
+$('#enable-push').addEventListener('click',async()=>{try{if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');}catch(error){toast(error.message);}});
+$('#export-backup').addEventListener('click',async()=>{try{const passphrase=$('#backup-passphrase').value;const response=await fetch('/api/backups/export',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Orbit-CSRF':state.csrf},body:JSON.stringify({passphrase})});if(!response.ok)throw new Error((await response.json()).error);const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`orbit-backup-${new Date().toISOString().slice(0,10)}.orbitbackup`;link.click();URL.revokeObjectURL(url);toast('Encrypted backup downloaded.');}catch(error){toast(error.message);}});
+$('#restore-backup').addEventListener('click',async()=>{try{const file=$('#restore-file').files[0];if(!file)throw new Error('Choose an Orbit backup first.');if(file.size>10*1024*1024)throw new Error('Backup is too large.');if(prompt('Restoring merges data and pauses Orbit. Type RESTORE to continue:')!=='RESTORE')return;const payload=await file.text();await api('/api/backups/restore',{method:'POST',body:JSON.stringify({payload,passphrase:$('#backup-passphrase').value,confirm:'RESTORE'})});await refresh();toast('Backup restored. Orbit remains paused for review.');}catch(error){toast(error.message);}});
+$('#rotate-recovery').addEventListener('click',async()=>{try{const result=await api('/api/recovery-codes/rotate',{method:'POST',body:JSON.stringify({password:$('#recovery-password').value})});showCodes(result.recoveryCodes);$('#recovery-password').value='';}catch(error){toast(error.message);}});
+$('#pause-button').addEventListener('click',async()=>{try{await api('/api/admin/pause',{method:'POST'});await refresh();toast('Emergency pause enabled.');}catch(error){toast(error.message);}});$('#resume-button').addEventListener('click',async()=>{if(prompt('Type RESUME to restart Orbit work:')!=='RESUME')return;try{await api('/api/admin/resume',{method:'POST',body:JSON.stringify({confirm:'RESUME'})});await refresh();toast('Orbit resumed.');}catch(error){toast(error.message);}});
+if('serviceWorker'in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});connect();setInterval(()=>{if(state.user)refresh().catch(()=>{});},7000);

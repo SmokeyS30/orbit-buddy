@@ -1,6 +1,6 @@
 {
   "name": "orbit-buddy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A privacy-first, self-hostable persistent AI buddy for the web, Mac, and iPhone.",
   "type": "module",
   "engines": {
@@ -11,6 +11,9 @@
     "dev": "NODE_ENV=development node --watch server.js",
     "test": "node --test",
     "check": "node --check server.js && node --check src/database.js && node --check src/model.js && node --check public/app.js && npm test"
+  },
+  "dependencies": {
+    "web-push": "3.6.7"
   },
   "keywords": [
     "ai-agent",

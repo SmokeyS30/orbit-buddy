@@ -5,31 +5,77 @@ import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
 
-async function fixture() {
+async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-server-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', BUDDY_ACCESS_TOKEN: 'test-token', OPENAI_MODEL: 'gpt-5.4-mini' } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-5.4-mini', ...extraEnv } });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
-  const port = app.server.address().port;
-  return { app, base: `http://127.0.0.1:${port}` };
+  return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
 
-test('health is public and API data is protected', async (t) => {
+async function register(base, { email = 'owner@example.com', displayName = 'Owner', inviteCode } = {}) {
+  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName, password: 'correct horse battery staple', inviteCode }) });
+  assert.equal(response.status, 201);
+  const body = await response.json();
+  return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, body };
+}
+
+const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
+
+test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   assert.equal((await fetch(`${base}/healthz`)).status, 200);
+  assert.equal((await fetch(`${base}/api/auth/setup-status`)).status, 200);
   assert.equal((await fetch(`${base}/api/status`)).status, 401);
-  const response = await fetch(`${base}/api/status`, { headers: { Authorization: 'Bearer test-token' } });
-  assert.equal(response.status, 200); assert.equal((await response.json()).modelConfigured, false);
+  const auth = await register(base);
+  const response = await fetch(`${base}/api/auth/me`, { headers: { Cookie: auth.cookie } });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).user.email, 'owner@example.com');
 });
 
-test('demo chat stores a safe response', async (t) => {
+test('CSRF is enforced and background work produces a saved artifact', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
-  const response = await fetch(`${base}/api/chat`, {
-    method: 'POST', headers: { Authorization: 'Bearer test-token', 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: 'Help me plan tomorrow' })
-  });
-  assert.equal(response.status, 201);
-  const snapshot = await fetch(`${base}/api/snapshot`, { headers: { Authorization: 'Bearer test-token' } });
+  const auth = await register(base);
+  assert.equal((await fetch(`${base}/api/tasks`, { method: 'POST', headers: { Cookie: auth.cookie, 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+  const created = await fetch(`${base}/api/tasks`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ title: 'Plan', prompt: 'Make a plan' }) });
+  assert.equal(created.status, 201);
+  await app.runDueTasks();
+  const snapshot = await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } });
   const body = await snapshot.json();
-  assert.equal(body.messages.length, 2);
-  assert.match(body.messages[1].content, /demo mode/i);
+  assert.equal(body.tasks[0].status, 'completed');
+  assert.equal(body.artifacts.length, 1);
+  assert.match(body.artifacts[0].name, /plan/i);
+});
+
+test('owner emergency pause blocks work until explicit resume', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const paused = await fetch(`${base}/api/admin/pause`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(paused.status, 200);
+  assert.equal((await fetch(`${base}/api/tasks`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ title: 'Blocked', prompt: 'Do work' }) })).status, 423);
+  const resumed = await fetch(`${base}/api/admin/resume`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ confirm: 'RESUME' }) });
+  assert.equal(resumed.status, 200);
+});
+
+test('scoped automation tokens create internal-only tasks', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const tokenResponse = await fetch(`${base}/api/automation-tokens`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ label: 'iPhone Shortcut' }) });
+  const token = (await tokenResponse.json()).token;
+  const taskResponse = await fetch(`${base}/api/automation/tasks`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'From phone', prompt: 'Prepare a checklist', risk: 'external' }) });
+  assert.equal(taskResponse.status, 201);
+  assert.equal((await taskResponse.json()).risk, 'internal');
+});
+
+test('only the owner can restore a backup and restoration leaves work paused', async (t) => {
+  const { app, base } = await fixture({ ORBIT_INVITE_CODE: 'invite-only' }); t.after(() => app.close());
+  const owner = await register(base);
+  const member = await register(base, { email: 'member@example.com', displayName: 'Member', inviteCode: 'invite-only' });
+  const exported = await fetch(`${base}/api/backups/export`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ passphrase: 'a separate backup passphrase' }) });
+  assert.equal(exported.status, 200);
+  const payload = await exported.text();
+  const blocked = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(member), body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE' }) });
+  assert.equal(blocked.status, 403);
+  const restored = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE' }) });
+  assert.equal(restored.status, 200);
+  assert.equal((await restored.json()).paused, true);
 });

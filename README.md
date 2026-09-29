@@ -1,22 +1,25 @@
 # Orbit Buddy
 
-Orbit Buddy is a privacy-first, self-hostable AI companion that keeps context, prepares background work, remembers only what you explicitly save, and works from a desktop or phone browser.
+Orbit Buddy is a privacy-first, self-hostable AI companion that can stay online, remember only what people explicitly save, prepare background work, and remain usable from a desktop, iPhone, or Android device.
 
-It is an original open-source project inspired by the category of persistent assistants. It is **not** OpenAI Dots, is not affiliated with OpenAI, and does not copy OpenAI branding or proprietary implementation details.
+It is an original open-source project inspired by persistent assistants. It is **not** OpenAI Dots, is not affiliated with OpenAI, and does not copy OpenAI branding or proprietary implementation details.
 
-## What works in v0.1
+## What works in v0.2
 
-- Responsive control center installable as a PWA on macOS, iPhone, Android, Windows, and Linux
-- Authenticated chat through the OpenAI Responses API
-- Useful demo mode when no API key is configured
-- Persistent SQLite conversation history, user-approved memory, tasks, results, and audit events
-- Immediate, scheduled, daily, and weekly background thinking tasks
-- Explicit approval gate for tasks marked as external
-- Server-side API credentials, strict browser security headers, rate limiting, request-size limits, and constant-time token comparison
-- Docker and Render deployment files
-- Zero runtime npm dependencies
+- Responsive control center installable as a PWA on iPhone, Android, macOS, Windows, and Linux
+- Multi-user accounts with salted `scrypt` password hashes, 30-day secure sessions, CSRF protection, and one-time recovery codes
+- Authenticated chat through the OpenAI Responses API, with a clearly labeled demo mode when no API key is configured
+- Persistent SQLite messages, explicit memories, scheduled tasks, generated artifacts, connections, and audit events
+- Immediate, scheduled, daily, and weekly background thinking tasks that continue on the server after the browser closes
+- Push notifications through standards-based Web Push
+- Read-only OAuth previews for GitHub repositories, Google Calendar events, and Slack channels
+- Scoped automation tokens for Apple Shortcuts, Android automation tools, and personal integrations
+- Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
+- Owner-only emergency pause that stops new AI work and connector access without deleting data
+- A native iPhone companion source project in `ios/OrbitCompanion`
+- Docker, Render, CI, CodeQL, and Dependabot configuration
 
-Orbit v0.1 does **not** control a computer, send messages, make purchases, or access connected apps. External tasks produce a plan or draft even after approval. This limit is intentional while the connector permission model is developed.
+Orbit does not provide arbitrary remote shell access, silently send messages, make purchases, or take high-impact actions. External tasks stop at an approval gate and currently produce a plan or draft. That boundary is deliberate.
 
 ## Quick start
 
@@ -26,68 +29,100 @@ Requires Node.js 24 or newer.
 git clone https://github.com/SmokeyS30/orbit-buddy.git
 cd orbit-buddy
 cp .env.example .env
-```
-
-Load the environment values with your preferred secret manager, then run:
-
-```bash
+npm ci
 npm start
 ```
 
-Open `http://127.0.0.1:3000` and enter `BUDDY_ACCESS_TOKEN`.
+Open `http://127.0.0.1:3000`. The first person to register becomes the owner and receives ten one-time recovery codes. Save those codes outside Orbit. Later registrations require `ORBIT_INVITE_CODE`.
 
-At minimum, use a unique access token containing 24 or more characters. `OPENAI_API_KEY` is optional; without it Orbit clearly identifies demo mode. The default model is `gpt-5.4-mini`, and you can select another Responses API model with `OPENAI_MODEL`.
+`OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The default model is configurable with `OPENAI_MODEL`.
 
 ## Deploy on Render
 
-The included `render.yaml` creates a Docker web service, a generated access token, and a 1 GB persistent disk. Render's persistent disk requires a paid instance; removing the disk makes data ephemeral and is not recommended for a real buddy.
+The included blueprint creates a Docker web service with a 1 GB persistent disk. The disk is required for durable accounts, tasks, and backups and normally requires a paid Render instance.
 
 [Deploy to Render](https://render.com/deploy?repo=https://github.com/SmokeyS30/orbit-buddy)
 
-After deployment:
+During setup, provide `OPENAI_API_KEY` for real AI responses. Orbit generates and preserves a Web Push signing key pair on its protected persistent disk. OAuth connectors require provider-specific client credentials added later in Render. Unconfigured connectors stay visibly disabled.
 
-1. Add `OPENAI_API_KEY` in Render's Environment page.
-2. Copy the generated `BUDDY_ACCESS_TOKEN` into a password manager.
-3. Open the service URL and unlock Orbit with that token.
-4. On iPhone, use Safari's **Share → Add to Home Screen**.
+After the first deployment:
 
-Never put either secret in GitHub, screenshots, issues, or client-side JavaScript.
+1. Open the Render URL and create the owner account.
+2. Store the recovery codes in a password manager or offline safe.
+3. Install Orbit from Safari's **Share → Add to Home Screen** on iPhone, or Chrome's **Install app** on Android.
+4. Enable notifications from Orbit's Safety tab.
+5. Export an encrypted backup and verify that you can retain its passphrase separately.
 
-## How it differs from OpenAI Dots
+Never put API keys, OAuth secrets, recovery codes, backup passphrases, or automation tokens in GitHub, screenshots, or issues.
 
-OpenAI describes Dots as managed, always-on agents with cloud computers, connected apps, proactive memory, messaging channels, and optional local-computer access. Orbit's first release focuses on the open, inspectable foundation: self-hosting, explicit memory, scheduling, approval boundaries, and an audit log. It deliberately omits broad computer and app access until those capabilities can be added with narrowly scoped connectors.
+## Phone automation
+
+Orbit can create a limited token that only permits internal thinking tasks. In **Connections → Phone automation**, create a token and copy it once. A Shortcut can then make this request:
+
+```http
+POST https://YOUR-ORBIT.example/api/automation/tasks
+Authorization: Bearer orbit_YOUR_TOKEN
+Content-Type: application/json
+
+{"title":"Phone note","prompt":"Turn this note into a checklist"}
+```
+
+Requests through this endpoint are forced to `internal` risk. They cannot use the token to access memories, files, connectors, account controls, or emergency controls.
+
+## OAuth connectors
+
+Orbit currently asks only for read-oriented scopes:
+
+- GitHub: profile and email, then a preview of the user's repositories
+- Google: identity plus read-only Calendar access
+- Slack: read channel metadata and basic user information
+
+Tokens are encrypted before entering SQLite. Each connector can be disconnected from the UI. Configure the provider callback as:
+
+```text
+https://YOUR-ORBIT.example/api/connectors/PROVIDER/callback
+```
+
+where `PROVIDER` is `github`, `google`, or `slack`. See [docs/OAUTH.md](docs/OAUTH.md) for provider-specific setup.
+
+## Backups and recovery
+
+- **Account recovery:** one-time recovery codes reset the password and revoke active sessions.
+- **Portable backup:** the user supplies a 16+ character passphrase; the browser downloads an authenticated AES-256-GCM archive.
+- **Automatic backup:** when `BACKUP_ENCRYPTION_KEY` is set, Orbit writes one encrypted backup per user per day to the persistent disk and retains seven.
+- **Restore:** data is merged without deleting existing records, then Orbit remains paused for review.
+
+The Render disk is not an off-site backup. Download portable backups to a separate protected location.
 
 ## Architecture
 
 ```text
-Browser / installed PWA
-        │ bearer token
-        ▼
-Node HTTP service ─────► OpenAI Responses API (optional, store=false)
-        │
-        ├── SQLite: chat, tasks, explicit memory
-        ├── background task scheduler
-        └── human-readable audit trail
+Installed PWA / native iPhone companion / Shortcut
+                      │ HTTPS + session or scoped token
+                      ▼
+               Node service on Render
+                  │      │       │
+                  │      │       └── Web Push
+                  │      └────────── OAuth providers (read-only previews)
+                  ├───────────────── OpenAI Responses API (optional, store=false)
+                  └───────────────── SQLite + encrypted backup files
 ```
 
 ## Development
 
 ```bash
-npm test
 npm run check
+npm audit
 npm run dev
 ```
 
 See [SECURITY.md](SECURITY.md) before adding any connector or tool. Contributions are welcome under the [Apache-2.0 license](LICENSE).
 
-## Roadmap
+## Honest platform limits
 
-- Encrypted multi-user accounts and passkeys
-- Push notifications and timezone-aware scheduling
-- Optional local model providers
-- Connector SDK with capability manifests, least-privilege OAuth, dry runs, and revocation
-- End-to-end encrypted backups
-- Voice input and accessible audio updates
-- Signed plugin bundles and a public connector registry
+- Render keeps server work running when the phone or computer is closed, subject to the selected Render service's availability.
+- The installed PWA is the production mobile client. iPhone Web Push requires an installed Home Screen web app and a supported iOS version.
+- The native iPhone project is a companion foundation for login, status, task creation, and emergency controls. It still requires an Apple developer team and a real-device archive before TestFlight or App Store distribution.
+- Orbit cannot run arbitrary work directly on an iPhone or control a Mac. A future local device agent must be separately installed and explicitly constrained to approved folders and capabilities.
 
-The goal is not “unlimited autonomy.” The goal is a dependable buddy whose access is understandable, reviewable, and easy to revoke.
+The goal is not unlimited autonomy. The goal is a dependable buddy whose access is understandable, reviewable, backed up, and easy to revoke.
