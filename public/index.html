@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101117">
+  <meta name="description" content="Orbit Buddy — your private, self-hosted AI companion.">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <title>Orbit Buddy</title>
+</head>
+<body>
+  <div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="#today" aria-label="Orbit Buddy home">
+        <span class="brand-mark"><span></span></span>
+        <span><strong id="brand-name">Orbit</strong><small>private AI buddy</small></span>
+      </a>
+      <div class="status"><span class="status-dot"></span><span id="status-text">Connecting</span></div>
+    </header>
+
+    <nav class="tabs" aria-label="Main sections">
+      <button class="tab active" data-view="today">Today</button>
+      <button class="tab" data-view="tasks">Tasks <span id="task-count" class="count">0</span></button>
+      <button class="tab" data-view="memory">Memory</button>
+      <button class="tab" data-view="activity">Activity</button>
+    </nav>
+
+    <section id="today" class="view active">
+      <div class="hero-card">
+        <div class="orb-wrap" aria-hidden="true">
+          <div class="orbit-ring ring-a"></div><div class="orbit-ring ring-b"></div>
+          <div class="orb"><span class="eye eye-left"></span><span class="eye eye-right"></span></div>
+        </div>
+        <div class="hero-copy">
+          <p class="eyebrow">YOUR STEADY COPILOT</p>
+          <h1>What should we move forward?</h1>
+          <p>Think together now, or hand Orbit a task to keep moving in the background.</p>
+          <div class="model-pill" id="model-pill">Demo mode</div>
+        </div>
+      </div>
+
+      <section class="panel conversation-panel">
+        <div class="panel-heading"><div><p class="eyebrow">CONVERSATION</p><h2>Talk with Orbit</h2></div></div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="chat-input">Message Orbit</label>
+          <textarea id="chat-input" rows="2" maxlength="6000" placeholder="Ask, plan, reflect, or decide…" required></textarea>
+          <button class="primary" type="submit">Send</button>
+        </form>
+      </section>
+    </section>
+
+    <section id="tasks" class="view">
+      <div class="split-heading"><div><p class="eyebrow">BACKGROUND WORK</p><h1>Tasks</h1><p>Orbit can keep thinking while you step away.</p></div><button id="new-task-button" class="primary">New task</button></div>
+      <form id="task-form" class="panel form-card hidden">
+        <label>Title<input id="task-title" maxlength="120" required placeholder="Weekly study plan"></label>
+        <label>Instructions<textarea id="task-prompt" maxlength="6000" rows="5" required placeholder="What outcome should Orbit prepare?"></textarea></label>
+        <div class="form-grid">
+          <label>Run at<input id="task-date" type="datetime-local"></label>
+          <label>Repeat<select id="task-recurrence"><option value="none">Once</option><option value="daily">Daily</option><option value="weekly">Weekly</option></select></label>
+          <label>Action level<select id="task-risk"><option value="internal">Think only</option><option value="external">External action (approval required)</option></select></label>
+        </div>
+        <p class="hint">Version 0.1 never executes external actions. Approval unlocks a plan or draft only.</p>
+        <div class="actions"><button type="button" id="cancel-task" class="ghost">Cancel</button><button class="primary" type="submit">Create task</button></div>
+      </form>
+      <div id="tasks-list" class="card-list"></div>
+    </section>
+
+    <section id="memory" class="view">
+      <div class="split-heading"><div><p class="eyebrow">USER CONTROLLED</p><h1>Memory</h1><p>Only notes you explicitly save appear here.</p></div></div>
+      <form id="memory-form" class="panel inline-form"><input id="memory-input" maxlength="2000" required placeholder="Remember that I prefer concise weekly plans…"><button class="primary">Save</button></form>
+      <div id="memory-list" class="card-list"></div>
+    </section>
+
+    <section id="activity" class="view">
+      <div class="split-heading"><div><p class="eyebrow">TRANSPARENCY</p><h1>Activity</h1><p>A plain-language audit trail of what Orbit did.</p></div></div>
+      <div id="activity-list" class="timeline"></div>
+    </section>
+  </main>
+
+  <dialog id="login-dialog">
+    <form id="login-form" method="dialog" class="login-card">
+      <div class="brand-mark large"><span></span></div>
+      <p class="eyebrow">WELCOME TO ORBIT</p><h2>Enter your access token</h2>
+      <p>This token stays in this browser tab and is never stored in Orbit’s database.</p>
+      <label class="sr-only" for="token-input">Access token</label>
+      <input id="token-input" type="password" autocomplete="current-password" required placeholder="Access token">
+      <p id="login-error" class="error" role="alert"></p>
+      <button class="primary wide" type="submit">Unlock</button>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

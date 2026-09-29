@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: orbit-buddy
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: BUDDY_NAME
+        value: Orbit
+      - key: BUDDY_ACCESS_TOKEN
+        generateValue: true
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.4-mini
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: orbit-data
+      mountPath: /var/data
+      sizeGB: 1

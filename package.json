@@ -1,0 +1,29 @@
+{
+  "name": "orbit-buddy",
+  "version": "0.1.0",
+  "description": "A privacy-first, self-hostable persistent AI buddy for the web, Mac, and iPhone.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node --watch server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check src/database.js && node --check src/model.js && node --check public/app.js && npm test"
+  },
+  "keywords": [
+    "ai-agent",
+    "personal-assistant",
+    "pwa",
+    "self-hosted",
+    "openai",
+    "privacy"
+  ],
+  "author": "SmokeyS30 and contributors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SmokeyS30/orbit-buddy.git"
+  }
+}

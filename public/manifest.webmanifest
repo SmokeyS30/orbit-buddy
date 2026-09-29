@@ -1,0 +1,10 @@
+{
+  "name": "Orbit Buddy",
+  "short_name": "Orbit",
+  "description": "A private, self-hosted AI companion.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#101117",
+  "theme_color": "#101117",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
