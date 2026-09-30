@@ -19,6 +19,8 @@ services:
         value: gpt-5.4-mini
       - key: DATA_DIR
         value: /var/data/orbit
+      - key: PUBLIC_BASE_URL
+        value: https://orbit-buddy.onrender.com
     disk:
       name: orbit-data
       mountPath: /var/data
