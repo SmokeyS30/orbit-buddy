@@ -1,4 +1,5 @@
 import http from 'node:http';
+
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,7 +39,9 @@ export function createOrbitServer(options={}) {
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
   const requestLog=new Map();
-  function rateLimited(req,limit=240){const key=req.socket.remoteAddress||'unknown';const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  const chatLog=new Map();
+  function chatRateLimited(userId,limit=30,windowMs=5*60_000){const current=Date.now();const recent=(chatLog.get(userId)||[]).filter((time)=>current-time<windowMs);recent.push(current);chatLog.set(userId,recent);return recent.length>limit;}
   const paused=()=>db.getSetting('system_paused','false')==='true';
   const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
 
@@ -69,7 +72,7 @@ export function createOrbitServer(options={}) {
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:db.countUsers()===0||Boolean(env.ORBIT_INVITE_CODE)});
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
-        if(rateLimited(req,30))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
+        if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const password=await hashPassword(body.password);const count=db.countUsers();
@@ -80,12 +83,13 @@ export function createOrbitServer(options={}) {
         return json(res,201,{user:publicUser(user),csrf,recoveryCodes:codes});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
-        if(rateLimited(req,40))throw Object.assign(new Error('Too many login attempts.'),{status:429});
+        if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
+        
         const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&await verifyPassword(body.password,user.password_hash,user.password_salt);
         if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const csrf=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
-        if(rateLimited(req,25))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
+        if(rateLimited(req,25,'recover'))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
         const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const recovered=user&&db.consumeRecoveryCode(hashToken(String(body.recoveryCode||'').trim().toUpperCase()));
         if(!recovered||recovered.user_id!==user.id)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});const password=await hashPassword(body.newPassword);db.updatePassword(user.id,password.hash,password.salt);db.deleteUserSessions(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
       }
@@ -100,7 +104,7 @@ export function createOrbitServer(options={}) {
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName,model:model.model,modelConfigured:model.configured,version:'0.2.0',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='GET'&&url.pathname==='/api/snapshot')return json(res,200,{messages:db.listMessages(user.user_id||user.id),memories:db.listMemories(user.user_id||user.id),tasks:db.listTasks(user.user_id||user.id),events:db.listEvents(user.user_id||user.id),artifacts:db.listArtifacts(user.user_id||user.id),connectors:db.listConnectors(user.user_id||user.id),automationTokens:db.listAutomationTokens(user.user_id||user.id)});
         const userId=user.user_id||user.id;
-        if(req.method==='POST'&&url.pathname==='/api/chat'){if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});const body=await readJson(req);const message=cleanText(body.message,6000,'message');const history=db.listMessages(userId,20);db.addMessage(userId,'user',message);const answer=await model.respond({buddyName,message,memories:db.listMemories(userId),history});const saved=db.addMessage(userId,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');return json(res,201,saved);}
+        if(req.method==='POST'&&url.pathname==='/api/chat'){if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});if(chatRateLimited(userId))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});const body=await readJson(req);const message=cleanText(body.message,6000,'message');const history=db.listMessages(userId,20);db.addMessage(userId,'user',message);const answer=await model.respond({buddyName,message,memories:db.listMemories(userId),history});const saved=db.addMessage(userId,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');return json(res,201,saved);}
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'));db.addEvent(userId,'memory_added','Saved a user-approved memory.');return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/tasks'){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});const body=await readJson(req);const risk=body.risk==='external'?'external':'internal';const recurrence=['daily','weekly'].includes(body.recurrence)?body.recurrence:'none';let scheduleAt=null;if(body.scheduleAt){const date=new Date(body.scheduleAt);if(Number.isNaN(date.valueOf()))throw Object.assign(new Error('scheduleAt must be valid.'),{status:400});scheduleAt=date.toISOString();}const task=db.addTask(userId,{title:cleanText(body.title,120,'title'),prompt:cleanText(body.prompt,6000,'prompt'),risk,scheduleAt,recurrence});db.addEvent(userId,'task_created',`Created “${task.title}”.`,risk==='external'?'Waiting for approval.':null);setImmediate(runDueTasks);return json(res,201,task);}
