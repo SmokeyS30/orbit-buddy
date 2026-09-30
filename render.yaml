@@ -18,7 +18,7 @@ services:
       - key: OPENAI_MODEL
         value: gpt-5.4-mini
       - key: DATA_DIR
-        value: /var/data
+        value: /var/data/orbit
     disk:
       name: orbit-data
       mountPath: /var/data
