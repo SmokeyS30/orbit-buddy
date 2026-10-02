@@ -6,6 +6,7 @@
 - Added access requests: visitors facing a closed door can ask the owner for access; requests notify the owner by push and are rate-limited.
 - Added a door-left-open nudge and a one-tap "open the door" push action (single-use expiring token) for access requests.
 - Added read-only chat tools (web_search, fetch_url, get_datetime) with SSRF protection; tool use is logged to the activity timeline.
+- web_search now prefers the Brave Search API when BRAVE_SEARCH_API_KEY is set (sync: false in render.yaml), falling back to the free DuckDuckGo backend otherwise.
 
 ## 0.2.0
 
