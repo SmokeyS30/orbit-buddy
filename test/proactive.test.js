@@ -74,7 +74,14 @@ test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   assert.equal(assistants().length, 0);
   // One chat message, then 3 days pass: nudge fires once.
   const chat = await fetch(`${base}/api/chat`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ message: 'hello' }) });
-  assert.equal(chat.status, 201);
+  assert.equal(chat.status, 202);
+  // The reply now lands in the background; wait for it before the nudge checks.
+  const landed = Date.now();
+  while (Date.now() - landed < 8000) {
+    const c = app.db.ensureDefaultConversation(auth.userId);
+    if (app.db.listConversationMessages(auth.userId, c.id, 20).some((m) => m.role === 'assistant')) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
   const future = Date.now() + 3 * 24 * 3600_000;
   await app.runProactiveChecks(future);
   const afterFirst = assistants().length;
