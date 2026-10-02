@@ -24,6 +24,7 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - Quiet check-ins: a proactive nudge if you haven't chatted in a couple of days
 - Push notifications through standards-based Web Push
 - Read-only OAuth previews for GitHub repositories, Google Calendar events, and Slack channels
+- Read-only model tools in chat: live web search, page reading, and current date/time, with SSRF protection and tool use logged to the activity timeline
 - Scoped automation tokens for Apple Shortcuts, Android automation tools, and personal integrations
 - Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
 - Owner-only emergency pause that stops new AI work and connector access without deleting data
