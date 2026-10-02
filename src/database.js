@@ -86,6 +86,9 @@ export function openDatabase(filePath) {
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS proactive_state (
+      user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -137,6 +140,10 @@ export function openDatabase(filePath) {
     addMemory: db.prepare('INSERT INTO memories(id,user_id,content,created_at,updated_at) VALUES (?, ?, ?, ?, ?)'),
     listMemories: db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 100'),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
+    lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
+    getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
+    setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
+      ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`),
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
@@ -220,6 +227,9 @@ export function openDatabase(filePath) {
     addMemory(userId, content) { const now=timestamp(); const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now}; s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at); return row; },
     listMemories: (userId) => s.listMemories.all(userId),
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
+    lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
+    getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
+    setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
     addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none'}) {
       const now=timestamp(); const status=risk==='external'?'waiting_approval':scheduleAt?'scheduled':'queued';
       const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,result:null,created_at:now,updated_at:now};
