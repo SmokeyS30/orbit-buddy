@@ -12,8 +12,8 @@ async function fixture(extraEnv = {}) {
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
 
-async function register(base, { email = 'owner@example.com', displayName = 'Owner', inviteCode } = {}) {
-  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName, password: 'correct horse battery staple', inviteCode }) });
+async function register(base, { email = 'owner@example.com', displayName = 'Owner' } = {}) {
+  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName, password: 'correct horse battery staple' }) });
   assert.equal(response.status, 201);
   const body = await response.json();
   return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, body };
@@ -30,6 +30,27 @@ test('health and setup are public while private data requires a session', async 
   const response = await fetch(`${base}/api/auth/me`, { headers: { Cookie: auth.cookie } });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).user.email, 'owner@example.com');
+});
+
+test('registration closes after owner setup unless explicitly opened', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const before = await fetch(`${base}/api/auth/setup-status`).then((response) => response.json());
+  assert.deepEqual(before, { needsOwner: true, registrationOpen: true });
+  await register(base);
+  const after = await fetch(`${base}/api/auth/setup-status`).then((response) => response.json());
+  assert.deepEqual(after, { needsOwner: false, registrationOpen: false });
+  const blocked = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'blocked@example.com', displayName: 'Blocked', password: 'correct horse battery staple' }) });
+  assert.equal(blocked.status, 403);
+  assert.equal((await blocked.json()).error, 'Registration is currently closed.');
+});
+
+test('open registration creates members without invite codes', async (t) => {
+  const { app, base } = await fixture({ OPEN_REGISTRATION: 'true' }); t.after(() => app.close());
+  const owner = await register(base);
+  assert.equal(owner.body.user.role, 'owner');
+  const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
+  assert.equal(member.body.user.role, 'member');
+  assert.equal((await fetch(`${base}/api/auth/setup-status`).then((response) => response.json())).registrationOpen, true);
 });
 
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {
@@ -67,9 +88,9 @@ test('scoped automation tokens create internal-only tasks', async (t) => {
 });
 
 test('only the owner can restore a backup and restoration leaves work paused', async (t) => {
-  const { app, base } = await fixture({ ORBIT_INVITE_CODE: 'invite-only' }); t.after(() => app.close());
+  const { app, base } = await fixture({ OPEN_REGISTRATION: 'true' }); t.after(() => app.close());
   const owner = await register(base);
-  const member = await register(base, { email: 'member@example.com', displayName: 'Member', inviteCode: 'invite-only' });
+  const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
   const exported = await fetch(`${base}/api/backups/export`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ passphrase: 'a separate backup passphrase' }) });
   assert.equal(exported.status, 200);
   const payload = await exported.text();

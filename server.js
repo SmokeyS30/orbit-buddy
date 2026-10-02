@@ -59,6 +59,7 @@ export function createOrbitServer(options={}) {
   const push=createPushService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
   const production=env.NODE_ENV==='production';
+  const openRegistration=env.OPEN_REGISTRATION==='true';
   const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
@@ -137,13 +138,13 @@ export function createOrbitServer(options={}) {
     if(url.pathname==='/healthz')return json(res,200,{ok:true,service:'orbit-buddy',paused:paused()});
 
     try {
-      if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:db.countUsers()===0||Boolean(env.ORBIT_INVITE_CODE)});
+      if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){const needsOwner=db.countUsers()===0;return json(res,200,{needsOwner,registrationOpen:needsOwner||openRegistration});}
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const password=await hashPassword(body.password);const count=db.countUsers();
-        if(count>0&&(!env.ORBIT_INVITE_CODE||body.inviteCode!==env.ORBIT_INVITE_CODE))throw Object.assign(new Error('Registration requires a valid invite code.'),{status:403});
+        if(count>0&&!openRegistration)throw Object.assign(new Error('Registration is currently closed.'),{status:403});
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
         if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const csrf=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Replaced invite-code registration with a reversible `OPEN_REGISTRATION` switch and removed the invite-code field from the sign-up flow.
+
 ## 0.2.0
 
 - Added multi-user accounts, secure cookie sessions, recovery codes, and invite-gated registration.
