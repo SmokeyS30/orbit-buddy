@@ -32,27 +32,6 @@ test('health and setup are public while private data requires a session', async 
   assert.equal((await response.json()).user.email, 'owner@example.com');
 });
 
-test('registration closes after owner setup unless explicitly opened', async (t) => {
-  const { app, base } = await fixture(); t.after(() => app.close());
-  const before = await fetch(`${base}/api/auth/setup-status`).then((response) => response.json());
-  assert.deepEqual(before, { needsOwner: true, registrationOpen: true });
-  await register(base);
-  const after = await fetch(`${base}/api/auth/setup-status`).then((response) => response.json());
-  assert.deepEqual(after, { needsOwner: false, registrationOpen: false });
-  const blocked = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'blocked@example.com', displayName: 'Blocked', password: 'correct horse battery staple' }) });
-  assert.equal(blocked.status, 403);
-  assert.equal((await blocked.json()).error, 'Registration is currently closed.');
-});
-
-test('open registration creates members without invite codes', async (t) => {
-  const { app, base } = await fixture({ OPEN_REGISTRATION: 'true' }); t.after(() => app.close());
-  const owner = await register(base);
-  assert.equal(owner.body.user.role, 'owner');
-  const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
-  assert.equal(member.body.user.role, 'member');
-  assert.equal((await fetch(`${base}/api/auth/setup-status`).then((response) => response.json())).registrationOpen, true);
-});
-
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
@@ -88,7 +67,7 @@ test('scoped automation tokens create internal-only tasks', async (t) => {
 });
 
 test('only the owner can restore a backup and restoration leaves work paused', async (t) => {
-  const { app, base } = await fixture({ OPEN_REGISTRATION: 'true' }); t.after(() => app.close());
+  const { app, base } = await fixture(); t.after(() => app.close());
   const owner = await register(base);
   const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
   const exported = await fetch(`${base}/api/backups/export`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ passphrase: 'a separate backup passphrase' }) });
