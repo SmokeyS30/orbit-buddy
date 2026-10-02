@@ -14,7 +14,7 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
-        value: gpt-5.4-mini
+        sync: false
       - key: DATA_DIR
         value: /var/data/orbit
       - key: PUBLIC_BASE_URL
