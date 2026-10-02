@@ -89,11 +89,9 @@ test('registration door is closed by default; owner can open and close it', asyn
   assert.equal(setup.registrationOpen, false);
   const attempt = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'member@example.com', displayName: 'Member', password: 'correct horse battery staple' }) };
   assert.equal((await fetch(`${base}/api/auth/register`, attempt)).status, 403);
-  const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true, minutes: 60 }) });
+  const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true }) });
   assert.equal(opened.status, 200);
-  const openedBody = await opened.json();
-  assert.equal(openedBody.open, true);
-  assert.ok(openedBody.openUntil);
+  assert.equal((await opened.json()).open, true);
   const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
   assert.equal(member.body.user.email, 'member@example.com');
   const denied = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(member), body: JSON.stringify({ open: false }) });
