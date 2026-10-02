@@ -100,3 +100,41 @@ test('registration door is closed by default; owner can open and close it', asyn
   assert.equal((await closed.json()).open, false);
   assert.equal((await fetch(`${base}/api/auth/register`, { ...attempt, body: JSON.stringify({ email: 'third@example.com', displayName: 'Third', password: 'correct horse battery staple' }) })).status, 403);
 });
+
+test('access requests: public can ask, owner is notified and can dismiss', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const owner = await register(base);
+  const ask = (name, email) => fetch(`${base}/api/registration-request`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email }) });
+  assert.equal((await ask('', 'a@example.com')).status, 400);
+  assert.equal((await ask('Amy', 'not-an-email')).status, 400);
+  assert.equal((await ask('Amy', 'amy@example.com')).status, 201);
+  const listed = await fetch(`${base}/api/admin/access-requests`, { headers: authHeaders(owner) });
+  assert.equal(listed.status, 200);
+  const requests = (await listed.json()).requests;
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].name, 'Amy');
+  assert.equal(requests[0].email, 'amy@example.com');
+  assert.equal(requests[0].handled_at, null);
+  const events = await fetch(`${base}/api/snapshot`, { headers: { Cookie: owner.cookie } });
+  const eventTypes = (await events.json()).events.map((e) => e.type);
+  assert.ok(eventTypes.includes('access_request'));
+});
+
+test('access requests are rate-limited and owner-only to manage', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const owner = await register(base);
+  const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true }) });
+  assert.equal(opened.status, 200);
+  const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
+  const ask = (n) => fetch(`${base}/api/registration-request`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `Person ${n}`, email: `person${n}@example.com` }) });
+  assert.equal((await ask(1)).status, 201);
+  assert.equal((await ask(2)).status, 201);
+  assert.equal((await ask(3)).status, 201);
+  assert.equal((await ask(4)).status, 429);
+  const id = (await (await fetch(`${base}/api/admin/access-requests`, { headers: authHeaders(owner) })).json()).requests[0].id;
+  assert.equal((await fetch(`${base}/api/admin/access-requests`, { headers: authHeaders(member) })).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/access-requests/${id}`, { method: 'POST', headers: authHeaders(member) })).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/access-requests/${id}`, { method: 'POST', headers: authHeaders(owner) })).status, 200);
+  const remaining = (await (await fetch(`${base}/api/admin/access-requests`, { headers: authHeaders(owner) })).json()).requests.filter((r) => !r.handled_at);
+  assert.equal(remaining.length, 2);
+});
