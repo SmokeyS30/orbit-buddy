@@ -10,6 +10,17 @@ function ensureColumn(db, table, name, definition) {
   if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 
+function adoptOrphanMessages(db, userId) {
+  let convo = db.prepare('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 1').get(userId);
+  if (!convo) {
+    const now = timestamp(); const id = randomUUID();
+    db.prepare('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)').run(id, userId, 'General', now, now);
+    convo = { id };
+  }
+  db.prepare('UPDATE messages SET conversation_id=? WHERE user_id=? AND conversation_id IS NULL').run(convo.id, userId);
+  return convo.id;
+}
+
 export function openDatabase(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(filePath), 0o700);
@@ -71,6 +82,11 @@ export function openDatabase(filePath) {
       label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL,
       created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, created_at DESC);
@@ -79,6 +95,8 @@ export function openDatabase(filePath) {
 
   // Upgrade v0.1 databases in place without discarding user data.
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
+  ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
+  for (const row of db.prepare('SELECT DISTINCT user_id FROM messages WHERE conversation_id IS NULL AND user_id IS NOT NULL').all()) adoptOrphanMessages(db, row.user_id);
   ensureColumn(db, 'memories', 'user_id', 'TEXT');
   ensureColumn(db, 'tasks', 'user_id', 'TEXT');
   ensureColumn(db, 'events', 'user_id', 'TEXT');
@@ -107,7 +125,14 @@ export function openDatabase(filePath) {
     setting: db.prepare('SELECT value FROM settings WHERE key=?'),
     setSetting: db.prepare(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`),
-    addMessage: db.prepare('INSERT INTO messages(id,user_id,role,content,created_at) VALUES (?, ?, ?, ?, ?)'),
+    addMessage: db.prepare('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    createConversation: db.prepare('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)'),
+    listConversations: db.prepare('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,rowid DESC'),
+    getConversation: db.prepare('SELECT * FROM conversations WHERE id=? AND user_id=?'),
+    touchConversation: db.prepare('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?'),
+    deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
+    deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
+    listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     addMemory: db.prepare('INSERT INTO memories(id,user_id,content,created_at,updated_at) VALUES (?, ?, ?, ?, ?)'),
     listMemories: db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 100'),
@@ -161,7 +186,7 @@ export function openDatabase(filePath) {
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
-    claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); },
+    claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
     getSession: (tokenHash) => s.session.get(tokenHash, timestamp()),
     deleteSession: (tokenHash) => s.deleteSession.run(tokenHash),
@@ -181,7 +206,16 @@ export function openDatabase(filePath) {
     consumeRecoveryCode(hash) { const row=s.recovery.get(hash); if(!row) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
     getSetting: (key, fallback=null) => s.setting.get(key)?.value ?? fallback,
     setSetting(key,value) { s.setSetting.run(key,String(value),timestamp()); },
-    addMessage(userId, role, content) { const row={id:randomUUID(),user_id:userId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.role,row.content,row.created_at); return row; },
+    ensureDefaultConversation(userId) { const existing=s.listConversations.get(userId); if(existing){adoptOrphanMessages(db,userId);return existing;}
+      const now=timestamp();const row={id:randomUUID(),user_id:userId,title:'General',created_at:now,updated_at:now};
+      s.createConversation.run(row.id,row.user_id,row.title,row.created_at,row.updated_at);adoptOrphanMessages(db,userId);return row; },
+    createConversation(userId,title){const now=timestamp();const row={id:randomUUID(),user_id:userId,title,created_at:now,updated_at:now};s.createConversation.run(row.id,row.user_id,row.title,row.created_at,row.updated_at);return row;},
+    listConversations:(userId)=>s.listConversations.all(userId),
+    getConversation:(userId,id)=>s.getConversation.get(id,userId),
+    touchConversation:(userId,id)=>s.touchConversation.run(timestamp(),id,userId).changes>0,
+    deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
+    addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
+    listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
     addMemory(userId, content) { const now=timestamp(); const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now}; s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at); return row; },
     listMemories: (userId) => s.listMemories.all(userId),
@@ -215,11 +249,12 @@ export function openDatabase(filePath) {
     listAutomationTokens: (userId) => s.listAutomation.all(userId),
     getAutomationToken(hash) { const row=s.automation.get(hash); if(row) s.touchAutomation.run(timestamp(),row.id); return row; },
     revokeAutomationToken: (userId,id) => s.revokeAutomation.run(timestamp(),id,userId).changes>0,
-    exportUser(userId) { return {version:2,exportedAt:timestamp(),user:s.userById.get(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) { return {version:2,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
       if (!bundle || bundle.version !== 2) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
-        message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,role,content,created_at) VALUES(?,?,?,?,?)'),
+        conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
+        message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
         memory: db.prepare('INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at) VALUES(?,?,?,?,?)'),
         task: db.prepare('INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
         event: db.prepare('INSERT OR IGNORE INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?)'),
@@ -227,7 +262,8 @@ export function openDatabase(filePath) {
       };
       db.exec('BEGIN IMMEDIATE');
       try {
-        for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.role,row.content,row.created_at);
+        for (const row of bundle.conversations || []) inserts.conversation.run(row.id,userId,row.title,row.created_at,row.updated_at);
+        for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
         for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,row.content,row.created_at,row.updated_at);
         for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at);
         for (const row of bundle.events || []) inserts.event.run(row.id,userId,row.type,row.message,row.detail,row.created_at);
