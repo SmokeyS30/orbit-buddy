@@ -44,7 +44,7 @@ npm ci
 npm start
 ```
 
-Open `http://127.0.0.1:3000`. The first person to register becomes the owner and receives ten one-time recovery codes. Save those codes outside Orbit. Registration closes after the owner account is created unless `OPEN_REGISTRATION=true`; the included Render blueprint enables it so people can create accounts without an invite code. Set it to `false` at any time to stop new registrations without affecting existing users.
+Open `http://127.0.0.1:3000`. The first person to register becomes the owner and receives ten one-time recovery codes. Save those codes outside Orbit. Later registrations are open to anyone with the link — no invite code.
 
 `OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The default model is configurable with `OPENAI_MODEL`.
 

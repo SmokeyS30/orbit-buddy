@@ -7,8 +7,6 @@ services:
     envVars:
       - key: BUDDY_NAME
         value: Orbit
-      - key: OPEN_REGISTRATION
-        value: "true"
       - key: CONNECTOR_ENCRYPTION_KEY
         generateValue: true
       - key: BACKUP_ENCRYPTION_KEY
