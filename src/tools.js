@@ -83,9 +83,37 @@ export function parseLiteResults(html) {
   return results;
 }
 
-export async function toolWebSearch(args = {}) {
+export async function toolWebSearch(args = {}, env = process.env) {
   const query = String(args.query || '').trim().slice(0, 200);
   if (!query) throw new Error('A search query is required.');
+  const braveKey = env.BRAVE_SEARCH_API_KEY?.trim();
+  if (braveKey) {
+    try {
+      return await braveSearch(query, braveKey);
+    } catch {
+      // fall through to the free backend
+    }
+  }
+  return duckDuckGoSearch(query);
+}
+
+async function braveSearch(query, apiKey) {
+  const response = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&text_decorations=false`, {
+    headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+  });
+  if (!response.ok) throw new Error(`Brave search failed (HTTP ${response.status}).`);
+  const data = await response.json().catch(() => null);
+  const results = (data?.web?.results || []).slice(0, 5).map((entry) => ({
+    url: String(entry.url || ''),
+    title: String(entry.title || '').slice(0, 200),
+    snippet: String(entry.description || '').slice(0, 280)
+  })).filter((entry) => entry.url && entry.title);
+  if (!results.length) throw new Error('Brave returned no results.');
+  return { results, via: 'brave' };
+}
+
+async function duckDuckGoSearch(query) {
   const headers = { 'User-Agent': 'orbit-buddy/1.0 (read-only web research)' };
   try {
     const response = await fetch(`https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
@@ -170,12 +198,12 @@ const TOOL_SUMMARIES = {
   fetch_url: (args) => String(args.url || '').slice(0, 80)
 };
 
-export async function executeTool(name, args = {}) {
+export async function executeTool(name, args = {}, env = process.env) {
   const clean = args && typeof args === 'object' ? args : {};
   switch (name) {
     case 'get_datetime': return { result: toolGetDatetime(clean), summary: '' };
     case 'web_search': {
-      const result = await toolWebSearch(clean);
+      const result = await toolWebSearch(clean, env);
       return { result, summary: String(clean.query || '').slice(0, 80) };
     }
     case 'fetch_url': {

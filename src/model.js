@@ -114,7 +114,7 @@ export function createModelClient(env = process.env) {
             toolCalls.push({ name: call.name, detail: summarizeToolCall(call.name, args) });
             let result;
             try {
-              result = (await executeTool(call.name, args)).result;
+              result = (await executeTool(call.name, args, env)).result;
             } catch (error) {
               result = { error: String(error?.message || error).slice(0, 500) };
             }
