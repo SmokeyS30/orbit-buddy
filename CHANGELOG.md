@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Removed invite-code registration entirely; anyone with the link can now create an account.
+- Added a registration door: signups are closed by default and the owner opens them from Safety → Registration door (auto-closes after an hour).
 
 ## 0.2.0
 
