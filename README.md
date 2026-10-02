@@ -1,8 +1,17 @@
 # Orbit Buddy
 
-Orbit Buddy is a privacy-first, self-hostable AI companion that can stay online, remember only what people explicitly save, prepare background work, and remain usable from a desktop, iPhone, or Android device.
+Orbit Buddy is a privacy-first, self-hostable AI companion that stays online, remembers what matters, checks in on its own, prepares background work, and remains usable from a desktop, iPhone, or Android device.
 
 It is an original open-source project inspired by persistent assistants. It is **not** OpenAI Dots, is not affiliated with OpenAI, and does not copy OpenAI branding or proprietary implementation details.
+
+## Why Orbit is different
+
+Most AI apps wait for you to type. Orbit is built to do the opposite — it comes to you:
+
+- **It follows up.** Mention an upcoming appointment, interview, trip, or deadline and Orbit notes the date, then checks in afterward to ask how it went — in chat and as a push notification.
+- **It checks in first.** Morning briefings, evening wind-downs, and a gentle nudge if you've been quiet for a couple of days keep the conversation alive without you having to start it.
+- **It's yours, privately.** Self-hostable and open source: your conversations live in your own SQLite database, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
+- **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
 ## What works in v0.2
 
@@ -11,6 +20,8 @@ It is an original open-source project inspired by persistent assistants. It is *
 - Authenticated chat through the OpenAI Responses API, with a clearly labeled demo mode when no API key is configured
 - Persistent SQLite messages, explicit memories, scheduled tasks, generated artifacts, connections, and audit events
 - Immediate, scheduled, daily, and weekly background thinking tasks that continue on the server after the browser closes
+- Automatic follow-ups: Orbit notices dated events you mention in chat and checks in afterward, unprompted
+- Quiet check-ins: a proactive nudge if you haven't chatted in a couple of days
 - Push notifications through standards-based Web Push
 - Read-only OAuth previews for GitHub repositories, Google Calendar events, and Slack channels
 - Scoped automation tokens for Apple Shortcuts, Android automation tools, and personal integrations
