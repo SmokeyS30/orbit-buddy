@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Added a registration door: signups are closed by default and the owner opens them from Safety → Registration door (auto-closes after an hour).
+- Added a registration door: signups are closed by default and the owner opens/closes them from Safety → Registration door.
 
 ## 0.2.0
 
