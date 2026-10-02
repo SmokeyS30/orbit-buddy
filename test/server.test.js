@@ -138,3 +138,35 @@ test('access requests are rate-limited and owner-only to manage', async (t) => {
   const remaining = (await (await fetch(`${base}/api/admin/access-requests`, { headers: authHeaders(owner) })).json()).requests.filter((r) => !r.handled_at);
   assert.equal(remaining.length, 2);
 });
+
+test('door-left-open nudge fires once after an hour', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const owner = await register(base);
+  await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true }) });
+  await app.checkDoorLeftOpen();
+  const fresh = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: owner.cookie } })).json();
+  assert.ok(!fresh.events.some((e) => e.type === 'registration_nudge'));
+  app.db.setSetting('registration_opened_at', new Date(Date.now() - 2 * 60 * 60_000).toISOString());
+  await app.checkDoorLeftOpen();
+  await app.checkDoorLeftOpen();
+  const after = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: owner.cookie } })).json();
+  assert.equal(after.events.filter((e) => e.type === 'registration_nudge').length, 1);
+});
+
+test('door token opens registration once, then expires', async (t) => {
+  const { hashToken } = await import('../src/security.js');
+  const { app, base } = await fixture(); t.after(() => app.close());
+  await register(base);
+  const raw = 'door_test_token_abc';
+  app.db.addDoorToken(hashToken(raw), new Date(Date.now() + 60_000).toISOString());
+  const post = (token) => fetch(`${base}/api/registration/door-token`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }) });
+  assert.equal((await post('')).status, 403);
+  assert.equal((await post('garbage')).status, 403);
+  const ok = await post(raw);
+  assert.equal(ok.status, 200);
+  assert.equal((await ok.json()).open, true);
+  assert.equal((await (await fetch(`${base}/api/auth/setup-status`)).json()).registrationOpen, true);
+  assert.equal((await post(raw)).status, 403);
+  app.db.addDoorToken(hashToken('expired'), new Date(Date.now() - 60_000).toISOString());
+  assert.equal((await post('expired')).status, 403);
+});
