@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Replaced invite-code registration with a reversible `OPEN_REGISTRATION` switch and removed the invite-code field from the sign-up flow.
+- Removed invite-code registration entirely; anyone with the link can now create an account.
 
 ## 0.2.0
 

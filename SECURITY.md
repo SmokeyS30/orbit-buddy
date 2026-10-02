@@ -13,7 +13,7 @@ Use GitHub private vulnerability reporting instead of opening a public issue. Do
 - Every private API route requires a signed-in session or a narrowly scoped automation token.
 - Passwords use salted `scrypt`; session tokens, recovery codes, OAuth states, and automation tokens are stored only as hashes.
 - Browser mutations require a per-session CSRF token. Session cookies are HttpOnly, SameSite Strict, and Secure in production.
-- The first account is the owner. Later registration is controlled by `OPEN_REGISTRATION`; disabling it stops new signups without affecting existing accounts.
+- The first account is the owner. Registration is open to anyone with the link, so share the URL selectively.
 - Model credentials remain server-side. Responses API calls use `store: false` by default.
 - OAuth access and refresh tokens are encrypted with AES-256-GCM before they enter SQLite.
 - GitHub, Google Calendar, and Slack connectors are read-only previews. Disconnecting removes their stored tokens from Orbit.
@@ -27,7 +27,7 @@ Use GitHub private vulnerability reporting instead of opening a public issue. Do
 
 1. Use the persistent disk and HTTPS endpoint supplied by Render.
 2. Generate a unique `CONNECTOR_ENCRYPTION_KEY` and `BACKUP_ENCRYPTION_KEY`; never reuse the account password.
-3. Set `OPEN_REGISTRATION=false` when public signups are not intended. Keep it easy to disable quickly if registration abuse appears.
+3. Registration is open to anyone with the link. Share the URL only with people you trust; per-user rate limits blunt signup abuse.
 4. Use separate OAuth applications for production and development, with exact callback URLs.
 5. Rotate OAuth credentials and connector encryption keys through a planned migration; changing the encryption key immediately makes existing stored connector tokens unreadable.
 6. Store recovery codes and portable backup passphrases separately from the server.
