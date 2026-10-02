@@ -93,6 +93,9 @@ export function openDatabase(filePath) {
       id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, note TEXT,
       created_at TEXT NOT NULL, handled_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS door_tokens (
+      token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -186,7 +189,11 @@ export function openDatabase(filePath) {
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     getAccessRequest: db.prepare('SELECT * FROM access_requests WHERE id=?'),
     listAccessRequests: db.prepare('SELECT * FROM access_requests ORDER BY created_at DESC,rowid DESC LIMIT 100'),
-    dismissAccessRequest: db.prepare('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL')
+    dismissAccessRequest: db.prepare('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL'),
+    addDoorToken: db.prepare('INSERT INTO door_tokens VALUES (?, ?, NULL, ?)'),
+    consumeDoorToken: db.prepare('SELECT * FROM door_tokens WHERE token_hash=? AND used_at IS NULL AND expires_at>?'),
+    useDoorToken: db.prepare('UPDATE door_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL'),
+    pruneDoorTokens: db.prepare('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL')
   };
 
   return {
@@ -270,6 +277,9 @@ export function openDatabase(filePath) {
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     listAccessRequests: () => s.listAccessRequests.all(),
     dismissAccessRequest: (id) => s.dismissAccessRequest.run(timestamp(),id).changes>0,
+    addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
+    consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
+    pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
     exportUser(userId) { return {version:2,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
       if (!bundle || bundle.version !== 2) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
