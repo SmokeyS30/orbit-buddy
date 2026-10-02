@@ -69,6 +69,8 @@ test('scoped automation tokens create internal-only tasks', async (t) => {
 test('only the owner can restore a backup and restoration leaves work paused', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const owner = await register(base);
+  const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true }) });
+  assert.equal(opened.status, 200);
   const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
   const exported = await fetch(`${base}/api/backups/export`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ passphrase: 'a separate backup passphrase' }) });
   assert.equal(exported.status, 200);
@@ -78,4 +80,25 @@ test('only the owner can restore a backup and restoration leaves work paused', a
   const restored = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE' }) });
   assert.equal(restored.status, 200);
   assert.equal((await restored.json()).paused, true);
+});
+
+test('registration door is closed by default; owner can open and close it', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const owner = await register(base);
+  const setup = await (await fetch(`${base}/api/auth/setup-status`)).json();
+  assert.equal(setup.registrationOpen, false);
+  const attempt = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'member@example.com', displayName: 'Member', password: 'correct horse battery staple' }) };
+  assert.equal((await fetch(`${base}/api/auth/register`, attempt)).status, 403);
+  const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true, minutes: 60 }) });
+  assert.equal(opened.status, 200);
+  const openedBody = await opened.json();
+  assert.equal(openedBody.open, true);
+  assert.ok(openedBody.openUntil);
+  const member = await register(base, { email: 'member@example.com', displayName: 'Member' });
+  assert.equal(member.body.user.email, 'member@example.com');
+  const denied = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(member), body: JSON.stringify({ open: false }) });
+  assert.equal(denied.status, 403);
+  const closed = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: false }) });
+  assert.equal((await closed.json()).open, false);
+  assert.equal((await fetch(`${base}/api/auth/register`, { ...attempt, body: JSON.stringify({ email: 'third@example.com', displayName: 'Third', password: 'correct horse battery staple' }) })).status, 403);
 });
