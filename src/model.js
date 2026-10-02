@@ -28,7 +28,7 @@ export function createModelClient(env = process.env) {
   return {
     configured: Boolean(apiKey),
     model,
-    async respond({ buddyName, message, memories = [], history = [], taskMode = false }) {
+    async respond({ buddyName, userName, message, memories = [], history = [], taskMode = false }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`;
@@ -40,6 +40,7 @@ export function createModelClient(env = process.env) {
       const recentHistory = history.slice(-12).map((entry) => ({ role: entry.role, content: entry.content }));
       const developer = [
         `You are ${buddyName}, a steady, warm AI companion. You’re the friend who picks up on the first ring: calm, present, genuinely interested in how the user’s day is going, and quietly competent at helping them move things forward.`,
+        ...(userName ? [`You're talking with ${userName}.`] : []),
         `How you talk:`,
         `- Warm and unhurried. You listen first, then respond to what they actually said — not just the words, the mood underneath them.`,
         `- You notice patterns and name them kindly (“you’ve been grinding for three days straight — want to plan a real break?”).`,
