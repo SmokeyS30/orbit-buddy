@@ -67,6 +67,31 @@ test('fetch_url reads text and strips scripts', async (t) => {
   await assert.rejects(() => executeTool('nope', {}), /Unknown tool/);
 });
 
+test('web_search prefers Brave when a key is set, falls back to DDG', async (t) => {
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  global.fetch = async (url, options) => {
+    if (String(url).includes('api.search.brave.com')) {
+      assert.equal(options.headers['X-Subscription-Token'], 'test-brave-key');
+      return {
+        ok: true,
+        json: async () => ({ web: { results: [{ url: 'https://example.com/sox', title: 'Sox win', description: 'Boston won 5-4.' }] } })
+      };
+    }
+    throw new Error('DDG should not be called when Brave succeeds');
+  };
+  const { result } = await executeTool('web_search', { query: 'red sox' }, { BRAVE_SEARCH_API_KEY: 'test-brave-key' });
+  assert.equal(result.via, 'brave');
+  assert.equal(result.results[0].title, 'Sox win');
+
+  global.fetch = async (url) => {
+    if (String(url).includes('api.search.brave.com')) return { ok: false, status: 429 };
+    return { ok: true, json: async () => ({ AbstractText: 'Fallback answer.', AbstractURL: 'https://example.com/fb' }) };
+  };
+  const fallback = await executeTool('web_search', { query: 'red sox' }, { BRAVE_SEARCH_API_KEY: 'bad-key' });
+  assert.equal(fallback.result.via, 'instant-answer');
+});
+
 test('web_search uses the instant-answer API when available', async (t) => {
   const realFetch = global.fetch;
   t.after(() => { global.fetch = realFetch; });
