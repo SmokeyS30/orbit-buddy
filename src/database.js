@@ -89,6 +89,10 @@ export function openDatabase(filePath) {
     CREATE TABLE IF NOT EXISTS proactive_state (
       user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS access_requests (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, note TEXT,
+      created_at TEXT NOT NULL, handled_at TEXT
+    );
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -178,7 +182,11 @@ export function openDatabase(filePath) {
     listAutomation: db.prepare('SELECT id,label,scopes,created_at,last_used_at,revoked_at FROM automation_tokens WHERE user_id=? ORDER BY created_at DESC'),
     automation: db.prepare('SELECT * FROM automation_tokens WHERE token_hash=? AND revoked_at IS NULL'),
     touchAutomation: db.prepare('UPDATE automation_tokens SET last_used_at=? WHERE id=?'),
-    revokeAutomation: db.prepare('UPDATE automation_tokens SET revoked_at=? WHERE id=? AND user_id=?')
+    revokeAutomation: db.prepare('UPDATE automation_tokens SET revoked_at=? WHERE id=? AND user_id=?'),
+    addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
+    getAccessRequest: db.prepare('SELECT * FROM access_requests WHERE id=?'),
+    listAccessRequests: db.prepare('SELECT * FROM access_requests ORDER BY created_at DESC,rowid DESC LIMIT 100'),
+    dismissAccessRequest: db.prepare('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL')
   };
 
   return {
@@ -259,6 +267,9 @@ export function openDatabase(filePath) {
     listAutomationTokens: (userId) => s.listAutomation.all(userId),
     getAutomationToken(hash) { const row=s.automation.get(hash); if(row) s.touchAutomation.run(timestamp(),row.id); return row; },
     revokeAutomationToken: (userId,id) => s.revokeAutomation.run(timestamp(),id,userId).changes>0,
+    addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
+    listAccessRequests: () => s.listAccessRequests.all(),
+    dismissAccessRequest: (id) => s.dismissAccessRequest.run(timestamp(),id).changes>0,
     exportUser(userId) { return {version:2,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
       if (!bundle || bundle.version !== 2) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
