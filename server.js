@@ -71,6 +71,19 @@ export function createOrbitServer(options={}) {
   const paused=()=>db.getSetting('system_paused','false')==='true';
   const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
   const registrationOpen=()=>db.getSetting('registration_open','false')==='true';
+  async function checkDoorLeftOpen(){
+    db.pruneDoorTokens();
+    if(!registrationOpen())return;
+    const openedAt=db.getSetting('registration_opened_at');
+    if(!openedAt||Date.now()-new Date(openedAt).valueOf()<60*60_000)return;
+    const lastNudge=db.getSetting('registration_nudge_at');
+    if(lastNudge&&new Date(lastNudge).valueOf()>=new Date(openedAt).valueOf())return;
+    const owner=db.listUsers().find((u)=>u.role==='owner');
+    if(!owner)return;
+    db.setSetting('registration_nudge_at',new Date().toISOString());
+    db.addEvent(owner.id,'registration_nudge','Registration has been open for over an hour.');
+    await push.notify(owner.id,'Registration still open','The Orbit registration door has been open for over an hour.',{view:'safety'});
+  }
 
   function originFor(req){if(publicBase)return publicBase;const protocol=req.headers['x-forwarded-proto']==='https'?'https':production?'https':'http';return `${protocol}://${req.headers.host}`;}
   function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session;if(!token)return null;return db.getSession(hashToken(token));}
@@ -147,8 +160,22 @@ export function createOrbitServer(options={}) {
         const note=body.note&&String(body.note).trim()?cleanText(body.note,500,'note'):null;
         const saved=db.addAccessRequest({name,email,note});
         const owner=db.listUsers().find((u)=>u.role==='owner');
-        if(owner){db.addEvent(owner.id,'access_request',`${name} (${email}) asked for Orbit access.`);await push.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety'});}
+        if(owner){
+          const doorToken='door_'+randomToken(24);
+          db.addDoorToken(hashToken(doorToken),new Date(Date.now()+24*60_60_000).toISOString());
+          db.addEvent(owner.id,'access_request',`${name} (${email}) asked for Orbit access.`);
+          await push.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety',doorAction:true,doorToken});
+        }
         return json(res,201,{ok:true,id:saved.id});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/registration/door-token'){
+        if(hourlyLimited(req,10,'door-token'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);const token=String(body.token||'');
+        if(!db.consumeDoorToken(hashToken(token)))throw Object.assign(new Error('This link has expired or was already used.'),{status:403});
+        db.setSetting('registration_open','true');db.setSetting('registration_opened_at',new Date().toISOString());
+        const owner=db.listUsers().find((u)=>u.role==='owner');
+        if(owner)db.addEvent(owner.id,'registration_opened','Opened registration from a push action.');
+        return json(res,200,{open:true});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
@@ -206,7 +233,7 @@ export function createOrbitServer(options={}) {
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyName} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
-        if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.setSetting('registration_opened_at',open?new Date().toISOString():'');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
         return json(res,404,{error:'API route not found.'});
@@ -218,8 +245,8 @@ export function createOrbitServer(options={}) {
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,runDueTasks,runProactiveChecks,
-    startWorker(){workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+  return {server,db,runDueTasks,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }

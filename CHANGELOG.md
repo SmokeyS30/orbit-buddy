@@ -4,6 +4,7 @@
 
 - Added a registration door: signups are closed by default and the owner opens/closes them from Safety → Registration door.
 - Added access requests: visitors facing a closed door can ask the owner for access; requests notify the owner by push and are rate-limited.
+- Added a door-left-open nudge and a one-tap "open the door" push action (single-use expiring token) for access requests.
 
 ## 0.2.0
 

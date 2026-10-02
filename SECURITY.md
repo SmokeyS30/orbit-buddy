@@ -15,6 +15,7 @@ Use GitHub private vulnerability reporting instead of opening a public issue. Do
 - Browser mutations require a per-session CSRF token. Session cookies are HttpOnly, SameSite Strict, and Secure in production.
 - The first account is the owner. Registration is closed by default; the owner opens the door from Safety → Registration door when adding someone, then closes it again.
 - Access requests are unauthenticated by design and rate-limited to a few per hour per address; they only notify the owner and never create accounts.
+- The owner is notified if registration stays open over an hour. Push action tokens that open the door are single-use, expire after a day, and are stored only as hashes.
 - Model credentials remain server-side. Responses API calls use `store: false` by default.
 - OAuth access and refresh tokens are encrypted with AES-256-GCM before they enter SQLite.
 - GitHub, Google Calendar, and Slack connectors are read-only previews. Disconnecting removes their stored tokens from Orbit.
