@@ -24,6 +24,31 @@ async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for 
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
 function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
 
+// Buddy-initiative helpers: the model flags upcoming events with [FOLLOWUP: <desc> on YYYY-MM-DD]
+// markers; the server turns them into memories and later checks in unprompted.
+const FOLLOWUP_MARKER_RE = /\[FOLLOWUP:\s*([^\]\n]+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s*\]/gi;
+const FOLLOWUP_MEMORY_RE = /^follow up:\s*(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s*$/i;
+export function parseFollowUpMarkers(text){
+  const out=[];if(typeof text!=='string')return out;FOLLOWUP_MARKER_RE.lastIndex=0;let match;
+  while((match=FOLLOWUP_MARKER_RE.exec(text))){
+    const date=match[2];
+    if(date>='2020-01-01'&&date<='2100-12-31')out.push({description:match[1].trim().slice(0,120),date});
+  }
+  return out;
+}
+export function stripFollowUpMarkers(text){
+  if(typeof text!=='string')return text;
+  return text.replace(/\[FOLLOWUP:[^\]\n]*\]/gi,'').replace(/\n{3,}/g,'\n\n').trim();
+}
+// Quiet-nudge timing: idle >48h since the user's last message, and no nudge in the last 7 days.
+export function quietNudgeDue(lastActivityAt,lastNudgeAt,nowMs){
+  if(!lastActivityAt)return false;
+  const idleMs=nowMs-new Date(lastActivityAt).valueOf();
+  if(!(idleMs>48*3600_000))return false;
+  if(!lastNudgeAt)return true;
+  return (nowMs-new Date(lastNudgeAt).valueOf())>7*24*3600_000;
+}
+
 export function createOrbitServer(options={}) {
   const env=options.env||process.env;
   const buddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
@@ -54,7 +79,50 @@ export function createOrbitServer(options={}) {
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role};}
 
   let workerBusy=false;
-  async function runDueTasks(){if(workerBusy||paused())return;workerBusy=true;try{for(const task of db.dueTasks()){db.setTaskStatus(task.user_id,task.id,'running');db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);try{const result=await model.respond({buddyName,message:task.prompt,memories:db.listMemories(task.user_id),history:[],taskMode:true});const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);await push.notify(task.user_id,isNudge?buddyName:`${buddyName} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});}catch(error){db.completeTask(task.user_id,task.id,'Task failed safely.','failed',null);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyName} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}}}finally{workerBusy=false;}}
+  async function runDueTasks(){if(workerBusy||paused())return;workerBusy=true;try{for(const task of db.dueTasks()){db.setTaskStatus(task.user_id,task.id,'running');db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);try{const taskUser=db.getUserById(task.user_id);const result=await model.respond({buddyName,userName:taskUser?.display_name,message:task.prompt,memories:db.listMemories(task.user_id),history:[],taskMode:true});const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);await push.notify(task.user_id,isNudge?buddyName:`${buddyName} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});}catch(error){db.completeTask(task.user_id,task.id,'Task failed safely.','failed',null);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyName} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}}}finally{workerBusy=false;}}
+
+  // A proactive message lands in the default conversation AND as a push notification,
+  // so the buddy reaches out even on devices without push enabled.
+  async function deliverProactive(user,text,eventType,eventMessage){
+    const conversation=db.ensureDefaultConversation(user.id);
+    db.addMessage(user.id,conversation.id,'assistant',text);
+    db.touchConversation(user.id,conversation.id);
+    db.addEvent(user.id,eventType,eventMessage);
+    await push.notify(user.id,buddyName,text,{view:'today'});
+  }
+  async function runFollowUps(today){
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      for(const memory of db.listMemories(user.id)){
+        const match=FOLLOWUP_MEMORY_RE.exec(memory.content);
+        if(!match||match[2]>today)continue;
+        const prompt=`Write a short, warm check-in message (1-2 sentences, plain text, no greeting header) asking how "${match[1]}" went. Sound like a caring friend dropping by, not a notification. Do not mention that this is automated.`;
+        try{
+          const text=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listMemories(user.id),history:[],taskMode:true});
+          await deliverProactive(user,text,'followup_sent',`Checked in about “${match[1]}”.`);
+          db.deleteMemory(user.id,memory.id);
+        }catch(error){db.addEvent(user.id,'followup_failed',`Could not check in about “${match[1]}”.`,error.message);}
+      }
+    }
+  }
+  async function runQuietNudges(nowMs){
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
+      const prompt=`Write a short, warm check-in (1-2 sentences, plain text) for someone you have not heard from in a couple of days. Sound like a friend popping by, not a notification. You may gently reference something from their memories if one fits naturally; otherwise keep it simple. Do not mention that this is automated.`;
+      try{
+        const text=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listMemories(user.id),history:[],taskMode:true});
+        db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString());
+        await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.');
+      }catch(error){db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
+    }
+  }
+  let proactiveBusy=false;
+  async function runProactiveChecks(nowMs=Date.now()){
+    if(proactiveBusy||paused())return;proactiveBusy=true;
+    try{await runFollowUps(new Date(nowMs).toISOString().slice(0,10));await runQuietNudges(nowMs);}
+    finally{proactiveBusy=false;}
+  }
 
   let backupBusy=false;
   async function runBackups(){if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;const today=new Date().toISOString().slice(0,10);if(db.getSetting('last_automatic_backup')===today)return;backupBusy=true;try{for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,passphrase:env.BACKUP_ENCRYPTION_KEY});db.setSetting('last_automatic_backup',today);}finally{backupBusy=false;}}
@@ -102,7 +170,7 @@ export function createOrbitServer(options={}) {
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName,model:model.model,modelConfigured:model.configured,version:'0.2.0',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),automationTokens:db.listAutomationTokens(me)});}
         const userId=user.user_id||user.id;
-        if(req.method==='POST'&&url.pathname==='/api/chat'){if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});if(user.automation)throw Object.assign(new Error('Automation tokens cannot use chat.'),{status:403});if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);const history=db.listConversationMessages(userId,conversation.id,20);db.addMessage(userId,conversation.id,'user',message);const answer=await model.respond({buddyName,userName:user.display_name,message,memories:db.listMemories(userId),history});const saved=db.addMessage(userId,conversation.id,'assistant',answer);db.touchConversation(userId,conversation.id);db.addEvent(userId,'chat','Orbit replied to a message.');return json(res,201,saved);}
+        if(req.method==='POST'&&url.pathname==='/api/chat'){if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});if(user.automation)throw Object.assign(new Error('Automation tokens cannot use chat.'),{status:403});if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);const history=db.listConversationMessages(userId,conversation.id,20);db.addMessage(userId,conversation.id,'user',message);const rawAnswer=await model.respond({buddyName,userName:user.display_name,message,memories:db.listMemories(userId),history});for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addMemory(userId,`Follow up: ${followUp.description} on ${followUp.date}`);db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}const answer=stripFollowUpMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';const saved=db.addMessage(userId,conversation.id,'assistant',answer);db.touchConversation(userId,conversation.id);db.addEvent(userId,'chat','Orbit replied to a message.');return json(res,201,saved);}
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
         if(req.method==='POST'&&url.pathname==='/api/conversations'){const body=await readJson(req);const raw=String(body.title||'').trim();const title=raw?cleanText(raw,80,'title'):'New chat';return json(res,201,db.createConversation(userId,title));}
         const convoMatch=url.pathname.match(/^\/api\/conversations\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&convoMatch){if(!db.deleteConversation(userId,convoMatch[1]))throw Object.assign(new Error('Conversation not found.'),{status:404});return json(res,200,{ok:true});}
@@ -134,8 +202,8 @@ export function createOrbitServer(options={}) {
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,runDueTasks,
-    startWorker(){workerTimer=setInterval(runDueTasks,workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(runDueTasks);setImmediate(runBackups);},
+  return {server,db,runDueTasks,runProactiveChecks,
+    startWorker(){workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }
