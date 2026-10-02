@@ -64,6 +64,8 @@ export function createOrbitServer(options={}) {
 
   const requestLog=new Map();
   function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  const hourLog=new Map();
+  function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
   function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
   const paused=()=>db.getSetting('system_paused','false')==='true';
@@ -139,6 +141,15 @@ export function createOrbitServer(options={}) {
 
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
+      if(req.method==='POST'&&url.pathname==='/api/registration-request'){
+        if(hourlyLimited(req,3,'reg-request'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);const name=cleanText(body.name,80,'name');const email=safeEmail(body.email);
+        const note=body.note&&String(body.note).trim()?cleanText(body.note,500,'note'):null;
+        const saved=db.addAccessRequest({name,email,note});
+        const owner=db.listUsers().find((u)=>u.role==='owner');
+        if(owner){db.addEvent(owner.id,'access_request',`${name} (${email}) asked for Orbit access.`);await push.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety'});}
+        return json(res,201,{ok:true,id:saved.id});
+      }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
@@ -196,6 +207,8 @@ export function createOrbitServer(options={}) {
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
         if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
+        const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
         return json(res,404,{error:'API route not found.'});
       }
     } catch(error) { return json(res,error.status||500,{error:error.status?error.message:'Request failed safely.'}); }
