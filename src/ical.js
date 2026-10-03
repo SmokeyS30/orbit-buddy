@@ -332,6 +332,45 @@ export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, de
   return { events, feedErrors, feeds: feeds.map((f) => ({ id: f.id, label: f.label })) };
 }
 
+// Group events under Today/Tomorrow headings for the morning-briefing prompt.
+// Pure formatting over { title, startMs, endMs, allDay, location, calendar } entries.
+export function formatBriefingAgenda(events, zone, todayStr) {
+  if (!events.length) return '';
+  const localDay = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: zone });
+  const timeFmt = (ms) => new Date(ms).toLocaleTimeString('en-US', { timeZone: zone, hour: 'numeric', minute: '2-digit' });
+  const dayHead = (dateStr) => {
+    const label = new Date(`${dateStr}T12:00:00Z`).toLocaleDateString('en-US', { timeZone: zone, weekday: 'short', month: 'short', day: 'numeric' });
+    if (dateStr === todayStr) return `Today (${label})`;
+    return `Tomorrow (${label})`;
+  };
+  const byDay = new Map();
+  for (const e of events) {
+    const day = localDay(e.startMs);
+    if (day !== todayStr && day !== addDaysStr(todayStr, 1)) continue;
+    if (!byDay.has(day)) byDay.set(day, []);
+    const when = e.allDay ? 'All day' : `${timeFmt(e.startMs)}${e.endMs && e.endMs !== e.startMs ? ` – ${timeFmt(e.endMs)}` : ''}`;
+    const where = e.location ? ` @ ${e.location}` : '';
+    byDay.get(day).push(`- ${when}: ${e.title}${where} [${e.calendar || 'Calendar'}]`);
+  }
+  const lines = [];
+  for (const [day, items] of [...byDay.entries()].sort()) lines.push(`${dayHead(day)}:\n${items.join('\n')}`);
+  return lines.join('\n');
+}
+
+function addDaysStr(dateStr, n) {
+  const [y, mo, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, mo - 1, d) + n * 86400_000).toISOString().slice(0, 10);
+}
+
+// Today's + tomorrow's agenda as prompt-ready text, or '' when there's nothing to show.
+export async function getBriefingAgenda(db, userId, days = 2) {
+  const zone = DEFAULT_ZONE;
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: zone });
+  const { events, feeds } = await getEventsForRange(db, userId, dayStartMs(todayStr, 0, zone), dayStartMs(todayStr, days, zone), zone);
+  if (!feeds.length || !events.length) return '';
+  return formatBriefingAgenda(events, zone, todayStr);
+}
+
 // Start of `dayOffset` days after `dateStr` (YYYY-MM-DD) in `timeZone`, as UTC ms.
 export function dayStartMs(dateStr, dayOffset, timeZone) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ''));
