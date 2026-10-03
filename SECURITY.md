@@ -10,8 +10,8 @@ Use GitHub private vulnerability reporting instead of opening a public issue. Do
 
 ## Security model
 
-- Every private API route requires a signed-in session or a narrowly scoped automation token.
-- Passwords use salted `scrypt`; session tokens, recovery codes, OAuth states, and automation tokens are stored only as hashes.
+- Every private API route requires a signed-in session.
+- Passwords use salted `scrypt`; session tokens, recovery codes, and OAuth states are stored only as hashes.
 - Browser mutations require a per-session CSRF token. Session cookies are HttpOnly, SameSite Strict, and Secure in production.
 - The first account is the owner. Registration is closed by default; the owner opens the door from Safety → Registration door when adding someone, then closes it again.
 - Access requests are unauthenticated by design and rate-limited to a few per hour per address; they only notify the owner and never create accounts.
