@@ -63,6 +63,41 @@ test('parseResponsesStream handles chunks split mid-event and empty streams', as
   assert.deepEqual(empty, []);
 });
 
+test('parseResponsesStream accepts CRLF and a final event without a blank delimiter', async () => {
+  const added = `data: ${JSON.stringify({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } })}\r\n\r\n`;
+  const delta = `data: ${JSON.stringify({ type: 'response.output_text.delta', output_index: 0, delta: 'Connected.' })}`;
+  const output = await parseResponsesStream(sseBody([added.slice(0, -3), added.slice(-3), delta]), null);
+  assert.equal(output[0].content[0].text, 'Connected.');
+});
+
+test('an empty streamed reply retries once without streaming', async (t) => {
+  let calls = 0;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      calls += 1;
+      const sent = JSON.parse(body);
+      if (sent.stream) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        return res.end('data: [DONE]\n\n');
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Recovered.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'test-model',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+  const result = await model.respond({ buddyName: 'Orbit', message: 'Hello', tools: true, onToken: () => {} });
+  assert.equal(result.text, 'Recovered.');
+  assert.equal(calls, 2);
+});
+
 test('tool loop streams tokens and still handles function calls', async (t) => {
   const stub = http.createServer((req, res) => {
     let body = '';

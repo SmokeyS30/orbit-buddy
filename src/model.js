@@ -109,17 +109,24 @@ export async function parseResponsesStream(body, onToken) {
       item.arguments = (item.arguments || '') + String(event.delta || '');
     }
   };
+  const consumeEvent = (raw) => {
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('data:')) handleEvent(line.slice(5).trim());
+    }
+  };
   const pump = (chunk, done) => {
-    if (chunk) {
-      pump.buffer = (pump.buffer || '') + decoder.decode(chunk, { stream: !done });
-      let idx;
-      while ((idx = pump.buffer.indexOf('\n\n')) !== -1) {
-        const raw = pump.buffer.slice(0, idx);
-        pump.buffer = pump.buffer.slice(idx + 2);
-        for (const line of raw.split('\n')) {
-          if (line.startsWith('data:')) handleEvent(line.slice(5).trim());
-        }
-      }
+    pump.buffer = (pump.buffer || '') + decoder.decode(chunk || new Uint8Array(), { stream: !done });
+    // SSE permits CRLF as well as LF. Normalize after appending so a CR/LF
+    // pair split across network chunks is handled on the next pump.
+    pump.buffer = pump.buffer.replace(/\r\n/g, '\n');
+    let idx;
+    while ((idx = pump.buffer.indexOf('\n\n')) !== -1) {
+      consumeEvent(pump.buffer.slice(0, idx));
+      pump.buffer = pump.buffer.slice(idx + 2);
+    }
+    if (done && pump.buffer.trim()) {
+      consumeEvent(pump.buffer);
+      pump.buffer = '';
     }
     return done;
   };
@@ -335,12 +342,19 @@ export function createModelClient(env = process.env) {
       const requestOutput = async (input, stream) => {
         let failure;
         try {
-          return await callWithFallback(stream ? requestModelStream : requestModel, input);
+          const output = await callWithFallback(stream ? requestModelStream : requestModel, input);
+          const usable = output.some((item) => item?.type === 'function_call' || extractText({ output: [item] }));
+          if (stream && !usable) {
+            const error = new Error('The streamed model response contained no usable output.');
+            error.classification = 'stream';
+            throw error;
+          }
+          return output;
         } catch (error) {
           failure = error;
         }
         let classification = failure?.classification || classifyModelError(failure);
-        if (stream && ['network', 'service'].includes(classification)) {
+        if (stream && ['network', 'service', 'request', 'stream'].includes(classification)) {
           try {
             return await callWithFallback(requestModel, input);
           } catch (error) {
