@@ -98,11 +98,30 @@ export async function toolWebSearch(args = {}, env = process.env) {
 }
 
 async function braveSearch(query, apiKey) {
-  const response = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&text_decorations=false`, {
-    headers: { Accept: 'application/json', 'X-Subscription-Token': apiKey },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-  });
-  if (!response.ok) throw new Error(`Brave search failed (HTTP ${response.status}).`);
+  const url = `https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5&text_decorations=false`;
+  const headers = { Accept: 'application/json', 'X-Subscription-Token': apiKey };
+  let response = null;
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let transient = false;
+    try {
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (res.ok) {
+        response = res;
+        break;
+      }
+      // 429/5xx may clear up: retry. Other 4xx are the request's fault (bad
+      // key included) — no point burning retries or credits on them.
+      transient = res.status === 429 || res.status >= 500;
+      lastError = new Error(`Brave search failed (HTTP ${res.status}).`);
+    } catch (error) {
+      transient = true; // network error, timeout, abort
+      lastError = error;
+    }
+    if (!transient) break;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+  }
+  if (!response) throw lastError || new Error('Brave search failed.');
   const data = await response.json().catch(() => null);
   const results = (data?.web?.results || []).slice(0, 5).map((entry) => ({
     url: String(entry.url || ''),
@@ -157,6 +176,47 @@ export async function toolFetchUrl(args = {}) {
   return { url: finalUrl, text: text.slice(0, 6000) };
 }
 
+function cleanArg(value, max, field) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
+  return value.trim().slice(0, max);
+}
+
+function writeContext(ctx, tool) {
+  if (!ctx || !ctx.db || !ctx.userId) throw new Error(`${tool} is not available in this context.`);
+  return ctx;
+}
+
+export function toolCreateTask(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'create_task');
+  const title = cleanArg(args.title, 120, 'title');
+  const prompt = cleanArg(args.prompt, 6000, 'prompt');
+  const risk = args.risk === 'external' ? 'external' : 'internal';
+  const recurrence = ['daily', 'weekly'].includes(args.recurrence) ? args.recurrence : 'none';
+  let scheduleAt = null;
+  if (args.scheduleAt) {
+    const date = new Date(args.scheduleAt);
+    if (Number.isNaN(date.valueOf())) throw new Error('scheduleAt must be a valid date.');
+    scheduleAt = date.toISOString();
+  }
+  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence });
+  return {
+    id: task.id,
+    title: task.title,
+    status: task.status,
+    risk: task.risk,
+    note: task.status === 'waiting_approval'
+      ? 'Created, waiting for the owner to approve it in the Tasks tab.'
+      : 'Created.'
+  };
+}
+
+export function toolSaveMemory(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'save_memory');
+  const content = cleanArg(args.content, 2000, 'content');
+  const memory = db.addMemory(userId, content);
+  return { id: memory.id, content: memory.content, note: 'Saved. The user can delete it in the Memories tab.' };
+}
+
 export const TOOL_DEFINITIONS = [
   {
     type: 'function',
@@ -189,16 +249,46 @@ export const TOOL_DEFINITIONS = [
       required: ['url'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'create_task',
+    description: 'Create a task for Orbit to work on. Only call this when the user clearly asked for a task or reminder. Think-only (internal) tasks are created right away; external-action tasks go to "waiting approval" for the user to approve in the Tasks tab. Always tell the user what you created in your visible reply.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Short task title.' },
+        prompt: { type: 'string', description: 'What Orbit should do for this task.' },
+        risk: { type: 'string', description: '"internal" for think-only (default) or "external" for tasks that act on the world.' },
+        recurrence: { type: 'string', description: '"none" (default), "daily", or "weekly".' },
+        scheduleAt: { type: 'string', description: 'ISO date/time for when the task should run. Omit to queue it now.' }
+      },
+      required: ['title', 'prompt'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'save_memory',
+    description: 'Save something the user asked you to remember. Only call this when the user clearly asked ("remember this") or it is plainly worth keeping. Always tell the user what you saved in your visible reply.',
+    parameters: {
+      type: 'object',
+      properties: { content: { type: 'string', description: 'The memory to save (max 2000 characters).' } },
+      required: ['content'],
+      additionalProperties: false
+    }
   }
 ];
 
 const TOOL_SUMMARIES = {
   get_datetime: () => '',
   web_search: (args) => String(args.query || '').slice(0, 80),
-  fetch_url: (args) => String(args.url || '').slice(0, 80)
+  fetch_url: (args) => String(args.url || '').slice(0, 80),
+  create_task: (args) => String(args.title || '').slice(0, 80),
+  save_memory: (args) => String(args.content || '').slice(0, 80)
 };
 
-export async function executeTool(name, args = {}, env = process.env) {
+export async function executeTool(name, args = {}, env = process.env, ctx = null) {
   const clean = args && typeof args === 'object' ? args : {};
   switch (name) {
     case 'get_datetime': return { result: toolGetDatetime(clean), summary: '' };
@@ -209,6 +299,14 @@ export async function executeTool(name, args = {}, env = process.env) {
     case 'fetch_url': {
       const result = await toolFetchUrl(clean);
       return { result, summary: String(clean.url || '').slice(0, 80) };
+    }
+    case 'create_task': {
+      const result = toolCreateTask(clean, ctx);
+      return { result, summary: String(clean.title || '').slice(0, 80) };
+    }
+    case 'save_memory': {
+      const result = toolSaveMemory(clean, ctx);
+      return { result, summary: String(clean.content || '').slice(0, 80) };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
