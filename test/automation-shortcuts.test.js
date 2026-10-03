@@ -39,20 +39,32 @@ test('token creation accepts scopes and rejects empty or unknown scopes', async 
   assert.equal(bogus.status, 400);
 });
 
-test('POST /api/automation/ask answers with the chat:ask scope and saves the exchange', async (t) => {
+test('POST /api/automation/ask answers asynchronously with the chat:ask scope and saves the exchange', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
   const { token } = await createToken(base, auth, 'Shortcuts', ['chat:ask']);
-  const response = await fetch(`${base}/api/automation/ask`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ message: 'What is on my calendar today?' }) });
-  assert.equal(response.status, 200);
-  const body = await response.json();
-  assert.equal(typeof body.answer, 'string');
-  assert.ok(body.answer.length > 0);
-  assert.ok(!body.answer.includes('SUGGEST_MEMORY'), 'markers stripped from the answer');
+  const bearer = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+  const response = await fetch(`${base}/api/automation/ask`, { method: 'POST', headers: bearer, body: JSON.stringify({ message: 'What is on my calendar today?' }) });
+  assert.equal(response.status, 202);
+  const { id } = await response.json();
+  assert.ok(id, 'returns a request id');
+  let answer = null;
+  for (let i = 0; i < 50 && answer === null; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const poll = await fetch(`${base}/api/automation/ask/${id}`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(poll.status, 200);
+    const state = await poll.json();
+    if (state.state === 'done') answer = state.answer;
+    else assert.equal(state.state, 'working');
+  }
+  assert.equal(typeof answer, 'string');
+  assert.ok(answer.length > 0);
+  assert.ok(!answer.includes('SUGGEST_MEMORY'), 'markers stripped from the answer');
   const conversation = app.db.ensureDefaultConversation(auth.userId);
   const messages = app.db.listConversationMessages(auth.userId, conversation.id, 10);
   const roles = messages.map((m) => m.role);
   assert.ok(roles.includes('user') && roles.includes('assistant'), 'exchange persisted to the default conversation');
+  assert.equal((await fetch(`${base}/api/automation/ask/no-such-id`, { headers: { Authorization: `Bearer ${token}` } })).status, 404);
 });
 
 test('POST /api/automation/ask rejects missing auth and insufficient scope', async (t) => {
