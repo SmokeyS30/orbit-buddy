@@ -49,6 +49,9 @@ export function openDatabase(filePath) {
     CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY, user_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS memory_suggestions (
+      id TEXT PRIMARY KEY, user_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, user_id TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
       risk TEXT NOT NULL CHECK(risk IN ('internal','external')), schedule_at TEXT,
@@ -151,6 +154,10 @@ export function openDatabase(filePath) {
     addMemory: db.prepare('INSERT INTO memories(id,user_id,content,created_at,updated_at) VALUES (?, ?, ?, ?, ?)'),
     listMemories: db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 100'),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
+    addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at) VALUES (?,?,?,?)'),
+    getMemorySuggestion: db.prepare('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?'),
+    listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
+    deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
     lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
     getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
@@ -251,6 +258,10 @@ export function openDatabase(filePath) {
     addMemory(userId, content) { const now=timestamp(); const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now}; s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at); return row; },
     listMemories: (userId) => s.listMemories.all(userId),
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
+    addMemorySuggestion(userId,content){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at);return row;},
+    listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
+    dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
+    approveMemorySuggestion(userId,id){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const now=timestamp();s.addMemory.run(randomUUID(),userId,row.content,now,now);s.deleteMemorySuggestion.run(id,userId);return row;},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
