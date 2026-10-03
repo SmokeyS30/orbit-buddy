@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed stale installed-app JavaScript hiding newly deployed Safety controls.
+- Made direct Safety links activate the correct view on startup.
+
 ## 0.4.1
 
 - Added a no-token OpenAI key and model-availability check that runs at startup and on demand from Safety.

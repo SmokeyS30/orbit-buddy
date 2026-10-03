@@ -23,6 +23,8 @@ const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csr
 
 test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
+  const appScript = await fetch(`${base}/app.js`);
+  assert.match(appScript.headers.get('cache-control'), /no-cache/);
   const health = await fetch(`${base}/healthz`);
   assert.equal(health.status, 200);
   assert.deepEqual((await health.json()).ai, { configured: false, state: 'demo', primaryModel: 'gpt-6-luna', activeModel: 'gpt-6-luna', availableTextModelCount: null });
