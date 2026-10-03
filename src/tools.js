@@ -1,47 +1,10 @@
-import { lookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
+import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
+import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 
-const FETCH_TIMEOUT_MS = 10_000;
+// Re-exported so existing callers keep working; new code imports from net.js.
+export { assertPublicUrl };
+
 const MAX_PAGE_BYTES = 300_000;
-
-function ipIsPrivate(ip) {
-  if (ip === '::1' || ip === '::ffff:127.0.0.1') return true;
-  if (ip.includes(':')) {
-    const lower = ip.toLowerCase();
-    return lower.startsWith('fe80:') || lower.startsWith('fc') || lower.startsWith('fd') || ip === '::';
-  }
-  const parts = ip.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
-  const [a, b] = parts;
-  return a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0;
-}
-
-// Blocks server-side request forgery: the model must never fetch internal,
-// link-local, or otherwise non-public addresses, including via redirects.
-export async function assertPublicUrl(raw) {
-  let url;
-  try {
-    url = new URL(String(raw || '').trim());
-  } catch {
-    throw new Error('That is not a valid URL.');
-  }
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Only http and https URLs are allowed.');
-  const host = url.hostname.replace(/^\[|\]$/g, '');
-  if (isIP(host)) {
-    if (ipIsPrivate(host)) throw new Error('That address is not publicly reachable.');
-    return url.toString();
-  }
-  let addresses;
-  try {
-    addresses = await lookup(host, { all: true });
-  } catch {
-    throw new Error('Could not resolve that hostname.');
-  }
-  if (!addresses.length || addresses.some((entry) => ipIsPrivate(entry.address))) {
-    throw new Error('That address is not publicly reachable.');
-  }
-  return url.toString();
-}
 
 export function toolGetDatetime(args = {}) {
   let timeZone = 'America/New_York';
@@ -217,6 +180,43 @@ export function toolSaveMemory(args = {}, ctx = null) {
   return { id: memory.id, content: memory.content, note: 'Saved. The user can delete it in the Memories tab.' };
 }
 
+function validDateStr(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
+  if (!match) return null;
+  const [, y, mo, d] = match;
+  const check = new Date(Date.UTC(+y, +mo - 1, +d));
+  if (check.getUTCFullYear() !== +y || check.getUTCMonth() !== +mo - 1 || check.getUTCDate() !== +d) return null;
+  return `${y}-${mo}-${d}`;
+}
+
+export async function toolReadCalendar(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'read_calendar');
+  const zone = DEFAULT_ZONE;
+  const dateStr = validDateStr(args.date) || new Date().toLocaleDateString('en-CA', { timeZone: zone });
+  let days = Math.floor(Number(args.days));
+  if (!Number.isFinite(days) || days < 1) days = 1;
+  if (days > 14) days = 14;
+  const rangeStartMs = dayStartMs(dateStr, 0, zone);
+  const rangeEndMs = dayStartMs(dateStr, days, zone);
+  const { events, feedErrors, feeds } = await getEventsForRange(db, userId, rangeStartMs, rangeEndMs, zone);
+  if (!feeds.length) {
+    return { date: dateStr, days, events: [], note: 'No calendars are connected yet. Add an iCal feed in the Connections tab.' };
+  }
+  return {
+    date: dateStr,
+    days,
+    events: events.map((e) => ({
+      calendar: e.calendar,
+      title: e.title,
+      start: new Date(e.startMs).toISOString(),
+      end: new Date(e.endMs).toISOString(),
+      allDay: e.allDay,
+      ...(e.location ? { location: e.location } : {})
+    })),
+    ...(feedErrors.length ? { feedErrors } : {})
+  };
+}
+
 export const TOOL_DEFINITIONS = [
   {
     type: 'function',
@@ -277,6 +277,19 @@ export const TOOL_DEFINITIONS = [
       required: ['content'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'read_calendar',
+    description: 'Read the user\'s calendar events across all connected iCal feeds. Use it when the user asks about their schedule, upcoming events, or availability on a date.',
+    parameters: {
+      type: 'object',
+      properties: {
+        date: { type: 'string', description: 'Start date as YYYY-MM-DD. Defaults to today.' },
+        days: { type: 'number', description: 'How many days to include starting from date. Default 1, max 14.' }
+      },
+      additionalProperties: false
+    }
   }
 ];
 
@@ -285,7 +298,8 @@ const TOOL_SUMMARIES = {
   web_search: (args) => String(args.query || '').slice(0, 80),
   fetch_url: (args) => String(args.url || '').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
-  save_memory: (args) => String(args.content || '').slice(0, 80)
+  save_memory: (args) => String(args.content || '').slice(0, 80),
+  read_calendar: (args) => String(args.date || 'today').slice(0, 40)
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -307,6 +321,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'save_memory': {
       const result = toolSaveMemory(clean, ctx);
       return { result, summary: String(clean.content || '').slice(0, 80) };
+    }
+    case 'read_calendar': {
+      const result = await toolReadCalendar(clean, ctx);
+      return { result, summary: String(clean.date || 'today').slice(0, 40) };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
