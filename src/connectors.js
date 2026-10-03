@@ -1,18 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { decryptSecret, encryptSecret, hashToken, randomToken } from './security.js';
 
-const providers = {
-  github: {
-    label: 'GitHub', clientId: 'GITHUB_OAUTH_CLIENT_ID', clientSecret: 'GITHUB_OAUTH_CLIENT_SECRET',
-    authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token',
-    scope: 'read:user user:email', profile: 'https://api.github.com/user', pkce: true
-  },
-  slack: {
-    label: 'Slack', clientId: 'SLACK_OAUTH_CLIENT_ID', clientSecret: 'SLACK_OAUTH_CLIENT_SECRET',
-    authorize: 'https://slack.com/oauth/v2/authorize', token: 'https://slack.com/api/oauth.v2.access',
-    scope: 'channels:read users:read', profile: 'https://slack.com/api/auth.test', pkce: false
-  }
-};
+// No OAuth providers are configured. Calendar access is handled by per-user
+// iCal feeds (see src/ical.js) instead of provider OAuth.
+const providers = {};
 
 const challenge = (value) => createHash('sha256').update(value).digest('base64url');
 
