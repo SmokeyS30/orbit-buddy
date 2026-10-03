@@ -281,3 +281,20 @@ test('normalizeFeedUrl converts webcal schemes to https', async () => {
   assert.equal(normalizeFeedUrl('https://example.com/cal.ics'), 'https://example.com/cal.ics');
   assert.equal(normalizeFeedUrl('  webcal://example.com/cal.ics  '), 'https://example.com/cal.ics');
 });
+
+test('formatBriefingAgenda groups events under Today/Tomorrow headings', async () => {
+  const { formatBriefingAgenda } = await import('../src/ical.js');
+  const zone = 'America/New_York';
+  const events = [
+    { title: 'Standup', startMs: Date.UTC(2026, 9, 5, 13, 0), endMs: Date.UTC(2026, 9, 5, 14, 0), allDay: false, location: 'Room 3', calendar: 'Work' },
+    { title: 'Dentist', startMs: Date.UTC(2026, 9, 5, 4, 0), endMs: Date.UTC(2026, 9, 6, 4, 0), allDay: true, calendar: 'Personal' },
+    { title: 'Call with Mom', startMs: Date.UTC(2026, 9, 6, 18, 30), endMs: Date.UTC(2026, 9, 6, 19, 0), allDay: false, calendar: 'Personal' },
+  ];
+  const text = formatBriefingAgenda(events, zone, '2026-10-05');
+  assert.match(text, /Today \(Mon, Oct 5\):/);
+  assert.match(text, /9:00 AM – 10:00 AM: Standup @ Room 3 \[Work\]/);
+  assert.match(text, /All day: Dentist \[Personal\]/);
+  assert.match(text, /Tomorrow \(Tue, Oct 6\):/);
+  assert.match(text, /2:30 PM – 3:00 PM: Call with Mom \[Personal\]/);
+  assert.equal(formatBriefingAgenda([], zone, '2026-10-05'), '');
+});
