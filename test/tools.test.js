@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 3);
+  assert.equal(TOOL_DEFINITIONS.length, 5);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['fetch_url', 'get_datetime', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'save_memory', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -162,4 +162,105 @@ test('respond without tools keeps the single-request behavior', async (t) => {
   assert.equal(text, 'Hello.');
   assert.deepEqual(toolCalls, []);
   assert.equal(requests, 1);
+});
+
+function writeCtx() {
+  const calls = [];
+  return {
+    userId: 'user-1',
+    calls,
+    db: {
+      addTask: (userId, task) => {
+        calls.push(['addTask', userId, task]);
+        return {
+          id: 'task-1',
+          title: task.title,
+          status: task.risk === 'external' ? 'waiting_approval' : (task.scheduleAt ? 'scheduled' : 'queued'),
+          risk: task.risk
+        };
+      },
+      addMemory: (userId, content) => {
+        calls.push(['addMemory', userId, content]);
+        return { id: 'mem-1', content };
+      }
+    }
+  };
+}
+
+test('create_task validates input and creates via ctx', async () => {
+  const ctx = writeCtx();
+  const { result } = await executeTool('create_task', { title: '  Morning brief  ', prompt: 'Summarize the news', recurrence: 'daily' }, {}, ctx);
+  assert.equal(result.status, 'queued');
+  assert.deepEqual(ctx.calls[0][2], {
+    title: 'Morning brief',
+    prompt: 'Summarize the news',
+    risk: 'internal',
+    scheduleAt: null,
+    recurrence: 'daily'
+  });
+});
+
+test('create_task routes external risk through approval', async () => {
+  const ctx = writeCtx();
+  const { result } = await executeTool('create_task', { title: 'Buy milk', prompt: 'Order milk', risk: 'external' }, {}, ctx);
+  assert.equal(result.status, 'waiting_approval');
+  assert.match(result.note, /waiting/i);
+});
+
+test('create_task parses scheduleAt and rejects bad input or missing context', async () => {
+  const ctx = writeCtx();
+  const scheduled = await executeTool('create_task', { title: 't', prompt: 'x', scheduleAt: '2026-10-04T13:00:00Z' }, {}, ctx);
+  assert.equal(scheduled.result.status, 'scheduled');
+  await assert.rejects(() => executeTool('create_task', { title: '', prompt: 'x' }, {}, ctx), /title is required/);
+  await assert.rejects(() => executeTool('create_task', { title: 't', prompt: 'x', scheduleAt: 'not-a-date' }, {}, ctx), /valid date/);
+  await assert.rejects(() => executeTool('create_task', { title: 't', prompt: 'x' }, {}, null), /not available in this context/);
+  await assert.rejects(() => executeTool('create_task', { title: 't', prompt: 'x' }, {}, { userId: 'u' }), /not available in this context/);
+});
+
+test('save_memory validates and saves via ctx', async () => {
+  const ctx = writeCtx();
+  const { result } = await executeTool('save_memory', { content: '  Edward likes Earl Grey  ' }, {}, ctx);
+  assert.equal(result.content, 'Edward likes Earl Grey');
+  assert.deepEqual(ctx.calls[0], ['addMemory', 'user-1', 'Edward likes Earl Grey']);
+  await assert.rejects(() => executeTool('save_memory', { content: '   ' }, {}, ctx), /content is required/);
+  await assert.rejects(() => executeTool('save_memory', { content: 'x' }, {}, null), /not available in this context/);
+});
+
+test('save_memory truncates long content at 2000 chars', async () => {
+  const ctx = writeCtx();
+  const { result } = await executeTool('save_memory', { content: 'a'.repeat(2500) }, {}, ctx);
+  assert.equal(result.content.length, 2000);
+});
+
+test('Brave retries transient failures before giving up', async (t) => {
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  let braveCalls = 0;
+  global.fetch = async (url) => {
+    if (String(url).includes('api.search.brave.com')) {
+      braveCalls += 1;
+      if (braveCalls < 3) return { ok: false, status: 503 };
+      return { ok: true, json: async () => ({ web: { results: [{ url: 'https://example.com/a', title: 'A', description: 'D' }] } }) };
+    }
+    throw new Error('DDG should not be called when Brave recovers');
+  };
+  const { result } = await executeTool('web_search', { query: 'retry test' }, { BRAVE_SEARCH_API_KEY: 'k' });
+  assert.equal(result.via, 'brave');
+  assert.equal(braveCalls, 3);
+});
+
+test('Brave does not retry auth failures', async (t) => {
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  let braveCalls = 0;
+  global.fetch = async (url) => {
+    if (String(url).includes('api.search.brave.com')) {
+      braveCalls += 1;
+      return { ok: false, status: 401 };
+    }
+    return { ok: true, json: async () => ({ AbstractText: 'Fallback.', AbstractURL: 'https://example.com/fb' }) };
+  };
+  const { result } = await executeTool('web_search', { query: 'auth test' }, { BRAVE_SEARCH_API_KEY: 'bad' });
+  assert.equal(result.via, 'instant-answer');
+  assert.equal(braveCalls, 1);
 });
