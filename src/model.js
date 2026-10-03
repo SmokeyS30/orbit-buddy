@@ -23,6 +23,70 @@ function extractText(payload) {
   return parts.join('\n').trim();
 }
 
+// Parses a Responses API server-sent-events stream, rebuilding the output items
+// in the same shape as a non-streaming response. Calls onToken(delta) for each
+// response.output_text.delta event as it arrives. Exported for testing.
+export async function parseResponsesStream(body, onToken) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const items = new Map();
+  const order = [];
+  const getItem = (index) => {
+    if (!items.has(index)) {
+      items.set(index, {});
+      order.push(index);
+    }
+    return items.get(index);
+  };
+  const handleEvent = (data) => {
+    if (!data || data === '[DONE]') return;
+    let event;
+    try {
+      event = JSON.parse(data);
+    } catch {
+      return;
+    }
+    const type = event.type || '';
+    if (type === 'response.output_item.added' && event.item) {
+      const item = getItem(event.output_index);
+      Object.assign(item, event.item);
+      if (item.type === 'function_call') item.arguments = item.arguments || '';
+      if (item.type === 'message') item._text = '';
+    } else if (type === 'response.output_text.delta') {
+      const item = getItem(event.output_index);
+      item._text = (item._text || '') + String(event.delta || '');
+      if (onToken) onToken(String(event.delta || ''));
+    } else if (type === 'response.function_call_arguments.delta') {
+      const item = getItem(event.output_index);
+      item.arguments = (item.arguments || '') + String(event.delta || '');
+    }
+  };
+  const pump = (chunk, done) => {
+    if (chunk) {
+      pump.buffer = (pump.buffer || '') + decoder.decode(chunk, { stream: !done });
+      let idx;
+      while ((idx = pump.buffer.indexOf('\n\n')) !== -1) {
+        const raw = pump.buffer.slice(0, idx);
+        pump.buffer = pump.buffer.slice(idx + 2);
+        for (const line of raw.split('\n')) {
+          if (line.startsWith('data:')) handleEvent(line.slice(5).trim());
+        }
+      }
+    }
+    return done;
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (pump(value, done)) break;
+  }
+  return order.map((index) => {
+    const item = items.get(index);
+    const { _text, ...clean } = item;
+    if (clean.type === 'message') clean.content = [{ type: 'output_text', text: _text || '' }];
+    return clean;
+  });
+}
+
 export function createModelClient(env = process.env) {
   const apiKey = env.OPENAI_API_KEY?.trim();
   const model = env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
@@ -31,7 +95,7 @@ export function createModelClient(env = process.env) {
   return {
     configured: Boolean(apiKey),
     model,
-    async respond({ buddyName, userName, message, memories = [], history = [], taskMode = false, tools = false, toolContext = null }) {
+    async respond({ buddyName, userName, message, memories = [], history = [], taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -88,6 +152,41 @@ export function createModelClient(env = process.env) {
         return payload.output || [];
       };
 
+      // Streaming variant of requestModel: parses the Responses API SSE stream,
+      // rebuilding output items in the same shape as the non-streaming response
+      // and calling onToken for each text delta as it arrives.
+      const requestModelStream = async (modelInput) => {
+        const response = await fetch(`${baseUrl}/responses`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            Accept: 'text/event-stream'
+          },
+          body: JSON.stringify({
+            model,
+            store: false,
+            max_output_tokens: 1200,
+            stream: true,
+            ...(tools ? { tools: TOOL_DEFINITIONS } : {}),
+            input: modelInput
+          }),
+          signal: AbortSignal.timeout(90_000)
+        });
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          const detail = payload?.error?.message || `HTTP ${response.status}`;
+          throw new Error(`Model request failed: ${detail}`);
+        }
+        const contentType = response.headers.get('content-type') || '';
+        if (!response.body || !contentType.includes('text/event-stream')) {
+          // The endpoint ignored stream:true: parse as a regular JSON response.
+          const payload = await response.json().catch(() => ({}));
+          return payload.output || [];
+        }
+        return parseResponsesStream(response.body, onToken);
+      };
+
       const parseArgs = (raw) => {
         try {
           const parsed = JSON.parse(raw || '{}');
@@ -106,7 +205,14 @@ export function createModelClient(env = process.env) {
       let lastOutput = [];
       if (tools) {
         for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
-          const output = await requestModel(modelInput);
+          if (onTurn) onTurn(iteration);
+          let output;
+          try {
+            output = await requestModelStream(modelInput);
+          } catch {
+            // Streaming hiccup: fall back to a single non-streaming request.
+            output = await requestModel(modelInput);
+          }
           lastOutput = output;
           const calls = output.filter((item) => item?.type === 'function_call');
           modelInput = [...modelInput, ...output];
