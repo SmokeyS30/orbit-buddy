@@ -13,6 +13,7 @@
     "check": "node --check server.js && node --check src/database.js && node --check src/model.js && node --check public/app.js && npm test"
   },
   "dependencies": {
+    "rrule": "^2.8.1",
     "web-push": "3.6.7"
   },
   "keywords": [
