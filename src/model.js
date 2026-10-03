@@ -2,7 +2,18 @@ import { TOOL_DEFINITIONS, executeTool, summarizeToolCall } from './tools.js';
 import { todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
+const COMPATIBILITY_MODEL = 'gpt-5.4-mini';
 const MAX_TOOL_ITERATIONS = 4;
+
+function normalizeModelName(value) {
+  const name = String(value || '').trim();
+  const aliases = { astra: 'gpt-6-astra', luna: 'gpt-6-luna', sol: 'gpt-6.1-sol' };
+  return aliases[name.toLowerCase()] || name;
+}
+
+function uniqueModels(models) {
+  return [...new Set(models.map(normalizeModelName).filter(Boolean))];
+}
 
 export function classifyModelError(error) {
   const status = Number(error?.status) || null;
@@ -113,16 +124,61 @@ export async function parseResponsesStream(body, onToken) {
 
 export function createModelClient(env = process.env) {
   const apiKey = env.OPENAI_API_KEY?.trim();
-  const model = env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
-  const fallbackModel = env.OPENAI_FALLBACK_MODEL?.trim() || DEFAULT_MODEL;
+  const model = normalizeModelName(env.OPENAI_MODEL) || DEFAULT_MODEL;
+  const configuredFallbacks = String(env.OPENAI_FALLBACK_MODELS || env.OPENAI_FALLBACK_MODEL || DEFAULT_MODEL).split(',');
+  const fallbackModels = uniqueModels([...configuredFallbacks, DEFAULT_MODEL, COMPATIBILITY_MODEL]).filter((name) => name !== model);
+  const fallbackModel = fallbackModels[0] || null;
   const baseUrl = validateBaseUrl(env.OPENAI_BASE_URL, env.ALLOW_INSECURE_MODEL_URL === 'true');
-  const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, lastError: null, checkedAt: null };
+  const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, lastError: null, checkedAt: null };
+  let preferredModel = model;
+
+  const recordFailure = (error) => {
+    const classification = error?.classification || classifyModelError(error);
+    health.state = classification;
+    health.activeModel = null;
+    health.lastError = String(error?.message || error).slice(0, 300);
+    health.checkedAt = new Date().toISOString();
+    return classification;
+  };
+
+  const checkConnection = async () => {
+    if (!apiKey) return { ...health };
+    try {
+      const response = await fetch(`${baseUrl}/models`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(20_000)
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw modelRequestError(response, payload, model);
+      const available = new Set((payload.data || []).map((entry) => entry?.id).filter(Boolean));
+      const selected = uniqueModels([model, ...fallbackModels]).find((name) => available.has(name));
+      health.checkedAt = new Date().toISOString();
+      if (!selected) {
+        preferredModel = model;
+        health.state = 'model_access';
+        health.activeModel = null;
+        health.lastError = `The OpenAI project does not list ${model} or Orbit's compatible fallback models.`;
+        return { ...health };
+      }
+      preferredModel = selected;
+      health.activeModel = selected;
+      health.state = selected === model ? 'ready' : 'fallback';
+      health.lastError = selected === model ? null : `${model} is not available to this OpenAI project; using ${selected}.`;
+      return { ...health };
+    } catch (error) {
+      error.classification = error?.classification || classifyModelError(error);
+      recordFailure(error);
+      return { ...health };
+    }
+  };
 
   return {
     configured: Boolean(apiKey),
     model,
     fallbackModel,
+    fallbackModels,
     diagnostics: () => ({ ...health }),
+    checkConnection,
     async respond({ buddyName, userName, message, memories = [], goals = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
@@ -237,35 +293,28 @@ export function createModelClient(env = process.env) {
       ];
       const toolCalls = [];
       let lastOutput = [];
-      let selectedModel = model;
+      let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
       const callWithFallback = async (request, input) => {
-        try {
-          const output = await request(input, selectedModel);
-          health.state = selectedModel === model ? 'ready' : 'fallback';
-          health.activeModel = selectedModel;
-          health.checkedAt = new Date().toISOString();
-          if (selectedModel === model) health.lastError = null;
-          return output;
-        } catch (rawError) {
-          const classification = rawError?.classification || classifyModelError(rawError);
-          if (classification === 'model_access' && fallbackModel && fallbackModel !== selectedModel) {
-            const primaryMessage = String(rawError?.message || rawError).slice(0, 300);
-            selectedModel = fallbackModel;
-            try {
-              const output = await request(input, selectedModel);
-              health.state = 'fallback';
-              health.activeModel = selectedModel;
-              health.lastError = `${model} was unavailable; using ${selectedModel}. ${primaryMessage}`;
-              health.checkedAt = new Date().toISOString();
-              return output;
-            } catch (fallbackError) {
-              fallbackError.classification = fallbackError?.classification || classifyModelError(fallbackError);
-              throw fallbackError;
-            }
+        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
+        const unavailable = [];
+        for (const candidate of candidates) {
+          selectedModel = candidate;
+          try {
+            const output = await request(input, selectedModel);
+            preferredModel = selectedModel;
+            health.state = selectedModel === model ? 'ready' : 'fallback';
+            health.activeModel = selectedModel;
+            health.checkedAt = new Date().toISOString();
+            health.lastError = selectedModel === model ? null : `${unavailable.join(', ') || model} unavailable; using ${selectedModel}.`;
+            return output;
+          } catch (error) {
+            error.classification = error?.classification || classifyModelError(error);
+            if (error.classification !== 'model_access') throw error;
+            unavailable.push(selectedModel);
+            if (candidate === candidates.at(-1)) throw error;
           }
-          rawError.classification = classification;
-          throw rawError;
         }
+        throw new Error('No compatible model was available.');
       };
       const requestOutput = async (input, stream) => {
         let failure;
@@ -283,10 +332,7 @@ export function createModelClient(env = process.env) {
             classification = error?.classification || classifyModelError(error);
           }
         }
-        health.state = classification;
-        health.activeModel = null;
-        health.lastError = String(failure?.message || failure).slice(0, 300);
-        health.checkedAt = new Date().toISOString();
+        recordFailure(failure);
         throw failure;
       };
       if (tools) {

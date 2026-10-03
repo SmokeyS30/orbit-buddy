@@ -50,9 +50,9 @@ npm start
 
 Open `http://127.0.0.1:3000`. The first person to register becomes the owner and receives ten one-time recovery codes. Save those codes outside Orbit. Later registrations stay closed unless the owner opens the door from Safety → Registration door. Visitors facing a closed door can send an access request from the signup screen instead. The owner is nudged if the door stays open over an hour, and access-request push notifications carry a one-tap button to open the door.
 
-`OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The primary model is configurable with `OPENAI_MODEL`; the default is `gpt-6-luna`. `OPENAI_FALLBACK_MODEL` also defaults to `gpt-6-luna` and is tried only when the primary model is unavailable to the API project. Authentication, quota, and billing failures are shown as connection errors and are not retried against another model.
+`OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The primary model is configurable with `OPENAI_MODEL`; the default is `gpt-6-luna`. `OPENAI_FALLBACK_MODELS` accepts a comma-separated compatibility chain and defaults to `gpt-6-luna,gpt-5.4-mini`. Orbit checks the project's model list without generating tokens, then selects the first available model. Authentication, quota, and billing failures are shown as connection errors and are not retried against another model.
 
-To request Astra, set `OPENAI_MODEL=gpt-6-astra`. Astra access is project-dependent. If that project cannot use Astra, Orbit continues with Luna and displays the fallback reason in Safety instead of failing the conversation.
+To request Astra, set `OPENAI_MODEL=gpt-6-astra` (the shorthand `astra` is also normalized). Astra access is project-dependent. If that project cannot use Astra, Orbit continues with an available fallback and displays the exact failure class in Safety instead of failing the conversation. Use **Safety → AI model connection → Check connection** to re-run the no-token diagnostic after changing Render settings.
 
 ## Deploy on Render
 

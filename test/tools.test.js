@@ -187,6 +187,30 @@ test('model access failure falls back to the configured starter model', async (t
   assert.equal(model.diagnostics().activeModel, 'gpt-6-luna');
 });
 
+test('model access fallback continues to the compatibility model', async (t) => {
+  const attempted = [];
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const sent = JSON.parse(body);
+      attempted.push(sent.model);
+      const works = sent.model === 'gpt-5.4-mini';
+      res.writeHead(works ? 200 : 404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(works
+        ? { output: [{ type: 'message', content: [{ type: 'output_text', text: 'Compatible model worked.' }] }] }
+        : { error: { code: 'model_not_found', message: 'Project does not have access to this model.' } }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'astra', OPENAI_FALLBACK_MODEL: 'luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const response = await model.respond({ buddyName: 'Orbit', message: 'Hello' });
+  assert.equal(response.text, 'Compatible model worked.');
+  assert.deepEqual(attempted, ['gpt-6-astra', 'gpt-6-luna', 'gpt-5.4-mini']);
+  assert.equal(model.diagnostics().activeModel, 'gpt-5.4-mini');
+});
+
 test('authentication failures are diagnosed without a fallback retry', async (t) => {
   let requests = 0;
   const stub = http.createServer((req, res) => {
@@ -198,6 +222,40 @@ test('authentication failures are diagnosed without a fallback retry', async (t)
   await assert.rejects(() => model.respond({ buddyName: 'Orbit', message: 'Hello' }), (error) => error.classification === 'authentication');
   assert.equal(requests, 1);
   assert.equal(model.diagnostics().state, 'authentication');
+});
+
+test('connection check validates the key without generating tokens and selects an available fallback', async (t) => {
+  let requests = 0;
+  const stub = http.createServer((req, res) => {
+    requests += 1;
+    assert.equal(req.method, 'GET');
+    assert.equal(req.url, '/models');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'gpt-6-luna' }] }));
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'astra', OPENAI_FALLBACK_MODEL: 'luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const status = await model.checkConnection();
+  assert.equal(requests, 1);
+  assert.equal(model.model, 'gpt-6-astra');
+  assert.equal(status.state, 'fallback');
+  assert.equal(status.activeModel, 'gpt-6-luna');
+  assert.deepEqual(status.fallbackModels, ['gpt-6-luna', 'gpt-5.4-mini']);
+});
+
+test('connection check identifies a revoked key without a generation request', async (t) => {
+  const stub = http.createServer((req, res) => {
+    assert.equal(req.method, 'GET');
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { code: 'invalid_api_key', message: 'Incorrect API key.' } }));
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'revoked-key', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const status = await model.checkConnection();
+  assert.equal(status.state, 'authentication');
+  assert.equal(status.activeModel, null);
 });
 
 function writeCtx() {

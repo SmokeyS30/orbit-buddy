@@ -23,13 +23,25 @@ const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csr
 
 test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
-  assert.equal((await fetch(`${base}/healthz`)).status, 200);
+  const health = await fetch(`${base}/healthz`);
+  assert.equal(health.status, 200);
+  assert.deepEqual((await health.json()).ai, { configured: false, state: 'demo', activeModel: 'gpt-6-luna' });
   assert.equal((await fetch(`${base}/api/auth/setup-status`)).status, 200);
   assert.equal((await fetch(`${base}/api/status`)).status, 401);
   const auth = await register(base);
   const response = await fetch(`${base}/api/auth/me`, { headers: { Cookie: auth.cookie } });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).user.email, 'owner@example.com');
+});
+
+test('authenticated model check returns safe diagnostics without a configured key', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const response = await fetch(`${base}/api/model/check`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.modelStatus.state, 'demo');
+  assert.equal(result.modelStatus.lastError, null);
 });
 
 test('user preferences and typed memory are exposed in the snapshot', async (t) => {

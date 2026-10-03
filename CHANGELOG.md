@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.4.1
+
+- Added a no-token OpenAI key and model-availability check that runs at startup and on demand from Safety.
+- Added model-name aliases and a compatibility fallback chain for projects without Astra access.
+- Replaced the generic model failure response with actionable authentication, quota, access, network, and service diagnostics.
+
 ## 0.4.0
 
 - Added measurable goals with progress history, next actions, target dates, and explicit user control over progress updates.
