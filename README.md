@@ -79,7 +79,14 @@ Content-Type: application/json
 {"message":"What is on my calendar today?"}
 ```
 
-Returns `{"answer":"..."}` — pipe it into **Speak Text** or **Show Result**. The exchange is also saved to your default conversation, and any memory suggestions go through the usual approval flow.
+Returns `202 {"id":"…","status":"working"}` immediately — the answer is generated in the background (the model can take longer than a shortcut will wait for one response). Poll until it's ready:
+
+```http
+GET https://YOUR-ORBIT.example/api/automation/ask/ASK_ID
+Authorization: Bearer orbit_YOUR_TOKEN
+```
+
+Returns `{"state":"working"}` or `{"state":"done","answer":"..."}`. Pipe the answer into **Speak Text** or **Show Result**. The exchange is also saved to your default conversation, and any memory suggestions go through the usual approval flow.
 
 ```http
 POST https://YOUR-ORBIT.example/api/automation/memories
@@ -89,7 +96,7 @@ Content-Type: application/json
 {"content":"Edward prefers oat milk lattes."}
 ```
 
-**Apple Shortcuts recipe — "Ask Orbit":** Ask for Input (or Siri dictation) → Get Contents of URL: POST to `https://YOUR-ORBIT.example/api/automation/ask`, Headers: `Authorization: Bearer orbit_…`, Request Body: JSON `{"message": "Provided Input"}` → Get Dictionary Value `answer` → Speak Text (or Show Result). **"Remember this":** same, but POST to `/api/automation/memories` with `{"content": "Provided Input"}` and a token that has the Save memories scope.
+**Apple Shortcuts recipe — "Ask Orbit":** Ask for Input (or Siri dictation) → Get Contents of URL: POST to `https://YOUR-ORBIT.example/api/automation/ask`, Headers: `Authorization: Bearer orbit_…`, Request Body: JSON `{"message": "Provided Input"}` → Get Dictionary Value `id` → Repeat 20 times: Wait 4 seconds → Get Contents of URL: GET `https://YOUR-ORBIT.example/api/automation/ask/` + the id value, same Authorization header → Get Dictionary Value `state` → If `state` is `done`: Get Dictionary Value `answer` → Speak Text (or Show Result) → Stop This Shortcut. **"Remember this":** Ask for Input → Get Contents of URL: POST to `/api/automation/memories` with `{"content": "Provided Input"}` and a token that has the Save memories scope → Show Notification "Saved".
 
 Requests through `/api/automation/tasks` are forced to `internal` risk. Tokens cannot touch anything outside their granted scopes — create separate tokens per shortcut so a leaked token does the least damage.
 
