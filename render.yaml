@@ -9,6 +9,7 @@ services:
         value: Orbit
       - key: DATA_ENCRYPTION_KEY
         generateValue: true
+        sync: false
       - key: BACKUP_ENCRYPTION_KEY
         generateValue: true
       - key: OPENAI_API_KEY
