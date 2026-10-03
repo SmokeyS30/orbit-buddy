@@ -241,7 +241,7 @@ test('connection check validates the key without generating tokens and selects a
   assert.equal(model.model, 'gpt-6-astra');
   assert.equal(status.state, 'fallback');
   assert.equal(status.activeModel, 'gpt-6-luna');
-  assert.deepEqual(status.fallbackModels, ['gpt-6-luna', 'gpt-5.4-mini']);
+  assert.deepEqual(status.fallbackModels, ['gpt-6-luna', 'gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini']);
 });
 
 test('connection check identifies a revoked key without a generation request', async (t) => {

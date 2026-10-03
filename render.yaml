@@ -16,7 +16,7 @@ services:
       - key: OPENAI_MODEL
         sync: false
       - key: OPENAI_FALLBACK_MODELS
-        value: gpt-6-luna,gpt-5.4-mini
+        value: gpt-6-luna,gpt-5.4-mini,gpt-4.1-mini,gpt-4o-mini
       - key: BRAVE_SEARCH_API_KEY
         sync: false
       - key: DATA_DIR

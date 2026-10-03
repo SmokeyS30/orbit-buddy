@@ -2,7 +2,7 @@ import { TOOL_DEFINITIONS, executeTool, summarizeToolCall } from './tools.js';
 import { todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
-const COMPATIBILITY_MODEL = 'gpt-5.4-mini';
+const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const MAX_TOOL_ITERATIONS = 4;
 
 function normalizeModelName(value) {
@@ -126,7 +126,7 @@ export function createModelClient(env = process.env) {
   const apiKey = env.OPENAI_API_KEY?.trim();
   const model = normalizeModelName(env.OPENAI_MODEL) || DEFAULT_MODEL;
   const configuredFallbacks = String(env.OPENAI_FALLBACK_MODELS || env.OPENAI_FALLBACK_MODEL || DEFAULT_MODEL).split(',');
-  const fallbackModels = uniqueModels([...configuredFallbacks, DEFAULT_MODEL, COMPATIBILITY_MODEL]).filter((name) => name !== model);
+  const fallbackModels = uniqueModels([...configuredFallbacks, DEFAULT_MODEL, ...COMPATIBILITY_MODELS]).filter((name) => name !== model);
   const fallbackModel = fallbackModels[0] || null;
   const baseUrl = validateBaseUrl(env.OPENAI_BASE_URL, env.ALLOW_INSECURE_MODEL_URL === 'true');
   const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, lastError: null, checkedAt: null };
