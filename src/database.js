@@ -84,11 +84,7 @@ export function openDatabase(filePath) {
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       label TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS automation_tokens (
-      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL,
-      created_at TEXT NOT NULL, last_used_at TEXT, revoked_at TEXT
-    );
+    DROP TABLE IF EXISTS automation_tokens;
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -195,13 +191,6 @@ export function openDatabase(filePath) {
     addOauthState: db.prepare('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)'),
     consumeOauthState: db.prepare('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?'),
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
-    addAutomation: db.prepare(`INSERT INTO automation_tokens
-      (id,user_id,label,token_hash,scopes,created_at,last_used_at,revoked_at)
-      VALUES(?,?,?,?,?,?,NULL,NULL)`),
-    listAutomation: db.prepare('SELECT id,label,scopes,created_at,last_used_at,revoked_at FROM automation_tokens WHERE user_id=? ORDER BY created_at DESC'),
-    automation: db.prepare('SELECT * FROM automation_tokens WHERE token_hash=? AND revoked_at IS NULL'),
-    touchAutomation: db.prepare('UPDATE automation_tokens SET last_used_at=? WHERE id=?'),
-    revokeAutomation: db.prepare('UPDATE automation_tokens SET revoked_at=? WHERE id=? AND user_id=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     getAccessRequest: db.prepare('SELECT * FROM access_requests WHERE id=?'),
     listAccessRequests: db.prepare('SELECT * FROM access_requests ORDER BY created_at DESC,rowid DESC LIMIT 100'),
@@ -299,10 +288,6 @@ export function openDatabase(filePath) {
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
-    addAutomationToken(userId,{label,tokenHash,scopes}) { const id=randomUUID(); s.addAutomation.run(id,userId,label,tokenHash,scopes,timestamp()); return {id,label,scopes}; },
-    listAutomationTokens: (userId) => s.listAutomation.all(userId),
-    getAutomationToken(hash) { const row=s.automation.get(hash); if(row) s.touchAutomation.run(timestamp(),row.id); return row; },
-    revokeAutomationToken: (userId,id) => s.revokeAutomation.run(timestamp(),id,userId).changes>0,
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     listAccessRequests: () => s.listAccessRequests.all(),
     dismissAccessRequest: (id) => s.dismissAccessRequest.run(timestamp(),id).changes>0,
