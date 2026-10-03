@@ -263,8 +263,15 @@ export function expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone = DE
 
 const feedCache = new Map(); // feedId -> {fetchedAt, vevents, error}
 
+// Apple Calendar share links use the webcal:// scheme, which is plain HTTPS
+// with a calendar label. Normalize to https:// before any validation/fetch.
+export function normalizeFeedUrl(url) {
+  const text = String(url || '').trim();
+  return text.replace(/^webcals?:\/\//i, 'https://');
+}
+
 export async function fetchFeedText(url) {
-  let current = await assertPublicUrl(url);
+  let current = await assertPublicUrl(normalizeFeedUrl(url));
   let response = null;
   for (let hop = 0; hop < 6; hop += 1) {
     try {
