@@ -25,7 +25,6 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - Push notifications through standards-based Web Push
 - Read-only OAuth previews for GitHub repositories, Google Calendar events, and Slack channels
 - Read-only model tools in chat: live web search, page reading, and current date/time, with SSRF protection and tool use logged to the activity timeline
-- Scoped automation tokens for Apple Shortcuts, Android automation tools, and personal integrations
 - Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
 - Owner-only emergency pause that stops new AI work and connector access without deleting data
 - A native iPhone companion source project in `ios/OrbitCompanion`
@@ -65,40 +64,8 @@ After the first deployment:
 4. Enable notifications from Orbit's Safety tab.
 5. Export an encrypted backup and verify that you can retain its passphrase separately.
 
-Never put API keys, OAuth secrets, recovery codes, backup passphrases, or automation tokens in GitHub, screenshots, or issues.
+Never put API keys, OAuth secrets, recovery codes, or backup passphrases in GitHub, screenshots, or issues.
 
-## Phone automation
-
-Orbit can create scoped tokens for Apple Shortcuts, Android automation, or scripts. In **Connections → Shortcuts & automation**, create a token, tick what it may do (**Ask Orbit**, **Create tasks**, **Save memories**), and copy it once. A Shortcut can then make these requests:
-
-```http
-POST https://YOUR-ORBIT.example/api/automation/ask
-Authorization: Bearer orbit_YOUR_TOKEN
-Content-Type: application/json
-
-{"message":"What is on my calendar today?"}
-```
-
-Returns `202 {"id":"…","status":"working"}` immediately — the answer is generated in the background (the model can take longer than a shortcut will wait for one response). Poll the plain-text endpoint until the answer arrives — no JSON parsing needed in the shortcut:
-
-```http
-GET https://YOUR-ORBIT.example/api/automation/ask/ASK_ID/answer
-Authorization: Bearer orbit_YOUR_TOKEN
-```
-
-Returns `200` with an empty body while working, and the answer as `text/plain` when done. (The JSON form `GET .../ask/ASK_ID` returning `{"state":"working"}` / `{"state":"done","answer":"..."}` also exists.) The exchange is also saved to your default conversation, and any memory suggestions go through the usual approval flow.
-
-```http
-POST https://YOUR-ORBIT.example/api/automation/memories
-Authorization: Bearer orbit_YOUR_TOKEN
-Content-Type: application/json
-
-{"content":"Edward prefers oat milk lattes."}
-```
-
-**Apple Shortcuts recipe — "Ask Orbit":** Ask for Input (or Siri dictation) → Get Contents of URL: POST to `https://YOUR-ORBIT.example/api/automation/ask`, Headers: `Authorization: Bearer orbit_…`, Request Body: JSON `{"message": "Provided Input"}` → Get Dictionary Value `id` → Repeat 20 times: Wait 4 seconds → Get Contents of URL: GET `https://YOUR-ORBIT.example/api/automation/ask/` + the id value + `/answer`, same Authorization header → If Contents of URL **has any value**: Show → Stop This Shortcut. **"Remember this":** Ask for Input → Get Contents of URL: POST to `/api/automation/memories` with `{"content": "Provided Input"}` and a token that has the Save memories scope → Show Notification "Saved".
-
-Requests through `/api/automation/tasks` are forced to `internal` risk. Tokens cannot touch anything outside their granted scopes — create separate tokens per shortcut so a leaked token does the least damage.
 
 ## OAuth connectors
 
@@ -128,8 +95,8 @@ The Render disk is not an off-site backup. Download portable backups to a separa
 ## Architecture
 
 ```text
-Installed PWA / native iPhone companion / Shortcut
-                      │ HTTPS + session or scoped token
+Installed PWA / native iPhone companion
+                      │ HTTPS + session
                       ▼
                Node service on Render
                   │      │       │
