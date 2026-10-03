@@ -258,6 +258,20 @@ test('connection check identifies a revoked key without a generation request', a
   assert.equal(status.activeModel, null);
 });
 
+test('connection check adapts to a compatible text model listed by the project', async (t) => {
+  const stub = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'text-embedding-3-small' }, { id: 'gpt-4o-2024-08-06' }] }));
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'astra', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const status = await model.checkConnection();
+  assert.equal(status.state, 'fallback');
+  assert.equal(status.activeModel, 'gpt-4o-2024-08-06');
+  assert.equal(status.availableTextModelCount, 1);
+});
+
 function writeCtx() {
   const calls = [];
   return {

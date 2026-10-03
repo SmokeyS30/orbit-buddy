@@ -15,6 +15,19 @@ function uniqueModels(models) {
   return [...new Set(models.map(normalizeModelName).filter(Boolean))];
 }
 
+function rankAvailableTextModels(models) {
+  const preferred = ['gpt-5-mini', 'gpt-5-nano', 'gpt-5', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4o'];
+  const blocked = /(audio|realtime|transcribe|tts|image|embedding|moderation|search|codex|computer-use)/i;
+  return uniqueModels(models).filter((name) => /^gpt-/i.test(name) && !blocked.test(name)).sort((a, b) => {
+    const score = (name) => {
+      const exact = preferred.indexOf(name);
+      const family = preferred.findIndex((base) => name.startsWith(`${base}-`));
+      return (exact >= 0 ? 1000 - exact * 20 : family >= 0 ? 700 - family * 20 : 100) - (/\d{4}-\d{2}-\d{2}/.test(name) ? 1 : 0);
+    };
+    return score(b) - score(a) || a.localeCompare(b);
+  });
+}
+
 export function classifyModelError(error) {
   const status = Number(error?.status) || null;
   const code = String(error?.code || '').toLowerCase();
@@ -129,8 +142,9 @@ export function createModelClient(env = process.env) {
   const fallbackModels = uniqueModels([...configuredFallbacks, DEFAULT_MODEL, ...COMPATIBILITY_MODELS]).filter((name) => name !== model);
   const fallbackModel = fallbackModels[0] || null;
   const baseUrl = validateBaseUrl(env.OPENAI_BASE_URL, env.ALLOW_INSECURE_MODEL_URL === 'true');
-  const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, lastError: null, checkedAt: null };
+  const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, availableTextModelCount: null, lastError: null, checkedAt: null };
   let preferredModel = model;
+  let discoveredModels = [];
 
   const recordFailure = (error) => {
     const classification = error?.classification || classifyModelError(error);
@@ -151,7 +165,9 @@ export function createModelClient(env = process.env) {
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw modelRequestError(response, payload, model);
       const available = new Set((payload.data || []).map((entry) => entry?.id).filter(Boolean));
-      const selected = uniqueModels([model, ...fallbackModels]).find((name) => available.has(name));
+      discoveredModels = rankAvailableTextModels([...available]);
+      health.availableTextModelCount = discoveredModels.length;
+      const selected = uniqueModels([model, ...fallbackModels, ...discoveredModels]).find((name) => available.has(name));
       health.checkedAt = new Date().toISOString();
       if (!selected) {
         preferredModel = model;
@@ -295,7 +311,7 @@ export function createModelClient(env = process.env) {
       let lastOutput = [];
       let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
       const callWithFallback = async (request, input) => {
-        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
+        const candidates = uniqueModels([selectedModel, ...fallbackModels, ...discoveredModels]);
         const unavailable = [];
         for (const candidate of candidates) {
           selectedModel = candidate;

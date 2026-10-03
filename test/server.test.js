@@ -25,7 +25,7 @@ test('health and setup are public while private data requires a session', async 
   const { app, base } = await fixture(); t.after(() => app.close());
   const health = await fetch(`${base}/healthz`);
   assert.equal(health.status, 200);
-  assert.deepEqual((await health.json()).ai, { configured: false, state: 'demo', activeModel: 'gpt-6-luna' });
+  assert.deepEqual((await health.json()).ai, { configured: false, state: 'demo', activeModel: 'gpt-6-luna', availableTextModelCount: null });
   assert.equal((await fetch(`${base}/api/auth/setup-status`)).status, 200);
   assert.equal((await fetch(`${base}/api/status`)).status, 401);
   const auth = await register(base);
