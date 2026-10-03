@@ -272,3 +272,12 @@ test('calendar feed endpoints require auth', async (t) => {
   assert.equal((await fetch(`${base}/api/calendar-feeds`)).status, 401);
   assert.equal((await fetch(`${base}/api/calendar-feeds`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
 });
+
+test('normalizeFeedUrl converts webcal schemes to https', async () => {
+  const { normalizeFeedUrl } = await import('../src/ical.js');
+  assert.equal(normalizeFeedUrl('webcal://example.com/cal.ics'), 'https://example.com/cal.ics');
+  assert.equal(normalizeFeedUrl('webcals://example.com/cal.ics'), 'https://example.com/cal.ics');
+  assert.equal(normalizeFeedUrl('WEBCAL://example.com/cal.ics'), 'https://example.com/cal.ics');
+  assert.equal(normalizeFeedUrl('https://example.com/cal.ics'), 'https://example.com/cal.ics');
+  assert.equal(normalizeFeedUrl('  webcal://example.com/cal.ics  '), 'https://example.com/cal.ics');
+});
