@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 5);
+  assert.equal(TOOL_DEFINITIONS.length, 6);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'save_memory', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'read_calendar', 'save_memory', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
