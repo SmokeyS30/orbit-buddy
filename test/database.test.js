@@ -6,11 +6,12 @@ import path from 'node:path';
 import { openDatabase } from '../src/database.js';
 import { DatabaseSync } from 'node:sqlite';
 
-function fixture() {
+function fixture(options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-db-'));
-  const db = openDatabase(path.join(directory, 'test.sqlite'));
+  const filePath = path.join(directory, 'test.sqlite');
+  const db = openDatabase(filePath, options);
   const user = db.createUser({ email: 'owner@example.com', displayName: 'Owner', passwordHash: 'hash', passwordSalt: 'salt', role: 'owner' });
-  return { db, user };
+  return { db, user, filePath };
 }
 
 test('isolates persistent data by user and saves artifacts', () => {
@@ -94,5 +95,40 @@ test('pre-thread messages are adopted into a General conversation on open', () =
   const msgs = db.listConversationMessages(uid, convos[0].id);
   assert.equal(msgs.length, 1);
   assert.equal(msgs[0].content, 'old hello');
+  db.close();
+});
+
+test('stores typed memory and ranks relevant details ahead of unrelated ones', () => {
+  const { db, user } = fixture();
+  db.addMemory(user.id, 'Prefers aisle seats on flights.', { kind: 'preference' });
+  db.addMemory(user.id, 'The garden shed is painted blue.', { kind: 'fact' });
+  const ranked = db.listRelevantMemories(user.id, 'Help plan my next flight', 2);
+  assert.equal(ranked[0].kind, 'preference');
+  assert.match(ranked[0].content, /aisle seats/);
+  db.close();
+});
+
+test('encrypts calendar feed URLs at rest and decrypts them through the database API', () => {
+  const key = Buffer.alloc(32, 7);
+  const { db, user, filePath } = fixture({ encryptionKey: key });
+  const secretUrl = 'https://calendar.example/private/secret-token.ics';
+  db.addCalendarFeed(user.id, { label: 'Private', url: secretUrl });
+  assert.equal(db.listCalendarFeeds(user.id)[0].url, secretUrl);
+  db.close();
+  const raw = new DatabaseSync(filePath, { readOnly: true });
+  const stored = raw.prepare('SELECT url FROM calendar_feeds').get().url;
+  raw.close();
+  assert.match(stored, /^enc:v1:/);
+  assert.ok(!stored.includes('secret-token'));
+});
+
+test('recovers a task whose worker lease expired', () => {
+  const { db, user } = fixture();
+  const task = db.addTask(user.id, { title: 'Recover me', prompt: 'Continue safely' });
+  assert.equal(db.startTask(user.id, task.id, -1000), true);
+  assert.equal(db.getTask(user.id, task.id).status, 'running');
+  assert.equal(db.recoverStaleTasks(), 1);
+  assert.equal(db.getTask(user.id, task.id).status, 'queued');
+  assert.equal(db.dueTasks()[0].id, task.id);
   db.close();
 });

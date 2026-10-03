@@ -1,13 +1,14 @@
 import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
+import { normalizeMemoryKind, todayInZone, validTimeZone } from './intelligence.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
 
 const MAX_PAGE_BYTES = 300_000;
 
-export function toolGetDatetime(args = {}) {
-  let timeZone = 'America/New_York';
+export function toolGetDatetime(args = {}, ctx = null) {
+  let timeZone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
   if (typeof args.timeZone === 'string' && args.timeZone.trim()) {
     try {
       new Intl.DateTimeFormat('en-US', { timeZone: args.timeZone.trim() });
@@ -176,8 +177,25 @@ export function toolCreateTask(args = {}, ctx = null) {
 export function toolSaveMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_memory');
   const content = cleanArg(args.content, 2000, 'content');
-  const memory = db.addMemory(userId, content);
+  const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
   return { id: memory.id, content: memory.content, note: 'Saved. The user can delete it in the Memories tab.' };
+}
+
+export function toolProposeMemory(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'propose_memory');
+  const content = cleanArg(args.content, 500, 'content');
+  const kind = normalizeMemoryKind(args.kind);
+  const suggestion = db.addMemorySuggestion(userId, content, { kind, confidence: 0.7 });
+  return { id: suggestion.id, content, kind, note: 'Proposed for the user to approve or dismiss.' };
+}
+
+export function toolScheduleFollowUp(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'schedule_followup');
+  const description = cleanArg(args.description, 120, 'description');
+  const dueDate = validDateStr(args.date);
+  if (!dueDate) throw new Error('date must be YYYY-MM-DD.');
+  const followUp = db.addFollowUp(userId, { description, dueDate, sourceMessageId: ctx.messageId || null });
+  return { id: followUp.id, description, date: dueDate, note: 'Scheduled. The user can remove it from Memory.' };
 }
 
 function validDateStr(value) {
@@ -191,8 +209,8 @@ function validDateStr(value) {
 
 export async function toolReadCalendar(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'read_calendar');
-  const zone = DEFAULT_ZONE;
-  const dateStr = validDateStr(args.date) || new Date().toLocaleDateString('en-CA', { timeZone: zone });
+  const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
+  const dateStr = validDateStr(args.date) || todayInZone(zone);
   let days = Math.floor(Number(args.days));
   if (!Number.isFinite(days) || days < 1) days = 1;
   if (days > 14) days = 14;
@@ -270,11 +288,42 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'save_memory',
-    description: 'Save something the user asked you to remember. Only call this when the user clearly asked ("remember this") or it is plainly worth keeping. Always tell the user what you saved in your visible reply.',
+    description: 'Save something the user explicitly asked you to remember. Never call this merely because a detail seems useful. Always tell the user what you saved in your visible reply.',
     parameters: {
       type: 'object',
-      properties: { content: { type: 'string', description: 'The memory to save (max 2000 characters).' } },
+      properties: {
+        content: { type: 'string', description: 'The memory to save (max 2000 characters).' },
+        kind: { type: 'string', enum: ['fact', 'preference', 'goal', 'project', 'decision', 'relationship'] }
+      },
       required: ['content'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'propose_memory',
+    description: 'Propose a durable fact, preference, goal, project detail, decision, or relationship detail for the user to approve. Use this instead of save_memory when the user did not explicitly ask you to remember it. Do not propose transient or sensitive details.',
+    parameters: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'One concise, self-contained memory proposal.' },
+        kind: { type: 'string', enum: ['fact', 'preference', 'goal', 'project', 'decision', 'relationship'] }
+      },
+      required: ['content', 'kind'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'schedule_followup',
+    description: 'Schedule a warm follow-up after the user mentions a meaningful upcoming event with a clear date. Do not use for vague dates or routine calendar items.',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', description: 'Short event description.' },
+        date: { type: 'string', description: 'Follow-up date as YYYY-MM-DD.' }
+      },
+      required: ['description', 'date'],
       additionalProperties: false
     }
   },
@@ -299,13 +348,15 @@ const TOOL_SUMMARIES = {
   fetch_url: (args) => String(args.url || '').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
+  propose_memory: (args) => String(args.content || '').slice(0, 80),
+  schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
   read_calendar: (args) => String(args.date || 'today').slice(0, 40)
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
   const clean = args && typeof args === 'object' ? args : {};
   switch (name) {
-    case 'get_datetime': return { result: toolGetDatetime(clean), summary: '' };
+    case 'get_datetime': return { result: toolGetDatetime(clean, ctx), summary: '' };
     case 'web_search': {
       const result = await toolWebSearch(clean, env);
       return { result, summary: String(clean.query || '').slice(0, 80) };
@@ -321,6 +372,14 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'save_memory': {
       const result = toolSaveMemory(clean, ctx);
       return { result, summary: String(clean.content || '').slice(0, 80) };
+    }
+    case 'propose_memory': {
+      const result = toolProposeMemory(clean, ctx);
+      return { result, summary: String(clean.content || '').slice(0, 80) };
+    }
+    case 'schedule_followup': {
+      const result = toolScheduleFollowUp(clean, ctx);
+      return { result, summary: `${String(clean.description || '').slice(0, 60)} on ${String(clean.date || '').slice(0, 10)}` };
     }
     case 'read_calendar': {
       const result = await toolReadCalendar(clean, ctx);

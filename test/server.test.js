@@ -32,6 +32,19 @@ test('health and setup are public while private data requires a session', async 
   assert.equal((await response.json()).user.email, 'owner@example.com');
 });
 
+test('user preferences and typed memory are exposed in the snapshot', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const saved = await fetch(`${base}/api/preferences`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ timeZone: 'Europe/London', quietStart: '23:00', quietEnd: '07:00', proactiveEnabled: false }) });
+  assert.equal(saved.status, 200);
+  const memory = await fetch(`${base}/api/memories`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ content: 'Working toward a marathon.', kind: 'goal' }) });
+  assert.equal(memory.status, 201);
+  const snapshot = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } })).json();
+  assert.equal(snapshot.preferences.time_zone, 'Europe/London');
+  assert.equal(snapshot.preferences.proactive_enabled, 0);
+  assert.equal(snapshot.memories[0].kind, 'goal');
+});
+
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);

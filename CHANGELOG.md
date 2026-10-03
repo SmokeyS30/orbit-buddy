@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added typed, relevance-ranked memory and approval-required memory suggestions.
+- Added structured, visible follow-ups and user-controlled timezone, quiet hours, and proactive check-in preferences.
+- Added conversation summaries for long-running threads and crash-safe task leases with recovery.
+- Added encryption at rest for iCal feed URLs through `DATA_ENCRYPTION_KEY`.
+- Corrected product copy and documentation to reflect that OAuth providers are disabled and external tasks create plans or drafts only.
 - Added a registration door: signups are closed by default and the owner opens/closes them from Safety → Registration door.
 - Added access requests: visitors facing a closed door can ask the owner for access; requests notify the owner by push and are rate-limited.
 - Added a door-left-open nudge and a one-tap "open the door" push action (single-use expiring token) for access requests.

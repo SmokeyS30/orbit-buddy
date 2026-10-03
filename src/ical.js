@@ -363,8 +363,8 @@ function addDaysStr(dateStr, n) {
 }
 
 // Today's + tomorrow's agenda as prompt-ready text, or '' when there's nothing to show.
-export async function getBriefingAgenda(db, userId, days = 2) {
-  const zone = DEFAULT_ZONE;
+export async function getBriefingAgenda(db, userId, days = 2, timeZone = DEFAULT_ZONE) {
+  const zone = validZone(timeZone) || DEFAULT_ZONE;
   const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: zone });
   const { events, feeds } = await getEventsForRange(db, userId, dayStartMs(todayStr, 0, zone), dayStartMs(todayStr, days, zone), zone);
   if (!feeds.length || !events.length) return '';

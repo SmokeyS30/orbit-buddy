@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { decryptSecret, encryptSecret } from './security.js';
+import { normalizeMemoryKind, normalizePreferences, rankMemories } from './intelligence.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -21,12 +23,23 @@ function adoptOrphanMessages(db, userId) {
   return convo.id;
 }
 
-export function openDatabase(filePath) {
+export function openDatabase(filePath, { encryptionKey = null } = {}) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.chmodSync(path.dirname(filePath), 0o700);
   const db = new DatabaseSync(filePath);
   fs.chmodSync(filePath, 0o600);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  const protectSecret = (value) => {
+    const text = String(value || '');
+    if (!text || text.startsWith('enc:v1:') || !encryptionKey) return text;
+    return `enc:v1:${encryptSecret(text, encryptionKey)}`;
+  };
+  const revealSecret = (value) => {
+    const text = String(value || '');
+    if (!text.startsWith('enc:v1:')) return text;
+    if (!encryptionKey) throw new Error('Data encryption key is required to read protected calendar feeds.');
+    return decryptSecret(text.slice('enc:v1:'.length), encryptionKey);
+  };
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
@@ -51,6 +64,12 @@ export function openDatabase(filePath) {
     );
     CREATE TABLE IF NOT EXISTS memory_suggestions (
       id TEXT PRIMARY KEY, user_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS follow_ups (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      description TEXT NOT NULL, due_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
+      source_message_id TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+      UNIQUE(user_id, description, due_date)
     );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, user_id TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
@@ -92,6 +111,17 @@ export function openDatabase(filePath) {
     CREATE TABLE IF NOT EXISTS proactive_state (
       user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      time_zone TEXT NOT NULL DEFAULT 'America/New_York', quiet_start TEXT NOT NULL DEFAULT '22:00',
+      quiet_end TEXT NOT NULL DEFAULT '08:00', proactive_enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS conversation_summaries (
+      conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      summary TEXT NOT NULL, message_count INTEGER NOT NULL, updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS access_requests (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL, note TEXT,
       created_at TEXT NOT NULL, handled_at TEXT
@@ -104,15 +134,51 @@ export function openDatabase(filePath) {
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_followups_due ON follow_ups(user_id, status, due_date);
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC)');
   for (const row of db.prepare('SELECT DISTINCT user_id FROM messages WHERE conversation_id IS NULL AND user_id IS NOT NULL').all()) adoptOrphanMessages(db, row.user_id);
   ensureColumn(db, 'memories', 'user_id', 'TEXT');
+  ensureColumn(db, 'memories', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
+  ensureColumn(db, 'memories', 'source', "TEXT NOT NULL DEFAULT 'legacy'");
+  ensureColumn(db, 'memories', 'status', "TEXT NOT NULL DEFAULT 'approved'");
+  ensureColumn(db, 'memories', 'confidence', 'REAL NOT NULL DEFAULT 1');
+  ensureColumn(db, 'memories', 'expires_at', 'TEXT');
+  ensureColumn(db, 'memories', 'last_confirmed_at', 'TEXT');
+  ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
+  ensureColumn(db, 'memory_suggestions', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
   ensureColumn(db, 'tasks', 'user_id', 'TEXT');
+  ensureColumn(db, 'tasks', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'tasks', 'lease_expires_at', 'TEXT');
+  ensureColumn(db, 'tasks', 'last_error', 'TEXT');
   ensureColumn(db, 'events', 'user_id', 'TEXT');
+
+  if (encryptionKey) {
+    const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
+    const updateFeed = db.prepare('UPDATE calendar_feeds SET url=?,updated_at=? WHERE id=?');
+    if (legacyFeeds.length) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const feed of legacyFeeds) updateFeed.run(protectSecret(feed.url), timestamp(), feed.id);
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    }
+  }
+
+  const legacyFollowups = db.prepare("SELECT id,user_id,content,created_at FROM memories WHERE status='approved' AND lower(content) LIKE 'follow up:% on ____-__-__'").all();
+  const insertFollowup = db.prepare("INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,source_message_id,created_at,completed_at) VALUES(?,?,?,?,'scheduled',NULL,?,NULL)");
+  const archiveMemory = db.prepare("UPDATE memories SET status='archived',updated_at=? WHERE id=?");
+  for (const memory of legacyFollowups) {
+    const match = /^follow up:\s*(.+?)\s+on\s+(\d{4}-\d{2}-\d{2})\s*$/i.exec(memory.content);
+    if (match && memory.user_id) {
+      insertFollowup.run(randomUUID(), memory.user_id, match[1], match[2], memory.created_at || timestamp());
+      archiveMemory.run(timestamp(), memory.id);
+    }
+  }
 
   const s = {
     countUsers: db.prepare('SELECT COUNT(*) AS count FROM users'),
@@ -147,17 +213,31 @@ export function openDatabase(filePath) {
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
-    addMemory: db.prepare('INSERT INTO memories(id,user_id,content,created_at,updated_at) VALUES (?, ?, ?, ?, ?)'),
-    listMemories: db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 100'),
+    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`),
+    listMemories: db.prepare("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,rowid DESC LIMIT 100"),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
-    addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at) VALUES (?,?,?,?)'),
+    addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES (?,?,?,?,?,?)'),
     getMemorySuggestion: db.prepare('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?'),
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
+    addFollowUp: db.prepare("INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,source_message_id,created_at,completed_at) VALUES(?,?,?,?,'scheduled',?,?,NULL)"),
+    listFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY due_date,created_at"),
+    dueFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' AND due_date<=? ORDER BY due_date,created_at"),
+    completeFollowUp: db.prepare("UPDATE follow_ups SET status='completed',completed_at=? WHERE id=? AND user_id=? AND status='scheduled'"),
+    deleteFollowUp: db.prepare('DELETE FROM follow_ups WHERE id=? AND user_id=?'),
     lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
     getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`),
+    getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),
+    upsertPreferences: db.prepare(`INSERT INTO user_preferences(user_id,time_zone,quiet_start,quiet_end,proactive_enabled,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
+      quiet_end=excluded.quiet_end,proactive_enabled=excluded.proactive_enabled,updated_at=excluded.updated_at`),
+    getConversationSummary: db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?'),
+    upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
+    countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
@@ -167,7 +247,10 @@ export function openDatabase(filePath) {
     deleteCalendarFeed: db.prepare('DELETE FROM calendar_feeds WHERE id=? AND user_id=?'),
     getTask: db.prepare('SELECT * FROM tasks WHERE id=? AND user_id=?'),
     updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
-    completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,updated_at=? WHERE id=? AND user_id=?'),
+    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')"),
+    recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
+    completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?'),
+    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -244,16 +327,34 @@ export function openDatabase(filePath) {
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
-    addMemory(userId, content) { const now=timestamp(); const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now}; s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at); return row; },
+    addMemory(userId, content, options={}) {
+      const now=timestamp();
+      const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now,
+        kind:normalizeMemoryKind(options.kind),source:String(options.source||'user').slice(0,40),status:'approved',
+        confidence:Math.max(0,Math.min(Number(options.confidence??1),1)),expires_at:options.expiresAt||null,last_confirmed_at:now};
+      s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at);
+      return row;
+    },
     listMemories: (userId) => s.listMemories.all(userId),
+    listRelevantMemories(userId,query,limit=8){return rankMemories(s.listMemories.all(userId),query,limit);},
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
-    addMemorySuggestion(userId,content){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at);return row;},
+    addMemorySuggestion(userId,content,options={}){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
     dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
-    approveMemorySuggestion(userId,id){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const now=timestamp();s.addMemory.run(randomUUID(),userId,row.content,now,now);s.deleteMemorySuggestion.run(id,userId);return row;},
+    approveMemorySuggestion(userId,id){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const saved=this.addMemory(userId,row.content,{kind:row.kind,source:'suggestion',confidence:row.confidence});s.deleteMemorySuggestion.run(id,userId);return {...row,memory_id:saved.id};},
+    addFollowUp(userId,{description,dueDate,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:dueDate,status:'scheduled',source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===dueDate);},
+    listFollowUps:(userId)=>s.listFollowUps.all(userId),
+    dueFollowUps:(userId,today)=>s.dueFollowUps.all(userId,today),
+    completeFollowUp:(userId,id)=>s.completeFollowUp.run(timestamp(),id,userId).changes>0,
+    deleteFollowUp:(userId,id)=>s.deleteFollowUp.run(id,userId).changes>0,
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
+    getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,now,now);return s.getPreferences.get(userId);},
+    setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,current.created_at||now,now);return s.getPreferences.get(userId);},
+    getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
+    setConversationSummary(userId,conversationId,summary,messageCount){s.upsertConversationSummary.run(conversationId,userId,summary,messageCount,timestamp());return s.getConversationSummary.get(conversationId,userId);},
+    countConversationMessages:(userId,conversationId)=>s.countConversationMessages.get(conversationId,userId).count,
     addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none'}) {
       const now=timestamp(); const status=risk==='external'?'waiting_approval':scheduleAt?'scheduled':'queued';
       const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,result:null,created_at:now,updated_at:now};
@@ -263,14 +364,17 @@ export function openDatabase(filePath) {
     addCalendarFeed(userId, { label, url }) {
       const now = timestamp();
       const row = { id: randomUUID(), user_id: userId, label, url, created_at: now, updated_at: now };
-      s.addCalendarFeed.run(row.id, row.user_id, row.label, row.url, row.created_at, row.updated_at);
+      s.addCalendarFeed.run(row.id, row.user_id, row.label, protectSecret(row.url), row.created_at, row.updated_at);
       return row;
     },
-    listCalendarFeeds: (userId) => s.listCalendarFeeds.all(userId),
+    listCalendarFeeds: (userId) => s.listCalendarFeeds.all(userId).map((row)=>({...row,url:revealSecret(row.url)})),
     deleteCalendarFeed: (userId, id) => s.deleteCalendarFeed.run(id, userId).changes > 0,
     getTask: (userId,id) => s.getTask.get(id,userId),
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
+    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.run(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId).changes>0,
+    recoverStaleTasks(){const current=timestamp();return s.recoverTasks.run(current,current,current).changes;},
     completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
+    failTask:(userId,id,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId).changes>0,
     dueTasks: () => s.dueTasks.all(timestamp()),
     addEvent(userId,type,message,detail=null) { const row={id:randomUUID(),user_id:userId,type,message,detail,created_at:timestamp()}; s.addEvent.run(row.id,row.user_id,row.type,row.message,row.detail,row.created_at); return row; },
     listEvents: (userId,limit=80) => s.listEvents.all(userId,Math.min(Math.max(limit,1),200)),
@@ -294,14 +398,20 @@ export function openDatabase(filePath) {
     addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
     consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:2,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) { return {version:3,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
-      if (!bundle || bundle.version !== 2) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
-        memory: db.prepare('INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at) VALUES(?,?,?,?,?)'),
-        task: db.prepare('INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
+        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)`),
+        suggestion: db.prepare('INSERT OR IGNORE INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)'),
+        followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?)'),
+        summary: db.prepare('INSERT OR IGNORE INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?)'),
+        calendar: db.prepare('INSERT OR IGNORE INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?)'),
+        task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
         event: db.prepare('INSERT OR IGNORE INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?)'),
         artifact: db.prepare('INSERT OR IGNORE INTO artifacts(id,user_id,task_id,name,mime_type,content,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?)')
       };
@@ -309,10 +419,15 @@ export function openDatabase(filePath) {
       try {
         for (const row of bundle.conversations || []) inserts.conversation.run(row.id,userId,row.title,row.created_at,row.updated_at);
         for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
-        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,row.content,row.created_at,row.updated_at);
-        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at);
+        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,row.content,row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at);
+        for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,row.content,row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
+        for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',row.source_message_id||null,row.created_at,row.completed_at||null);
+        for (const row of bundle.conversationSummaries || []) inserts.summary.run(row.conversation_id,userId,row.summary,row.message_count,row.updated_at);
+        for (const row of bundle.calendarFeeds || []) inserts.calendar.run(row.id,userId,row.label,protectSecret(row.url),row.created_at,row.updated_at);
+        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);
         for (const row of bundle.events || []) inserts.event.run(row.id,userId,row.type,row.message,row.detail,row.created_at);
         for (const row of bundle.artifacts || []) inserts.artifact.run(row.id,userId,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at);
+        if(bundle.preferences){const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,created,timestamp());}
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     }

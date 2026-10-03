@@ -49,14 +49,15 @@ test('quietNudgeDue respects idle and cooldown windows', () => {
 test('follow-up sweep checks in on due events only', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
-  app.db.addMemory(auth.userId, 'Follow up: dentist appointment on 2000-01-01');
-  app.db.addMemory(auth.userId, 'Follow up: future trip on 2999-01-01');
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
+  app.db.addFollowUp(auth.userId, { description: 'dentist appointment', dueDate: '2000-01-01' });
+  app.db.addFollowUp(auth.userId, { description: 'future trip', dueDate: '2999-01-01' });
   app.db.addMemory(auth.userId, 'Just a regular memory');
   await app.runProactiveChecks();
-  const remaining = app.db.listMemories(auth.userId).map((m) => m.content);
-  assert.ok(!remaining.some((c) => c.includes('dentist')), 'due follow-up memory is consumed');
-  assert.ok(remaining.some((c) => c.includes('future trip')), 'future follow-up stays');
-  assert.ok(remaining.some((c) => c.includes('Just a regular memory')), 'other memories untouched');
+  const remaining = app.db.listFollowUps(auth.userId).map((item) => item.description);
+  assert.ok(!remaining.includes('dentist appointment'), 'due follow-up is completed');
+  assert.ok(remaining.includes('future trip'), 'future follow-up stays');
+  assert.ok(app.db.listMemories(auth.userId).some((item) => item.content.includes('regular memory')), 'memories are untouched');
   const convo = app.db.ensureDefaultConversation(auth.userId);
   const messages = app.db.listConversationMessages(auth.userId, convo.id, 10);
   assert.ok(messages.some((m) => m.role === 'assistant'), 'follow-up lands in the conversation');
@@ -67,6 +68,7 @@ test('follow-up sweep checks in on due events only', async (t) => {
 test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
   // Never chatted: no nudge, even far in the future.
   await app.runProactiveChecks(Date.now() + 30 * 24 * 3600_000);
   const convo = app.db.ensureDefaultConversation(auth.userId);

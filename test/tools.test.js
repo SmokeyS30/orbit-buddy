@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 6);
+  assert.equal(TOOL_DEFINITIONS.length, 8);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'read_calendar', 'save_memory', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -179,9 +179,17 @@ function writeCtx() {
           risk: task.risk
         };
       },
-      addMemory: (userId, content) => {
-        calls.push(['addMemory', userId, content]);
+      addMemory: (userId, content, options) => {
+        calls.push(['addMemory', userId, content, options]);
         return { id: 'mem-1', content };
+      },
+      addMemorySuggestion: (userId, content, options) => {
+        calls.push(['addMemorySuggestion', userId, content, options]);
+        return { id: 'suggestion-1', content, ...options };
+      },
+      addFollowUp: (userId, followUp) => {
+        calls.push(['addFollowUp', userId, followUp]);
+        return { id: 'followup-1', description: followUp.description, due_date: followUp.dueDate };
       }
     }
   };
@@ -221,7 +229,7 @@ test('save_memory validates and saves via ctx', async () => {
   const ctx = writeCtx();
   const { result } = await executeTool('save_memory', { content: '  Edward likes Earl Grey  ' }, {}, ctx);
   assert.equal(result.content, 'Edward likes Earl Grey');
-  assert.deepEqual(ctx.calls[0], ['addMemory', 'user-1', 'Edward likes Earl Grey']);
+  assert.deepEqual(ctx.calls[0], ['addMemory', 'user-1', 'Edward likes Earl Grey', { kind: 'fact', source: 'explicit' }]);
   await assert.rejects(() => executeTool('save_memory', { content: '   ' }, {}, ctx), /content is required/);
   await assert.rejects(() => executeTool('save_memory', { content: 'x' }, {}, null), /not available in this context/);
 });
@@ -230,6 +238,21 @@ test('save_memory truncates long content at 2000 chars', async () => {
   const ctx = writeCtx();
   const { result } = await executeTool('save_memory', { content: 'a'.repeat(2500) }, {}, ctx);
   assert.equal(result.content.length, 2000);
+});
+
+test('propose_memory queues an approval instead of silently saving', async () => {
+  const ctx = writeCtx();
+  const { result } = await executeTool('propose_memory', { content: ' Prefers aisle seats ', kind: 'preference' }, {}, ctx);
+  assert.equal(result.kind, 'preference');
+  assert.deepEqual(ctx.calls[0], ['addMemorySuggestion', 'user-1', 'Prefers aisle seats', { kind: 'preference', confidence: 0.7 }]);
+});
+
+test('schedule_followup validates dates and preserves the source message', async () => {
+  const ctx = { ...writeCtx(), messageId: 'message-1' };
+  const { result } = await executeTool('schedule_followup', { description: ' dentist appointment ', date: '2026-10-08' }, {}, ctx);
+  assert.equal(result.date, '2026-10-08');
+  assert.deepEqual(ctx.calls[0], ['addFollowUp', 'user-1', { description: 'dentist appointment', dueDate: '2026-10-08', sourceMessageId: 'message-1' }]);
+  await assert.rejects(() => executeTool('schedule_followup', { description: 'trip', date: '2026-02-30' }, {}, ctx), /YYYY-MM-DD/);
 });
 
 test('Brave retries transient failures before giving up', async (t) => {

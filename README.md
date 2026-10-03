@@ -13,18 +13,19 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - **It's yours, privately.** Self-hostable and open source: your conversations live in your own SQLite database, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
 - **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
-## What works in v0.2
+## What works in v0.3
 
 - Responsive control center installable as a PWA on iPhone, Android, macOS, Windows, and Linux
 - Multi-user accounts with salted `scrypt` password hashes, 30-day secure sessions, CSRF protection, and one-time recovery codes
 - Authenticated chat through the OpenAI Responses API, with a clearly labeled demo mode when no API key is configured
-- Persistent SQLite messages, explicit memories, scheduled tasks, generated artifacts, connections, and audit events
+- Persistent SQLite messages, typed user-approved memories, scheduled follow-ups, user timezone and quiet-hour preferences, tasks, generated artifacts, and audit events
 - Immediate, scheduled, daily, and weekly background thinking tasks that continue on the server after the browser closes
-- Automatic follow-ups: Orbit notices dated events you mention in chat and checks in afterward, unprompted
-- Quiet check-ins: a proactive nudge if you haven't chatted in a couple of days
+- Approval-based intelligence: Orbit can propose inferred memories for review and retrieve the most relevant approved memories for each conversation
+- Automatic follow-ups: Orbit can schedule dated check-ins from chat, while keeping them visible and removable in Memory
+- Quiet check-ins: a proactive nudge if you haven't chatted in a couple of days, respecting your timezone, quiet hours, and opt-out setting
 - Push notifications through standards-based Web Push
-- Read-only OAuth previews for GitHub repositories, Google Calendar events, and Slack channels
-- Read-only model tools in chat: live web search, page reading, and current date/time, with SSRF protection and tool use logged to the activity timeline
+- Read-only iCal feeds for Google, Apple, Outlook, and other calendars; feed URLs are encrypted at rest when `DATA_ENCRYPTION_KEY` is configured
+- Model tools in chat: live web search, page reading, current date/time, calendar reading, task creation, approved memory saving, memory proposals, and scheduled follow-ups
 - Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
 - Owner-only emergency pause that stops new AI work and connector access without deleting data
 - A native iPhone companion source project in `ios/OrbitCompanion`
@@ -54,7 +55,7 @@ The included blueprint creates a Docker web service with a 1 GB persistent disk.
 
 [Deploy to Render](https://render.com/deploy?repo=https://github.com/SmokeyS30/orbit-buddy)
 
-During setup, provide `OPENAI_API_KEY` for real AI responses. Orbit generates and preserves a Web Push signing key pair on its protected persistent disk. OAuth connectors require provider-specific client credentials added later in Render. Unconfigured connectors stay visibly disabled.
+During setup, provide `OPENAI_API_KEY` for real AI responses. Orbit generates and preserves a Web Push signing key pair on its protected persistent disk. The blueprint also generates `DATA_ENCRYPTION_KEY` so private calendar feed URLs are encrypted in SQLite.
 
 After the first deployment:
 
@@ -67,21 +68,9 @@ After the first deployment:
 Never put API keys, OAuth secrets, recovery codes, or backup passphrases in GitHub, screenshots, or issues.
 
 
-## OAuth connectors
+## Calendar connections
 
-Orbit currently asks only for read-oriented scopes:
-
-- GitHub: profile and email, then a preview of the user's repositories
-- Google: identity plus read-only Calendar access
-- Slack: read channel metadata and basic user information
-
-Tokens are encrypted before entering SQLite. Each connector can be disconnected from the UI. Configure the provider callback as:
-
-```text
-https://YOUR-ORBIT.example/api/connectors/PROVIDER/callback
-```
-
-where `PROVIDER` is `github`, `google`, or `slack`. See [docs/OAUTH.md](docs/OAUTH.md) for provider-specific setup.
+Orbit v0.3 uses read-only iCal subscription URLs instead of OAuth. Add a calendar from the Connections tab; Orbit masks the URL in API responses and encrypts it at rest when `DATA_ENCRYPTION_KEY` is set. Treat iCal URLs like passwords because anyone holding one may be able to read that calendar. OAuth providers are intentionally disabled in this release; [docs/OAUTH.md](docs/OAUTH.md) records that boundary.
 
 ## Backups and recovery
 
@@ -101,7 +90,7 @@ Installed PWA / native iPhone companion
                Node service on Render
                   │      │       │
                   │      │       └── Web Push
-                  │      └────────── OAuth providers (read-only previews)
+                  │      └────────── Calendar providers (read-only iCal)
                   ├───────────────── OpenAI Responses API (optional, store=false)
                   └───────────────── SQLite + encrypted backup files
 ```
