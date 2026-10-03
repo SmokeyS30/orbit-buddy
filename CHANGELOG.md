@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.1
+
+- Fixed quiet-hour time fields overlapping on narrow Safety layouts.
+- Kept unsaved Time & check-ins edits from being overwritten by automatic refreshes.
+
 ## 0.5.0
 
 - Fixed stale installed-app JavaScript hiding newly deployed Safety controls.
