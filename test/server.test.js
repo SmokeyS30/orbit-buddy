@@ -59,7 +59,7 @@ test('owner emergency pause blocks work until explicit resume', async (t) => {
 test('scoped automation tokens create internal-only tasks', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
-  const tokenResponse = await fetch(`${base}/api/automation-tokens`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ label: 'iPhone Shortcut' }) });
+  const tokenResponse = await fetch(`${base}/api/automation-tokens`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ label: 'iPhone Shortcut', scopes: ['tasks:create'] }) });
   const token = (await tokenResponse.json()).token;
   const taskResponse = await fetch(`${base}/api/automation/tasks`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'From phone', prompt: 'Prepare a checklist', risk: 'external' }) });
   assert.equal(taskResponse.status, 201);
