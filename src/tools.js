@@ -225,6 +225,58 @@ export function toolUpdateGoal(args = {}, ctx = null) {
   return { id: goal.id, title: goal.title, progress: goal.progress, status: goal.status, nextStep: goal.next_step, note: 'Goal updated.' };
 }
 
+export function toolCreateProject(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'create_project');
+  const title = cleanArg(args.title, 120, 'title');
+  const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
+  const targetDate = args.targetDate ? validDateString(args.targetDate) : null;
+  if (args.targetDate && !targetDate) throw new Error('targetDate must be YYYY-MM-DD.');
+  const steps = Array.isArray(args.steps) ? args.steps.slice(0, 20).map((step) => {
+    const dueDate = step?.dueDate ? validDateString(step.dueDate) : null;
+    if (step?.dueDate && !dueDate) throw new Error('step dueDate must be YYYY-MM-DD.');
+    return {
+      title: cleanArg(step?.title, 160, 'step title'),
+      details: typeof step?.details === 'string' ? step.details.trim().slice(0, 1000) : null,
+      dueDate
+    };
+  }) : [];
+  const project = db.addProject(userId, { title, description, priority: normalizePriority(args.priority), targetDate, steps });
+  return { id: project.id, title: project.title, steps: project.steps.map((step) => ({ id: step.id, title: step.title, status: step.status })), note: 'Project created. Progress remains user-controlled.' };
+}
+
+export function toolUpdateProjectStep(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_project_step');
+  const stepId = cleanArg(args.stepId, 80, 'stepId');
+  const status = ['planned', 'in_progress', 'blocked', 'completed'].includes(args.status) ? args.status : null;
+  if (!status) throw new Error('status must be planned, in_progress, blocked, or completed.');
+  const step = db.updateProjectStep(userId, stepId, { status, details: args.note === undefined ? undefined : String(args.note || '').slice(0, 1000) });
+  if (!step) throw new Error('Project step not found.');
+  return { id: step.id, title: step.title, status: step.status, note: 'Project step updated from the user’s explicit report.' };
+}
+
+export function toolProposeCalendarEvent(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'propose_calendar_event');
+  const title = cleanArg(args.title, 160, 'title');
+  const start = new Date(args.startAt);
+  const end = new Date(args.endAt);
+  if (Number.isNaN(start.valueOf()) || Number.isNaN(end.valueOf()) || end <= start) throw new Error('startAt and endAt must be valid ISO times, with endAt after startAt.');
+  const timeZone = validTimeZone(args.timeZone || ctx?.timeZone, DEFAULT_ZONE);
+  const payload = {
+    title,
+    startAt: start.toISOString(),
+    endAt: end.toISOString(),
+    timeZone,
+    location: typeof args.location === 'string' && args.location.trim() ? args.location.trim().slice(0, 300) : null,
+    notes: typeof args.notes === 'string' && args.notes.trim() ? args.notes.trim().slice(0, 1000) : null
+  };
+  const approval = db.addApproval(userId, {
+    kind: 'calendar_event', title: `Add “${title}” to a calendar`,
+    summary: `${start.toISOString()} to ${end.toISOString()} (${timeZone})`, payload,
+    sourceMessageId: ctx?.messageId || null
+  });
+  return { approvalId: approval.id, status: 'pending', ...payload, note: 'Calendar event proposed. Nothing is added until the user approves it in Approvals.' };
+}
+
 export function toolCreateRoutine(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_routine');
   const title = cleanArg(args.title, 120, 'title');
@@ -417,6 +469,44 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'create_project',
+    description: 'Create a multi-step project only when the user explicitly asks Orbit to plan or track one. Project and step progress remain user-controlled.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' }, description: { type: 'string' },
+        priority: { type: 'number', description: '1 low, 2 normal, or 3 high.' },
+        targetDate: { type: 'string', description: 'Optional YYYY-MM-DD target.' },
+        steps: { type: 'array', maxItems: 20, items: { type: 'object', properties: { title: { type: 'string' }, details: { type: 'string' }, dueDate: { type: 'string', description: 'Optional YYYY-MM-DD due date.' } }, required: ['title'], additionalProperties: false } }
+      },
+      required: ['title', 'steps'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'update_project_step',
+    description: 'Update a project step only when the user explicitly reports its state or asks to change it. Never infer completion.',
+    parameters: {
+      type: 'object',
+      properties: { stepId: { type: 'string' }, status: { type: 'string', enum: ['planned', 'in_progress', 'blocked', 'completed'] }, note: { type: 'string' } },
+      required: ['stepId', 'status'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'propose_calendar_event',
+    description: 'Propose a calendar event only when the user explicitly asks to schedule or add it. This creates an approval item and never writes to an external calendar automatically.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' }, startAt: { type: 'string', description: 'ISO date/time with offset.' }, endAt: { type: 'string', description: 'ISO date/time with offset.' },
+        timeZone: { type: 'string', description: 'IANA timezone.' }, location: { type: 'string' }, notes: { type: 'string' }
+      },
+      required: ['title', 'startAt', 'endAt'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'read_calendar',
     description: 'Read the user\'s calendar events across all connected iCal feeds. Use it when the user asks about their schedule, upcoming events, or availability on a date.',
     parameters: {
@@ -441,6 +531,9 @@ const TOOL_SUMMARIES = {
   create_goal: (args) => String(args.title || '').slice(0, 80),
   update_goal: (args) => String(args.goalId || '').slice(0, 80),
   create_routine: (args) => String(args.title || '').slice(0, 80),
+  create_project: (args) => String(args.title || '').slice(0, 80),
+  update_project_step: (args) => String(args.stepId || '').slice(0, 80),
+  propose_calendar_event: (args) => String(args.title || '').slice(0, 80),
   read_calendar: (args) => String(args.date || 'today').slice(0, 40)
 };
 
@@ -482,6 +575,18 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     }
     case 'create_routine': {
       const result = toolCreateRoutine(clean, ctx);
+      return { result, summary: String(clean.title || '').slice(0, 80) };
+    }
+    case 'create_project': {
+      const result = toolCreateProject(clean, ctx);
+      return { result, summary: String(clean.title || '').slice(0, 80) };
+    }
+    case 'update_project_step': {
+      const result = toolUpdateProjectStep(clean, ctx);
+      return { result, summary: String(clean.stepId || '').slice(0, 80) };
+    }
+    case 'propose_calendar_event': {
+      const result = toolProposeCalendarEvent(clean, ctx);
       return { result, summary: String(clean.title || '').slice(0, 80) };
     }
     case 'read_calendar': {

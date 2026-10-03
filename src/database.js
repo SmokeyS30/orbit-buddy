@@ -90,6 +90,28 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       day_of_week INTEGER, enabled INTEGER NOT NULL DEFAULT 1, last_run_date TEXT, last_run_at TEXT,
       lease_date TEXT, lease_expires_at TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','paused','completed')),
+      priority INTEGER NOT NULL DEFAULT 2, target_date TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS project_steps (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, details TEXT, status TEXT NOT NULL DEFAULT 'planned'
+        CHECK(status IN ('planned','in_progress','blocked','completed')),
+      position INTEGER NOT NULL DEFAULT 0, due_date TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS approvals (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','executed','rejected','failed')),
+      source_message_id TEXT, result_json TEXT, last_error TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reviewed_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, user_id TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
       risk TEXT NOT NULL CHECK(risk IN ('internal','external')), schedule_at TEXT,
@@ -156,6 +178,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE INDEX IF NOT EXISTS idx_followups_due ON follow_ups(user_id, status, due_date);
     CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id, status, priority DESC, target_date);
     CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id, enabled, time_local);
+    CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, status, priority DESC, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_project_steps ON project_steps(user_id, project_id, position, created_at);
+    CREATE INDEX IF NOT EXISTS idx_approvals_user ON approvals(user_id, status, created_at DESC);
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
@@ -273,6 +298,23 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       AND (last_run_date IS NULL OR last_run_date<>?) AND (lease_expires_at IS NULL OR lease_expires_at<=?)`),
     completeRoutine: db.prepare('UPDATE routines SET last_run_date=?,last_run_at=?,lease_date=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND lease_date=?'),
     failRoutine: db.prepare('UPDATE routines SET lease_date=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND lease_date=?'),
+    addProject: db.prepare(`INSERT INTO projects(id,user_id,title,description,status,priority,target_date,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,'active',?,?,?, ?,NULL)`),
+    getProject: db.prepare('SELECT * FROM projects WHERE id=? AND user_id=?'),
+    listProjects: db.prepare("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC"),
+    updateProject: db.prepare('UPDATE projects SET title=?,description=?,status=?,priority=?,target_date=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?'),
+    deleteProject: db.prepare('DELETE FROM projects WHERE id=? AND user_id=?'),
+    addProjectStep: db.prepare(`INSERT INTO project_steps(id,project_id,user_id,title,details,status,position,due_date,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,?,'planned',?,?,?, ?,NULL)`),
+    getProjectStep: db.prepare('SELECT * FROM project_steps WHERE id=? AND user_id=?'),
+    listProjectSteps: db.prepare('SELECT * FROM project_steps WHERE project_id=? AND user_id=? ORDER BY position,created_at'),
+    updateProjectStep: db.prepare('UPDATE project_steps SET title=?,details=?,status=?,position=?,due_date=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?'),
+    deleteProjectStep: db.prepare('DELETE FROM project_steps WHERE id=? AND user_id=?'),
+    addApproval: db.prepare(`INSERT INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at)
+      VALUES(?,?,?,?,?,?,'pending',?,NULL,NULL,?,?,NULL)`),
+    getApproval: db.prepare('SELECT * FROM approvals WHERE id=? AND user_id=?'),
+    listApprovals: db.prepare("SELECT * FROM approvals WHERE user_id=? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 200"),
+    resolveApproval: db.prepare("UPDATE approvals SET status=?,result_json=?,last_error=?,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'"),
     lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
     getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
@@ -417,6 +459,32 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimRoutine(userId,id,localDate,leaseMs=2*60_000){const now=timestamp();return s.claimRoutine.run(localDate,new Date(Date.now()+leaseMs).toISOString(),now,id,userId,localDate,now).changes>0;},
     completeRoutine(userId,id,localDate){const now=timestamp();return s.completeRoutine.run(localDate,now,now,id,userId,localDate).changes>0;},
     failRoutine(userId,id,localDate,error){return s.failRoutine.run(String(error||'').slice(0,1000),timestamp(),id,userId,localDate).changes>0;},
+    addProject(userId,{title,description=null,priority=2,targetDate=null,steps=[]}){
+      const now=timestamp();const row={id:randomUUID(),user_id:userId,title,description:description||null,status:'active',priority:normalizePriority(priority),target_date:targetDate?validDateString(targetDate):null,created_at:now,updated_at:now,completed_at:null};
+      db.exec('BEGIN IMMEDIATE');
+      try{
+        s.addProject.run(row.id,row.user_id,row.title,row.description,row.priority,row.target_date,row.created_at,row.updated_at);
+        let position=0;
+        for(const value of steps.slice(0,50)){
+          const step=typeof value==='string'?{title:value}:{...value};const stepTitle=String(step.title||'').trim().slice(0,160);if(!stepTitle)continue;
+          const stepNow=timestamp();s.addProjectStep.run(randomUUID(),row.id,userId,stepTitle,typeof step.details==='string'&&step.details.trim()?step.details.trim().slice(0,1000):null,position,step.dueDate?validDateString(step.dueDate):null,stepNow,stepNow);position+=1;
+        }
+        db.exec('COMMIT');
+      }catch(error){db.exec('ROLLBACK');throw error;}
+      return {...row,steps:s.listProjectSteps.all(row.id,userId)};
+    },
+    getProject(userId,id){const row=s.getProject.get(id,userId);return row?{...row,steps:s.listProjectSteps.all(id,userId)}:null;},
+    listProjects(userId){return s.listProjects.all(userId).map((row)=>({...row,steps:s.listProjectSteps.all(row.id,userId)}));},
+    updateProject(userId,id,patch={}){const current=s.getProject.get(id,userId);if(!current)return null;const status=patch.status===undefined?current.status:(['active','paused','completed'].includes(patch.status)?patch.status:current.status);const title=patch.title===undefined?current.title:String(patch.title||'').trim().slice(0,120)||current.title;const description=patch.description===undefined?current.description:(String(patch.description||'').trim().slice(0,1000)||null);const priority=patch.priority===undefined?current.priority:normalizePriority(patch.priority);const targetDate=patch.targetDate===undefined?current.target_date:(patch.targetDate?validDateString(patch.targetDate):null);const now=timestamp();const completedAt=status==='completed'?(current.completed_at||now):null;s.updateProject.run(title,description,status,priority,targetDate,now,completedAt,id,userId);return this.getProject(userId,id);},
+    deleteProject:(userId,id)=>s.deleteProject.run(id,userId).changes>0,
+    addProjectStep(userId,projectId,{title,details=null,dueDate=null}){if(!s.getProject.get(projectId,userId))return null;const existing=s.listProjectSteps.all(projectId,userId);const now=timestamp();const row={id:randomUUID(),project_id:projectId,user_id:userId,title,details:details||null,status:'planned',position:existing.length,due_date:dueDate?validDateString(dueDate):null,created_at:now,updated_at:now,completed_at:null};s.addProjectStep.run(row.id,row.project_id,row.user_id,row.title,row.details,row.position,row.due_date,row.created_at,row.updated_at);return row;},
+    getProjectStep:(userId,id)=>s.getProjectStep.get(id,userId)||null,
+    updateProjectStep(userId,id,patch={}){const current=s.getProjectStep.get(id,userId);if(!current)return null;const status=patch.status===undefined?current.status:(['planned','in_progress','blocked','completed'].includes(patch.status)?patch.status:current.status);const title=patch.title===undefined?current.title:String(patch.title||'').trim().slice(0,160)||current.title;const details=patch.details===undefined?current.details:(String(patch.details||'').trim().slice(0,1000)||null);const position=patch.position===undefined?current.position:Math.max(0,Math.min(Number(patch.position)||0,1000));const dueDate=patch.dueDate===undefined?current.due_date:(patch.dueDate?validDateString(patch.dueDate):null);const now=timestamp();const completedAt=status==='completed'?(current.completed_at||now):null;s.updateProjectStep.run(title,details,status,position,dueDate,now,completedAt,id,userId);const project=s.getProject.get(current.project_id,userId);if(project)s.updateProject.run(project.title,project.description,project.status,project.priority,project.target_date,now,project.completed_at,project.id,userId);return s.getProjectStep.get(id,userId);},
+    deleteProjectStep:(userId,id)=>s.deleteProjectStep.run(id,userId).changes>0,
+    addApproval(userId,{kind,title,summary,payload={},sourceMessageId=null}){const now=timestamp();const row={id:randomUUID(),user_id:userId,kind:String(kind||'proposal').slice(0,60),title,summary,payload_json:JSON.stringify(payload),status:'pending',source_message_id:sourceMessageId,result_json:null,last_error:null,created_at:now,updated_at:now,reviewed_at:null};s.addApproval.run(row.id,row.user_id,row.kind,row.title,row.summary,row.payload_json,row.source_message_id,row.created_at,row.updated_at);return {...row,payload};},
+    getApproval(userId,id){const row=s.getApproval.get(id,userId);if(!row)return null;let payload={},result=null;try{payload=JSON.parse(row.payload_json||'{}');}catch{}try{result=row.result_json?JSON.parse(row.result_json):null;}catch{}return {...row,payload,result};},
+    listApprovals(userId){return s.listApprovals.all(userId).map((row)=>{let payload={},result=null;try{payload=JSON.parse(row.payload_json||'{}');}catch{}try{result=row.result_json?JSON.parse(row.result_json):null;}catch{}return {...row,payload,result};});},
+    resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
@@ -472,9 +540,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
     consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:4,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
-      if (!bundle || ![2,3,4].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
@@ -485,6 +553,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         goal: db.prepare('INSERT OR IGNORE INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'),
         goalCheckin: db.prepare('INSERT OR IGNORE INTO goal_checkins(id,goal_id,user_id,progress,note,created_at) VALUES(?,?,?,?,?,?)'),
         routine: db.prepare('INSERT OR IGNORE INTO routines(id,user_id,title,prompt,kind,cadence,time_local,day_of_week,enabled,last_run_date,last_run_at,lease_date,lease_expires_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'),
+        project: db.prepare('INSERT OR IGNORE INTO projects(id,user_id,title,description,status,priority,target_date,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?)'),
+        projectStep: db.prepare('INSERT OR IGNORE INTO project_steps(id,project_id,user_id,title,details,status,position,due_date,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)'),
+        approval: db.prepare('INSERT OR IGNORE INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'),
         summary: db.prepare('INSERT OR IGNORE INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?)'),
         calendar: db.prepare('INSERT OR IGNORE INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?)'),
         task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
@@ -502,6 +573,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         for (const row of bundle.goals || []) inserts.goal.run(row.id,userId,row.title,row.description||null,row.status||'active',normalizePriority(row.priority),Math.max(0,Math.min(Number(row.progress)||0,100)),row.target_date||null,row.next_step||null,row.created_at,row.updated_at,row.completed_at||null);
         for (const row of bundle.goalCheckins || []) inserts.goalCheckin.run(row.id,row.goal_id,userId,row.progress,row.note||null,row.created_at);
         for (const row of bundle.routines || []) inserts.routine.run(row.id,userId,row.title,row.prompt,row.kind||'custom',row.cadence||'daily',validTimeString(row.time_local,'09:00'),row.day_of_week??null,row.enabled===0?0:1,row.last_run_date||null,row.last_run_at||null,null,null,row.last_error||null,row.created_at,row.updated_at);
+        for (const row of bundle.projects || []) inserts.project.run(row.id,userId,row.title,row.description||null,['active','paused','completed'].includes(row.status)?row.status:'active',normalizePriority(row.priority),row.target_date||null,row.created_at,row.updated_at,row.completed_at||null);
+        for (const row of bundle.projectSteps || []) inserts.projectStep.run(row.id,row.project_id,userId,row.title,row.details||null,['planned','in_progress','blocked','completed'].includes(row.status)?row.status:'planned',Number(row.position)||0,row.due_date||null,row.created_at,row.updated_at,row.completed_at||null);
+        for (const row of bundle.approvals || []) inserts.approval.run(row.id,userId,row.kind,row.title,row.summary,row.payload_json||'{}',['pending','executed','rejected','failed'].includes(row.status)?row.status:'pending',row.source_message_id||null,row.result_json||null,row.last_error||null,row.created_at,row.updated_at,row.reviewed_at||null);
         for (const row of bundle.conversationSummaries || []) inserts.summary.run(row.conversation_id,userId,row.summary,row.message_count,row.updated_at);
         for (const row of bundle.calendarFeeds || []) inserts.calendar.run(row.id,userId,row.label,protectSecret(row.url),row.created_at,row.updated_at);
         for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);

@@ -2,10 +2,16 @@
 
 ## Unreleased
 
+## 0.5.0
+
 - Fixed stale installed-app JavaScript hiding newly deployed Safety controls.
 - Made direct Safety links activate the correct view on startup.
 - Made the model check a permanent Safety control and reload open app windows after an app-shell update.
 - Fixed streamed Astra replies being discarded when the API used CRLF framing or returned an empty stream, with an automatic non-streaming retry.
+- Added resumable multi-step projects with user-controlled progress.
+- Added a unified approval center for external task plans and calendar-event proposals.
+- Added approval-generated `.ics` files without granting Orbit calendar write access.
+- Added a seven-day reliability dashboard for model health, chat success, background work, approvals, and safe failures.
 
 ## 0.4.1
 

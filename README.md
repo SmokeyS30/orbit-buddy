@@ -13,7 +13,7 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - **It's yours, privately.** Self-hostable and open source: your conversations live in your own SQLite database, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
 - **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
-## What works in v0.4
+## What works in v0.5
 
 - Responsive control center installable as a PWA on iPhone, Android, macOS, Windows, and Linux
 - Multi-user accounts with salted `scrypt` password hashes, 30-day secure sessions, CSRF protection, and one-time recovery codes
@@ -23,11 +23,15 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - Approval-based intelligence: Orbit can propose inferred memories for review and retrieve the most relevant approved memories for each conversation
 - Automatic follow-ups: Orbit can schedule and prioritize dated check-ins from chat, while keeping them visible and removable in Memory
 - Goals and routines: create measurable goals, record progress, and schedule daily or weekly briefings, reflections, and custom check-ins from the Goals tab
+- Multi-step projects with priorities, target dates, resumable steps, and progress that changes only when the user reports or confirms it
+- A unified Approvals tab for reviewing external task plans and calendar proposals before anything is produced
+- Calendar-event proposals that become downloadable `.ics` files after approval, without giving Orbit calendar write access
+- A seven-day Reliability view for model health, chat and background-work success, pending approvals, and recent safe failures
 - Grounded daily briefings that combine the upcoming agenda, active goals, pending tasks, and due follow-ups into a short set of priorities
 - Respectful proactivity: follow-ups, routines, and quiet nudges share a three-message daily limit and honor timezone, quiet hours, and opt-out settings
 - Push notifications through standards-based Web Push
 - Read-only iCal feeds for Google, Apple, Outlook, and other calendars; feed URLs are encrypted at rest when `DATA_ENCRYPTION_KEY` is configured
-- Model tools in chat: live web search, page reading, current date/time, calendar reading, task creation, goal and routine management, approved memory saving, memory proposals, and scheduled follow-ups
+- Model tools in chat: live web search, page reading, current date/time, calendar reading, task creation, project and goal tracking, routine management, approval-gated calendar proposals, approved memory saving, memory proposals, and scheduled follow-ups
 - Model connection diagnostics with an automatic Luna fallback when a configured model such as Astra is unavailable to the OpenAI project
 - Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
 - Owner-only emergency pause that stops new AI work and connector access without deleting data
@@ -75,7 +79,7 @@ Never put API keys, OAuth secrets, recovery codes, or backup passphrases in GitH
 
 ## Calendar connections
 
-Orbit v0.4 uses read-only iCal subscription URLs instead of OAuth. Add a calendar from the Connections tab; Orbit masks the URL in API responses and encrypts it at rest when `DATA_ENCRYPTION_KEY` is set. Treat iCal URLs like passwords because anyone holding one may be able to read that calendar. OAuth providers are intentionally disabled in this release; [docs/OAUTH.md](docs/OAUTH.md) records that boundary.
+Orbit v0.5 uses read-only iCal subscription URLs instead of OAuth. Add a calendar from the Connections tab; Orbit masks the URL in API responses and encrypts it at rest when `DATA_ENCRYPTION_KEY` is set. Treat iCal URLs like passwords because anyone holding one may be able to read that calendar. Orbit can propose events, but approval only produces an `.ics` file for you to import; it cannot silently write to a calendar. OAuth providers are intentionally disabled in this release; [docs/OAUTH.md](docs/OAUTH.md) records that boundary.
 
 ## Backups and recovery
 

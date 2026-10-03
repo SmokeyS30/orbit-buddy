@@ -151,16 +151,53 @@ test('tracks goal progress and recurring routine leases', () => {
   db.close();
 });
 
-test('backup version 4 preserves goals and routines', () => {
+test('backup version 5 preserves goals, routines, projects, and approvals', () => {
   const source = fixture();
   source.db.addGoal(source.user.id, { title: 'Run a 10K', priority: 2 });
   source.db.addRoutine(source.user.id, { title: 'Evening reflection', prompt: 'Reflect', kind: 'reflection', cadence: 'daily', timeLocal: '20:00' });
+  source.db.addProject(source.user.id, { title: 'Move house', steps: [{ title: 'Book movers', dueDate: '2026-11-01' }] });
+  source.db.addApproval(source.user.id, { kind: 'calendar_event', title: 'Add moving day', summary: 'Calendar proposal', payload: { title: 'Moving day', startAt: '2026-11-10T14:00:00.000Z', endAt: '2026-11-10T16:00:00.000Z' } });
   const bundle = source.db.exportUser(source.user.id);
-  assert.equal(bundle.version, 4);
+  assert.equal(bundle.version, 5);
   source.db.close();
   const target = fixture();
   target.db.restoreUser(target.user.id, bundle);
   assert.equal(target.db.listGoals(target.user.id)[0].title, 'Run a 10K');
   assert.equal(target.db.listRoutines(target.user.id)[0].kind, 'reflection');
+  assert.equal(target.db.listProjects(target.user.id)[0].steps[0].title, 'Book movers');
+  assert.equal(target.db.listApprovals(target.user.id)[0].payload.title, 'Moving day');
   target.db.close();
+});
+
+test('projects and approval decisions are isolated by user', () => {
+  const { db, user } = fixture();
+  const second = db.createUser({ email: 'member@example.com', displayName: 'Member', passwordHash: 'hash', passwordSalt: 'salt', role: 'member' });
+  const project = db.addProject(user.id, {
+    title: 'Launch site',
+    priority: 3,
+    steps: [{ title: 'Review copy' }, { title: 'Publish', dueDate: '2026-10-20' }]
+  });
+  assert.equal(project.steps.length, 2);
+  const completed = db.updateProjectStep(user.id, project.steps[0].id, { status: 'completed' });
+  assert.equal(completed.status, 'completed');
+  assert.ok(completed.completed_at);
+  assert.ok(db.getProject(user.id, project.id).updated_at);
+  assert.equal(db.getProject(second.id, project.id), null);
+  assert.equal(db.updateProjectStep(second.id, project.steps[1].id, { status: 'completed' }), null);
+  assert.equal(db.deleteProject(second.id, project.id), false);
+
+  const approval = db.addApproval(user.id, {
+    kind: 'calendar_event',
+    title: 'Add launch review',
+    summary: 'Review proposed calendar entry',
+    payload: { title: 'Launch review' }
+  });
+  assert.equal(approval.status, 'pending');
+  assert.equal(db.getApproval(second.id, approval.id), null);
+  assert.equal(db.resolveApproval(second.id, approval.id, 'rejected'), null);
+  const resolved = db.resolveApproval(user.id, approval.id, 'executed', { result: { artifactId: 'artifact-1' } });
+  assert.equal(resolved.status, 'executed');
+  assert.equal(resolved.result.artifactId, 'artifact-1');
+  assert.equal(db.resolveApproval(user.id, approval.id, 'rejected'), null);
+  db.close();
 });

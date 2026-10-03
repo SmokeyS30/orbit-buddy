@@ -54,11 +54,15 @@
       <nav class="tabs" aria-label="Main sections">
         <button class="tab active" data-view="today">Today</button
         ><button class="tab" data-view="goals">Goals</button
+        ><button class="tab" data-view="projects">Projects</button
+        ><button class="tab" data-view="approvals">
+          Approvals <span id="approval-count" class="count">0</span></button
         ><button class="tab" data-view="tasks">
           Tasks <span id="task-count" class="count">0</span></button
         ><button class="tab" data-view="files">Files</button
         ><button class="tab" data-view="memory">Memory</button
         ><button class="tab" data-view="connections">Connections</button
+        ><button class="tab" data-view="reliability">Reliability</button
         ><button class="tab" data-view="activity">Activity</button
         ><button class="tab" data-view="safety">Safety</button>
       </nav>
@@ -298,6 +302,73 @@
         </div>
       </section>
 
+      <section id="projects" class="view">
+        <div class="split-heading">
+          <div>
+            <p class="eyebrow">MULTI-STEP WORK</p>
+            <h1>Projects</h1>
+            <p>Plans stay resumable, visible, and under your control.</p>
+          </div>
+          <button id="new-project-button" class="primary">New project</button>
+        </div>
+        <form id="project-form" class="panel form-card hidden">
+          <label
+            >Project name<input
+              id="project-title"
+              maxlength="120"
+              required
+              placeholder="Prepare for the certification exam"
+          /></label>
+          <label
+            >Description<textarea
+              id="project-description"
+              maxlength="1000"
+              rows="3"
+              placeholder="What outcome should this project produce?"
+            ></textarea>
+          </label>
+          <div class="form-grid two">
+            <label
+              >Priority<select id="project-priority">
+                <option value="3">High</option>
+                <option value="2" selected>Normal</option>
+                <option value="1">Low</option>
+              </select></label
+            ><label
+              >Target date<input id="project-target" type="date"
+            /></label>
+          </div>
+          <label
+            >Initial steps<textarea
+              id="project-steps"
+              maxlength="4000"
+              rows="5"
+              placeholder="One step per line"
+            ></textarea>
+          </label>
+          <div class="actions">
+            <button type="button" id="cancel-project" class="ghost">
+              Cancel</button
+            ><button class="primary">Create project</button>
+          </div>
+        </form>
+        <div id="projects-list" class="card-list"></div>
+      </section>
+
+      <section id="approvals" class="view">
+        <div class="split-heading">
+          <div>
+            <p class="eyebrow">EXPLICIT CONTROL</p>
+            <h1>Approvals</h1>
+            <p>
+              Review every proposed calendar file and external-action plan
+              before Orbit proceeds.
+            </p>
+          </div>
+        </div>
+        <div id="approvals-list" class="card-list"></div>
+      </section>
+
       <section id="files" class="view">
         <div class="split-heading">
           <div>
@@ -366,6 +437,20 @@
           </div>
         </div>
         <div id="activity-list" class="timeline"></div>
+      </section>
+      <section id="reliability" class="view">
+        <div class="split-heading">
+          <div>
+            <p class="eyebrow">LAST 7 DAYS</p>
+            <h1>Reliability</h1>
+            <p>Connection health, completion rates, and recent safe failures.</p>
+          </div>
+        </div>
+        <div id="reliability-metrics" class="metric-grid"></div>
+        <section class="section-gap">
+          <h2>Recent failures</h2>
+          <div id="reliability-failures" class="card-list"></div>
+        </section>
       </section>
       <section id="safety" class="view">
         <div class="split-heading">

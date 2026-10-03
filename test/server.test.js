@@ -80,6 +80,76 @@ test('goal and routine endpoints update the proactive snapshot', async (t) => {
   assert.equal(snapshot.routines[0].enabled, 0);
 });
 
+test('project endpoints preserve user-controlled step progress', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const created = await fetch(`${base}/api/projects`, {
+    method: 'POST',
+    headers: authHeaders(auth),
+    body: JSON.stringify({ title: 'Launch Orbit', priority: 3, targetDate: '2026-12-01', steps: [{ title: 'Review release' }, { title: 'Deploy' }] })
+  });
+  assert.equal(created.status, 201);
+  const project = await created.json();
+  assert.equal(project.steps.length, 2);
+  const progressed = await fetch(`${base}/api/project-steps/${project.steps[0].id}`, {
+    method: 'PATCH',
+    headers: authHeaders(auth),
+    body: JSON.stringify({ status: 'completed', details: 'Reviewed by the user' })
+  });
+  assert.equal(progressed.status, 200);
+  assert.equal((await progressed.json()).status, 'completed');
+  const added = await fetch(`${base}/api/projects/${project.id}/steps`, {
+    method: 'POST',
+    headers: authHeaders(auth),
+    body: JSON.stringify({ title: 'Verify production' })
+  });
+  assert.equal(added.status, 201);
+  const snapshot = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } })).json();
+  assert.equal(snapshot.projects[0].steps.length, 3);
+  assert.equal(snapshot.projects[0].steps[0].status, 'completed');
+  assert.equal(snapshot.reliability.windowDays, 7);
+  assert.equal(snapshot.reliability.pendingApprovals, 0);
+  const invalid = await fetch(`${base}/api/projects`, {
+    method: 'POST',
+    headers: authHeaders(auth),
+    body: JSON.stringify({ title: 'Invalid project', steps: [{ title: 'Impossible deadline', dueDate: '2026-02-30' }] })
+  });
+  assert.equal(invalid.status, 400);
+});
+
+test('calendar approvals create a downloadable calendar file and can be rejected', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const userId = auth.body.user.id;
+  const approval = app.db.addApproval(userId, {
+    kind: 'calendar_event',
+    title: 'Add planning review',
+    summary: 'Calendar proposal',
+    payload: {
+      title: 'Planning review',
+      startAt: '2026-10-12T14:00:00.000Z',
+      endAt: '2026-10-12T15:00:00.000Z',
+      location: 'Video call',
+      notes: 'Review launch readiness'
+    }
+  });
+  const approved = await fetch(`${base}/api/approvals/${approval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(approved.status, 200);
+  const approvedBody = await approved.json();
+  assert.equal(approvedBody.approval.status, 'executed');
+  assert.equal(approvedBody.artifact.mime_type, 'text/calendar; charset=utf-8');
+  const artifact = app.db.getArtifact(userId, approvedBody.artifact.id);
+  assert.match(artifact.content, /^BEGIN:VCALENDAR\r\n/);
+  assert.match(artifact.content, /SUMMARY:Planning review/);
+  assert.match(artifact.content, /END:VCALENDAR\r\n$/);
+  assert.equal((await fetch(`${base}/api/approvals/${approval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' })).status, 409);
+
+  const rejectedApproval = app.db.addApproval(userId, { kind: 'calendar_event', title: 'Add optional call', summary: 'Optional', payload: { title: 'Optional call' } });
+  const rejected = await fetch(`${base}/api/approvals/${rejectedApproval.id}/reject`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(rejected.status, 200);
+  assert.equal((await rejected.json()).status, 'rejected');
+});
+
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);

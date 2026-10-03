@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 11);
+  assert.equal(TOOL_DEFINITIONS.length, 14);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_routine', 'create_task', 'fetch_url', 'get_datetime', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_project', 'create_routine', 'create_task', 'fetch_url', 'get_datetime', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -310,6 +310,18 @@ function writeCtx() {
       addRoutine: (userId, routine) => {
         calls.push(['addRoutine', userId, routine]);
         return { id: 'routine-1', ...routine, time_local: routine.timeLocal };
+      },
+      addProject: (userId, project) => {
+        calls.push(['addProject', userId, project]);
+        return { id: 'project-1', title: project.title, steps: project.steps.map((step, index) => ({ id: `step-${index + 1}`, title: step.title, status: 'planned' })) };
+      },
+      updateProjectStep: (userId, stepId, update) => {
+        calls.push(['updateProjectStep', userId, stepId, update]);
+        return { id: stepId, title: 'Review copy', status: update.status };
+      },
+      addApproval: (userId, approval) => {
+        calls.push(['addApproval', userId, approval]);
+        return { id: 'approval-1', status: 'pending', ...approval };
       }
     }
   };
@@ -384,6 +396,48 @@ test('goal tools create and update user-controlled progress', async () => {
   assert.equal(updated.result.progress, 40);
   assert.deepEqual(ctx.calls[1], ['updateGoal', 'user-1', 'goal-1', { progress: 40, status: undefined, nextStep: undefined, note: 'Finished a module' }]);
   await assert.rejects(() => executeTool('update_goal', { goalId: 'goal-1', progress: 101 }, {}, ctx), /0 to 100/);
+});
+
+test('project tools create ordered steps and only update explicit progress', async () => {
+  const ctx = writeCtx();
+  const created = await executeTool('create_project', {
+    title: ' Website launch ',
+    priority: 3,
+    targetDate: '2026-12-01',
+    steps: [{ title: 'Review copy', dueDate: '2026-11-20' }, { title: 'Publish' }]
+  }, {}, ctx);
+  assert.equal(created.result.id, 'project-1');
+  assert.deepEqual(ctx.calls[0], ['addProject', 'user-1', {
+    title: 'Website launch',
+    description: null,
+    priority: 3,
+    targetDate: '2026-12-01',
+    steps: [
+      { title: 'Review copy', details: null, dueDate: '2026-11-20' },
+      { title: 'Publish', details: null, dueDate: null }
+    ]
+  }]);
+  const updated = await executeTool('update_project_step', { stepId: 'step-1', status: 'completed', note: 'Done with the user' }, {}, ctx);
+  assert.equal(updated.result.status, 'completed');
+  assert.deepEqual(ctx.calls[1], ['updateProjectStep', 'user-1', 'step-1', { status: 'completed', details: 'Done with the user' }]);
+  await assert.rejects(() => executeTool('create_project', { title: 'Bad', steps: [{ title: 'Step', dueDate: '2026-02-30' }] }, {}, ctx), /YYYY-MM-DD/);
+  await assert.rejects(() => executeTool('update_project_step', { stepId: 'step-1', status: 'guessed' }, {}, ctx), /status must be/);
+});
+
+test('calendar proposals require approval and reject invalid ranges', async () => {
+  const ctx = { ...writeCtx(), messageId: 'message-1', timeZone: 'Europe/London' };
+  const proposed = await executeTool('propose_calendar_event', {
+    title: 'Planning review',
+    startAt: '2026-10-12T14:00:00Z',
+    endAt: '2026-10-12T15:00:00Z',
+    location: 'Video call'
+  }, {}, ctx);
+  assert.equal(proposed.result.status, 'pending');
+  assert.equal(proposed.result.timeZone, 'Europe/London');
+  assert.deepEqual(ctx.calls[0][0], 'addApproval');
+  assert.equal(ctx.calls[0][2].kind, 'calendar_event');
+  assert.equal(ctx.calls[0][2].sourceMessageId, 'message-1');
+  await assert.rejects(() => executeTool('propose_calendar_event', { title: 'Bad range', startAt: '2026-10-12T15:00:00Z', endAt: '2026-10-12T14:00:00Z' }, {}, ctx), /endAt after startAt/);
 });
 
 test('create_routine validates local time and weekly schedule', async () => {

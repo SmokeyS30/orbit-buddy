@@ -20,6 +20,7 @@ Use GitHub private vulnerability reporting instead of opening a public issue. Do
 - OAuth providers are disabled in the current release. Calendar access uses read-only iCal feeds.
 - Calendar feed URLs are masked in API responses and encrypted with AES-256-GCM in SQLite when `DATA_ENCRYPTION_KEY` is configured.
 - External tasks stop for explicit approval and currently produce only plans or drafts.
+- Calendar-event proposals stop for explicit approval and produce a downloadable `.ics` file; they do not write to a calendar provider.
 - The emergency pause stops new AI work, the background worker, and connector reads. It does not erase data or revoke provider tokens.
 - Portable and automatic backups use authenticated encryption. Restore merges data and leaves Orbit paused for human review.
 - Saved memory is typed, explicit, and deletable. Inferred memories remain suggestions until the user approves them.
