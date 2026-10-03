@@ -69,17 +69,29 @@ Never put API keys, OAuth secrets, recovery codes, backup passphrases, or automa
 
 ## Phone automation
 
-Orbit can create a limited token that only permits internal thinking tasks. In **Connections → Phone automation**, create a token and copy it once. A Shortcut can then make this request:
+Orbit can create scoped tokens for Apple Shortcuts, Android automation, or scripts. In **Connections → Shortcuts & automation**, create a token, tick what it may do (**Ask Orbit**, **Create tasks**, **Save memories**), and copy it once. A Shortcut can then make these requests:
 
 ```http
-POST https://YOUR-ORBIT.example/api/automation/tasks
+POST https://YOUR-ORBIT.example/api/automation/ask
 Authorization: Bearer orbit_YOUR_TOKEN
 Content-Type: application/json
 
-{"title":"Phone note","prompt":"Turn this note into a checklist"}
+{"message":"What is on my calendar today?"}
 ```
 
-Requests through this endpoint are forced to `internal` risk. They cannot use the token to access memories, files, connectors, account controls, or emergency controls.
+Returns `{"answer":"..."}` — pipe it into **Speak Text** or **Show Result**. The exchange is also saved to your default conversation, and any memory suggestions go through the usual approval flow.
+
+```http
+POST https://YOUR-ORBIT.example/api/automation/memories
+Authorization: Bearer orbit_YOUR_TOKEN
+Content-Type: application/json
+
+{"content":"Edward prefers oat milk lattes."}
+```
+
+**Apple Shortcuts recipe — "Ask Orbit":** Ask for Input (or Siri dictation) → Get Contents of URL: POST to `https://YOUR-ORBIT.example/api/automation/ask`, Headers: `Authorization: Bearer orbit_…`, Request Body: JSON `{"message": "Provided Input"}` → Get Dictionary Value `answer` → Speak Text (or Show Result). **"Remember this":** same, but POST to `/api/automation/memories` with `{"content": "Provided Input"}` and a token that has the Save memories scope.
+
+Requests through `/api/automation/tasks` are forced to `internal` risk. Tokens cannot touch anything outside their granted scopes — create separate tokens per shortcut so a leaked token does the least damage.
 
 ## OAuth connectors
 
