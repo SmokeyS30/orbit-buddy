@@ -77,6 +77,10 @@ export function openDatabase(filePath) {
       state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, code_verifier TEXT, redirect_uri TEXT NOT NULL, expires_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS calendar_feeds (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      label TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS automation_tokens (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       label TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL,
@@ -154,6 +158,10 @@ export function openDatabase(filePath) {
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
+    addCalendarFeed: db.prepare(`INSERT INTO calendar_feeds(id,user_id,label,url,created_at,updated_at)
+      VALUES(?,?,?,?,?,?)`),
+    listCalendarFeeds: db.prepare('SELECT * FROM calendar_feeds WHERE user_id=? ORDER BY label COLLATE NOCASE'),
+    deleteCalendarFeed: db.prepare('DELETE FROM calendar_feeds WHERE id=? AND user_id=?'),
     getTask: db.prepare('SELECT * FROM tasks WHERE id=? AND user_id=?'),
     updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
     completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,updated_at=? WHERE id=? AND user_id=?'),
@@ -252,6 +260,14 @@ export function openDatabase(filePath) {
       s.addTask.run(row.id,row.user_id,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.created_at,row.updated_at); return row;
     },
     listTasks: (userId) => s.listTasks.all(userId),
+    addCalendarFeed(userId, { label, url }) {
+      const now = timestamp();
+      const row = { id: randomUUID(), user_id: userId, label, url, created_at: now, updated_at: now };
+      s.addCalendarFeed.run(row.id, row.user_id, row.label, row.url, row.created_at, row.updated_at);
+      return row;
+    },
+    listCalendarFeeds: (userId) => s.listCalendarFeeds.all(userId),
+    deleteCalendarFeed: (userId, id) => s.deleteCalendarFeed.run(id, userId).changes > 0,
     getTask: (userId,id) => s.getTask.get(id,userId),
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
     completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
