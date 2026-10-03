@@ -23,6 +23,8 @@ const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csr
 
 test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
+  const shell = await fetch(base);
+  assert.match(await shell.text(), /id="model-check-button"/);
   const appScript = await fetch(`${base}/app.js`);
   assert.match(appScript.headers.get('cache-control'), /no-cache/);
   const health = await fetch(`${base}/healthz`);

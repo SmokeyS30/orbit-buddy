@@ -4,6 +4,7 @@
 
 - Fixed stale installed-app JavaScript hiding newly deployed Safety controls.
 - Made direct Safety links activate the correct view on startup.
+- Made the model check a permanent Safety control and reload open app windows after an app-shell update.
 
 ## 0.4.1
 
