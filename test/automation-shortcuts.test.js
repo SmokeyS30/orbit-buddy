@@ -67,6 +67,27 @@ test('POST /api/automation/ask answers asynchronously with the chat:ask scope an
   assert.equal((await fetch(`${base}/api/automation/ask/no-such-id`, { headers: { Authorization: `Bearer ${token}` } })).status, 404);
 });
 
+test('GET /api/automation/ask/:id/answer returns plain text only when done', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const { token } = await createToken(base, auth, 'Shortcuts', ['chat:ask']);
+  const bearer = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+  const response = await fetch(`${base}/api/automation/ask`, { method: 'POST', headers: bearer, body: JSON.stringify({ message: 'hi' }) });
+  assert.equal(response.status, 202);
+  const { id } = await response.json();
+  let answer = null;
+  for (let i = 0; i < 50 && answer === null; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const poll = await fetch(`${base}/api/automation/ask/${id}/answer`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(poll.status, 200);
+    assert.ok(poll.headers.get('content-type').includes('text/plain'));
+    const body = await poll.text();
+    if (body) answer = body;
+  }
+  assert.ok(answer && answer.length > 0, 'answer arrives as plain text');
+  assert.equal((await fetch(`${base}/api/automation/ask/no-such-id/answer`, { headers: { Authorization: `Bearer ${token}` } })).status, 404);
+});
+
 test('POST /api/automation/ask rejects missing auth and insufficient scope', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
