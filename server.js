@@ -179,6 +179,11 @@ export function createOrbitServer(options={}) {
         if(owner)db.addEvent(owner.id,'registration_opened','Opened registration from a push action.');
         return json(res,200,{open:true});
       }
+      if(req.method==='GET'&&url.pathname==='/api/public/usage'){
+        if(hourlyLimited(req,60,'public-usage'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const now=new Date();const monthStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)).toISOString();
+        return json(res,200,{month:monthStart.slice(0,7),braveConfigured:!!env.BRAVE_SEARCH_API_KEY?.trim(),webSearches:db.countToolUseSince('web_search',monthStart)});
+      }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
