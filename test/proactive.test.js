@@ -7,7 +7,7 @@ import { createOrbitServer, parseFollowUpMarkers, stripFollowUpMarkers, quietNud
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-proactive-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-5.4-mini', ...extraEnv } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
@@ -92,4 +92,34 @@ test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   // Second run inside the cooldown window: no duplicate.
   await app.runProactiveChecks(future + 3600_000);
   assert.equal(assistants().length, afterFirst, 'no duplicate nudge in cooldown');
+});
+
+test('a due routine creates one proactive briefing and does not repeat that day', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { timeZone: 'UTC', quietStart: '00:00', quietEnd: '00:00' });
+  const routine = app.db.addRoutine(auth.userId, { title: 'Morning focus', prompt: 'Prepare my focus', kind: 'briefing', cadence: 'daily', timeLocal: '00:00' });
+  const now = Date.parse('2026-10-03T12:00:00Z');
+  await app.runProactiveChecks(now);
+  const first = app.db.getRoutine(auth.userId, routine.id);
+  assert.equal(first.last_run_date, '2026-10-03');
+  const convo = app.db.ensureDefaultConversation(auth.userId);
+  const count = app.db.listConversationMessages(auth.userId, convo.id, 20).filter((m) => m.role === 'assistant').length;
+  await app.runProactiveChecks(now + 3600_000);
+  assert.equal(app.db.listConversationMessages(auth.userId, convo.id, 20).filter((m) => m.role === 'assistant').length, count);
+  assert.ok(app.db.listEvents(auth.userId, 20).some((event) => event.type === 'routine_sent'));
+});
+
+test('follow-ups are priority ordered and capped at three proactive messages per day', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { timeZone: 'UTC', quietStart: '00:00', quietEnd: '00:00' });
+  for (const [description, priority] of [['low priority', 1], ['high one', 3], ['high two', 3], ['normal', 2]]) {
+    app.db.addFollowUp(auth.userId, { description, dueDate: '2026-10-03', priority });
+  }
+  await app.runProactiveChecks(Date.parse('2026-10-03T12:00:00Z'));
+  const remaining = app.db.listFollowUps(auth.userId);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].description, 'low priority');
+  assert.equal(app.db.listEvents(auth.userId, 20).filter((event) => event.type === 'followup_sent').length, 3);
 });

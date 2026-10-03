@@ -7,7 +7,7 @@ import { createOrbitServer } from '../server.js';
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-server-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-5.4-mini', ...extraEnv } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
@@ -43,6 +43,25 @@ test('user preferences and typed memory are exposed in the snapshot', async (t) 
   assert.equal(snapshot.preferences.time_zone, 'Europe/London');
   assert.equal(snapshot.preferences.proactive_enabled, 0);
   assert.equal(snapshot.memories[0].kind, 'goal');
+});
+
+test('goal and routine endpoints update the proactive snapshot', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const createdGoal = await fetch(`${base}/api/goals`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ title: 'Finish certification', priority: 3, targetDate: '2026-12-01', nextStep: 'Study chapter four' }) });
+  assert.equal(createdGoal.status, 201);
+  const goal = await createdGoal.json();
+  const progressed = await fetch(`${base}/api/goals/${goal.id}`, { method: 'PATCH', headers: authHeaders(auth), body: JSON.stringify({ progress: 45, note: 'Practice exam completed' }) });
+  assert.equal(progressed.status, 200);
+  assert.equal((await progressed.json()).progress, 45);
+  const createdRoutine = await fetch(`${base}/api/routines`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ title: 'Morning brief', prompt: 'Prepare my priorities', kind: 'briefing', cadence: 'weekdays', timeLocal: '08:00' }) });
+  assert.equal(createdRoutine.status, 201);
+  const routine = await createdRoutine.json();
+  const paused = await fetch(`${base}/api/routines/${routine.id}`, { method: 'PATCH', headers: authHeaders(auth), body: JSON.stringify({ enabled: false }) });
+  assert.equal(paused.status, 200);
+  const snapshot = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } })).json();
+  assert.equal(snapshot.goals[0].progress, 45);
+  assert.equal(snapshot.routines[0].enabled, 0);
 });
 
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {

@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 8);
+  assert.equal(TOOL_DEFINITIONS.length, 11);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_task', 'fetch_url', 'get_datetime', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_routine', 'create_task', 'fetch_url', 'get_datetime', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -164,6 +164,42 @@ test('respond without tools keeps the single-request behavior', async (t) => {
   assert.equal(requests, 1);
 });
 
+test('model access failure falls back to the configured starter model', async (t) => {
+  let requests = 0;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      requests += 1;
+      const sent = JSON.parse(body);
+      res.writeHead(sent.model === 'gpt-6-astra' ? 404 : 200, { 'Content-Type': 'application/json' });
+      if (sent.model === 'gpt-6-astra') res.end(JSON.stringify({ error: { code: 'model_not_found', message: 'Project does not have access to this model.' } }));
+      else res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Fallback worked.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6-astra', OPENAI_FALLBACK_MODEL: 'gpt-6-luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const response = await model.respond({ buddyName: 'Orbit', message: 'Hello', tools: true });
+  assert.equal(response.text, 'Fallback worked.');
+  assert.equal(requests, 2);
+  assert.equal(model.diagnostics().state, 'fallback');
+  assert.equal(model.diagnostics().activeModel, 'gpt-6-luna');
+});
+
+test('authentication failures are diagnosed without a fallback retry', async (t) => {
+  let requests = 0;
+  const stub = http.createServer((req, res) => {
+    req.resume();req.on('end', () => { requests += 1;res.writeHead(401, { 'Content-Type': 'application/json' });res.end(JSON.stringify({ error: { code: 'invalid_api_key', message: 'Incorrect API key.' } })); });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6-astra', OPENAI_FALLBACK_MODEL: 'gpt-6-luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  await assert.rejects(() => model.respond({ buddyName: 'Orbit', message: 'Hello' }), (error) => error.classification === 'authentication');
+  assert.equal(requests, 1);
+  assert.equal(model.diagnostics().state, 'authentication');
+});
+
 function writeCtx() {
   const calls = [];
   return {
@@ -190,6 +226,18 @@ function writeCtx() {
       addFollowUp: (userId, followUp) => {
         calls.push(['addFollowUp', userId, followUp]);
         return { id: 'followup-1', description: followUp.description, due_date: followUp.dueDate };
+      },
+      addGoal: (userId, goal) => {
+        calls.push(['addGoal', userId, goal]);
+        return { id: 'goal-1', title: goal.title, priority: goal.priority, target_date: goal.targetDate };
+      },
+      updateGoal: (userId, goalId, update) => {
+        calls.push(['updateGoal', userId, goalId, update]);
+        return { id: goalId, title: 'Certification', progress: update.progress ?? 25, status: update.status || 'active', next_step: update.nextStep || null };
+      },
+      addRoutine: (userId, routine) => {
+        calls.push(['addRoutine', userId, routine]);
+        return { id: 'routine-1', ...routine, time_local: routine.timeLocal };
       }
     }
   };
@@ -251,8 +299,28 @@ test('schedule_followup validates dates and preserves the source message', async
   const ctx = { ...writeCtx(), messageId: 'message-1' };
   const { result } = await executeTool('schedule_followup', { description: ' dentist appointment ', date: '2026-10-08' }, {}, ctx);
   assert.equal(result.date, '2026-10-08');
-  assert.deepEqual(ctx.calls[0], ['addFollowUp', 'user-1', { description: 'dentist appointment', dueDate: '2026-10-08', sourceMessageId: 'message-1' }]);
+  assert.deepEqual(ctx.calls[0], ['addFollowUp', 'user-1', { description: 'dentist appointment', dueDate: '2026-10-08', priority: 2, sourceMessageId: 'message-1' }]);
   await assert.rejects(() => executeTool('schedule_followup', { description: 'trip', date: '2026-02-30' }, {}, ctx), /YYYY-MM-DD/);
+});
+
+test('goal tools create and update user-controlled progress', async () => {
+  const ctx = writeCtx();
+  const created = await executeTool('create_goal', { title: ' Certification ', priority: 3, targetDate: '2026-12-01', nextStep: 'Book exam' }, {}, ctx);
+  assert.equal(created.result.id, 'goal-1');
+  assert.deepEqual(ctx.calls[0], ['addGoal', 'user-1', { title: 'Certification', description: null, priority: 3, targetDate: '2026-12-01', nextStep: 'Book exam' }]);
+  const updated = await executeTool('update_goal', { goalId: 'goal-1', progress: 40, note: 'Finished a module' }, {}, ctx);
+  assert.equal(updated.result.progress, 40);
+  assert.deepEqual(ctx.calls[1], ['updateGoal', 'user-1', 'goal-1', { progress: 40, status: undefined, nextStep: undefined, note: 'Finished a module' }]);
+  await assert.rejects(() => executeTool('update_goal', { goalId: 'goal-1', progress: 101 }, {}, ctx), /0 to 100/);
+});
+
+test('create_routine validates local time and weekly schedule', async () => {
+  const ctx = writeCtx();
+  const created = await executeTool('create_routine', { title: 'Monday brief', prompt: 'Prepare my week', kind: 'briefing', cadence: 'weekly', timeLocal: '08:30', dayOfWeek: 1 }, {}, ctx);
+  assert.equal(created.result.cadence, 'weekly');
+  assert.deepEqual(ctx.calls[0][2], { title: 'Monday brief', prompt: 'Prepare my week', kind: 'briefing', cadence: 'weekly', timeLocal: '08:30', dayOfWeek: 1 });
+  await assert.rejects(() => executeTool('create_routine', { title: 'Bad', prompt: 'x', kind: 'custom', cadence: 'daily', timeLocal: '25:00' }, {}, ctx), /HH:MM/);
+  await assert.rejects(() => executeTool('create_routine', { title: 'Bad day', prompt: 'x', kind: 'custom', cadence: 'weekly', timeLocal: '08:00', dayOfWeek: 8 }, {}, ctx), /dayOfWeek/);
 });
 
 test('Brave retries transient failures before giving up', async (t) => {

@@ -13,19 +13,22 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - **It's yours, privately.** Self-hostable and open source: your conversations live in your own SQLite database, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
 - **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
-## What works in v0.3
+## What works in v0.4
 
 - Responsive control center installable as a PWA on iPhone, Android, macOS, Windows, and Linux
 - Multi-user accounts with salted `scrypt` password hashes, 30-day secure sessions, CSRF protection, and one-time recovery codes
 - Authenticated chat through the OpenAI Responses API, with a clearly labeled demo mode when no API key is configured
-- Persistent SQLite messages, typed user-approved memories, scheduled follow-ups, user timezone and quiet-hour preferences, tasks, generated artifacts, and audit events
+- Persistent SQLite messages, typed user-approved memories, goals with user-controlled progress, scheduled follow-ups, timezone-aware routines, tasks, generated artifacts, and audit events
 - Immediate, scheduled, daily, and weekly background thinking tasks that continue on the server after the browser closes
 - Approval-based intelligence: Orbit can propose inferred memories for review and retrieve the most relevant approved memories for each conversation
-- Automatic follow-ups: Orbit can schedule dated check-ins from chat, while keeping them visible and removable in Memory
-- Quiet check-ins: a proactive nudge if you haven't chatted in a couple of days, respecting your timezone, quiet hours, and opt-out setting
+- Automatic follow-ups: Orbit can schedule and prioritize dated check-ins from chat, while keeping them visible and removable in Memory
+- Goals and routines: create measurable goals, record progress, and schedule daily or weekly briefings, reflections, and custom check-ins from the Goals tab
+- Grounded daily briefings that combine the upcoming agenda, active goals, pending tasks, and due follow-ups into a short set of priorities
+- Respectful proactivity: follow-ups, routines, and quiet nudges share a three-message daily limit and honor timezone, quiet hours, and opt-out settings
 - Push notifications through standards-based Web Push
 - Read-only iCal feeds for Google, Apple, Outlook, and other calendars; feed URLs are encrypted at rest when `DATA_ENCRYPTION_KEY` is configured
-- Model tools in chat: live web search, page reading, current date/time, calendar reading, task creation, approved memory saving, memory proposals, and scheduled follow-ups
+- Model tools in chat: live web search, page reading, current date/time, calendar reading, task creation, goal and routine management, approved memory saving, memory proposals, and scheduled follow-ups
+- Model connection diagnostics with an automatic Luna fallback when a configured model such as Astra is unavailable to the OpenAI project
 - Encrypted downloadable backups, daily encrypted server backups, seven-backup retention, and non-destructive restore
 - Owner-only emergency pause that stops new AI work and connector access without deleting data
 - A native iPhone companion source project in `ios/OrbitCompanion`
@@ -47,7 +50,9 @@ npm start
 
 Open `http://127.0.0.1:3000`. The first person to register becomes the owner and receives ten one-time recovery codes. Save those codes outside Orbit. Later registrations stay closed unless the owner opens the door from Safety → Registration door. Visitors facing a closed door can send an access request from the signup screen instead. The owner is nudged if the door stays open over an hour, and access-request push notifications carry a one-tap button to open the door.
 
-`OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The default model is configurable with `OPENAI_MODEL`.
+`OPENAI_API_KEY` is optional. Without it, Orbit works in demo mode and never pretends a model request ran. The primary model is configurable with `OPENAI_MODEL`; the default is `gpt-6-luna`. `OPENAI_FALLBACK_MODEL` also defaults to `gpt-6-luna` and is tried only when the primary model is unavailable to the API project. Authentication, quota, and billing failures are shown as connection errors and are not retried against another model.
+
+To request Astra, set `OPENAI_MODEL=gpt-6-astra`. Astra access is project-dependent. If that project cannot use Astra, Orbit continues with Luna and displays the fallback reason in Safety instead of failing the conversation.
 
 ## Deploy on Render
 
@@ -70,7 +75,7 @@ Never put API keys, OAuth secrets, recovery codes, or backup passphrases in GitH
 
 ## Calendar connections
 
-Orbit v0.3 uses read-only iCal subscription URLs instead of OAuth. Add a calendar from the Connections tab; Orbit masks the URL in API responses and encrypts it at rest when `DATA_ENCRYPTION_KEY` is set. Treat iCal URLs like passwords because anyone holding one may be able to read that calendar. OAuth providers are intentionally disabled in this release; [docs/OAUTH.md](docs/OAUTH.md) records that boundary.
+Orbit v0.4 uses read-only iCal subscription URLs instead of OAuth. Add a calendar from the Connections tab; Orbit masks the URL in API responses and encrypts it at rest when `DATA_ENCRYPTION_KEY` is set. Treat iCal URLs like passwords because anyone holding one may be able to read that calendar. OAuth providers are intentionally disabled in this release; [docs/OAUTH.md](docs/OAUTH.md) records that boundary.
 
 ## Backups and recovery
 

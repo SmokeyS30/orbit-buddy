@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- Added measurable goals with progress history, next actions, target dates, and explicit user control over progress updates.
+- Added timezone-aware daily and weekly briefings, reflections, and custom routines.
+- Added grounded daily briefings based on the user's agenda, active goals, tasks, and due follow-ups.
+- Added priority ordering and a shared three-message daily limit for proactive follow-ups, routines, and quiet nudges.
+- Added model connection diagnostics and an automatic Luna fallback when a configured model such as Astra is unavailable to the OpenAI project.
+- Added safe retry cooldowns for failed proactive work and expanded encrypted backup support for goals and routines.
+
+## 0.3.0
+
 - Added typed, relevance-ranked memory and approval-required memory suggestions.
 - Added structured, visible follow-ups and user-controlled timezone, quiet hours, and proactive check-in preferences.
 - Added conversation summaries for long-running threads and crash-safe task leases with recovery.

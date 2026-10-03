@@ -4,6 +4,7 @@ const STOP_WORDS = new Set([
   'i', 'in', 'is', 'it', 'me', 'my', 'of', 'on', 'or', 'that', 'the', 'this', 'to', 'was', 'we',
   'were', 'what', 'when', 'where', 'which', 'who', 'will', 'with', 'you', 'your'
 ]);
+const WEEKDAY_INDEX = new Map([['Sun', 0], ['Mon', 1], ['Tue', 2], ['Wed', 3], ['Thu', 4], ['Fri', 5], ['Sat', 6]]);
 
 export function normalizeMemoryKind(value) {
   const kind = String(value || '').trim().toLowerCase();
@@ -22,6 +23,66 @@ export function validTimeZone(value, fallback = 'America/New_York') {
 
 export function todayInZone(timeZone, nowMs = Date.now()) {
   return new Date(nowMs).toLocaleDateString('en-CA', { timeZone: validTimeZone(timeZone) });
+}
+
+export function validDateString(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
+  if (!match) return null;
+  const [, year, month, day] = match;
+  const check = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return check.getUTCFullYear() === Number(year) && check.getUTCMonth() === Number(month) - 1 && check.getUTCDate() === Number(day)
+    ? `${year}-${month}-${day}` : null;
+}
+
+export function validTimeString(value, fallback = null) {
+  const time = String(value || '').trim();
+  return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time) ? time : fallback;
+}
+
+export function normalizePriority(value, fallback = 2) {
+  const priority = Math.round(Number(value));
+  return Number.isFinite(priority) ? Math.max(1, Math.min(priority, 3)) : fallback;
+}
+
+export function localDateTimeParts(timeZone, nowMs = Date.now()) {
+  const zone = validTimeZone(timeZone);
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23', weekday: 'short'
+  }).formatToParts(new Date(nowMs));
+  const value = (type) => parts.find((part) => part.type === type)?.value || '';
+  return {
+    date: `${value('year')}-${value('month')}-${value('day')}`,
+    time: `${value('hour')}:${value('minute')}`,
+    weekday: WEEKDAY_INDEX.get(value('weekday')) ?? 0,
+    timeZone: zone
+  };
+}
+
+export function routineDue(routine, timeZone, nowMs = Date.now()) {
+  if (!routine || routine.enabled === 0 || routine.enabled === false) return false;
+  const local = localDateTimeParts(timeZone, nowMs);
+  if (routine.last_error && routine.updated_at && nowMs - new Date(routine.updated_at).valueOf() < 15 * 60_000) return false;
+  if (routine.last_run_date === local.date || local.time < validTimeString(routine.time_local, '09:00')) return false;
+  if (routine.cadence === 'weekdays' && (local.weekday === 0 || local.weekday === 6)) return false;
+  if (routine.cadence === 'weekly' && local.weekday !== Number(routine.day_of_week)) return false;
+  return ['daily', 'weekdays', 'weekly'].includes(routine.cadence);
+}
+
+export function rankGoals(goals, limit = 5, nowDate = todayInZone('America/New_York')) {
+  const todayMs = Date.parse(`${nowDate}T00:00:00Z`);
+  return (goals || []).filter((goal) => goal.status === 'active').map((goal, index) => {
+    const priority = normalizePriority(goal.priority);
+    const progress = Math.max(0, Math.min(Number(goal.progress) || 0, 100));
+    let urgency = 0;
+    if (goal.target_date) {
+      const days = Math.floor((Date.parse(`${goal.target_date}T00:00:00Z`) - todayMs) / 86400_000);
+      urgency = days < 0 ? 5 : days === 0 ? 4 : days <= 7 ? 3 : days <= 30 ? 1 : 0;
+    }
+    return { goal, score: priority * 3 + urgency + (100 - progress) / 100 - index * 0.001 };
+  }).sort((a, b) => b.score - a.score)
+    .slice(0, Math.max(1, Math.min(Number(limit) || 5, 20)))
+    .map(({ goal }) => goal);
 }
 
 function tokenize(value) {

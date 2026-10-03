@@ -1,6 +1,6 @@
 import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
-import { normalizeMemoryKind, todayInZone, validTimeZone } from './intelligence.js';
+import { normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -194,8 +194,50 @@ export function toolScheduleFollowUp(args = {}, ctx = null) {
   const description = cleanArg(args.description, 120, 'description');
   const dueDate = validDateStr(args.date);
   if (!dueDate) throw new Error('date must be YYYY-MM-DD.');
-  const followUp = db.addFollowUp(userId, { description, dueDate, sourceMessageId: ctx.messageId || null });
-  return { id: followUp.id, description, date: dueDate, note: 'Scheduled. The user can remove it from Memory.' };
+  const priority = normalizePriority(args.priority);
+  const followUp = db.addFollowUp(userId, { description, dueDate, priority, sourceMessageId: ctx.messageId || null });
+  return { id: followUp.id, description, date: dueDate, priority, note: 'Scheduled. The user can remove it from Memory.' };
+}
+
+export function toolCreateGoal(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'create_goal');
+  const title = cleanArg(args.title, 120, 'title');
+  const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
+  const targetDate = args.targetDate ? validDateString(args.targetDate) : null;
+  if (args.targetDate && !targetDate) throw new Error('targetDate must be YYYY-MM-DD.');
+  const nextStep = typeof args.nextStep === 'string' && args.nextStep.trim() ? args.nextStep.trim().slice(0, 500) : null;
+  const goal = db.addGoal(userId, { title, description, priority: normalizePriority(args.priority), targetDate, nextStep });
+  return { id: goal.id, title: goal.title, priority: goal.priority, targetDate: goal.target_date, note: 'Goal created. Progress stays user-controlled.' };
+}
+
+export function toolUpdateGoal(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_goal');
+  const goalId = cleanArg(args.goalId, 80, 'goalId');
+  const progressValue = Number(args.progress);
+  if (args.progress !== undefined && (!Number.isFinite(progressValue) || progressValue < 0 || progressValue > 100)) throw new Error('progress must be a number from 0 to 100.');
+  const progress = args.progress === undefined ? undefined : Math.round(progressValue);
+  const status = args.status === undefined ? undefined : (['active', 'paused', 'completed'].includes(args.status) ? args.status : null);
+  if (args.status !== undefined && !status) throw new Error('status must be active, paused, or completed.');
+  const nextStep = args.nextStep === undefined ? undefined : String(args.nextStep || '').trim().slice(0, 500);
+  const note = typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 1000) : null;
+  const goal = db.updateGoal(userId, goalId, { progress, status, nextStep, note });
+  if (!goal) throw new Error('Goal not found.');
+  return { id: goal.id, title: goal.title, progress: goal.progress, status: goal.status, nextStep: goal.next_step, note: 'Goal updated.' };
+}
+
+export function toolCreateRoutine(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'create_routine');
+  const title = cleanArg(args.title, 120, 'title');
+  const prompt = cleanArg(args.prompt, 2000, 'prompt');
+  const kind = ['briefing', 'reflection', 'custom'].includes(args.kind) ? args.kind : 'custom';
+  const cadence = ['daily', 'weekdays', 'weekly'].includes(args.cadence) ? args.cadence : 'daily';
+  const timeLocal = validTimeString(args.timeLocal);
+  if (!timeLocal) throw new Error('timeLocal must be HH:MM in 24-hour time.');
+  const requestedDay = Number(args.dayOfWeek);
+  if (cadence === 'weekly' && (!Number.isInteger(requestedDay) || requestedDay < 0 || requestedDay > 6)) throw new Error('dayOfWeek must be an integer from 0 (Sunday) through 6 (Saturday).');
+  const dayOfWeek = cadence === 'weekly' ? requestedDay : null;
+  const routine = db.addRoutine(userId, { title, prompt, kind, cadence, timeLocal, dayOfWeek });
+  return { id: routine.id, title: routine.title, kind, cadence, timeLocal, dayOfWeek, note: 'Routine created. It follows your timezone and quiet-hour settings.' };
 }
 
 function validDateStr(value) {
@@ -321,10 +363,56 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         description: { type: 'string', description: 'Short event description.' },
-        date: { type: 'string', description: 'Follow-up date as YYYY-MM-DD.' }
+        date: { type: 'string', description: 'Follow-up date as YYYY-MM-DD.' },
+        priority: { type: 'number', description: '1 low, 2 normal, or 3 high.' }
       },
       required: ['description', 'date'],
       additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'create_goal',
+    description: 'Create a user-owned goal only when the user explicitly asks to track or create one. Progress must never be inferred as completed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' }, description: { type: 'string' },
+        priority: { type: 'number', description: '1 low, 2 normal, or 3 high.' },
+        targetDate: { type: 'string', description: 'Optional YYYY-MM-DD target.' },
+        nextStep: { type: 'string', description: 'Optional concrete next action.' }
+      },
+      required: ['title'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'update_goal',
+    description: 'Update a goal only when the user clearly reports progress, changes its status, or asks to change its next step. Never infer completion.',
+    parameters: {
+      type: 'object',
+      properties: {
+        goalId: { type: 'string' }, progress: { type: 'number', description: '0 to 100.' },
+        status: { type: 'string', enum: ['active', 'paused', 'completed'] },
+        nextStep: { type: 'string' }, note: { type: 'string' }
+      },
+      required: ['goalId'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'create_routine',
+    description: 'Create a proactive recurring briefing, reflection, or custom routine only when the user explicitly asks for one.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' }, prompt: { type: 'string' },
+        kind: { type: 'string', enum: ['briefing', 'reflection', 'custom'] },
+        cadence: { type: 'string', enum: ['daily', 'weekdays', 'weekly'] },
+        timeLocal: { type: 'string', description: 'Local 24-hour HH:MM time.' },
+        dayOfWeek: { type: 'number', description: 'For weekly routines: 0 Sunday through 6 Saturday.' }
+      },
+      required: ['title', 'prompt', 'kind', 'cadence', 'timeLocal'], additionalProperties: false
     }
   },
   {
@@ -350,6 +438,9 @@ const TOOL_SUMMARIES = {
   save_memory: (args) => String(args.content || '').slice(0, 80),
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
+  create_goal: (args) => String(args.title || '').slice(0, 80),
+  update_goal: (args) => String(args.goalId || '').slice(0, 80),
+  create_routine: (args) => String(args.title || '').slice(0, 80),
   read_calendar: (args) => String(args.date || 'today').slice(0, 40)
 };
 
@@ -380,6 +471,18 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'schedule_followup': {
       const result = toolScheduleFollowUp(clean, ctx);
       return { result, summary: `${String(clean.description || '').slice(0, 60)} on ${String(clean.date || '').slice(0, 10)}` };
+    }
+    case 'create_goal': {
+      const result = toolCreateGoal(clean, ctx);
+      return { result, summary: String(clean.title || '').slice(0, 80) };
+    }
+    case 'update_goal': {
+      const result = toolUpdateGoal(clean, ctx);
+      return { result, summary: String(clean.goalId || '').slice(0, 80) };
+    }
+    case 'create_routine': {
+      const result = toolCreateRoutine(clean, ctx);
+      return { result, summary: String(clean.title || '').slice(0, 80) };
     }
     case 'read_calendar': {
       const result = await toolReadCalendar(clean, ctx);

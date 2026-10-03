@@ -7,7 +7,7 @@ import { createOrbitServer } from '../server.js';
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-asyncchat-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-5.4-mini', ...extraEnv } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
@@ -81,7 +81,10 @@ test('a failing model call saves a graceful reply instead of a 500', async (t) =
   assert.ok(landed, 'a reply was saved even though the model failed');
   const convo = app.db.ensureDefaultConversation(auth.userId);
   const reply = app.db.listConversationMessages(auth.userId, convo.id, 10).find((m) => m.role === 'assistant');
-  assert.ok(reply.content.includes('trouble'), 'graceful fallback message saved');
+  assert.ok(reply.content.includes('connection needs attention'), 'targeted connection guidance saved');
   const events = app.db.listEvents(auth.userId, 10);
   assert.ok(events.some((e) => e.type === 'chat_failed'), 'chat_failed event logged');
+  const status = await (await fetch(`${base}/api/status`, { headers: { Cookie: auth.cookie } })).json();
+  assert.equal(status.modelStatus.state, 'network');
+  assert.equal(status.modelStatus.activeModel, null);
 });

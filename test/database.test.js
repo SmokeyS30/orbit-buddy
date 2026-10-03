@@ -132,3 +132,35 @@ test('recovers a task whose worker lease expired', () => {
   assert.equal(db.dueTasks()[0].id, task.id);
   db.close();
 });
+
+test('tracks goal progress and recurring routine leases', () => {
+  const { db, user } = fixture();
+  const goal = db.addGoal(user.id, { title: 'Certification', priority: 3, targetDate: '2026-12-01', nextStep: 'Finish module two' });
+  const updated = db.updateGoal(user.id, goal.id, { progress: 35, note: 'Finished module one' });
+  assert.equal(updated.progress, 35);
+  assert.equal(updated.status, 'active');
+  assert.equal(db.listGoalCheckins(user.id, goal.id)[0].note, 'Finished module one');
+  assert.equal(db.listActiveGoals(user.id)[0].id, goal.id);
+
+  const routine = db.addRoutine(user.id, { title: 'Morning brief', prompt: 'Prepare my day', kind: 'briefing', cadence: 'weekdays', timeLocal: '08:00' });
+  assert.equal(db.claimRoutine(user.id, routine.id, '2026-10-05'), true);
+  assert.equal(db.claimRoutine(user.id, routine.id, '2026-10-05'), false);
+  assert.equal(db.completeRoutine(user.id, routine.id, '2026-10-05'), true);
+  assert.equal(db.getRoutine(user.id, routine.id).last_run_date, '2026-10-05');
+  assert.equal(db.claimRoutine(user.id, routine.id, '2026-10-05'), false);
+  db.close();
+});
+
+test('backup version 4 preserves goals and routines', () => {
+  const source = fixture();
+  source.db.addGoal(source.user.id, { title: 'Run a 10K', priority: 2 });
+  source.db.addRoutine(source.user.id, { title: 'Evening reflection', prompt: 'Reflect', kind: 'reflection', cadence: 'daily', timeLocal: '20:00' });
+  const bundle = source.db.exportUser(source.user.id);
+  assert.equal(bundle.version, 4);
+  source.db.close();
+  const target = fixture();
+  target.db.restoreUser(target.user.id, bundle);
+  assert.equal(target.db.listGoals(target.user.id)[0].title, 'Run a 10K');
+  assert.equal(target.db.listRoutines(target.user.id)[0].kind, 'reflection');
+  target.db.close();
+});

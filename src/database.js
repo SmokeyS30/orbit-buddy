@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
-import { normalizeMemoryKind, normalizePreferences, rankMemories } from './intelligence.js';
+import { normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -68,8 +68,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS follow_ups (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       description TEXT NOT NULL, due_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled',
-      source_message_id TEXT, created_at TEXT NOT NULL, completed_at TEXT,
+      priority INTEGER NOT NULL DEFAULT 2, source_message_id TEXT, attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT, last_error TEXT, created_at TEXT NOT NULL, completed_at TEXT,
       UNIQUE(user_id, description, due_date)
+    );
+    CREATE TABLE IF NOT EXISTS goals (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, description TEXT, status TEXT NOT NULL DEFAULT 'active',
+      priority INTEGER NOT NULL DEFAULT 2, progress INTEGER NOT NULL DEFAULT 0,
+      target_date TEXT, next_step TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS goal_checkins (
+      id TEXT PRIMARY KEY, goal_id TEXT NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      progress INTEGER NOT NULL, note TEXT, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS routines (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL, prompt TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'custom',
+      cadence TEXT NOT NULL DEFAULT 'daily', time_local TEXT NOT NULL DEFAULT '09:00',
+      day_of_week INTEGER, enabled INTEGER NOT NULL DEFAULT 1, last_run_date TEXT, last_run_at TEXT,
+      lease_date TEXT, lease_expires_at TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY, user_id TEXT, title TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
@@ -135,6 +154,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id, expires_at);
     CREATE INDEX IF NOT EXISTS idx_followups_due ON follow_ups(user_id, status, due_date);
+    CREATE INDEX IF NOT EXISTS idx_goals_user ON goals(user_id, status, priority DESC, target_date);
+    CREATE INDEX IF NOT EXISTS idx_routines_user ON routines(user_id, enabled, time_local);
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
@@ -151,11 +172,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'memories', 'last_confirmed_at', 'TEXT');
   ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
   ensureColumn(db, 'memory_suggestions', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
+  ensureColumn(db, 'follow_ups', 'priority', 'INTEGER NOT NULL DEFAULT 2');
+  ensureColumn(db, 'follow_ups', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'follow_ups', 'next_attempt_at', 'TEXT');
+  ensureColumn(db, 'follow_ups', 'last_error', 'TEXT');
   ensureColumn(db, 'tasks', 'user_id', 'TEXT');
   ensureColumn(db, 'tasks', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'tasks', 'lease_expires_at', 'TEXT');
   ensureColumn(db, 'tasks', 'last_error', 'TEXT');
   ensureColumn(db, 'events', 'user_id', 'TEXT');
+  ensureColumn(db, 'proactive_state', 'last_outreach_at', 'TEXT');
+  ensureColumn(db, 'proactive_state', 'outreach_date', 'TEXT');
+  ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -221,15 +249,41 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMemorySuggestion: db.prepare('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?'),
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
-    addFollowUp: db.prepare("INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,source_message_id,created_at,completed_at) VALUES(?,?,?,?,'scheduled',?,?,NULL)"),
-    listFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY due_date,created_at"),
-    dueFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' AND due_date<=? ORDER BY due_date,created_at"),
-    completeFollowUp: db.prepare("UPDATE follow_ups SET status='completed',completed_at=? WHERE id=? AND user_id=? AND status='scheduled'"),
+    addFollowUp: db.prepare("INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,attempt_count,next_attempt_at,last_error,created_at,completed_at) VALUES(?,?,?,?,'scheduled',?,?,0,NULL,NULL,?,NULL)"),
+    listFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY priority DESC,due_date,created_at"),
+    dueFollowUps: db.prepare("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' AND due_date<=? AND (next_attempt_at IS NULL OR next_attempt_at<=?) ORDER BY priority DESC,due_date,created_at"),
+    completeFollowUp: db.prepare("UPDATE follow_ups SET status='completed',completed_at=?,next_attempt_at=NULL,last_error=NULL WHERE id=? AND user_id=? AND status='scheduled'"),
+    failFollowUp: db.prepare("UPDATE follow_ups SET attempt_count=attempt_count+1,next_attempt_at=?,last_error=? WHERE id=? AND user_id=? AND status='scheduled'"),
     deleteFollowUp: db.prepare('DELETE FROM follow_ups WHERE id=? AND user_id=?'),
+    addGoal: db.prepare(`INSERT INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at)
+      VALUES(?,?,?,?,'active',?,0,?,?,?, ?,NULL)`),
+    getGoal: db.prepare('SELECT * FROM goals WHERE id=? AND user_id=?'),
+    listGoals: db.prepare("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC"),
+    updateGoal: db.prepare('UPDATE goals SET progress=?,status=?,next_step=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?'),
+    deleteGoal: db.prepare('DELETE FROM goals WHERE id=? AND user_id=?'),
+    addGoalCheckin: db.prepare('INSERT INTO goal_checkins(id,goal_id,user_id,progress,note,created_at) VALUES(?,?,?,?,?,?)'),
+    listGoalCheckins: db.prepare('SELECT * FROM goal_checkins WHERE goal_id=? AND user_id=? ORDER BY created_at DESC LIMIT ?'),
+    addRoutine: db.prepare(`INSERT INTO routines(id,user_id,title,prompt,kind,cadence,time_local,day_of_week,enabled,last_run_date,last_run_at,lease_date,lease_expires_at,last_error,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,1,NULL,NULL,NULL,NULL,NULL,?,?)`),
+    getRoutine: db.prepare('SELECT * FROM routines WHERE id=? AND user_id=?'),
+    listRoutines: db.prepare('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,title COLLATE NOCASE'),
+    updateRoutineEnabled: db.prepare('UPDATE routines SET enabled=?,lease_date=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?'),
+    deleteRoutine: db.prepare('DELETE FROM routines WHERE id=? AND user_id=?'),
+    claimRoutine: db.prepare(`UPDATE routines SET lease_date=?,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND enabled=1
+      AND (last_run_date IS NULL OR last_run_date<>?) AND (lease_expires_at IS NULL OR lease_expires_at<=?)`),
+    completeRoutine: db.prepare('UPDATE routines SET last_run_date=?,last_run_at=?,lease_date=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND lease_date=?'),
+    failRoutine: db.prepare('UPDATE routines SET lease_date=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND lease_date=?'),
     lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
     getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`),
+    getProactiveState: db.prepare('SELECT * FROM proactive_state WHERE user_id=?'),
+    upsertProactiveSlot: db.prepare(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
+      ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
+      outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END`),
+    markOutreach: db.prepare('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?'),
+    releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
+      WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
     getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),
     upsertPreferences: db.prepare(`INSERT INTO user_preferences(user_id,time_zone,quiet_start,quiet_end,proactive_enabled,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
@@ -342,14 +396,34 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
     dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
     approveMemorySuggestion(userId,id){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const saved=this.addMemory(userId,row.content,{kind:row.kind,source:'suggestion',confidence:row.confidence});s.deleteMemorySuggestion.run(id,userId);return {...row,memory_id:saved.id};},
-    addFollowUp(userId,{description,dueDate,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:dueDate,status:'scheduled',source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===dueDate);},
+    addFollowUp(userId,{description,dueDate,priority=2,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:validDateString(dueDate)||dueDate,status:'scheduled',priority:normalizePriority(priority),source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.priority,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===row.due_date);},
     listFollowUps:(userId)=>s.listFollowUps.all(userId),
-    dueFollowUps:(userId,today)=>s.dueFollowUps.all(userId,today),
+    dueFollowUps:(userId,today,at=timestamp())=>s.dueFollowUps.all(userId,today,at),
     completeFollowUp:(userId,id)=>s.completeFollowUp.run(timestamp(),id,userId).changes>0,
+    failFollowUp:(userId,id,error,retryMs=15*60_000)=>s.failFollowUp.run(new Date(Date.now()+retryMs).toISOString(),String(error||'').slice(0,1000),id,userId).changes>0,
     deleteFollowUp:(userId,id)=>s.deleteFollowUp.run(id,userId).changes>0,
+    addGoal(userId,{title,description=null,priority=2,targetDate=null,nextStep=null}){const now=timestamp();const row={id:randomUUID(),user_id:userId,title,description:description||null,status:'active',priority:normalizePriority(priority),progress:0,target_date:targetDate?validDateString(targetDate):null,next_step:nextStep||null,created_at:now,updated_at:now,completed_at:null};s.addGoal.run(row.id,row.user_id,row.title,row.description,row.priority,row.target_date,row.next_step,row.created_at,row.updated_at);return row;},
+    getGoal:(userId,id)=>s.getGoal.get(id,userId)||null,
+    listGoals:(userId)=>s.listGoals.all(userId),
+    listActiveGoals(userId,limit=10){return rankGoals(s.listGoals.all(userId),limit);},
+    updateGoal(userId,id,{progress,status,nextStep,note=null}={}){const current=s.getGoal.get(id,userId);if(!current)return null;const nextProgress=Math.max(0,Math.min(Math.round(Number(progress??current.progress)),100));let nextStatus=['active','paused','completed'].includes(status)?status:current.status;if(nextProgress>=100)nextStatus='completed';const completedAt=nextStatus==='completed'?(current.completed_at||timestamp()):null;const updated=timestamp();s.updateGoal.run(nextProgress,nextStatus,nextStep===undefined?current.next_step:(nextStep||null),updated,completedAt,id,userId);if(note||nextProgress!==current.progress)s.addGoalCheckin.run(randomUUID(),id,userId,nextProgress,note?String(note).slice(0,1000):null,updated);return s.getGoal.get(id,userId);},
+    deleteGoal:(userId,id)=>s.deleteGoal.run(id,userId).changes>0,
+    listGoalCheckins:(userId,goalId,limit=20)=>s.listGoalCheckins.all(goalId,userId,Math.min(Math.max(limit,1),100)),
+    addRoutine(userId,{title,prompt,kind='custom',cadence='daily',timeLocal='09:00',dayOfWeek=null}){const now=timestamp();const cleanKind=['briefing','reflection','custom'].includes(kind)?kind:'custom';const cleanCadence=['daily','weekdays','weekly'].includes(cadence)?cadence:'daily';const requestedDay=Number(dayOfWeek);const cleanDay=cleanCadence==='weekly'&&Number.isInteger(requestedDay)&&requestedDay>=0&&requestedDay<=6?requestedDay:(cleanCadence==='weekly'?1:null);const row={id:randomUUID(),user_id:userId,title,prompt,kind:cleanKind,cadence:cleanCadence,time_local:validTimeString(timeLocal,'09:00'),day_of_week:cleanDay,enabled:1,last_run_date:null,last_run_at:null,lease_date:null,lease_expires_at:null,last_error:null,created_at:now,updated_at:now};s.addRoutine.run(row.id,row.user_id,row.title,row.prompt,row.kind,row.cadence,row.time_local,row.day_of_week,row.created_at,row.updated_at);return row;},
+    getRoutine:(userId,id)=>s.getRoutine.get(id,userId)||null,
+    listRoutines:(userId)=>s.listRoutines.all(userId),
+    setRoutineEnabled(userId,id,enabled){return s.updateRoutineEnabled.run(enabled?1:0,timestamp(),id,userId).changes>0;},
+    deleteRoutine:(userId,id)=>s.deleteRoutine.run(id,userId).changes>0,
+    claimRoutine(userId,id,localDate,leaseMs=2*60_000){const now=timestamp();return s.claimRoutine.run(localDate,new Date(Date.now()+leaseMs).toISOString(),now,id,userId,localDate,now).changes>0;},
+    completeRoutine(userId,id,localDate){const now=timestamp();return s.completeRoutine.run(localDate,now,now,id,userId,localDate).changes>0;},
+    failRoutine(userId,id,localDate,error){return s.failRoutine.run(String(error||'').slice(0,1000),timestamp(),id,userId,localDate).changes>0;},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
+    getLastOutreachAt: (userId) => s.getProactiveState.get(userId)?.last_outreach_at || null,
+    claimProactiveSlot(userId,localDate,limit=3){const current=s.getProactiveState.get(userId);if(current?.outreach_date===localDate&&current.outreach_count>=limit)return false;s.upsertProactiveSlot.run(userId,localDate);return true;},
+    markOutreach:(userId)=>s.markOutreach.run(timestamp(),userId).changes>0,
+    releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,current.created_at||now,now);return s.getPreferences.get(userId);},
     getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
@@ -398,16 +472,19 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
     consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:3,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) { return {version:4,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
-      if (!bundle || ![2,3].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
         memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
           VALUES(?,?,?,?,?,?,?,?,?,?,?)`),
         suggestion: db.prepare('INSERT OR IGNORE INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)'),
-        followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?)'),
+        followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)'),
+        goal: db.prepare('INSERT OR IGNORE INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'),
+        goalCheckin: db.prepare('INSERT OR IGNORE INTO goal_checkins(id,goal_id,user_id,progress,note,created_at) VALUES(?,?,?,?,?,?)'),
+        routine: db.prepare('INSERT OR IGNORE INTO routines(id,user_id,title,prompt,kind,cadence,time_local,day_of_week,enabled,last_run_date,last_run_at,lease_date,lease_expires_at,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'),
         summary: db.prepare('INSERT OR IGNORE INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?)'),
         calendar: db.prepare('INSERT OR IGNORE INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?)'),
         task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
@@ -421,7 +498,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
         for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,row.content,row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at);
         for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,row.content,row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
-        for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',row.source_message_id||null,row.created_at,row.completed_at||null);
+        for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',normalizePriority(row.priority),row.source_message_id||null,row.created_at,row.completed_at||null);
+        for (const row of bundle.goals || []) inserts.goal.run(row.id,userId,row.title,row.description||null,row.status||'active',normalizePriority(row.priority),Math.max(0,Math.min(Number(row.progress)||0,100)),row.target_date||null,row.next_step||null,row.created_at,row.updated_at,row.completed_at||null);
+        for (const row of bundle.goalCheckins || []) inserts.goalCheckin.run(row.id,row.goal_id,userId,row.progress,row.note||null,row.created_at);
+        for (const row of bundle.routines || []) inserts.routine.run(row.id,userId,row.title,row.prompt,row.kind||'custom',row.cadence||'daily',validTimeString(row.time_local,'09:00'),row.day_of_week??null,row.enabled===0?0:1,row.last_run_date||null,row.last_run_at||null,null,null,row.last_error||null,row.created_at,row.updated_at);
         for (const row of bundle.conversationSummaries || []) inserts.summary.run(row.conversation_id,userId,row.summary,row.message_count,row.updated_at);
         for (const row of bundle.calendarFeeds || []) inserts.calendar.run(row.id,userId,row.label,protectSecret(row.url),row.created_at,row.updated_at);
         for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);

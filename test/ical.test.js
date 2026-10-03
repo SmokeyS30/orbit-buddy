@@ -194,7 +194,7 @@ async function serverFixture(extraEnv = {}) {
   const os = await import('node:os');
   const path = await import('node:path');
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-ical-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-5.4-mini', ...extraEnv } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
