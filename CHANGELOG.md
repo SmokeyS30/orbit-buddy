@@ -6,6 +6,7 @@
 
 - Added a no-token OpenAI key and model-availability check that runs at startup and on demand from Safety.
 - Added model-name aliases and a compatibility fallback chain through Luna, GPT-5.4 mini, GPT-4.1 mini, and GPT-4o mini for projects without Astra access.
+- Set Astra as the primary model for the Render deployment while preserving compatibility fallbacks.
 - Replaced the generic model failure response with actionable authentication, quota, access, network, and service diagnostics.
 
 ## 0.4.0

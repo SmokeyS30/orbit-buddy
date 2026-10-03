@@ -229,7 +229,7 @@ export function createOrbitServer(options={}) {
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
-    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
+    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
 
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
