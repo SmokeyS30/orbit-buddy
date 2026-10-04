@@ -13,6 +13,7 @@
     "check": "node --check server.js && node --check src/database.js && node --check src/intelligence.js && node --check src/model.js && node --check src/proactive.js && node --check src/tools.js && node --check public/app.js && node --check public/sw.js && npm test"
   },
   "dependencies": {
+    "pdfkit": "^0.17.2",
     "rrule": "^2.8.1",
     "web-push": "3.6.7"
   },
