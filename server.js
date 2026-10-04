@@ -298,44 +298,65 @@ export function createOrbitServer(options={}) {
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
-      const local=todayInZone(timeZone,nowMs);
-      // Get local hour
-      const localHour=new Date(nowMs).toLocaleString('en-US',{timeZone,hour:'numeric',hour12:false});
-      const hour=parseInt(localHour,10);
-      const today=local; // YYYY-MM-DD
+      const today=todayInZone(timeZone,nowMs);
+      const localTime=new Date(nowMs).toLocaleString('en-US',{timeZone,hour:'numeric',minute:'2-digit',hour12:true,weekday:'long'});
 
-      // Morning briefing: 7-9 AM local, once per day
-      if(hour>=7&&hour<9){
-        const lastMorning=db.getSetting(`smart_morning_${user.id}_${today}`);
-        if(!lastMorning){
-          const lastOutreach=db.getLastOutreachAt(user.id);
-          if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<12*3600_000)continue;
-          if(!db.claimProactiveSlot(user.id,today))continue;
-          const prompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update (progress/pace), and one helpful suggestion for the day. Sound like a caring friend, not a notification. Do not mention that this is automated.`;
-          try{
-            const { text }=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-            db.setSetting(`smart_morning_${user.id}_${today}`,new Date(nowMs).toISOString());
-            await deliverProactive(user,text,'smart_morning_sent','Sent smart morning briefing.');
-          }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'smart_morning_failed','Could not send morning briefing.',error.message);}
+      // Safety rails: max 2 smart check-ins per day, min 6 hours apart
+      const checkinCount=parseInt(db.getSetting(`smart_checkin_count_${user.id}_${today}`)||'0',10);
+      if(checkinCount>=2)continue;
+      const lastCheckinAt=db.getSetting(`smart_checkin_last_${user.id}`);
+      if(lastCheckinAt&&nowMs-new Date(lastCheckinAt).valueOf()<6*3600_000)continue;
+
+      // Don't nudge if user was recently active (they don't need it)
+      const lastOutreach=db.getLastOutreachAt(user.id);
+      const lastUserMsg=db.lastUserMessageAt(user.id);
+      const lastActive=Math.max(lastOutreach?new Date(lastOutreach).valueOf():0,lastUserMsg?new Date(lastUserMsg).valueOf():0);
+      if(lastActive&&nowMs-lastActive<4*3600_000)continue;
+
+      if(!db.claimProactiveSlot(user.id,today))continue;
+
+      // Let the AI decide: is now a good time? What kind of check-in?
+      const decidePrompt=`It is currently ${localTime} (${timeZone}). You are deciding whether to send a proactive check-in to ${user.display_name||'the user'}.
+
+Consider:
+- Time of day (morning = briefing with weather/calendar/goals; evening = warm wind-down; midday = only if something notable)
+- When they were last active (don't interrupt someone who's already engaged)
+- Whether a check-in would genuinely be welcome right now
+
+Respond with ONLY one of:
+- "MORNING" if a morning briefing is appropriate (weather, today's calendar, goal momentum, one suggestion)
+- "EVENING" if an evening wind-down is appropriate (day recap, tomorrow preview, encouragement)
+- "CHECKIN" if a brief friendly check-in is appropriate (1-2 sentences, reference something from their life if natural)
+- "SKIP" if now is not a good time for any proactive message
+
+Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
+
+      try{
+        const { text: decision }=await model.respond({buddyName,userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const decisionClean=decision.trim().toUpperCase();
+
+        if(decisionClean==='SKIP'||!['MORNING','EVENING','CHECKIN'].includes(decisionClean)){
+          db.releaseProactiveSlot(user.id,today);
           continue;
         }
-      }
 
-      // Evening check-in: 8-10 PM local, once per day
-      if(hour>=20&&hour<22){
-        const lastEvening=db.getSetting(`smart_evening_${user.id}_${today}`);
-        if(!lastEvening){
-          const lastOutreach=db.getLastOutreachAt(user.id);
-          if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<12*3600_000)continue;
-          if(!db.claimProactiveSlot(user.id,today))continue;
-          const prompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, preview tomorrow's calendar if anything is scheduled, and offer gentle encouragement about their goals. If they seem behind on a goal, be supportive not guilt-trippy. Sound like a caring friend winding down the day together. Do not mention that this is automated.`;
-          try{
-            const { text }=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-            db.setSetting(`smart_evening_${user.id}_${today}`,new Date(nowMs).toISOString());
-            await deliverProactive(user,text,'smart_evening_sent','Sent smart evening check-in.');
-          }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'smart_evening_failed','Could not send evening check-in.',error.message);}
-          continue;
+        // Generate the appropriate check-in
+        let genPrompt;
+        if(decisionClean==='MORNING'){
+          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update, and one helpful suggestion. Sound like a caring friend, not a notification. Do not mention that this is automated.`;
+        }else if(decisionClean==='EVENING'){
+          genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, preview tomorrow if anything is scheduled, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.`;
+        }else{
+          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.`;
         }
+
+        const { text }=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
+        db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
+        await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
+      }catch(error){
+        db.releaseProactiveSlot(user.id,today);
+        db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
       }
     }
   }
