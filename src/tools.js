@@ -140,6 +140,77 @@ export async function toolFetchUrl(args = {}) {
   return { url: finalUrl, text: text.slice(0, 6000) };
 }
 
+export async function toolGetWeather(args = {}) {
+  const location = String(args.location || '').trim().slice(0, 100) || 'Brewster, MA';
+  // Geocode the location (Open-Meteo, free, no key)
+  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
+  let geo;
+  try {
+    const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const data = await res.json();
+    if (!data.results?.length) throw new Error('Location not found.');
+    geo = data.results[0];
+  } catch (e) {
+    throw new Error(`Could not find "${location}": ${e.message}`);
+  }
+  // Get weather (Fahrenheit, since user is US-based)
+  const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,weathercode&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=3`;
+  try {
+    const res = await fetch(wxUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    const wx = await res.json();
+    const cur = wx.current || {};
+    const daily = wx.daily || {};
+    const codeToDesc = (c) => ({0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Foggy',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Light showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm'}[c] || 'Unknown');
+    let out = `Weather for ${geo.name}${geo.admin1 ? ', '+geo.admin1 : ''}:\n`;
+    out += `Now: ${Math.round(cur.temperature_2m)}°F, ${codeToDesc(cur.weather_code)}, wind ${Math.round(cur.wind_speed_10m || 0)} mph\n`;
+    if (daily.time) {
+      out += `Forecast:\n`;
+      for (let i = 0; i < Math.min(3, daily.time.length); i++) {
+        const date = new Date(daily.time[i]+'T12:00:00').toLocaleDateString('en-US', {weekday:'short'});
+        out += `  ${date}: ${codeToDesc(daily.weathercode?.[i])}, ${Math.round(daily.temperature_2m_max?.[i])}°/${Math.round(daily.temperature_2m_min?.[i])}°F\n`;
+      }
+    }
+    return out.trim();
+  } catch (e) {
+    throw new Error(`Weather lookup failed: ${e.message}`);
+  }
+}
+
+export function toolCalculate(args = {}) {
+  const expr = String(args.expression || '').trim().slice(0, 200);
+  if (!expr) throw new Error('An expression is required.');
+  // Safe math: only allow numbers, operators, parentheses, decimals, and common functions
+  // Convert common phrases: "15% of 240" -> "240*0.15"
+  let cleaned = expr.toLowerCase()
+    .replace(/(\d+(?:\.\d+)?)\s*%\s*of\s*(\d+(?:\.\d+)?)/g, '($2*$1/100)')
+    .replace(/(\d+(?:\.\d+)?)\s*percent\s*of\s*(\d+(?:\.\d+)?)/g, '($2*$1/100)');
+  // Unit conversions (simple)
+  const conversions = [
+    [/(\d+(?:\.\d+)?)\s*miles?\s*to\s*km/i, (m) => `${m[1]} miles = ${(parseFloat(m[1])*1.60934).toFixed(2)} km`],
+    [/(\d+(?:\.\d+)?)\s*km\s*to\s*miles?/i, (m) => `${m[1]} km = ${(parseFloat(m[1])/1.60934).toFixed(2)} miles`],
+    [/(\d+(?:\.\d+)?)\s*°?f\s*to\s*°?c/i, (m) => `${m[1]}°F = ${((parseFloat(m[1])-32)*5/9).toFixed(1)}°C`],
+    [/(\d+(?:\.\d+)?)\s*°?c\s*to\s*°?f/i, (m) => `${m[1]}°C = ${(parseFloat(m[1])*9/5+32).toFixed(1)}°F`],
+    [/(\d+(?:\.\d+)?)\s*lbs?\s*to\s*kg/i, (m) => `${m[1]} lbs = ${(parseFloat(m[1])*0.453592).toFixed(2)} kg`],
+    [/(\d+(?:\.\d+)?)\s*kg\s*to\s*lbs?/i, (m) => `${m[1]} kg = ${(parseFloat(m[1])/0.453592).toFixed(2)} lbs`],
+  ];
+  for (const [regex, fn] of conversions) {
+    const m = cleaned.match(regex);
+    if (m) return fn(m);
+  }
+  // Safe arithmetic only: numbers, + - * / ( ) . and spaces
+  if (!/^[\d\s+\-*/().]+$/.test(cleaned)) {
+    throw new Error('I can only do basic arithmetic and unit conversions.');
+  }
+  try {
+    // eslint-disable-next-line no-new-func
+    const result = Function(`"use strict"; return (${cleaned})`)();
+    if (typeof result !== 'number' || !isFinite(result)) throw new Error('Invalid');
+    return `${expr} = ${Math.round(result*10000)/10000}`;
+  } catch {
+    throw new Error('Could not calculate that.');
+  }
+}
+
 function cleanArg(value, max, field) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
   return value.trim().slice(0, max);
@@ -413,6 +484,32 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'get_weather',
+    description: 'Get current weather and 3-day forecast for a location. Use when the user asks about weather, temperature, rain, etc.',
+    parameters: {
+      type: 'object',
+      properties: {
+        location: { type: 'string', description: 'City or place name (e.g. "Boston", "Brewster MA"). Defaults to Brewster, MA.' }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'calculate',
+    description: 'Do math: arithmetic, percentages, and unit conversions (miles/km, F/C, lbs/kg). Use for "what is 15% of 240" or "convert 5 miles to km".',
+    parameters: {
+      type: 'object',
+      properties: {
+        expression: { type: 'string', description: 'The math expression or conversion (e.g. "15% of 240", "5 miles to km", "(12+8)*3").' }
+      },
+      required: ['expression'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'create_task',
     description: 'Create a task for Orbit to work on. Only call this when the user clearly asked for a task or reminder. Think-only (internal) tasks are created right away; external-action tasks go to "waiting approval" for the user to approve in the Tasks tab. Always tell the user what you created in your visible reply.',
     parameters: {
@@ -574,6 +671,8 @@ const TOOL_SUMMARIES = {
   web_search: (args) => String(args.query || '').slice(0, 80),
   fetch_url: (args) => String(args.url || '').slice(0, 80),
   deep_research: (args) => String(args.topic || '').slice(0, 80),
+  get_weather: (args) => String(args.location || 'Brewster, MA').slice(0, 80),
+  calculate: (args) => String(args.expression || '').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
   propose_memory: (args) => String(args.content || '').slice(0, 80),
@@ -602,6 +701,14 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'deep_research': {
       const result = await toolDeepResearch(clean, env);
       return { result, summary: String(clean.topic || '').slice(0, 80) };
+    }
+    case 'get_weather': {
+      const result = await toolGetWeather(clean);
+      return { result, summary: String(clean.location || 'Brewster, MA').slice(0, 80) };
+    }
+    case 'calculate': {
+      const result = toolCalculate(clean);
+      return { result, summary: String(clean.expression || '').slice(0, 80) };
     }
     case 'create_task': {
       const result = toolCreateTask(clean, ctx);
