@@ -292,6 +292,53 @@ export function createOrbitServer(options={}) {
       }
     }
   }
+  async function runSmartCheckins(nowMs){
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      const preferences=db.getPreferences(user.id);
+      if(isQuietHours(preferences,nowMs))continue;
+      const timeZone=preferences.time_zone||'America/New_York';
+      const local=todayInZone(timeZone,nowMs);
+      // Get local hour
+      const localHour=new Date(nowMs).toLocaleString('en-US',{timeZone,hour:'numeric',hour12:false});
+      const hour=parseInt(localHour,10);
+      const today=local; // YYYY-MM-DD
+
+      // Morning briefing: 7-9 AM local, once per day
+      if(hour>=7&&hour<9){
+        const lastMorning=db.getSetting(`smart_morning_${user.id}_${today}`);
+        if(!lastMorning){
+          const lastOutreach=db.getLastOutreachAt(user.id);
+          if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<12*3600_000)continue;
+          if(!db.claimProactiveSlot(user.id,today))continue;
+          const prompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update (progress/pace), and one helpful suggestion for the day. Sound like a caring friend, not a notification. Do not mention that this is automated.`;
+          try{
+            const { text }=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+            db.setSetting(`smart_morning_${user.id}_${today}`,new Date(nowMs).toISOString());
+            await deliverProactive(user,text,'smart_morning_sent','Sent smart morning briefing.');
+          }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'smart_morning_failed','Could not send morning briefing.',error.message);}
+          continue;
+        }
+      }
+
+      // Evening check-in: 8-10 PM local, once per day
+      if(hour>=20&&hour<22){
+        const lastEvening=db.getSetting(`smart_evening_${user.id}_${today}`);
+        if(!lastEvening){
+          const lastOutreach=db.getLastOutreachAt(user.id);
+          if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<12*3600_000)continue;
+          if(!db.claimProactiveSlot(user.id,today))continue;
+          const prompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, preview tomorrow's calendar if anything is scheduled, and offer gentle encouragement about their goals. If they seem behind on a goal, be supportive not guilt-trippy. Sound like a caring friend winding down the day together. Do not mention that this is automated.`;
+          try{
+            const { text }=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+            db.setSetting(`smart_evening_${user.id}_${today}`,new Date(nowMs).toISOString());
+            await deliverProactive(user,text,'smart_evening_sent','Sent smart evening check-in.');
+          }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'smart_evening_failed','Could not send evening check-in.',error.message);}
+          continue;
+        }
+      }
+    }
+  }
   async function runQuietNudges(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
@@ -310,7 +357,7 @@ export function createOrbitServer(options={}) {
   let proactiveBusy=false;
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);}
     finally{proactiveBusy=false;}
   }
 
