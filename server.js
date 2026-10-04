@@ -466,6 +466,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);const name=cleanText(body.name,80,'name');const email=safeEmail(body.email);
         const note=body.note&&String(body.note).trim()?cleanText(body.note,500,'note'):null;
         const saved=db.addAccessRequest({name,email,note});
+        // Create a disabled placeholder account now so approval is seamless (no duplication)
+        let existing=db.getUserByEmail(email);
+        if(!existing){
+          const tempPass=await hashPassword(randomToken(32));
+          existing=db.createUser({email,displayName:name,passwordHash:tempPass.hash,passwordSalt:tempPass.salt,role:'member'});
+          db.setUserDisabled(existing.id,true);
+        }
         const owner=db.listUsers().find((u)=>u.role==='owner');
         if(owner){
           const doorToken='door_'+randomToken(24);
@@ -474,6 +481,30 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           await push.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety',doorAction:true,doorToken});
         }
         return json(res,201,{ok:true,id:saved.id});
+      }
+      if(req.method==='GET'&&url.pathname==='/api/access-status'){
+        const email=safeEmail(url.searchParams.get('email')||'');
+        if(!email)throw Object.assign(new Error('Email required.'),{status:400});
+        const user=db.getUserByEmail(email);
+        const requests=db.listAccessRequests().filter(r=>r.email===email);
+        const latest=requests[0];
+        let status='none';
+        if(user&&!user.disabled)status='approved';
+        else if(latest&&latest.handled_at)status='denied';
+        else if(latest||user)status='pending';
+        return json(res,200,{status});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/access-claim'){
+        if(hourlyLimited(req,5,'access-claim'))throw Object.assign(new Error('Too many attempts. Try again later.'),{status:429});
+        const body=await readJson(req);const email=safeEmail(body.email);const password=String(body.password||'');
+        if(password.length<8)throw Object.assign(new Error('Password must be at least 8 characters.'),{status:400});
+        const user=db.getUserByEmail(email);
+        if(!user||user.disabled)throw Object.assign(new Error('Access not approved yet.'),{status:403});
+        const hashed=await hashPassword(password);
+        db.updatePassword(user.id,hashed.hash,hashed.salt);
+        const csrf=createSession(user,req,res);
+        db.addEvent(user.id,'account_claimed','Claimed Orbit account after approval.');
+        return json(res,200,{user:publicUser(user),csrf});
       }
       if(req.method==='POST'&&url.pathname==='/api/registration/door-token'){
         if(hourlyLimited(req,10,'door-token'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
