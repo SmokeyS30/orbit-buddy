@@ -211,6 +211,43 @@ export function toolCalculate(args = {}) {
   }
 }
 
+export async function toolGetNews(args = {}) {
+  const topic = String(args.topic || '').trim().slice(0, 50).toLowerCase();
+  // Curated RSS feeds (free, no key)
+  const feeds = {
+    tech: 'https://news.ycombinator.com/rss',
+    world: 'http://feeds.bbci.co.uk/news/rss.xml',
+    us: 'http://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml',
+  };
+  const feedUrl = feeds[topic] || feeds.tech;
+  const feedName = topic && feeds[topic] ? topic : 'tech';
+  try {
+    const res = await fetch(feedUrl, {
+      headers: { 'User-Agent': 'orbit-buddy/1.0 (news reader)' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+    const xml = await res.text();
+    // Simple RSS parsing (no dependencies)
+    const items = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
+    let match;
+    while ((match = itemRegex.exec(xml)) && items.length < 8) {
+      const itemXml = match[1];
+      const title = (itemXml.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').trim();
+      const link = (itemXml.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || '').trim();
+      if (title) items.push({ title: title.slice(0, 120), link: link.slice(0, 200) });
+    }
+    if (!items.length) throw new Error('No headlines found.');
+    let out = `${feedName.charAt(0).toUpperCase() + feedName.slice(1)} headlines:\n`;
+    items.forEach((item, i) => {
+      out += `${i + 1}. ${item.title}\n`;
+    });
+    return out.trim();
+  } catch (e) {
+    throw new Error(`News lookup failed: ${e.message}`);
+  }
+}
+
 function cleanArg(value, max, field) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
   return value.trim().slice(0, max);
@@ -510,6 +547,19 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'get_news',
+    description: 'Get latest news headlines. Topics: "tech" (Hacker News), "world" (BBC), "us" (BBC US/Canada). Defaults to tech. Use when the user asks for news or headlines.',
+    parameters: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: '"tech", "world", or "us". Defaults to "tech".' }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'create_task',
     description: 'Create a task for Orbit to work on. Only call this when the user clearly asked for a task or reminder. Think-only (internal) tasks are created right away; external-action tasks go to "waiting approval" for the user to approve in the Tasks tab. Always tell the user what you created in your visible reply.',
     parameters: {
@@ -673,6 +723,7 @@ const TOOL_SUMMARIES = {
   deep_research: (args) => String(args.topic || '').slice(0, 80),
   get_weather: (args) => String(args.location || 'Brewster, MA').slice(0, 80),
   calculate: (args) => String(args.expression || '').slice(0, 80),
+  get_news: (args) => String(args.topic || 'tech').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
   propose_memory: (args) => String(args.content || '').slice(0, 80),
@@ -709,6 +760,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'calculate': {
       const result = toolCalculate(clean);
       return { result, summary: String(clean.expression || '').slice(0, 80) };
+    }
+    case 'get_news': {
+      const result = await toolGetNews(clean);
+      return { result, summary: String(clean.topic || 'tech').slice(0, 80) };
     }
     case 'create_task': {
       const result = toolCreateTask(clean, ctx);
