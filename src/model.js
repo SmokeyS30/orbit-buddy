@@ -95,6 +95,18 @@ export async function parseResponsesStream(body, onToken) {
       return;
     }
     const type = event.type || '';
+    if (type === 'error' || type === 'response.failed') {
+      // OpenAI can emit a top-level error event after the HTTP 200 handshake
+      // (e.g. upstream_server_error). Surface it as a classified error instead
+      // of silently producing empty output.
+      const embedded = event.error || event.response?.error || {};
+      const error = new Error(embedded.message || 'The model stream reported an error.');
+      error.code = embedded.code || null;
+      const status = Number(embedded.status) || null;
+      if (status) error.status = status;
+      error.classification = classifyModelError(error);
+      throw error;
+    }
     if (type === 'response.output_item.added' && event.item) {
       const item = getItem(event.output_index);
       Object.assign(item, event.item);
