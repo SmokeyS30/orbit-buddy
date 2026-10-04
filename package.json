@@ -13,6 +13,10 @@
     "check": "node --check server.js && node --check src/database.js && node --check src/intelligence.js && node --check src/model.js && node --check src/proactive.js && node --check src/tools.js && node --check public/app.js && node --check public/sw.js && npm test"
   },
   "dependencies": {
+    "@capacitor/cli": "^8.5.2",
+    "@capacitor/core": "^8.1.3",
+    "@capacitor/ios": "^8.1.3",
+    "@capacitor/push-notifications": "^8.1.3",
     "rrule": "^2.8.1",
     "web-push": "3.6.7"
   },
@@ -29,5 +33,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/SmokeyS30/orbit-buddy.git"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.1.3",
+    "typescript": "^5.0.0"
   }
 }
