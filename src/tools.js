@@ -150,6 +150,41 @@ function writeContext(ctx, tool) {
   return ctx;
 }
 
+function extractResearchUrls(text) {
+  const urlRegex = /https?:\/\/[^\s)"']+/g;
+  return [...new Set(String(text).match(urlRegex) || [])];
+}
+
+export async function toolDeepResearch(args = {}, env = process.env) {
+  const topic = String(args.topic || '').trim().slice(0, 200);
+  if (!topic) throw new Error('A research topic is required.');
+  const angles = String(args.angles || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);
+  const queries = [topic, ...angles.map(a => `${topic} ${a}`)].slice(0, 3);
+  const results = [];
+  const seenUrls = new Set();
+  for (const query of queries) {
+    try {
+      const searchResult = await toolWebSearch({ query }, env);
+      results.push({ query, search: String(searchResult).slice(0, 5000) });
+      for (const url of extractResearchUrls(searchResult).slice(0, 2)) {
+        if (seenUrls.has(url) || seenUrls.size >= 4) continue;
+        seenUrls.add(url);
+        try {
+          const content = await toolFetchUrl({ url });
+          results.push({ url, content: String(content).slice(0, 8000) });
+        } catch { /* skip failed fetches */ }
+      }
+    } catch { /* skip failed searches */ }
+    if (seenUrls.size >= 4) break;
+  }
+  let out = `# Research: ${topic}\n\n`;
+  for (const r of results) {
+    if (r.query) out += `## Search: ${r.query}\n${r.search}\n\n`;
+    else if (r.url) out += `## Source: ${r.url}\n${r.content}\n\n`;
+  }
+  return out.slice(0, 30000);
+}
+
 export function toolCreateTask(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_task');
   const title = cleanArg(args.title, 120, 'title');
@@ -364,6 +399,20 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'deep_research',
+    description: 'Do thorough multi-source research on a topic. Searches several angles, reads top results, and returns synthesized findings with sources. Use when the user asks to research something in depth, compare options, or get a comprehensive overview.',
+    parameters: {
+      type: 'object',
+      properties: {
+        topic: { type: 'string', description: 'The research topic or question.' },
+        angles: { type: 'string', description: 'Comma-separated search angles to cover (e.g. "pricing,reviews,alternatives"). Optional.' }
+      },
+      required: ['topic'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'create_task',
     description: 'Create a task for Orbit to work on. Only call this when the user clearly asked for a task or reminder. Think-only (internal) tasks are created right away; external-action tasks go to "waiting approval" for the user to approve in the Tasks tab. Always tell the user what you created in your visible reply.',
     parameters: {
@@ -524,6 +573,7 @@ const TOOL_SUMMARIES = {
   get_datetime: () => '',
   web_search: (args) => String(args.query || '').slice(0, 80),
   fetch_url: (args) => String(args.url || '').slice(0, 80),
+  deep_research: (args) => String(args.topic || '').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
   propose_memory: (args) => String(args.content || '').slice(0, 80),
@@ -548,6 +598,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'fetch_url': {
       const result = await toolFetchUrl(clean);
       return { result, summary: String(clean.url || '').slice(0, 80) };
+    }
+    case 'deep_research': {
+      const result = await toolDeepResearch(clean, env);
+      return { result, summary: String(clean.topic || '').slice(0, 80) };
     }
     case 'create_task': {
       const result = toolCreateTask(clean, ctx);
