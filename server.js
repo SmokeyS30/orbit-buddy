@@ -44,8 +44,10 @@ function markdownToHtml(md,autoPrint,printUrl){
     else{if(inList){html+='</ul>';inList=false;}if(line.trim())html+=`<p>${inline(line.trim())}</p>`;}
   }
   if(inList)html+='</ul>';
-  const onload=autoPrint?' onload="window.print()"':'';
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body${onload}><div class="toolbar"><a href="/#files">Done</a><a href="${printUrl}" target="_blank" rel="noopener">Print</a></div>${html}</body></html>`;
+  const toolbar=autoPrint
+    ? `<div class="toolbar"><button onclick="window.print()" style="font-size:1.2em;padding:.7em 1.5em;">Tap to Print</button></div>`
+    : `<div class="toolbar"><a href="/#files">Done</a><a href="${printUrl}" target="_blank" rel="noopener">Print</a></div>`;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
 }
 function icsEscape(value){return String(value||'').replace(/\\/g,'\\\\').replace(/\r?\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');}
 function icsUtc(value){return new Date(value).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z');}
