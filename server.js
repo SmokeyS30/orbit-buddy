@@ -408,7 +408,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Generate the appropriate check-in
         let genPrompt;
         if(decisionClean==='MORNING'){
-          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update, and one helpful suggestion. Sound like a caring friend, not a notification. Do not mention that this is automated.`;
+          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.`;
         }else if(decisionClean==='EVENING'){
           genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, preview tomorrow if anything is scheduled, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.`;
         }else{
