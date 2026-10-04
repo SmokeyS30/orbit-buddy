@@ -167,3 +167,29 @@ test('stream-state requires auth, rejects unknown conversations, and reports idl
   const bad = await fetch(`${base}/api/chat/stream-state?conversationId=nope`, { headers: authHeaders(auth) });
   assert.equal(bad.status, 404);
 });
+
+test('parseResponsesStream surfaces top-level error events as classified errors', async () => {
+  await assert.rejects(
+    () => parseResponsesStream(sseBody([
+      sse({ type: 'error', error: { message: 'upstream server error', code: 'server_error', status: 500 } })
+    ])),
+    (error) => {
+      assert.equal(error.message, 'upstream server error');
+      assert.equal(error.classification, 'service');
+      return true;
+    }
+  );
+});
+
+test('parseResponsesStream surfaces response.failed events', async () => {
+  await assert.rejects(
+    () => parseResponsesStream(sseBody([
+      sse({ type: 'response.failed', response: { error: { message: 'boom', code: 'server_error' } } })
+    ])),
+    (error) => {
+      assert.equal(error.message, 'boom');
+      assert.ok(error.classification);
+      return true;
+    }
+  );
+});
