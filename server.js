@@ -50,24 +50,55 @@ function markdownToHtml(md,autoPrint,printUrl){
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
 }
 function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
+function pdfEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)').replace(/[^\x20-\x7e]/g,'?');}
 function markdownToPdfBuffer(md){
-  const PDFDocument=require('pdfkit');
-  return new Promise((resolve,reject)=>{
-    const doc=new PDFDocument({margin:50});
-    const chunks=[];
-    doc.on('data',c=>chunks.push(c));
-    doc.on('end',()=>resolve(Buffer.concat(chunks)));
-    doc.on('error',reject);
-    for(const line of String(md||'').split('\n')){
-      const h=line.match(/^(#{1,4})\s+(.*)/);
-      const li=line.match(/^\s*[-*]\s+(.*)/);
-      if(h){doc.moveDown(0.4).font('Helvetica-Bold').fontSize([22,18,15,13][h[1].length-1]||13).text(stripInlineMd(h[2]));doc.moveDown(0.2);}
-      else if(li){doc.font('Helvetica').fontSize(11).text('\u2022  '+stripInlineMd(li[1]),{indent:18});}
-      else if(line.trim()){doc.font('Helvetica').fontSize(11).text(stripInlineMd(line.trim()));doc.moveDown(0.25);}
-      else{doc.moveDown(0.4);}
-    }
-    doc.end();
+  const lines=[];
+  for(const line of String(md||'').split('\n')){
+    const h=line.match(/^(#{1,4})\s+(.*)/);
+    const li=line.match(/^\s*[-*]\s+(.*)/);
+    if(h)lines.push({font:'F2',size:[22,18,15,13][h[1].length-1]||13,text:stripInlineMd(h[2]),gap:8});
+    else if(li)lines.push({font:'F1',size:11,text:'\u2022  '+stripInlineMd(li[1]),indent:18,gap:2});
+    else if(line.trim())lines.push({font:'F1',size:11,text:stripInlineMd(line.trim()),gap:4});
+    else lines.push({gap:8});
+  }
+  const pages=[];let cur=[],y=750;
+  for(const ln of lines){
+    const h=(ln.size||11)*1.4+(ln.gap||0);
+    if(y-h<50&&cur.length){pages.push(cur);cur=[];y=750;}
+    if(ln.text){cur.push({y,font:ln.font,size:ln.size,x:50+(ln.indent||0),text:ln.text});}
+    y-=h;
+  }
+  if(cur.length)pages.push(cur);
+  if(!pages.length)pages.push([]);
+  const objs=[];
+  const contentRefs=pages.map((_,i)=>`${6+i*2} 0 R`).join(' ');
+  objs[1]='<< /Type /Catalog /Pages 2 0 R >>';
+  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${3+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
+  pages.forEach((pg,i)=>{
+    const p=3+i*2,c=6+i*2;
+    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents ${c} 0 R >>`;
+    let stream='BT\n';
+    for(const t of pg){stream+=`/${t.font} ${t.size} Tf\n${t.x.toFixed(1)} ${t.y.toFixed(1)} Td\n(${pdfEscape(t.text)}) Tj\n`;}
+    stream+='ET';
+    objs[c]=`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
   });
+  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objs[5]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+  let pdf='%PDF-1.4\n';const offsets=[];
+  const maxObj=Math.max(...Object.keys(objs).map(Number));
+  for(let i=1;i<=maxObj;i++){
+    if(!objs[i])continue;
+    offsets[i]=Buffer.byteLength(pdf);
+    pdf+=`${i} 0 obj\n${objs[i]}\nendobj\n`;
+  }
+  const xrefPos=Buffer.byteLength(pdf);
+  pdf+=`xref\n0 ${maxObj+1}\n0000000000 65535 f \n`;
+  for(let i=1;i<=maxObj;i++){
+    if(!objs[i])continue;
+    pdf+=`${String(offsets[i]).padStart(10,'0')} 00000 n \n`;
+  }
+  pdf+=`trailer\n<< /Size ${maxObj+1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`;
+  return Promise.resolve(Buffer.from(pdf,'latin1'));
 }
 function icsEscape(value){return String(value||'').replace(/\\/g,'\\\\').replace(/\r?\n/g,'\\n').replace(/,/g,'\\,').replace(/;/g,'\\;');}
 function icsUtc(value){return new Date(value).toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z');}
