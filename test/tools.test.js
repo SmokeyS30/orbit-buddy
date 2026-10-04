@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 14);
+  assert.equal(TOOL_DEFINITIONS.length, 15);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_project', 'create_routine', 'create_task', 'fetch_url', 'get_datetime', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -513,4 +513,22 @@ test('tool loop requests a text summary after exhausting iterations on tool call
   assert.equal(toolCalls.length, 4);
   assert.equal(requests, 5);
   assert.equal(fifthHadTools, false);
+});
+
+test('deep_research requires a topic', async () => {
+  const { toolDeepResearch } = await import('../src/tools.js');
+  await assert.rejects(() => toolDeepResearch({}), /research topic is required/);
+  await assert.rejects(() => toolDeepResearch({ topic: '   ' }), /research topic is required/);
+});
+
+test('deep_research tool is wired in executeTool', async () => {
+  const { executeTool } = await import('../src/tools.js');
+  // Mock env without Brave key so it falls back to DuckDuckGo (may fail offline, that's ok)
+  // We just verify the wiring doesn't throw "Unknown tool"
+  try {
+    await executeTool('deep_research', { topic: 'test' }, {});
+  } catch (e) {
+    // Should not be "Unknown tool" — network failures are acceptable in test
+    assert.ok(!e.message.includes('Unknown tool'), 'deep_research should be a known tool');
+  }
 });
