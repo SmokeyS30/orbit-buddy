@@ -77,9 +77,8 @@ function markdownToPdfBuffer(md){
   pages.forEach((pg,i)=>{
     const p=3+i*2,c=6+i*2;
     objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents ${c} 0 R >>`;
-    let stream='BT\n';
-    for(const t of pg){stream+=`/${t.font} ${t.size} Tf\n${t.x.toFixed(1)} ${t.y.toFixed(1)} Td\n(${pdfEscape(t.text)}) Tj\n`;}
-    stream+='ET';
+    let stream='';
+    for(const t of pg){stream+=`BT /${t.font} ${t.size} Tf ${t.x.toFixed(1)} ${t.y.toFixed(1)} Td (${pdfEscape(t.text)}) Tj ET\n`;}
     objs[c]=`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
   });
   objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
