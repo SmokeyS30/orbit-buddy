@@ -52,14 +52,26 @@ function markdownToHtml(md,autoPrint,printUrl){
 }
 function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
 function pdfEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)').replace(/[^\x20-\x7e]/g,'?');}
+function wrapPdfText(text,size){
+  const maxChars=Math.max(20,Math.floor(500/(size*0.55)));
+  const words=String(text).split(/\s+/).filter(Boolean);
+  const out=[];let cur='';
+  for(const w of words){
+    const t=cur?cur+' '+w:w;
+    if(t.length>maxChars&&cur){out.push(cur);cur=w;}
+    else cur=t;
+  }
+  if(cur)out.push(cur);
+  return out.length?out:[''];
+}
 function markdownToPdfBuffer(md){
   const lines=[];
   for(const line of String(md||'').split('\n')){
     const h=line.match(/^(#{1,4})\s+(.*)/);
     const li=line.match(/^\s*[-*]\s+(.*)/);
-    if(h)lines.push({font:'F2',size:[22,18,15,13][h[1].length-1]||13,text:stripInlineMd(h[2]),gap:8});
-    else if(li)lines.push({font:'F1',size:11,text:'\u2022  '+stripInlineMd(li[1]),indent:18,gap:2});
-    else if(line.trim())lines.push({font:'F1',size:11,text:stripInlineMd(line.trim()),gap:4});
+    if(h){const size=[22,18,15,13][h[1].length-1]||13;const wt=wrapPdfText(stripInlineMd(h[2]),size);wt.forEach((t,i)=>lines.push({font:'F2',size,text:t,gap:i===wt.length-1?8:1}));}
+    else if(li){const wt=wrapPdfText(stripInlineMd(li[1]),11);wt.forEach((t,i)=>lines.push({font:'F1',size:11,text:(i===0?'\u2022  ':'    ')+t,indent:18,gap:i===wt.length-1?2:1}));}
+    else if(line.trim()){const wt=wrapPdfText(stripInlineMd(line.trim()),11);wt.forEach((t,i)=>lines.push({font:'F1',size:11,text:t,gap:i===wt.length-1?4:1}));}
     else lines.push({gap:8});
   }
   const pages=[];let cur=[],y=750;
