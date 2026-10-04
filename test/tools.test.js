@@ -481,3 +481,36 @@ test('Brave does not retry auth failures', async (t) => {
   assert.equal(result.via, 'instant-answer');
   assert.equal(braveCalls, 1);
 });
+
+test('tool loop requests a text summary after exhausting iterations on tool calls', async (t) => {
+  let requests = 0;
+  let fifthHadTools = null;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      requests += 1;
+      const sent = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (requests <= 4) {
+        res.end(JSON.stringify({ output: [{ type: 'function_call', call_id: `call_${requests}`, name: 'get_datetime', arguments: '{}' }] }));
+      } else {
+        fifthHadTools = !!sent.tools;
+        res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Done — created 4 tasks.' }] }] }));
+      }
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key',
+    OPENAI_MODEL: 'test-model',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+  const { text, toolCalls } = await model.respond({ buddyName: 'Orbit', message: 'Do many things', tools: true });
+  assert.equal(text, 'Done — created 4 tasks.');
+  assert.equal(toolCalls.length, 4);
+  assert.equal(requests, 5);
+  assert.equal(fifthHadTools, false);
+});
