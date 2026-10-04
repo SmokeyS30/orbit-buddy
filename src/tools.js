@@ -154,7 +154,7 @@ export async function toolGetWeather(args = {}) {
     throw new Error(`Could not find "${location}": ${e.message}`);
   }
   // Get weather (Fahrenheit, since user is US-based)
-  const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,weathercode&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=3`;
+  const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=3`;
   try {
     const res = await fetch(wxUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     const wx = await res.json();
@@ -167,7 +167,7 @@ export async function toolGetWeather(args = {}) {
       out += `Forecast:\n`;
       for (let i = 0; i < Math.min(3, daily.time.length); i++) {
         const date = new Date(daily.time[i]+'T12:00:00').toLocaleDateString('en-US', {weekday:'short'});
-        out += `  ${date}: ${codeToDesc(daily.weathercode?.[i])}, ${Math.round(daily.temperature_2m_max?.[i])}°/${Math.round(daily.temperature_2m_min?.[i])}°F\n`;
+        out += `  ${date}: ${codeToDesc(daily.weather_code?.[i])}, ${Math.round(daily.temperature_2m_max?.[i])}°/${Math.round(daily.temperature_2m_min?.[i])}°F\n`;
       }
     }
     return out.trim();
