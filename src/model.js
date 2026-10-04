@@ -410,6 +410,19 @@ export function createModelClient(env = process.env) {
         lastOutput = await requestOutput(modelInput,false);
         modelInput = [...modelInput, ...lastOutput];
       }
+      if (tools && !extractText({ output: lastOutput })) {
+        // The model spent all its tool turns on function calls without writing
+        // a reply (e.g. creating many tasks from a long list). Ask once more
+        // with tools disabled so the user gets a summary of what was done.
+        const withTools = tools;
+        tools = false;
+        try {
+          lastOutput = await requestOutput(modelInput, true);
+          modelInput = [...modelInput, ...lastOutput];
+        } finally {
+          tools = withTools;
+        }
+      }
       const text = extractText({ output: lastOutput });
       if (!text) throw new Error('The model returned no text output.');
       return { text, toolCalls };
