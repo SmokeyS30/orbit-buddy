@@ -162,12 +162,12 @@ export async function toolGetWeather(args = {}) {
     const daily = wx.daily || {};
     const codeToDesc = (c) => ({0:'Clear',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Foggy',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Light showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm'}[c] || 'Unknown');
     let out = `Weather for ${geo.name}${geo.admin1 ? ', '+geo.admin1 : ''}:\n`;
-    out += `Now: ${Math.round(cur.temperature_2m)}°F, ${codeToDesc(cur.weather_code)}, wind ${Math.round(cur.wind_speed_10m || 0)} mph\n`;
+    out += `CURRENT: ${Math.round(cur.temperature_2m)}°F, ${codeToDesc(cur.weather_code)}, wind ${Math.round(cur.wind_speed_10m || 0)} mph\n`;
     if (daily.time) {
-      out += `Forecast:\n`;
+      out += `3-DAY FORECAST (share all 3 days with the user):\n`;
       for (let i = 0; i < Math.min(3, daily.time.length); i++) {
         const date = new Date(daily.time[i]+'T12:00:00').toLocaleDateString('en-US', {weekday:'short'});
-        out += `  ${date}: ${codeToDesc(daily.weather_code?.[i])}, ${Math.round(daily.temperature_2m_max?.[i])}°/${Math.round(daily.temperature_2m_min?.[i])}°F\n`;
+        out += `  ${date}: ${codeToDesc(daily.weather_code?.[i])}, high ${Math.round(daily.temperature_2m_max?.[i])}°F / low ${Math.round(daily.temperature_2m_min?.[i])}°F\n`;
       }
     }
     return out.trim();
@@ -485,7 +485,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'get_weather',
-    description: 'Get current weather and 3-day forecast for a location. Use when the user asks about weather, temperature, rain, etc.',
+    description: 'Get current weather and 3-day forecast for a location. Returns current conditions PLUS a 3-day forecast — always share the full forecast with the user, not just today. Use when the user asks about weather, temperature, rain, etc.',
     parameters: {
       type: 'object',
       properties: {
