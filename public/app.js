@@ -132,7 +132,38 @@ $('#export-backup').addEventListener('click',async()=>{try{const passphrase=$('#
 $('#restore-backup').addEventListener('click',async()=>{try{const file=$('#restore-file').files[0];if(!file)throw new Error('Choose an Orbit backup first.');if(file.size>10*1024*1024)throw new Error('Backup is too large.');if(prompt('Restoring merges data and pauses Orbit. Type RESTORE to continue:')!=='RESTORE')return;const payload=await file.text();await api('/api/backups/restore',{method:'POST',body:JSON.stringify({payload,passphrase:$('#backup-passphrase').value,confirm:'RESTORE'})});await refresh();toast('Backup restored. Orbit remains paused for review.');}catch(error){toast(error.message);}});
 $('#rotate-recovery').addEventListener('click',async()=>{try{const result=await api('/api/recovery-codes/rotate',{method:'POST',body:JSON.stringify({password:$('#recovery-password').value})});showCodes(result.recoveryCodes);$('#recovery-password').value='';}catch(error){toast(error.message);}});
 $('#pause-button').addEventListener('click',async()=>{try{await api('/api/admin/pause',{method:'POST'});await refresh();toast('Emergency pause enabled.');}catch(error){toast(error.message);}});$('#show-request').addEventListener('click',()=>{$('#request-form').classList.toggle('hidden');$('#request-status').textContent='';});
-$('#send-request').addEventListener('click',async()=>{const status=$('#request-status');status.textContent='';try{const response=await fetch('/api/registration-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#request-name').value,email:$('#request-email').value})});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.error||`Request failed (${response.status}).`);status.textContent='Request sent — the owner has been notified.';$('#request-name').value='';$('#request-email').value='';}catch(error){status.textContent=error.message;}});
+$('#send-request').addEventListener('click',async()=>{const status=$('#request-status');status.textContent='';try{const email=$('#request-email').value;const response=await fetch('/api/registration-request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('#request-name').value,email})});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.error||`Request failed (${response.status}).`);status.textContent='Request sent! Waiting for approval…';$('#request-name').value='';$('#request-email').value='';pollAccessStatus(email);}catch(error){status.textContent=error.message;}});
+let accessPollTimer=null;
+async function pollAccessStatus(email){
+  if(accessPollTimer)clearInterval(accessPollTimer);
+  const status=$('#request-status');
+  const check=async()=>{
+    try{
+      const res=await fetch(`/api/access-status?email=${encodeURIComponent(email)}`);
+      const data=await res.json();
+      if(data.status==='approved'){
+        clearInterval(accessPollTimer);accessPollTimer=null;
+        status.innerHTML='Approved! Create your password:<br><input type="password" id="claim-password" placeholder="Choose a password (8+ chars)" style="margin:8px 0"><br><button id="claim-btn" class="primary">Create Account</button>';
+        $('#claim-btn').addEventListener('click',async()=>{
+          const pw=$('#claim-password').value;
+          if(pw.length<8){toast('Password must be at least 8 characters.');return;}
+          try{
+            const r=await fetch('/api/access-claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});
+            const d=await r.json();
+            if(!r.ok)throw new Error(d.error||'Claim failed.');
+            toast('Welcome to Orbit!');location.reload();
+          }catch(e){toast(e.message);}
+        });
+      }else if(data.status==='denied'){
+        clearInterval(accessPollTimer);accessPollTimer=null;
+        status.textContent='Sorry, your request was not approved.';
+      }
+      // else still pending, keep polling
+    }catch(_){}
+  };
+  await check();
+  accessPollTimer=setInterval(check,30000); // Poll every 30s
+}
 $('#registration-toggle').addEventListener('click',async()=>{try{const open=!state.setup?.registrationOpen;await api('/api/admin/registration',{method:'POST',body:JSON.stringify({open})});await refresh();toast(open?'Registration is open.':'Registration is closed.');}catch(error){toast(error.message);}});$('#resume-button').addEventListener('click',async()=>{if(prompt('Type RESUME to restart Orbit work:')!=='RESUME')return;try{await api('/api/admin/resume',{method:'POST',body:JSON.stringify({confirm:'RESUME'})});await refresh();toast('Orbit resumed.');}catch(error){toast(error.message);}});
 activateView(location.hash.slice(1)||'today',{updateHash:false});
 if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});}connect();setInterval(()=>{if(state.user)refresh().catch(()=>{});},7000);
