@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 15);
+  assert.equal(TOOL_DEFINITIONS.length, 17);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_weather', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -530,5 +530,26 @@ test('deep_research tool is wired in executeTool', async () => {
   } catch (e) {
     // Should not be "Unknown tool" — network failures are acceptable in test
     assert.ok(!e.message.includes('Unknown tool'), 'deep_research should be a known tool');
+  }
+});
+
+test('calculate handles arithmetic and conversions', async () => {
+  const { toolCalculate } = await import('../src/tools.js');
+  assert.ok(toolCalculate({ expression: '15% of 240' }).includes('36'));
+  assert.ok(toolCalculate({ expression: '5 miles to km' }).includes('8.05 km'));
+  assert.ok(toolCalculate({ expression: '(12+8)*3' }).includes('60'));
+  assert.throws(() => toolCalculate({}), /required/);
+  assert.throws(() => toolCalculate({ expression: 'hello world' }), /only do basic/);
+});
+
+test('get_weather requires location handling', async () => {
+  const { toolGetWeather } = await import('../src/tools.js');
+  // Will fail without network, but should not throw "Unknown tool"
+  try {
+    const result = await toolGetWeather({ location: 'Boston' });
+    assert.ok(result.includes('Weather for') || result.includes('°F'));
+  } catch (e) {
+    // Network failures OK in test, but not validation errors
+    assert.ok(!e.message.includes('required'), 'Should not fail validation');
   }
 });
