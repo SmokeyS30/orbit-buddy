@@ -292,6 +292,71 @@ export function createOrbitServer(options={}) {
       }
     }
   }
+  async function runLearningCycle(nowMs){
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      const preferences=db.getPreferences(user.id);
+      const timeZone=preferences.time_zone||'America/New_York';
+      // Run once per day per user
+      const today=todayInZone(timeZone,nowMs);
+      const lastLearned=db.getSetting(`last_learning_${user.id}`);
+      if(lastLearned&&lastLearned.slice(0,10)===today)continue;
+
+      // Get recent messages (last 24h, up to 40)
+      const messages=db.listMessages(user.id,40);
+      const cutoff=nowMs-24*3600_000;
+      const recent=messages.filter(m=>new Date(m.created_at).valueOf()>cutoff&&m.role==='user');
+      if(recent.length<3)continue; // Need minimum conversation to learn from
+
+      const convoText=recent.slice(-20).map(m=>`User: ${m.content.slice(0,500)}`).join('\n');
+      const learnPrompt=`Analyze this recent conversation. What did you learn about this person?
+
+Look for:
+- Preferences (communication style, topics they like/dislike, how they like answers formatted)
+- Habits (when they're active, routines they mention, repeated behaviors)
+- Facts (life details, plans, relationships, work/school)
+- Opinions (what they think about things)
+- Emotional patterns (stressed about X, excited about Y)
+
+Conversation:
+${convoText}
+
+Respond with a JSON array of insights. Each insight: {"type":"preference"|"habit"|"fact"|"opinion"|"pattern","content":"brief description","confidence":0.0-1.0}
+Only include genuine insights, not obvious restatements. Max 5 insights. If nothing meaningful, respond with [].`;
+
+      try{
+        const { text }=await model.respond({buddyName,userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        // Parse JSON array from response
+        const jsonMatch=text.match(/\[[\s\S]*\]/);
+        if(!jsonMatch)continue;
+        const insights=JSON.parse(jsonMatch[0]);
+        if(!Array.isArray(insights))continue;
+
+        let saved=0;
+        for(const insight of insights.slice(0,5)){
+          if(!insight.content||typeof insight.content!=='string')continue;
+          const content=insight.content.trim().slice(0,500);
+          if(content.length<10)continue;
+          // Avoid duplicates: check if similar memory already exists
+          const existing=db.listRelevantMemories(user.id,content,3);
+          const isDupe=existing.some(m=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)));
+          if(isDupe)continue;
+
+          const kindMap={preference:'preference',habit:'fact',fact:'fact',opinion:'preference',pattern:'fact'};
+          db.addMemory(user.id,content,{
+            kind:kindMap[insight.type]||'fact',
+            source:'auto',
+            confidence:Math.max(0.3,Math.min(Number(insight.confidence)||0.5,0.8))
+          });
+          saved++;
+        }
+        db.setSetting(`last_learning_${user.id}`,new Date(nowMs).toISOString());
+        if(saved>0)db.addEvent(user.id,'auto_learned',`Learned ${saved} new insight${saved>1?'s':''} about the user.`);
+      }catch(error){
+        db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
+      }
+    }
+  }
   async function runSmartCheckins(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
@@ -378,7 +443,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   let proactiveBusy=false;
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runLearningCycle(nowMs);}
     finally{proactiveBusy=false;}
   }
 
