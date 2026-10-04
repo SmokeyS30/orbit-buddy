@@ -248,6 +248,78 @@ export async function toolGetNews(args = {}) {
   }
 }
 
+export async function toolGetStock(args = {}) {
+  const symbol = String(args.symbol || '').trim().toUpperCase().slice(0, 20);
+  if (!symbol) throw new Error('A stock symbol or crypto name is required.');
+  // Crypto via CoinGecko (free, no key)
+  const cryptoMap = { BTC: 'bitcoin', ETH: 'ethereum', BITCOIN: 'bitcoin', ETHEREUM: 'ethereum', DOGE: 'dogecoin', SOL: 'solana' };
+  if (cryptoMap[symbol]) {
+    const id = cryptoMap[symbol];
+    try {
+      const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd&include_24hr_change=true`, {
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      });
+      const data = await res.json();
+      const info = data[id];
+      if (!info) throw new Error('Not found.');
+      const change = info.usd_24h_change || 0;
+      const arrow = change >= 0 ? '▲' : '▼';
+      return `${symbol}: $${info.usd.toLocaleString()} ${arrow} ${Math.abs(change).toFixed(2)}% (24h)`;
+    } catch (e) {
+      throw new Error(`Crypto lookup failed: ${e.message}`);
+    }
+  }
+  // Stocks via Yahoo Finance (no key)
+  try {
+    const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=2d`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+    const data = await res.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) throw new Error('Symbol not found.');
+    const meta = result.meta;
+    const price = meta.regularMarketPrice;
+    const prev = meta.chartPreviousClose || meta.previousClose;
+    if (price == null) throw new Error('No price data.');
+    const change = prev ? ((price - prev) / prev * 100) : 0;
+    const arrow = change >= 0 ? '▲' : '▼';
+    const name = meta.longName || meta.shortName || symbol;
+    return `${name} (${symbol}): $${price.toFixed(2)} ${arrow} ${Math.abs(change).toFixed(2)}%`;
+  } catch (e) {
+    throw new Error(`Stock lookup failed: ${e.message}`);
+  }
+}
+
+export async function toolGetSports(args = {}) {
+  const league = String(args.league || 'nfl').trim().toLowerCase().slice(0, 10);
+  // ESPN unofficial API (free, no key)
+  const leagues = { nfl: 'nfl', nba: 'nba', mlb: 'mlb', nhl: 'nhl' };
+  const espnLeague = leagues[league] || 'nfl';
+  try {
+    const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${espnLeague}/scoreboard?limit=10`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    });
+    const data = await res.json();
+    const events = data.events || [];
+    if (!events.length) return `No ${espnLeague.toUpperCase()} games found right now.`;
+    let out = `${espnLeague.toUpperCase()} scores:\n`;
+    for (const event of events.slice(0, 8)) {
+      const comp = event.competitions?.[0];
+      if (!comp) continue;
+      const teams = comp.competitors || [];
+      const away = teams.find(t => t.homeAway === 'away');
+      const home = teams.find(t => t.homeAway === 'home');
+      if (!away || !home) continue;
+      const status = event.status?.type?.shortDetail || '';
+      out += `${away.team.abbreviation} ${away.score} @ ${home.team.abbreviation} ${home.score} (${status})\n`;
+    }
+    return out.trim();
+  } catch (e) {
+    throw new Error(`Sports lookup failed: ${e.message}`);
+  }
+}
+
 function cleanArg(value, max, field) {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
   return value.trim().slice(0, max);
@@ -560,6 +632,32 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'get_stock',
+    description: 'Get stock or crypto price. For stocks use ticker like "AAPL"; for crypto use "BTC", "ETH", etc. Returns current price and daily change. Use when the user asks about stock prices or crypto.',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: 'Stock ticker (e.g. "AAPL") or crypto symbol (e.g. "BTC").' }
+      },
+      required: ['symbol'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'get_sports',
+    description: 'Get recent sports scores. Leagues: "nfl", "nba", "mlb", "nhl". Defaults to nfl. Use when the user asks about game scores or sports results.',
+    parameters: {
+      type: 'object',
+      properties: {
+        league: { type: 'string', description: '"nfl", "nba", "mlb", or "nhl". Defaults to "nfl".' }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'create_task',
     description: 'Create a task for Orbit to work on. Only call this when the user clearly asked for a task or reminder. Think-only (internal) tasks are created right away; external-action tasks go to "waiting approval" for the user to approve in the Tasks tab. Always tell the user what you created in your visible reply.',
     parameters: {
@@ -724,6 +822,8 @@ const TOOL_SUMMARIES = {
   get_weather: (args) => String(args.location || 'Brewster, MA').slice(0, 80),
   calculate: (args) => String(args.expression || '').slice(0, 80),
   get_news: (args) => String(args.topic || 'tech').slice(0, 80),
+  get_stock: (args) => String(args.symbol || '').slice(0, 80),
+  get_sports: (args) => String(args.league || 'nfl').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
   propose_memory: (args) => String(args.content || '').slice(0, 80),
@@ -764,6 +864,14 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'get_news': {
       const result = await toolGetNews(clean);
       return { result, summary: String(clean.topic || 'tech').slice(0, 80) };
+    }
+    case 'get_stock': {
+      const result = await toolGetStock(clean);
+      return { result, summary: String(clean.symbol || '').slice(0, 80) };
+    }
+    case 'get_sports': {
+      const result = await toolGetSports(clean);
+      return { result, summary: String(clean.league || 'nfl').slice(0, 80) };
     }
     case 'create_task': {
       const result = toolCreateTask(clean, ctx);
