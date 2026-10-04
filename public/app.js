@@ -81,6 +81,43 @@ $('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-reg
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload();});
 $('#chat-form').addEventListener('submit',async(event)=>{event.preventDefault();const submit=event.submitter;const input=$('#chat-input');const text=input.value;if(!text.trim())return;submit.disabled=true;input.value='';try{const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text,conversationId:activeConversationId})});pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());await refresh();}catch(error){input.value=text;toast(error.message);}finally{submit.disabled=false;}});
+
+// Voice input via Web Speech API
+(function(){
+  const voiceBtn=$('#voice-button');
+  const input=$('#chat-input');
+  if(!voiceBtn||!input)return;
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){voiceBtn.style.display='none';return;} // Hide if not supported
+  let recognizing=false;
+  let recognition=null;
+  voiceBtn.addEventListener('click',()=>{
+    if(recognizing&&recognition){recognition.stop();return;}
+    recognition=new SR();
+    recognition.lang='en-US';
+    recognition.interimResults=true;
+    recognition.maxAlternatives=1;
+    let finalTranscript='';
+    recognition.onresult=(event)=>{
+      let interim='';
+      for(let i=event.resultIndex;i<event.results.length;i++){
+        const transcript=event.results[i][0].transcript;
+        if(event.results[i].isFinal)finalTranscript+=transcript+' ';
+        else interim+=transcript;
+      }
+      input.value=(finalTranscript+interim).trim();
+    };
+    recognition.onend=()=>{recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');};
+    recognition.onerror=(event)=>{
+      recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');
+      if(event.error!=='aborted'&&event.error!=='no-speech')toast('Voice input: '+event.error);
+    };
+    recognition.start();
+    recognizing=true;
+    voiceBtn.textContent='🔴';
+    voiceBtn.classList.add('listening');
+  });
+})();
 $('#new-task-button').addEventListener('click',()=>$('#task-form').classList.remove('hidden'));$('#cancel-task').addEventListener('click',()=>$('#task-form').classList.add('hidden'));$('#task-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const date=$('#task-date').value;await api('/api/tasks',{method:'POST',body:JSON.stringify({title:$('#task-title').value,prompt:$('#task-prompt').value,recurrence:$('#task-recurrence').value,risk:$('#task-risk').value,scheduleAt:date?new Date(date).toISOString():null})});event.target.reset();event.target.classList.add('hidden');await refresh();toast('Task created.');}catch(error){toast(error.message);}});
 $('#new-goal-button').addEventListener('click',()=>$('#goal-form').classList.remove('hidden'));$('#cancel-goal').addEventListener('click',()=>$('#goal-form').classList.add('hidden'));$('#goal-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/goals',{method:'POST',body:JSON.stringify({title:$('#goal-title').value,description:$('#goal-description').value,targetDate:$('#goal-target').value||null,priority:Number($('#goal-priority').value),nextStep:$('#goal-next-step').value})});event.target.reset();$('#goal-priority').value='2';event.target.classList.add('hidden');await refresh();toast('Goal created.');}catch(error){toast(error.message);}});
 $('#new-routine-button').addEventListener('click',()=>$('#routine-form').classList.remove('hidden'));$('#cancel-routine').addEventListener('click',()=>$('#routine-form').classList.add('hidden'));$('#routine-cadence').addEventListener('change',()=>$('#routine-day-label').classList.toggle('hidden',$('#routine-cadence').value!=='weekly'));$('#routine-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/routines',{method:'POST',body:JSON.stringify({title:$('#routine-title').value,prompt:$('#routine-prompt').value,kind:$('#routine-kind').value,cadence:$('#routine-cadence').value,timeLocal:$('#routine-time').value,dayOfWeek:Number($('#routine-day').value)})});event.target.reset();$('#routine-time').value='08:00';$('#routine-day-label').classList.add('hidden');event.target.classList.add('hidden');await refresh();toast('Routine created.');}catch(error){toast(error.message);}});
