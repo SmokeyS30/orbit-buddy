@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 17);
+  assert.equal(TOOL_DEFINITIONS.length, 18);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_weather', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_news', 'get_weather', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -551,5 +551,17 @@ test('get_weather requires location handling', async () => {
   } catch (e) {
     // Network failures OK in test, but not validation errors
     assert.ok(!e.message.includes('required'), 'Should not fail validation');
+  }
+});
+
+test('get_news returns headlines', async () => {
+  const { toolGetNews } = await import('../src/tools.js');
+  try {
+    const result = await toolGetNews({ topic: 'tech' });
+    assert.ok(result.includes('headlines:'));
+    assert.ok(result.includes('1.'));
+  } catch (e) {
+    // Network failures OK in test
+    assert.ok(e.message.includes('failed') || e.message.includes('No headlines'));
   }
 });
