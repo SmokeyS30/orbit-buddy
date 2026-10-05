@@ -185,3 +185,44 @@ export function isoWeekKey(timeZone, nowMs = Date.now()) {
   const week = 1 + Math.round((date - firstThursday) / (7 * 86400_000));
   return `${year}-W${String(week).padStart(2, '0')}`;
 }
+
+// Find clear activity-time patterns from an array of millisecond timestamps.
+// Returns up to 3 patterns like {kind:'weekday'|'daypart', label, count, total}.
+// A pattern only qualifies with a clear peak (not a flat distribution) and a
+// minimum sample size, to avoid noise.
+export function findTimePatterns(timestamps, timeZone = 'America/New_York', minCount = 5) {
+  const entries = (timestamps || []).filter((t) => Number.isFinite(t));
+  if (entries.length < minCount) return [];
+  const zone = validTimeZone(timeZone);
+  const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+  const weekdayCounts = new Array(7).fill(0);
+  const daypartCounts = { morning: 0, afternoon: 0, evening: 0, night: 0 };
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short', hour: 'numeric', hourCycle: 'h23' });
+  for (const ts of entries) {
+    const parts = fmt.formatToParts(new Date(ts));
+    const get = (type) => parts.find((p) => p.type === type)?.value || '';
+    const wdi = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(get('weekday'));
+    if (wdi >= 0) weekdayCounts[wdi]++;
+    const hour = Number(get('hour'));
+    if (Number.isFinite(hour)) {
+      if (hour >= 5 && hour < 12) daypartCounts.morning++;
+      else if (hour >= 12 && hour < 18) daypartCounts.afternoon++;
+      else if (hour >= 18 && hour < 23) daypartCounts.evening++;
+      else daypartCounts.night++;
+    }
+  }
+  const total = entries.length;
+  const patterns = [];
+  // Weekday peak: top day has >= 2x the uniform share
+  const topWd = weekdayCounts.indexOf(Math.max(...weekdayCounts));
+  if (weekdayCounts[topWd] >= minCount && weekdayCounts[topWd] >= 2 * (total / 7)) {
+    patterns.push({ kind: 'weekday', label: `Most active on ${weekdayNames[topWd]}s`, count: weekdayCounts[topWd], total });
+  }
+  // Daypart peak: top part has >= 1.8x the uniform share
+  const dpEntries = Object.entries(daypartCounts);
+  const topDp = dpEntries.reduce((a, b) => (b[1] > a[1] ? b : a));
+  if (topDp[1] >= minCount && topDp[1] >= 1.8 * (total / 4)) {
+    patterns.push({ kind: 'daypart', label: `Tends to be active in the ${topDp[0]}`, count: topDp[1], total });
+  }
+  return patterns.slice(0, 3);
+}

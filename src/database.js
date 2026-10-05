@@ -185,6 +185,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       dismissed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, person_name)
     );
+    CREATE TABLE IF NOT EXISTS curiosity_gaps (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      question TEXT NOT NULL, context TEXT, priority INTEGER NOT NULL DEFAULT 2,
+      asked_at TEXT, dismissed INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_curiosity_user ON curiosity_gaps(user_id, dismissed, asked_at);
     CREATE TABLE IF NOT EXISTS streak_completions (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       item_type TEXT NOT NULL, item_id TEXT NOT NULL, date TEXT NOT NULL,
@@ -243,6 +251,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'events', 'user_id', 'TEXT');
   ensureColumn(db, 'proactive_state', 'last_outreach_at', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_date', 'TEXT');
+  ensureColumn(db, 'people_mentions', 'context_summary', 'TEXT');
+  ensureColumn(db, 'people_mentions', 'sentiment', 'TEXT');
+  ensureColumn(db, 'people_mentions', 'last_context_update', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
@@ -377,6 +388,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listPersonMentions: db.prepare('SELECT person_name FROM people_mentions WHERE user_id=? AND dismissed=0'),
     dismissPersonNudge: db.prepare('UPDATE people_mentions SET dismissed=1,updated_at=? WHERE user_id=? AND person_name=?'),
     markPersonNudged: db.prepare('UPDATE people_mentions SET last_nudged_at=?,updated_at=? WHERE user_id=? AND person_name=?'),
+    addCuriosityGap: db.prepare('INSERT INTO curiosity_gaps(id,user_id,question,context,priority,asked_at,dismissed,created_at) VALUES(?,?,?,?,?,?,?,?)'),
+    listCuriosityGaps: db.prepare('SELECT id,question,context,priority FROM curiosity_gaps WHERE user_id=? AND dismissed=0 AND asked_at IS NULL ORDER BY priority DESC,created_at ASC LIMIT 5'),
+    markCuriosityGapAsked: db.prepare('UPDATE curiosity_gaps SET asked_at=? WHERE id=? AND user_id=?'),
+    listTrackedPeople: db.prepare('SELECT person_name,context_summary,sentiment,last_mentioned_at FROM people_mentions WHERE user_id=? AND dismissed=0 ORDER BY last_mentioned_at DESC'),
+    getPersonContext: db.prepare('SELECT context_summary,sentiment FROM people_mentions WHERE user_id=? AND person_name=?'),
+    updatePersonContext: db.prepare('UPDATE people_mentions SET context_summary=?,sentiment=?,last_context_update=?,updated_at=? WHERE user_id=? AND person_name=?'),
+    recentlyMentionedPeople: db.prepare('SELECT person_name FROM people_mentions WHERE user_id=? AND dismissed=0 AND last_mentioned_at>? ORDER BY last_mentioned_at DESC LIMIT 5'),
     listMemoriesOnDate: db.prepare(`SELECT content,created_at FROM memories WHERE user_id=? AND status='approved'
       AND strftime('%m',created_at)=? AND strftime('%d',created_at)=? AND strftime('%Y',created_at)!=?
       ORDER BY created_at DESC LIMIT 5`),
@@ -576,6 +594,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
     dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,
     markPersonNudged(userId,personName){const now=timestamp();return s.markPersonNudged.run(now,now,userId,personName).changes>0;},
+    addCuriosityGap(userId,{question,context='',priority=2}={}){const q=String(question||'').trim().slice(0,300);if(q.length<10)return null;const now=timestamp();const id=randomUUID();s.addCuriosityGap.run(id,userId,q,String(context||'').slice(0,300),Math.max(1,Math.min(Number(priority)||2,3)),null,0,now);return id;},
+    listCuriosityGaps:(userId)=>s.listCuriosityGaps.all(userId),
+    markCuriosityGapAsked:(userId,id)=>s.markCuriosityGapAsked.run(timestamp(),id,userId).changes>0,
+    listTrackedPeople:(userId)=>s.listTrackedPeople.all(userId),
+    getPersonContext(userId,personName){return s.getPersonContext.get(userId,personName)||null;},
+    updatePersonContext(userId,personName,contextSummary,sentiment){const now=timestamp();const sent=['positive','neutral','mixed'].includes(String(sentiment).toLowerCase())?String(sentiment).toLowerCase():'neutral';return s.updatePersonContext.run(String(contextSummary||'').slice(0,500),sent,now,now,userId,personName).changes>0;},
+    recentlyMentionedPeople:(userId,sinceIso)=>s.recentlyMentionedPeople.all(userId,sinceIso).map((r)=>r.person_name),
     listMemoriesOnDate(userId,month,day){const mm=String(month).padStart(2,'0');const dd=String(day).padStart(2,'0');const yyyy=String(new Date().getUTCFullYear());return s.listMemoriesOnDate.all(userId,mm,dd,yyyy).map((row)=>({...row,year:row.created_at.slice(0,4)}));},
     recordStreakCompletion(userId,itemType,itemId,dateStr){return s.recordStreakCompletion.run(userId,itemType,itemId,dateStr,timestamp()).changes>0;},
     // Count consecutive days with a completion, working backward from today (or yesterday if today has none).
