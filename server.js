@@ -8,7 +8,7 @@ import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAg
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { isQuietHours, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
+import { extractPersonNames, isQuietHours, isoWeekKey, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import {
@@ -353,6 +353,8 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
         }
         db.setSetting(`last_learning_${user.id}`,new Date(nowMs).toISOString());
         if(saved>0)db.addEvent(user.id,'auto_learned',`Learned ${saved} new insight${saved>1?'s':''} about the user.`);
+        // Track people mentioned in recent conversation for gentle nudges later
+        try{for(const name of extractPersonNames(convoText))db.trackPersonMention(user.id,name);}catch(e){}
       }catch(error){
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
@@ -407,7 +409,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
 
         // Generate the appropriate check-in
-        let genPrompt;
+        let genPrompt;let nudgedPerson=null;
         if(decisionClean==='MORNING'){
           // Fetch real weather and calendar data so the briefing has actual details
           let weatherCtx='';
@@ -431,7 +433,17 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           if(weatherCtx)contextParts.push(weatherCtx);
           if(calCtx)contextParts.push(calCtx);
           const contextStr=contextParts.length?`\n\nUse this real data in your briefing:\n${contextParts.join('\n')}`:`\n\n(No weather or calendar data available — skip those parts gracefully.)`;
-          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}`;
+          // Briefing personality: tone + length from user preferences
+          const toneDesc={motivational:'energetic and encouraging',chill:'relaxed and easygoing',direct:'straightforward, no fluff'}[preferences.briefing_tone]||'energetic and encouraging';
+          const lengthDesc={quick:'2-3 sentences',detailed:'5-6 sentences with more detail'}[preferences.briefing_length]||'2-3 sentences';
+          // "On this day" flashbacks from prior years
+          let flashbackCtx='';
+          try{
+            const [,lm,ld]=localDateTimeParts(timeZone,nowMs).date.split('-').map(Number);
+            const flashbacks=db.listMemoriesOnDate(user.id,lm,ld).slice(0,2);
+            if(flashbacks.length)flashbackCtx=`\n\nOn this day in the past: ${flashbacks.map((f)=>`in ${f.year}, ${f.content.slice(0,200)}`).join(' | ')}. Weave in a brief, warm throwback reference if one fits naturally.`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -440,13 +452,23 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           }catch(e){}
           genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}`;
         }else{
-          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.`;
+          // Gentle nudge about someone they haven't mentioned in 2+ weeks
+          let nudgeCtx='';
+          try{
+            const stale=db.getStalePeople(user.id,14);
+            if(stale.length){
+              nudgedPerson=stale[0].person_name;
+              nudgeCtx=` You haven't mentioned ${nudgedPerson} in a while. Include a brief, natural nudge about them (e.g. "have you talked to ${nudgedPerson} lately?").`;
+            }
+          }catch(e){}
+          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}`;
         }
 
         const { text }=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
         db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
         db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
+        if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
       }catch(error){
         db.releaseProactiveSlot(user.id,today);
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
@@ -469,9 +491,51 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }
   }
   let proactiveBusy=false;
+  async function runWeeklyReview(nowMs){
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      const preferences=db.getPreferences(user.id);
+      if(isQuietHours(preferences,nowMs))continue;
+      const timeZone=preferences.time_zone||'America/New_York';
+      if(localDateTimeParts(timeZone,nowMs).weekday!==0)continue; // Sundays only
+      const weekKey=isoWeekKey(timeZone,nowMs);
+      if(db.getSetting(`weekly_review_last_${user.id}`)===weekKey)continue;
+
+      // Don't interrupt someone who's been active recently
+      const lastOutreach=db.getLastOutreachAt(user.id);
+      const lastUserMsg=db.lastUserMessageAt(user.id);
+      const lastActive=Math.max(lastOutreach?new Date(lastOutreach).valueOf():0,lastUserMsg?new Date(lastUserMsg).valueOf():0);
+      if(lastActive&&nowMs-lastActive<4*3600_000)continue;
+
+      const today=todayInZone(timeZone,nowMs);
+      if(!db.claimProactiveSlot(user.id,today))continue;
+
+      const sinceISO=new Date(nowMs-7*24*3600_000).toISOString();
+      const tasks=db.listTasksCompletedSince(user.id,sinceISO);
+      const checkins=db.listGoalCheckinsSince(user.id,sinceISO);
+      const memories=db.listMemoriesSince(user.id,sinceISO);
+      const userMessages=db.listMessages(user.id,200).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
+      if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today);continue;}
+
+      try{
+        const parts=[];
+        if(tasks.length)parts.push(`Tasks completed: ${tasks.slice(0,10).map((t)=>t.title).join('; ')}`);
+        if(checkins.length)parts.push(`Goal progress: ${checkins.slice(0,10).map((c)=>`${c.goal_title} → ${c.progress}%${c.note?` (${c.note.slice(0,80)})`:''}`).join('; ')}`);
+        if(memories.length)parts.push(`New memories: ${memories.slice(0,8).map((m)=>m.content.slice(0,120)).join('; ')}`);
+        parts.push(`Messages sent this week: ${userMessages.length}`);
+        const prompt=`Write a warm weekly review for ${user.display_name||'the user'} (4-6 sentences, plain text). Celebrate their wins, note goal progress, observe one interesting pattern if you see one, and offer one concrete suggestion for next week. Sound like a caring friend, not a status report. Do not mention that this is automated.\n\nThis week's activity:\n${parts.join('\n')}`;
+        const { text }=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        db.setSetting(`weekly_review_last_${user.id}`,weekKey);
+        await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.');
+      }catch(error){
+        db.releaseProactiveSlot(user.id,today);
+        db.addEvent(user.id,'weekly_review_failed','Could not send the weekly review.',error.message);
+      }
+    }
+  }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runLearningCycle(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);}
     finally{proactiveBusy=false;}
   }
 
