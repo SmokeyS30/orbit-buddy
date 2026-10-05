@@ -184,6 +184,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
+  ensureColumn(db, 'users', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC)');
@@ -236,7 +237,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   const s = {
     countUsers: db.prepare('SELECT COUNT(*) AS count FROM users'),
     listUsers: db.prepare('SELECT id,email,display_name,role,disabled,created_at,updated_at FROM users ORDER BY created_at'),
-    createUser: db.prepare('INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)'),
+    createUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)'),
+    createDemoUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,is_demo,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)'),
+    listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<?"),
+    deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
     updatePassword: db.prepare('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?'),
@@ -335,6 +339,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
       VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
     countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
+    countUserMessages: db.prepare("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'"),
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
@@ -389,6 +394,21 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const now = timestamp(); const id = randomUUID();
       s.createUser.run(id, email, displayName, passwordHash, passwordSalt, role, now, now);
       return s.userById.get(id);
+    },
+    createDemoUser() {
+      const now = timestamp(); const id = randomUUID();
+      const email = `demo-${id.slice(0,8)}@demo.orbitbuddy.app`;
+      s.createDemoUser.run(id, email, 'Demo Explorer', 'demo', 'demo', 'member', now, now);
+      return s.userById.get(id);
+    },
+    listExpiredDemoUsers(maxAgeMs) {
+      const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
+      return s.listExpiredDemoUsers.all(cutoff);
+    },
+    countUserMessages: (userId) => s.countUserMessages.get(userId).count,
+    deleteDemoUser(id) {
+      s.deleteUserSessions.run(id);
+      s.deleteUser.run(id);
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
