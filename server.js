@@ -908,6 +908,45 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
+        if(req.method==='GET'&&url.pathname==='/api/timeline'){
+          if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
+          let months=parseInt(url.searchParams.get('months')||'12',10);
+          if(!Number.isFinite(months)||months<1)months=12;
+          if(months>24)months=24;
+          const now=new Date();
+          const curKey=`${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}`;
+          const monthLabel=(key)=>{const[y,m]=key.split('-').map(Number);return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'});};
+          const out=[];
+          for(let i=0;i<months;i++){
+            const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));
+            const key=`${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
+            const data=db.timelineMonthData(userId,key);
+            const activity=data.memories.length+data.conversations.length+data.goalsCreated.length+data.goalsCompleted.length+data.checkins;
+            if(!activity)continue;
+            let narrative=db.getTimelineNarrative(userId,key);
+            if(!narrative||key===curKey){
+              const facts=[];
+              if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
+              if(data.goalsCompleted.length)facts.push(`Completed ${data.goalsCompleted.length} goals: ${data.goalsCompleted.map((g)=>g.title).join(', ')}`);
+              if(data.goalsCreated.length)facts.push(`Started ${data.goalsCreated.length} new goals: ${data.goalsCreated.map((g)=>g.title).join(', ')}`);
+              if(data.conversations.length)facts.push(`Had ${data.conversations.length} conversations${data.conversations[0]?`, often about: ${[...new Set(data.conversations.map((c)=>c.title))].filter((t)=>t&&t!=='General').slice(0,4).join('; ')||'various topics'}`:''}`);
+              if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
+              try{
+                const prefs=db.getPreferences(userId);
+                const {text}=await model.respond({buddyName,userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
+                narrative=text.trim().slice(0,1200)||null;
+                if(narrative)db.setTimelineNarrative(userId,key,narrative);
+              }catch(e){narrative=null;}
+              if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
+            }
+            const highlights=[];
+            for(const g of data.goalsCompleted.slice(0,3))highlights.push(`Completed "${g.title}"`);
+            for(const g of data.goalsCreated.slice(0,2))highlights.push(`Started "${g.title}"`);
+            if(data.memories.length)highlights.push(`${data.memories.length} memories saved`);
+            out.push({key,label:monthLabel(key),narrative,highlights:highlights.slice(0,6),stats:{memories:data.memories.length,conversations:data.conversations.length,goalsCompleted:data.goalsCompleted.length}});
+          }
+          return json(res,200,{months:out});
+        }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
         if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:db.listCalendarFeeds(userId).map(publicFeed)});
         if(req.method==='POST'&&url.pathname==='/api/calendar-feeds'){const body=await readJson(req);const label=cleanText(body.label,60,'label');const feedUrl=normalizeFeedUrl(cleanText(body.url,2000,'url'));let text;try{text=await fetchFeedText(feedUrl);}catch(error){throw Object.assign(new Error(`Could not read that calendar: ${error.message}`),{status:400});}const vevents=parseIcs(text);if(!vevents.length)throw Object.assign(new Error('That URL did not return a readable calendar (no events found).'),{status:400});const feed=db.addCalendarFeed(userId,{label,url:feedUrl});db.addEvent(userId,'calendar_feed_added',`Connected calendar \u201c${label}\u201d (${vevents.length} events found).`);return json(res,201,{feed:publicFeed(feed),eventsFound:vevents.length});}
