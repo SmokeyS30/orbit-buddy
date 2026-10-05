@@ -141,5 +141,47 @@ export function normalizePreferences(value = {}, current = {}) {
   const proactiveEnabled = value.proactiveEnabled === undefined && value.proactive_enabled === undefined
     ? current.proactive_enabled !== 0
     : value.proactiveEnabled === true || value.proactive_enabled === 1;
-  return { timeZone, quietStart, quietEnd, proactiveEnabled };
+  const briefingToneRaw = String(value.briefingTone ?? value.briefing_tone ?? current.briefing_tone ?? '').toLowerCase();
+  const briefingTone = ['motivational', 'chill', 'direct'].includes(briefingToneRaw) ? briefingToneRaw : (current.briefing_tone || 'motivational');
+  const briefingLengthRaw = String(value.briefingLength ?? value.briefing_length ?? current.briefing_length ?? '').toLowerCase();
+  const briefingLength = ['quick', 'detailed'].includes(briefingLengthRaw) ? briefingLengthRaw : (current.briefing_length || 'quick');
+  return { timeZone, quietStart, quietEnd, proactiveEnabled, briefingTone, briefingLength };
+}
+
+const RELATIONSHIP_NAMES = {
+  mom: 'Mom', dad: 'Dad', mother: 'Mom', father: 'Dad', brother: 'Brother', sister: 'Sister',
+  wife: 'Wife', husband: 'Husband', partner: 'Partner', girlfriend: 'Girlfriend',
+  boyfriend: 'Boyfriend', son: 'Son', daughter: 'Daughter'
+};
+const NAME_STOPLIST = new Set(['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday',
+  'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December',
+  'Christmas', 'Thanksgiving', 'Easter', 'Halloween']);
+
+// Heuristic extraction of person names from free text, for people-mention tracking.
+export function extractPersonNames(text) {
+  const found = new Set();
+  const src = String(text || '');
+  for (const m of src.matchAll(/\bmy\s+(mom|dad|mother|father|brother|sister|wife|husband|partner|girlfriend|boyfriend|son|daughter)s?\b/gi)) {
+    found.add(RELATIONSHIP_NAMES[m[1].toLowerCase()]);
+  }
+  for (const m of src.matchAll(/\b(talked to|met|with|called|texted|emailed|saw|visited|dinner with|lunch with)\s+([A-Za-z][a-z]{1,19})\b/gi)) {
+    const name = m[2];
+    if (/^[A-Z][a-z]{1,19}$/.test(name) && !NAME_STOPLIST.has(name)) found.add(name);
+  }
+  return [...found].slice(0, 10);
+}
+
+// ISO week key like "2026-W40" for the given instant in the given time zone.
+export function isoWeekKey(timeZone, nowMs = Date.now()) {
+  const local = localDateTimeParts(timeZone, nowMs);
+  const [y, m, d] = local.date.split('-').map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  const day = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - day + 3);
+  const year = date.getUTCFullYear();
+  const firstThursday = new Date(Date.UTC(year, 0, 4));
+  const fday = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - fday + 3);
+  const week = 1 + Math.round((date - firstThursday) / (7 * 86400_000));
+  return `${year}-W${String(week).padStart(2, '0')}`;
 }

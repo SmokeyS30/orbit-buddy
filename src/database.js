@@ -156,7 +156,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       time_zone TEXT NOT NULL DEFAULT 'America/New_York', quiet_start TEXT NOT NULL DEFAULT '22:00',
       quiet_end TEXT NOT NULL DEFAULT '08:00', proactive_enabled INTEGER NOT NULL DEFAULT 1,
+      briefing_tone TEXT NOT NULL DEFAULT 'motivational', briefing_length TEXT NOT NULL DEFAULT 'quick',
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS people_mentions (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      person_name TEXT NOT NULL, last_mentioned_at TEXT NOT NULL, last_nudged_at TEXT,
+      dismissed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, person_name)
     );
     CREATE TABLE IF NOT EXISTS conversation_summaries (
       conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
@@ -181,6 +188,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id, status, priority DESC, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_project_steps ON project_steps(user_id, project_id, position, created_at);
     CREATE INDEX IF NOT EXISTS idx_approvals_user ON approvals(user_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_people_stale ON people_mentions(user_id, dismissed, last_mentioned_at);
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
@@ -210,6 +218,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'proactive_state', 'last_outreach_at', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_date', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
+  ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -332,9 +342,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
       WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
     getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),
-    upsertPreferences: db.prepare(`INSERT INTO user_preferences(user_id,time_zone,quiet_start,quiet_end,proactive_enabled,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
-      quiet_end=excluded.quiet_end,proactive_enabled=excluded.proactive_enabled,updated_at=excluded.updated_at`),
+    trackPersonMention: db.prepare(`INSERT INTO people_mentions(user_id,person_name,last_mentioned_at,last_nudged_at,dismissed,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,person_name) DO UPDATE SET last_mentioned_at=excluded.last_mentioned_at,
+      dismissed=0,updated_at=excluded.updated_at`),
+    getStalePeople: db.prepare(`SELECT person_name,last_mentioned_at,last_nudged_at FROM people_mentions
+      WHERE user_id=? AND dismissed=0 AND last_mentioned_at<? AND (last_nudged_at IS NULL OR last_nudged_at<?)
+      ORDER BY last_mentioned_at ASC`),
+    listPersonMentions: db.prepare('SELECT person_name FROM people_mentions WHERE user_id=? AND dismissed=0'),
+    dismissPersonNudge: db.prepare('UPDATE people_mentions SET dismissed=1,updated_at=? WHERE user_id=? AND person_name=?'),
+    markPersonNudged: db.prepare('UPDATE people_mentions SET last_nudged_at=?,updated_at=? WHERE user_id=? AND person_name=?'),
+    listMemoriesOnDate: db.prepare(`SELECT content,created_at FROM memories WHERE user_id=? AND status='approved'
+      AND strftime('%m',created_at)=? AND strftime('%d',created_at)=? AND strftime('%Y',created_at)!=?
+      ORDER BY created_at DESC LIMIT 5`),
+    listTasksCompletedSince: db.prepare(`SELECT * FROM tasks WHERE user_id=? AND status='completed' AND updated_at>=? ORDER BY updated_at DESC`),
+    listMemoriesSince: db.prepare(`SELECT * FROM memories WHERE user_id=? AND status='approved' AND created_at>=? ORDER BY created_at DESC`),
+    listGoalCheckinsSince: db.prepare(`SELECT gc.*, g.title AS goal_title FROM goal_checkins gc JOIN goals g ON g.id=gc.goal_id
+      WHERE gc.user_id=? AND gc.created_at>=? ORDER BY gc.created_at DESC`),
+    upsertPreferences: db.prepare(`INSERT INTO user_preferences(user_id,time_zone,quiet_start,quiet_end,proactive_enabled,briefing_tone,briefing_length,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
+      quiet_end=excluded.quiet_end,proactive_enabled=excluded.proactive_enabled,briefing_tone=excluded.briefing_tone,
+      briefing_length=excluded.briefing_length,updated_at=excluded.updated_at`),
     getConversationSummary: db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?'),
     upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
       VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
@@ -514,8 +541,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimProactiveSlot(userId,localDate,limit=3){const current=s.getProactiveState.get(userId);if(current?.outreach_date===localDate&&current.outreach_count>=limit)return false;s.upsertProactiveSlot.run(userId,localDate);return true;},
     markOutreach:(userId)=>s.markOutreach.run(timestamp(),userId).changes>0,
     releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
-    getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,now,now);return s.getPreferences.get(userId);},
-    setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,current.created_at||now,now);return s.getPreferences.get(userId);},
+    getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
+    setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
+    trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
+    getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
+    dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,
+    markPersonNudged(userId,personName){const now=timestamp();return s.markPersonNudged.run(now,now,userId,personName).changes>0;},
+    listMemoriesOnDate(userId,month,day){const mm=String(month).padStart(2,'0');const dd=String(day).padStart(2,'0');const yyyy=String(new Date().getUTCFullYear());return s.listMemoriesOnDate.all(userId,mm,dd,yyyy).map((row)=>({...row,year:row.created_at.slice(0,4)}));},
+    listTasksCompletedSince:(userId,sinceISO)=>s.listTasksCompletedSince.all(userId,sinceISO),
+    listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
+    listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
     getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
     setConversationSummary(userId,conversationId,summary,messageCount){s.upsertConversationSummary.run(conversationId,userId,summary,messageCount,timestamp());return s.getConversationSummary.get(conversationId,userId);},
     countConversationMessages:(userId,conversationId)=>s.countConversationMessages.get(conversationId,userId).count,
@@ -603,7 +638,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);
         for (const row of bundle.events || []) inserts.event.run(row.id,userId,row.type,row.message,row.detail,row.created_at);
         for (const row of bundle.artifacts || []) inserts.artifact.run(row.id,userId,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at);
-        if(bundle.preferences){const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,created,timestamp());}
+        if(bundle.preferences){const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,p.briefingTone,p.briefingLength,created,timestamp());}
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     }

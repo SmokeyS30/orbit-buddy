@@ -1,6 +1,6 @@
 import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
-import { normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
+import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -393,6 +393,7 @@ export function toolSaveMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_memory');
   const content = cleanArg(args.content, 2000, 'content');
   const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
+  try { for (const name of extractPersonNames(content)) db.trackPersonMention(userId, name); } catch (e) {}
   return { id: memory.id, content: memory.content, note: 'Saved. The user can delete it in the Memories tab.' };
 }
 
