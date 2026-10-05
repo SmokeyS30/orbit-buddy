@@ -205,6 +205,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       evidence TEXT,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS emotional_profile (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      support_style TEXT NOT NULL DEFAULT 'unknown',
+      energy_notes TEXT,
+      evidence TEXT,
+      updated_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_curiosity_user ON curiosity_gaps(user_id, dismissed, asked_at);
     CREATE TABLE IF NOT EXISTS streak_completions (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -407,6 +414,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMotivationProfile: db.prepare('SELECT * FROM motivation_profile WHERE user_id=?'),
     setMotivationProfile: db.prepare(`INSERT INTO motivation_profile(user_id,style,evidence,updated_at) VALUES(?,?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET style=excluded.style,evidence=excluded.evidence,updated_at=excluded.updated_at`),
+    getEmotionalProfile: db.prepare('SELECT * FROM emotional_profile WHERE user_id=?'),
+    setEmotionalProfile: db.prepare(`INSERT INTO emotional_profile(user_id,support_style,energy_notes,evidence,updated_at) VALUES(?,?,?,?,?)
+      ON CONFLICT(user_id) DO UPDATE SET support_style=excluded.support_style,energy_notes=excluded.energy_notes,evidence=excluded.evidence,updated_at=excluded.updated_at`),
     listMemoriesBySource: db.prepare("SELECT * FROM memories WHERE user_id=? AND source=? AND status='approved' ORDER BY updated_at DESC LIMIT ?"),
     listTrackedPeople: db.prepare('SELECT person_name,context_summary,sentiment,last_mentioned_at FROM people_mentions WHERE user_id=? AND dismissed=0 ORDER BY last_mentioned_at DESC'),
     getPersonContext: db.prepare('SELECT context_summary,sentiment FROM people_mentions WHERE user_id=? AND person_name=?'),
@@ -624,6 +634,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     markCuriosityGapAsked:(userId,id)=>s.markCuriosityGapAsked.run(timestamp(),id,userId).changes>0,
     getMotivationProfile(userId){const row=s.getMotivationProfile.get(userId);return row||{user_id:userId,style:'unknown',evidence:null,updated_at:null};},
     setMotivationProfile(userId,style,evidence){const valid=['encouragement','data-driven','tough-love','calm','unknown'];const st=valid.includes(String(style))?String(style):'unknown';s.setMotivationProfile.run(userId,st,String(evidence||'').slice(0,500),timestamp());return st;},
+    getEmotionalProfile(userId){const row=s.getEmotionalProfile.get(userId);return row||{user_id:userId,support_style:'unknown',energy_notes:null,evidence:null,updated_at:null};},
+    setEmotionalProfile(userId,style,energyNotes,evidence){const valid=['solutions','listening','questions','humor','space','unknown'];const st=valid.includes(String(style))?String(style):'unknown';s.setEmotionalProfile.run(userId,st,String(energyNotes||'').slice(0,500),String(evidence||'').slice(0,500),timestamp());return st;},
     listMemoriesBySource:(userId,source,limit=20)=>s.listMemoriesBySource.all(userId,String(source).slice(0,40),Math.min(Math.max(limit,1),50)),
     listTrackedPeople:(userId)=>s.listTrackedPeople.all(userId),
     getPersonContext(userId,personName){return s.getPersonContext.get(userId,personName)||null;},
