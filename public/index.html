@@ -512,7 +512,22 @@
               <label class="check"
                 ><input id="preference-proactive" type="checkbox" /> Allow
                 proactive check-ins</label
-              ><button class="primary block-top">Save preferences</button>
+              >
+              <div class="form-grid two">
+                <label
+                  >Briefing tone<select id="preference-briefing-tone">
+                    <option value="motivational">Motivational</option>
+                    <option value="chill">Chill</option>
+                    <option value="direct">Direct</option>
+                  </select></label
+                ><label
+                  >Briefing length<select id="preference-briefing-length">
+                    <option value="quick">Quick</option>
+                    <option value="detailed">Detailed</option>
+                  </select></label
+                >
+              </div>
+              <button class="primary block-top">Save preferences</button>
             </form>
           </section>
           <section class="panel">
