@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isQuietHours, normalizeMemoryKind, normalizePreferences, rankMemories, todayInZone, validTimeZone } from '../src/intelligence.js';
+import { extractPersonNames, isQuietHours, isoWeekKey, normalizeMemoryKind, normalizePreferences, rankMemories, todayInZone, validTimeZone } from '../src/intelligence.js';
 
 test('normalizes memory kinds and timezone preferences', () => {
   assert.equal(normalizeMemoryKind('GOAL'), 'goal');
@@ -8,7 +8,28 @@ test('normalizes memory kinds and timezone preferences', () => {
   assert.equal(validTimeZone('Europe/London'), 'Europe/London');
   assert.equal(validTimeZone('Not/AZone'), 'America/New_York');
   const prefs = normalizePreferences({ timeZone: 'Asia/Tokyo', quietStart: '23:15', quietEnd: '07:30', proactiveEnabled: false });
-  assert.deepEqual(prefs, { timeZone: 'Asia/Tokyo', quietStart: '23:15', quietEnd: '07:30', proactiveEnabled: false });
+  assert.deepEqual(prefs, { timeZone: 'Asia/Tokyo', quietStart: '23:15', quietEnd: '07:30', proactiveEnabled: false, briefingTone: 'motivational', briefingLength: 'quick' });
+  const custom = normalizePreferences({ briefingTone: 'chill', briefingLength: 'detailed' });
+  assert.equal(custom.briefingTone, 'chill');
+  assert.equal(custom.briefingLength, 'detailed');
+  const invalid = normalizePreferences({ briefingTone: 'pirate', briefingLength: 'novel' });
+  assert.equal(invalid.briefingTone, 'motivational');
+  assert.equal(invalid.briefingLength, 'quick');
+});
+
+test('extracts person names from free text', () => {
+  assert.deepEqual(extractPersonNames('I had dinner with my mom yesterday'), ['Mom']);
+  assert.deepEqual(extractPersonNames('Talked to Sarah about the trip'), ['Sarah']);
+  assert.deepEqual(extractPersonNames('Met John and then called my dad'), ['Dad', 'John']);
+  assert.deepEqual(extractPersonNames('Going to the store on Monday'), []);
+  assert.deepEqual(extractPersonNames('nothing personal here'), []);
+});
+
+test('computes ISO week keys', () => {
+  // 2026-10-05 is a Monday; verify against a known reference
+  assert.equal(isoWeekKey('America/New_York', Date.parse('2026-10-05T12:00:00-04:00')), '2026-W41');
+  assert.equal(isoWeekKey('America/New_York', Date.parse('2026-10-04T12:00:00-04:00')), '2026-W40');
+  assert.equal(isoWeekKey('UTC', Date.parse('2026-01-01T12:00:00Z')), '2026-W01');
 });
 
 test('resolves local dates and overnight quiet hours', () => {

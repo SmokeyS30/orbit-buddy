@@ -123,3 +123,33 @@ test('follow-ups are priority ordered and capped at three proactive messages per
   assert.equal(remaining[0].description, 'low priority');
   assert.equal(app.db.listEvents(auth.userId, 20).filter((event) => event.type === 'followup_sent').length, 3);
 });
+
+test('weekly review runs once per Sunday with real activity', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
+  const task = app.db.addTask(auth.userId, { title: 'Finish report', prompt: 'Write it' });
+  app.db.completeTask(auth.userId, task.id, 'done');
+  app.db.addMemory(auth.userId, 'Learned something new this week');
+  const sunday = Date.parse('2026-10-04T15:00:00Z'); // Sunday, 11:00 AM EDT
+  await app.runProactiveChecks(sunday);
+  const events = app.db.listEvents(auth.userId, 20);
+  assert.ok(events.some((e) => e.type === 'weekly_review_sent'), 'weekly review delivered');
+  assert.equal(app.db.getSetting(`weekly_review_last_${auth.userId}`), '2026-W40');
+  const count = events.filter((e) => e.type === 'weekly_review_sent').length;
+  await app.runProactiveChecks(sunday + 3600_000);
+  const again = app.db.listEvents(auth.userId, 20);
+  assert.equal(again.filter((e) => e.type === 'weekly_review_sent').length, count, 'no duplicate review in the same week');
+});
+
+test('weekly review skips on non-Sundays and quiet weeks', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
+  const monday = Date.parse('2026-10-05T15:00:00Z'); // Monday
+  await app.runProactiveChecks(monday);
+  assert.ok(!app.db.listEvents(auth.userId, 20).some((e) => e.type === 'weekly_review_sent'), 'no review on Monday');
+  const sunday = Date.parse('2026-10-11T15:00:00Z'); // Sunday, but no activity at all
+  await app.runProactiveChecks(sunday);
+  assert.ok(!app.db.listEvents(auth.userId, 20).some((e) => e.type === 'weekly_review_sent'), 'no review for an empty week');
+});

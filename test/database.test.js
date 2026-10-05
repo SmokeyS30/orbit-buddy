@@ -201,3 +201,80 @@ test('projects and approval decisions are isolated by user', () => {
   assert.equal(db.resolveApproval(user.id, approval.id, 'rejected'), null);
   db.close();
 });
+
+test('tracks people mentions and finds stale ones for nudges', () => {
+  const { db, user, filePath } = fixture();
+  db.trackPersonMention(user.id, 'Mom');
+  db.trackPersonMention(user.id, 'Sarah');
+  assert.equal(db.getStalePeople(user.id, 14).length, 0, 'fresh mentions are not stale');
+  const raw = new DatabaseSync(filePath);
+  const ageMention = (days) => raw.prepare('UPDATE people_mentions SET last_mentioned_at=? WHERE user_id=? AND person_name=?')
+    .run(new Date(Date.now() - days * 86400_000).toISOString(), user.id, 'Mom');
+  ageMention(20);
+  let stale = db.getStalePeople(user.id, 14);
+  assert.equal(stale.length, 1);
+  assert.equal(stale[0].person_name, 'Mom');
+  db.markPersonNudged(user.id, 'Mom');
+  assert.equal(db.getStalePeople(user.id, 14).length, 0, 'nudged person cools down for 30 days');
+  raw.prepare('UPDATE people_mentions SET last_nudged_at=? WHERE user_id=? AND person_name=?')
+    .run(new Date(Date.now() - 31 * 86400_000).toISOString(), user.id, 'Mom');
+  assert.equal(db.getStalePeople(user.id, 14).length, 1, 'nudge cooldown expires after 30 days');
+  db.dismissPersonNudge(user.id, 'Mom');
+  assert.equal(db.getStalePeople(user.id, 14).length, 0, 'dismissed person is excluded');
+  db.trackPersonMention(user.id, 'Mom');
+  ageMention(20);
+  assert.equal(db.getStalePeople(user.id, 14).length, 1, 're-mention un-dismisses and refreshes');
+  raw.close();
+  db.close();
+});
+
+test('finds memories from the same date in prior years', () => {
+  const { db, user, filePath } = fixture();
+  const memory = db.addMemory(user.id, 'Trip to the museum');
+  const now = new Date();
+  const lastYear = new Date(Date.UTC(now.getUTCFullYear() - 1, now.getUTCMonth(), now.getUTCDate(), 12));
+  const raw = new DatabaseSync(filePath);
+  raw.prepare('UPDATE memories SET created_at=?, updated_at=? WHERE id=?').run(lastYear.toISOString(), lastYear.toISOString(), memory.id);
+  raw.close();
+  const month = lastYear.getUTCMonth() + 1;
+  const day = lastYear.getUTCDate();
+  const found = db.listMemoriesOnDate(user.id, month, day);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].content, 'Trip to the museum');
+  assert.equal(found[0].year, String(lastYear.getUTCFullYear()));
+  db.addMemory(user.id, 'Something today');
+  assert.ok(!db.listMemoriesOnDate(user.id, month, day).some((m) => m.content === 'Something today'), 'current-year memories excluded');
+  db.close();
+});
+
+test('lists recent completions for the weekly review', () => {
+  const { db, user } = fixture();
+  const task = db.addTask(user.id, { title: 'Finish report', prompt: 'Write it' });
+  db.completeTask(user.id, task.id, 'done');
+  const pending = db.addTask(user.id, { title: 'Later thing', prompt: 'Later' });
+  const weekAgo = new Date(Date.now() - 8 * 86400_000).toISOString();
+  const done = db.listTasksCompletedSince(user.id, weekAgo);
+  assert.ok(done.some((t) => t.id === task.id), 'completed task included');
+  assert.ok(!done.some((t) => t.id === pending.id), 'incomplete task excluded');
+  db.addMemory(user.id, 'Learned something new');
+  assert.ok(db.listMemoriesSince(user.id, weekAgo).some((m) => m.content === 'Learned something new'));
+  const goal = db.addGoal(user.id, { title: 'Run a 5k' });
+  db.updateGoal(user.id, goal.id, { progress: 50, note: 'Halfway there' });
+  const checkins = db.listGoalCheckinsSince(user.id, weekAgo);
+  assert.ok(checkins.some((c) => c.goal_title === 'Run a 5k' && c.progress === 50));
+  db.close();
+});
+
+test('stores briefing personality preferences with defaults', () => {
+  const { db, user } = fixture();
+  const defaults = db.getPreferences(user.id);
+  assert.equal(defaults.briefing_tone, 'motivational');
+  assert.equal(defaults.briefing_length, 'quick');
+  const updated = db.setPreferences(user.id, { briefingTone: 'chill', briefingLength: 'detailed' });
+  assert.equal(updated.briefing_tone, 'chill');
+  assert.equal(updated.briefing_length, 'detailed');
+  assert.equal(updated.time_zone, 'America/New_York', 'other prefs preserved');
+  const invalid = db.setPreferences(user.id, { briefingTone: 'pirate' });
+  assert.equal(invalid.briefing_tone, 'chill', 'invalid tone keeps current value');
+  db.close();
+});
