@@ -52,3 +52,34 @@ test('memory ranking prioritizes lexical relevance and omits expired entries', (
   assert.equal(ranked[0].id, 'flight');
   assert.ok(!ranked.some((memory) => memory.id === 'expired'));
 });
+
+test('findTimePatterns detects clear weekday and daypart peaks', async (t) => {
+  const { findTimePatterns } = await import('../src/intelligence.js');
+  // Build timestamps: 12 Tuesday mornings (10am ET) in America/New_York
+  // 2026-10-06 is a Tuesday
+  const base = Date.UTC(2026, 9, 6, 14, 0, 0); // 10am EDT = 14:00 UTC
+  const stamps = [];
+  for (let w = 0; w < 12; w++) stamps.push(base + w * 7 * 86400_000);
+  // Add 2 scattered messages (noise)
+  stamps.push(Date.UTC(2026, 9, 8, 2, 0, 0), Date.UTC(2026, 9, 10, 20, 0, 0));
+  const patterns = findTimePatterns(stamps, 'America/New_York');
+  assert.ok(patterns.length >= 1, 'detects at least one pattern');
+  const wd = patterns.find((p) => p.kind === 'weekday');
+  assert.ok(wd, 'detects weekday peak');
+  assert.ok(wd.label.includes('Tuesday'), `label mentions Tuesday: ${wd.label}`);
+  const dp = patterns.find((p) => p.kind === 'daypart');
+  assert.ok(dp, 'detects daypart peak');
+  assert.ok(dp.label.includes('morning'), `label mentions morning: ${dp.label}`);
+});
+
+test('findTimePatterns stays quiet on flat distributions', async () => {
+  const { findTimePatterns } = await import('../src/intelligence.js');
+  // Evenly spread across the week and dayparts: 4 per day (morning/afternoon/evening/night)
+  const stamps = [];
+  for (let d = 0; d < 7; d++) for (const h of [13, 18, 23, 4]) {
+    stamps.push(Date.UTC(2026, 9, 4 + d, h, 0, 0));
+  }
+  assert.deepEqual(findTimePatterns(stamps, 'America/New_York'), [], 'no false peak on flat data');
+  assert.deepEqual(findTimePatterns([1, 2, 3], 'America/New_York'), [], 'too few samples');
+  assert.deepEqual(findTimePatterns([], 'America/New_York'), [], 'empty input');
+});

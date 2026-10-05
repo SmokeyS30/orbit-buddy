@@ -324,3 +324,42 @@ test('backfillGoalStreaks seeds from existing checkins', () => {
   assert.ok(seeded >= 1);
   db.close();
 });
+
+test('curiosity gap lifecycle: add, list, mark asked', () => {
+  const { db, user } = fixture();
+  assert.deepEqual(db.listCuriosityGaps(user.id), []);
+  const id1 = db.addCuriosityGap(user.id, { question: 'What is your favorite hobby?', context: 'to personalize suggestions', priority: 3 });
+  const id2 = db.addCuriosityGap(user.id, { question: 'Do you have any pets?', priority: 1 });
+  assert.ok(id1 && id2);
+  // Short questions rejected
+  assert.equal(db.addCuriosityGap(user.id, { question: 'Hi?' }), null);
+  let gaps = db.listCuriosityGaps(user.id);
+  assert.equal(gaps.length, 2);
+  assert.equal(gaps[0].question, 'What is your favorite hobby?', 'higher priority first');
+  assert.ok(db.markCuriosityGapAsked(user.id, id1));
+  gaps = db.listCuriosityGaps(user.id);
+  assert.equal(gaps.length, 1, 'asked gaps excluded');
+  assert.equal(gaps[0].question, 'Do you have any pets?');
+});
+
+test('person context: update and retrieve relationship depth', () => {
+  const { db, user } = fixture();
+  db.trackPersonMention(user.id, 'Sarah');
+  assert.equal(db.getPersonContext(user.id, 'Sarah').context_summary, null);
+  assert.ok(db.updatePersonContext(user.id, 'Sarah', 'Study partner at college, things going well', 'positive'));
+  const ctx = db.getPersonContext(user.id, 'Sarah');
+  assert.equal(ctx.context_summary, 'Study partner at college, things going well');
+  assert.equal(ctx.sentiment, 'positive');
+  // Invalid sentiment falls back to neutral
+  db.updatePersonContext(user.id, 'Sarah', 'Just someone', 'ecstatic');
+  assert.equal(db.getPersonContext(user.id, 'Sarah').sentiment, 'neutral');
+  // Tracked people list includes context
+  const people = db.listTrackedPeople(user.id);
+  assert.equal(people.length, 1);
+  assert.equal(people[0].person_name, 'Sarah');
+  // Recently mentioned filter
+  const recent = db.recentlyMentionedPeople(user.id, new Date(Date.now() - 86400_000).toISOString());
+  assert.deepEqual(recent, ['Sarah']);
+  const old = db.recentlyMentionedPeople(user.id, new Date().toISOString());
+  assert.deepEqual(old, [], 'future cutoff excludes all');
+});

@@ -197,3 +197,18 @@ test('snapshot includes streaks for routines and goals', async (t) => {
   assert.equal(snap.streaks.routines[routine.id], 1, 'routine streak in snapshot');
   assert.ok(typeof snap.streaks.goals[goal.id] === 'number', 'goal streak in snapshot');
 });
+
+test('isCorrectionMessage detects correction signals', async (t) => {
+  const { isCorrectionMessage } = await import('../server.js');
+  assert.equal(isCorrectionMessage('Actually, I meant Tuesday not Wednesday'), true);
+  assert.equal(isCorrectionMessage('No, that\'s wrong — my name is Ed'), true);
+  assert.equal(isCorrectionMessage('Correction: the meeting is at 3pm'), true);
+  assert.equal(isCorrectionMessage('You\'re mistaken, I live in Boston'), true);
+  assert.equal(isCorrectionMessage('What I meant was the other one'), true);
+  assert.equal(isCorrectionMessage('Not quite, try again'), true);
+  assert.equal(isCorrectionMessage('Thanks, that was helpful!'), false);
+  assert.equal(isCorrectionMessage('What time is it?'), false);
+  assert.equal(isCorrectionMessage('I actually like that idea'), false, 'mid-sentence "actually" without comma is not a correction');
+  assert.equal(isCorrectionMessage(''), false);
+  assert.equal(isCorrectionMessage(null), false);
+});
