@@ -153,3 +153,47 @@ test('weekly review skips on non-Sundays and quiet weeks', async (t) => {
   await app.runProactiveChecks(sunday);
   assert.ok(!app.db.listEvents(auth.userId, 20).some((e) => e.type === 'weekly_review_sent'), 'no review for an empty week');
 });
+
+test('meeting prep skips when no calendar feeds connected', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
+  // No calendar feeds = no meeting candidates = no crash
+  const now = Date.now();
+  await app.runProactiveChecks(now);
+  const events = app.db.listEvents(auth.userId, 20);
+  assert.ok(!events.some((e) => e.type === 'smart_checkin_failed'), 'no check-in failures from meeting prep lookup');
+});
+
+test('email triage skips gracefully without Gmail connected', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
+  const now = Date.now();
+  await app.runProactiveChecks(now);
+  const events = app.db.listEvents(auth.userId, 20);
+  assert.ok(!events.some((e) => e.type === 'email_triage_failed'), 'no triage errors without Gmail');
+  assert.ok(!events.some((e) => e.type === 'email_urgent_sent'), 'no urgent push without Gmail');
+});
+
+test('snapshot includes streaks for routines and goals', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base, { email: 'streak@example.com' });
+  const headers = authHeaders(auth);
+  // Create a routine and a goal
+  let res = await fetch(`${base}/api/routines`, { method: 'POST', headers, body: JSON.stringify({ title: 'Morning run', prompt: 'Go for a run', timeLocal: '07:00' }) });
+  assert.equal(res.status, 201);
+  const routine = await res.json();
+  res = await fetch(`${base}/api/goals`, { method: 'POST', headers, body: JSON.stringify({ title: 'Read daily', priority: 2 }) });
+  assert.equal(res.status, 201);
+  const goal = await res.json();
+  // Record streak completions directly
+  const today = new Date().toISOString().slice(0, 10);
+  app.db.recordStreakCompletion(auth.userId, 'routine', routine.id, today);
+  res = await fetch(`${base}/api/snapshot`, { headers });
+  assert.equal(res.status, 200);
+  const snap = await res.json();
+  assert.ok(snap.streaks, 'snapshot has streaks');
+  assert.equal(snap.streaks.routines[routine.id], 1, 'routine streak in snapshot');
+  assert.ok(typeof snap.streaks.goals[goal.id] === 'number', 'goal streak in snapshot');
+});

@@ -278,3 +278,49 @@ test('stores briefing personality preferences with defaults', () => {
   assert.equal(invalid.briefing_tone, 'chill', 'invalid tone keeps current value');
   db.close();
 });
+
+test('streak completions count consecutive days', () => {
+  const { db, user } = fixture();
+  const today = new Date().toISOString().slice(0, 10);
+  const dayMs = 86400_000;
+  const dstr = (offset) => new Date(Date.parse(today + 'T12:00:00Z') + offset * dayMs).toISOString().slice(0, 10);
+  // 3 consecutive days ending today
+  db.recordStreakCompletion(user.id, 'routine', 'r1', dstr(0));
+  db.recordStreakCompletion(user.id, 'routine', 'r1', dstr(-1));
+  db.recordStreakCompletion(user.id, 'routine', 'r1', dstr(-2));
+  assert.equal(db.getStreak(user.id, 'routine', 'r1', today), 3);
+  // Gap breaks the streak (missing yesterday, has day before)
+  db.recordStreakCompletion(user.id, 'routine', 'r2', dstr(0));
+  db.recordStreakCompletion(user.id, 'routine', 'r2', dstr(-2));
+  assert.equal(db.getStreak(user.id, 'routine', 'r2', today), 1);
+  // Streak can start yesterday (today not done yet)
+  db.recordStreakCompletion(user.id, 'routine', 'r3', dstr(-1));
+  db.recordStreakCompletion(user.id, 'routine', 'r3', dstr(-2));
+  assert.equal(db.getStreak(user.id, 'routine', 'r3', today), 2);
+  // No completions = 0
+  assert.equal(db.getStreak(user.id, 'routine', 'nope', today), 0);
+  // Duplicate recording is idempotent
+  db.recordStreakCompletion(user.id, 'routine', 'r1', dstr(0));
+  assert.equal(db.getStreak(user.id, 'routine', 'r1', today), 3);
+  db.close();
+});
+
+test('goal streaks read from checkin history', () => {
+  const { db, user } = fixture();
+  const today = new Date().toISOString().slice(0, 10);
+  const goal = db.addGoal(user.id, { title: 'Exercise daily' });
+  // updateGoal records a checkin with the current timestamp
+  db.updateGoal(user.id, goal.id, { progress: 10, note: 'day 1' });
+  assert.ok(db.getGoalStreak(user.id, goal.id, today) >= 1);
+  db.close();
+});
+
+test('backfillGoalStreaks seeds from existing checkins', () => {
+  const { db, user } = fixture();
+  const goal = db.addGoal(user.id, { title: 'Read daily' });
+  db.updateGoal(user.id, goal.id, { progress: 20, note: 'started' });
+  db.updateGoal(user.id, goal.id, { progress: 40, note: 'more' });
+  const seeded = db.backfillGoalStreaks(user.id);
+  assert.ok(seeded >= 1);
+  db.close();
+});
