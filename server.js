@@ -408,9 +408,36 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Generate the appropriate check-in
         let genPrompt;
         if(decisionClean==='MORNING'){
-          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include: today's weather highlight, any calendar events today, one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.`;
+          // Fetch real weather and calendar data so the briefing has actual details
+          let weatherCtx='';
+          try{
+            const wxRes=await fetch('https://api.open-meteo.com/v1/forecast?latitude=41.76&longitude=-70.08&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=auto&forecast_days=1',{signal:AbortSignal.timeout(10000)});
+            const wx=await wxRes.json();
+            const cur=wx.current||{};
+            const daily=wx.daily||{};
+            const codeToDesc=(c)=>({0:'clear',1:'mainly clear',2:'partly cloudy',3:'overcast',45:'foggy',51:'light drizzle',61:'light rain',63:'rain',65:'heavy rain',71:'light snow',73:'snow',80:'light showers',95:'thunderstorm'}[c]||'');
+            const desc=codeToDesc(cur.weather_code);
+            const high=daily.temperature_2m_max?.[0]!=null?Math.round(daily.temperature_2m_max[0]):null;
+            const low=daily.temperature_2m_min?.[0]!=null?Math.round(daily.temperature_2m_min[0]):null;
+            weatherCtx=`Current weather: ${Math.round(cur.temperature_2m||0)}°F${desc?', '+desc:''}${high!=null?`, high ${high}°F / low ${low}°F today`:''}.`;
+          }catch(e){weatherCtx='';}
+          let calCtx='';
+          try{
+            const agenda=await getBriefingAgenda(db,user.id,1,timeZone);
+            if(agenda)calCtx=`Today's calendar:\n${agenda}`;
+          }catch(e){calCtx='';}
+          const contextParts=[];
+          if(weatherCtx)contextParts.push(weatherCtx);
+          if(calCtx)contextParts.push(calCtx);
+          const contextStr=contextParts.length?`\n\nUse this real data in your briefing:\n${contextParts.join('\n')}`:`\n\n(No weather or calendar data available — skip those parts gracefully.)`;
+          genPrompt=`Write a warm morning briefing (3-4 sentences, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}`;
         }else if(decisionClean==='EVENING'){
-          genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, preview tomorrow if anything is scheduled, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.`;
+          let tomorrowCtx='';
+          try{
+            const agenda=await getBriefingAgenda(db,user.id,2,timeZone);
+            if(agenda)tomorrowCtx=`\n\nCalendar data (today + tomorrow):\n${agenda}\nUse this for the tomorrow preview if anything is scheduled.`;
+          }catch(e){}
+          genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}`;
         }else{
           genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.`;
         }
