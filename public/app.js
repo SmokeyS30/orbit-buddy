@@ -200,7 +200,7 @@ if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addE
 (function(){
   const launch=document.getElementById('launch');
   const hide=()=>{if(launch&&!launch.classList.contains('done')){launch.classList.add('done');setTimeout(()=>launch.remove(),600);}};
-  window.addEventListener('load',()=>setTimeout(hide,300));
+  const bootAt=Date.now();window.addEventListener('load',()=>setTimeout(hide,Math.max(0,1200-(Date.now()-bootAt))));
   setTimeout(hide,5000); // fallback: never trap the user
   const banner=document.getElementById('offline-banner');
   const sync=()=>{if(banner)banner.classList.toggle('hidden',navigator.onLine);};
