@@ -198,10 +198,6 @@ $('#registration-toggle').addEventListener('click',async()=>{try{const open=!sta
 activateView(location.hash.slice(1)||'today',{updateHash:false});
 if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});}// PWA: launch fade + offline indicator
 (function(){
-  const launch=document.getElementById('launch');
-  const hide=()=>{if(launch&&!launch.classList.contains('done')){launch.classList.add('done');setTimeout(()=>launch.remove(),600);}};
-  const bootAt=Date.now();window.addEventListener('load',()=>setTimeout(hide,Math.max(0,5000-(Date.now()-bootAt))));
-  setTimeout(hide,5000); // fallback: never trap the user
   const banner=document.getElementById('offline-banner');
   const sync=()=>{if(banner)banner.classList.toggle('hidden',navigator.onLine);};
   window.addEventListener('online',sync);window.addEventListener('offline',sync);sync();
