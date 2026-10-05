@@ -199,6 +199,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       asked_at TEXT, dismissed INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS motivation_profile (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      style TEXT NOT NULL DEFAULT 'unknown',
+      evidence TEXT,
+      updated_at TEXT NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_curiosity_user ON curiosity_gaps(user_id, dismissed, asked_at);
     CREATE TABLE IF NOT EXISTS streak_completions (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -398,6 +404,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addCuriosityGap: db.prepare('INSERT INTO curiosity_gaps(id,user_id,question,context,priority,asked_at,dismissed,created_at) VALUES(?,?,?,?,?,?,?,?)'),
     listCuriosityGaps: db.prepare('SELECT id,question,context,priority FROM curiosity_gaps WHERE user_id=? AND dismissed=0 AND asked_at IS NULL ORDER BY priority DESC,created_at ASC LIMIT 5'),
     markCuriosityGapAsked: db.prepare('UPDATE curiosity_gaps SET asked_at=? WHERE id=? AND user_id=?'),
+    getMotivationProfile: db.prepare('SELECT * FROM motivation_profile WHERE user_id=?'),
+    setMotivationProfile: db.prepare(`INSERT INTO motivation_profile(user_id,style,evidence,updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(user_id) DO UPDATE SET style=excluded.style,evidence=excluded.evidence,updated_at=excluded.updated_at`),
+    listMemoriesBySource: db.prepare("SELECT * FROM memories WHERE user_id=? AND source=? AND status='approved' ORDER BY updated_at DESC LIMIT ?"),
     listTrackedPeople: db.prepare('SELECT person_name,context_summary,sentiment,last_mentioned_at FROM people_mentions WHERE user_id=? AND dismissed=0 ORDER BY last_mentioned_at DESC'),
     getPersonContext: db.prepare('SELECT context_summary,sentiment FROM people_mentions WHERE user_id=? AND person_name=?'),
     updatePersonContext: db.prepare('UPDATE people_mentions SET context_summary=?,sentiment=?,last_context_update=?,updated_at=? WHERE user_id=? AND person_name=?'),
@@ -612,6 +622,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addCuriosityGap(userId,{question,context='',priority=2}={}){const q=String(question||'').trim().slice(0,300);if(q.length<10)return null;const now=timestamp();const id=randomUUID();s.addCuriosityGap.run(id,userId,q,String(context||'').slice(0,300),Math.max(1,Math.min(Number(priority)||2,3)),null,0,now);return id;},
     listCuriosityGaps:(userId)=>s.listCuriosityGaps.all(userId),
     markCuriosityGapAsked:(userId,id)=>s.markCuriosityGapAsked.run(timestamp(),id,userId).changes>0,
+    getMotivationProfile(userId){const row=s.getMotivationProfile.get(userId);return row||{user_id:userId,style:'unknown',evidence:null,updated_at:null};},
+    setMotivationProfile(userId,style,evidence){const valid=['encouragement','data-driven','tough-love','calm','unknown'];const st=valid.includes(String(style))?String(style):'unknown';s.setMotivationProfile.run(userId,st,String(evidence||'').slice(0,500),timestamp());return st;},
+    listMemoriesBySource:(userId,source,limit=20)=>s.listMemoriesBySource.all(userId,String(source).slice(0,40),Math.min(Math.max(limit,1),50)),
     listTrackedPeople:(userId)=>s.listTrackedPeople.all(userId),
     getPersonContext(userId,personName){return s.getPersonContext.get(userId,personName)||null;},
     updatePersonContext(userId,personName,contextSummary,sentiment){const now=timestamp();const sent=['positive','neutral','mixed'].includes(String(sentiment).toLowerCase())?String(sentiment).toLowerCase():'neutral';return s.updatePersonContext.run(String(contextSummary||'').slice(0,500),sent,now,now,userId,personName).changes>0;},
