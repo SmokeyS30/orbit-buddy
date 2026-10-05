@@ -516,6 +516,38 @@ function validDateStr(value) {
   return `${y}-${mo}-${d}`;
 }
 
+import { sendEmail, searchEmails, readEmail } from './gmail.js';
+
+function gmailContext(ctx, tool) {
+  const { db, userId } = writeContext(ctx, tool);
+  if (!ctx.gmail) throw new Error('Gmail is not connected. Connect it in the Connections tab first.');
+  return { db, userId, gmail: ctx.gmail };
+}
+
+export async function toolGmailSend(args = {}, ctx = null) {
+  const { gmail } = gmailContext(ctx, 'gmail_send');
+  const result = await sendEmail(() => gmail.getToken(), {
+    to: cleanArg(args.to, 500, 'to'),
+    subject: cleanArg(args.subject, 200, 'subject'),
+    body: cleanArg(args.body, 10000, 'body'),
+    cc: args.cc ? cleanArg(args.cc, 500, 'cc') : undefined,
+    bcc: args.bcc ? cleanArg(args.bcc, 500, 'bcc') : undefined
+  });
+  return { ...result, note: 'Email sent via Gmail.' };
+}
+
+export async function toolGmailSearch(args = {}, ctx = null) {
+  const { gmail } = gmailContext(ctx, 'gmail_search');
+  const query = cleanArg(args.query, 200, 'query');
+  return searchEmails(() => gmail.getToken(), { query, max: args.max });
+}
+
+export async function toolGmailRead(args = {}, ctx = null) {
+  const { gmail } = gmailContext(ctx, 'gmail_read');
+  const query = cleanArg(args.query, 200, 'query');
+  return readEmail(() => gmail.getToken(), { query });
+}
+
 export async function toolReadCalendar(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'read_calendar');
   const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
@@ -811,6 +843,50 @@ export const TOOL_DEFINITIONS = [
       },
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'gmail_send',
+    description: 'Send an email via the user\'s connected Gmail. ALWAYS show the user the exact recipient, subject, and body and get their explicit confirmation before calling this. Never send without confirmation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Recipient email address (comma-separated for multiple).' },
+        subject: { type: 'string', description: 'Email subject.' },
+        body: { type: 'string', description: 'Plain text email body.' },
+        cc: { type: 'string', description: 'CC recipients (optional).' },
+        bcc: { type: 'string', description: 'BCC recipients (optional).' }
+      },
+      required: ['to', 'subject', 'body'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'gmail_search',
+    description: 'Search the user\'s Gmail inbox. Returns sender, subject, date, and snippet for up to 10 matches. Use Gmail search syntax (from:, subject:, is:unread, after:, etc.).',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Gmail search query.' },
+        max: { type: 'number', description: 'Max results (1-10, default 5).' }
+      },
+      required: ['query'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'gmail_read',
+    description: 'Read the full body of the best-matching email for a search query. Use when the user asks about the contents of a specific email.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Gmail search query to find the email to read.' }
+      },
+      required: ['query'],
+      additionalProperties: false
+    }
   }
 ];
 
@@ -834,7 +910,10 @@ const TOOL_SUMMARIES = {
   create_project: (args) => String(args.title || '').slice(0, 80),
   update_project_step: (args) => String(args.stepId || '').slice(0, 80),
   propose_calendar_event: (args) => String(args.title || '').slice(0, 80),
-  read_calendar: (args) => String(args.date || 'today').slice(0, 40)
+  read_calendar: (args) => String(args.date || 'today').slice(0, 40),
+  gmail_send: (args) => `${String(args.to || '').slice(0, 40)}: ${String(args.subject || '').slice(0, 40)}`,
+  gmail_search: (args) => String(args.query || '').slice(0, 80),
+  gmail_read: (args) => String(args.query || '').slice(0, 80)
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -916,6 +995,18 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'read_calendar': {
       const result = await toolReadCalendar(clean, ctx);
       return { result, summary: String(clean.date || 'today').slice(0, 40) };
+    }
+    case 'gmail_send': {
+      const result = await toolGmailSend(clean, ctx);
+      return { result, summary: `Email to ${String(clean.to || '').slice(0, 40)}` };
+    }
+    case 'gmail_search': {
+      const result = await toolGmailSearch(clean, ctx);
+      return { result, summary: String(clean.query || '').slice(0, 80) };
+    }
+    case 'gmail_read': {
+      const result = await toolGmailRead(clean, ctx);
+      return { result, summary: String(clean.query || '').slice(0, 80) };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
