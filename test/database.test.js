@@ -363,3 +363,30 @@ test('person context: update and retrieve relationship depth', () => {
   const old = db.recentlyMentionedPeople(user.id, new Date().toISOString());
   assert.deepEqual(old, [], 'future cutoff excludes all');
 });
+
+test('motivation profile defaults to unknown and stores inferred style', () => {
+  const { db, user } = fixture();
+  const initial = db.getMotivationProfile(user.id);
+  assert.equal(initial.style, 'unknown');
+  db.setMotivationProfile(user.id, 'encouragement', 'Replied to 4/5 encouraging check-ins');
+  const updated = db.getMotivationProfile(user.id);
+  assert.equal(updated.style, 'encouragement');
+  assert.ok(updated.evidence.includes('encouraging'));
+  // Invalid style falls back to unknown
+  db.setMotivationProfile(user.id, 'bogus-style', 'x');
+  assert.equal(db.getMotivationProfile(user.id).style, 'unknown');
+  db.close();
+});
+
+test('listMemoriesBySource filters auto-predict and auto-contradiction', () => {
+  const { db, user } = fixture();
+  db.addMemory(user.id, 'User likes coffee', { source: 'user' });
+  db.addMemory(user.id, 'Tends to slow down Thursdays', { source: 'auto-predict', confidence: 0.6 });
+  db.addMemory(user.id, 'Says not a morning person but active early', { source: 'auto-contradiction', confidence: 0.6 });
+  const preds = db.listMemoriesBySource(user.id, 'auto-predict', 10);
+  assert.equal(preds.length, 1);
+  assert.ok(preds[0].content.includes('Thursdays'));
+  const contras = db.listMemoriesBySource(user.id, 'auto-contradiction', 10);
+  assert.equal(contras.length, 1);
+  db.close();
+});
