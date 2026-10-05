@@ -26,6 +26,7 @@
     <title>Orbit Buddy</title>
   </head>
   <body>
+    <div id="launch" aria-hidden="true"><div class="launch-mark"><span></span></div></div>
     <div class="ambient ambient-one"></div>
     <div class="ambient ambient-two"></div>
     <main class="shell">
@@ -708,7 +709,7 @@
         </button>
       </section>
     </dialog>
-    <div id="toast" class="toast" role="status"></div>
+    <div id="offline-banner" class="offline-banner hidden" role="status">You're offline — Orbit will reconnect when you're back.</div><div id="toast" class="toast" role="status"></div>
     <script type="module" src="/app.js"></script>
   </body>
 </html>
