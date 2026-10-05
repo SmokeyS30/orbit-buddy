@@ -378,6 +378,40 @@ test('motivation profile defaults to unknown and stores inferred style', () => {
   db.close();
 });
 
+test('emotional profile defaults to unknown and stores support style', () => {
+  const { db, user } = fixture();
+  const initial = db.getEmotionalProfile(user.id);
+  assert.equal(initial.support_style, 'unknown');
+  assert.equal(initial.energy_notes, null);
+  db.setEmotionalProfile(user.id, 'listening', 'Energized by building things', 'User engaged most with validation');
+  const updated = db.getEmotionalProfile(user.id);
+  assert.equal(updated.support_style, 'listening');
+  assert.ok(updated.energy_notes.includes('building'));
+  assert.ok(updated.evidence.includes('validation'));
+  // Invalid style falls back to unknown
+  db.setEmotionalProfile(user.id, 'bogus-style', 'x', 'y');
+  assert.equal(db.getEmotionalProfile(user.id).support_style, 'unknown');
+  // Energy notes and evidence survive style updates
+  db.setEmotionalProfile(user.id, 'solutions', 'Drained by admin work', 'Replied to action steps');
+  const again = db.getEmotionalProfile(user.id);
+  assert.equal(again.support_style, 'solutions');
+  assert.ok(again.energy_notes.includes('admin'));
+  db.close();
+});
+
+test('listMemoriesBySource filters auto-emotion and auto-energy', () => {
+  const { db, user } = fixture();
+  db.addMemory(user.id, 'Emotional tone this week: steady.', { source: 'auto-emotion', confidence: 0.7 });
+  db.addMemory(user.id, 'Energizers: building things. Drainers: admin work.', { source: 'auto-energy', confidence: 0.55 });
+  const emos = db.listMemoriesBySource(user.id, 'auto-emotion', 10);
+  assert.equal(emos.length, 1);
+  assert.ok(emos[0].content.includes('steady'));
+  const energies = db.listMemoriesBySource(user.id, 'auto-energy', 10);
+  assert.equal(energies.length, 1);
+  assert.ok(energies[0].content.includes('Drainers'));
+  db.close();
+});
+
 test('listMemoriesBySource filters auto-predict and auto-contradiction', () => {
   const { db, user } = fixture();
   db.addMemory(user.id, 'User likes coffee', { source: 'user' });
