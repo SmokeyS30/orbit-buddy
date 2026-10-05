@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from './src/database.js';
 import { createModelClient } from './src/model.js';
-import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda } from './src/ical.js';
+import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
@@ -289,6 +289,7 @@ export function createOrbitServer(options={}) {
           const {text}=await model.respond({buddyName,userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
           await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`);
           db.completeRoutine(user.id,routine.id,local.date);
+          try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
         }catch(error){db.failRoutine(user.id,routine.id,local.date,error.message);db.releaseProactiveSlot(user.id,local.date);db.addEvent(user.id,'routine_failed',`Could not run routine “${routine.title}”.`,error.message);}
       }
     }
@@ -383,7 +384,26 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
 
       if(!db.claimProactiveSlot(user.id,today))continue;
 
+      // Meeting prep: check for upcoming events in the next 90 minutes
+      let meetingCandidate=null;
+      try{
+        const {events}=await getEventsForRange(db,user.id,nowMs,nowMs+90*60_000,timeZone);
+        const genericTitle=/^(lunch|break|focus|focus time|ooo|out of office|busy|personal|dentist|appointment)$/i;
+        for(const e of events){
+          if(e.allDay)continue;
+          if(e.startMs<=nowMs)continue; // already started
+          const prepKey=`meeting_prepped_${user.id}_${e.uid}_${e.instanceStartMs}`;
+          if(db.getSetting(prepKey))continue; // already prepped
+          const title=String(e.title||'').trim();
+          // Skip generic blocks unless they have a location or description suggesting a real meeting
+          if(genericTitle.test(title)&&!e.location&&!e.description)continue;
+          meetingCandidate={...e,prepKey};
+          break; // prep the soonest one only
+        }
+      }catch(e){}
+
       // Let the AI decide: is now a good time? What kind of check-in?
+      const meetingLine=meetingCandidate?`- "MEETING_PREP" if "${meetingCandidate.title}" starting at ${new Date(meetingCandidate.startMs).toLocaleTimeString('en-US',{timeZone,hour:'numeric',minute:'2-digit'})} could use a prep briefing (only if prep would genuinely help — skip for routine/generic blocks)\n`:'';
       const decidePrompt=`It is currently ${localTime} (${timeZone}). You are deciding whether to send a proactive check-in to ${user.display_name||'the user'}.
 
 Consider:
@@ -395,7 +415,7 @@ Respond with ONLY one of:
 - "MORNING" if a morning briefing is appropriate (weather, today's calendar, goal momentum, one suggestion)
 - "EVENING" if an evening wind-down is appropriate (day recap, tomorrow preview, encouragement)
 - "CHECKIN" if a brief friendly check-in is appropriate (1-2 sentences, reference something from their life if natural)
-- "SKIP" if now is not a good time for any proactive message
+${meetingLine}- "SKIP" if now is not a good time for any proactive message
 
 Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
 
@@ -403,7 +423,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const { text: decision }=await model.respond({buddyName,userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const decisionClean=decision.trim().toUpperCase();
 
-        if(decisionClean==='SKIP'||!['MORNING','EVENING','CHECKIN'].includes(decisionClean)){
+        if(decisionClean==='SKIP'||!['MORNING','EVENING','CHECKIN','MEETING_PREP'].includes(decisionClean)){
+          db.releaseProactiveSlot(user.id,today);
+          continue;
+        }
+        // If AI chose MEETING_PREP but we have no candidate (edge case), treat as SKIP
+        if(decisionClean==='MEETING_PREP'&&!meetingCandidate){
           db.releaseProactiveSlot(user.id,today);
           continue;
         }
@@ -443,7 +468,24 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const flashbacks=db.listMemoriesOnDate(user.id,lm,ld).slice(0,2);
             if(flashbacks.length)flashbackCtx=`\n\nOn this day in the past: ${flashbacks.map((f)=>`in ${f.year}, ${f.content.slice(0,200)}`).join(' | ')}. Weave in a brief, warm throwback reference if one fits naturally.`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}`;
+          // Email digest for Gmail-connected users
+          let emailDigestCtx='';
+          try{emailDigestCtx=await getMorningEmailDigest(user.id);}catch(e){}
+          // Active streaks so the AI can reference them naturally
+          let streakCtx='';
+          try{
+            const streaks=[];
+            for(const r of db.listRoutines(user.id).filter((r)=>r.enabled&&['daily','weekdays'].includes(r.cadence))){
+              const n=db.getStreak(user.id,'routine',r.id,today);
+              if(n>=2)streaks.push(`${n}-day streak on "${r.title}"`);
+            }
+            for(const g of db.listActiveGoals(user.id)){
+              const n=db.getGoalStreak(user.id,g.id,today);
+              if(n>=2)streaks.push(`${n}-day streak on goal "${g.title}"`);
+            }
+            if(streaks.length)streakCtx=`\n\nActive streaks: ${streaks.slice(0,4).join('; ')}. If one fits naturally, acknowledge it warmly (don't force it).`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -451,6 +493,36 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(agenda)tomorrowCtx=`\n\nCalendar data (today + tomorrow):\n${agenda}\nUse this for the tomorrow preview if anything is scheduled.`;
           }catch(e){}
           genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}`;
+        }else if(decisionClean==='MEETING_PREP'){
+          // Gather context: attendees, related memories, recent emails
+          const mc=meetingCandidate;
+          const whenStr=new Date(mc.startMs).toLocaleTimeString('en-US',{timeZone,hour:'numeric',minute:'2-digit'});
+          let attendeeCtx='';
+          try{
+            const names=extractPersonNames(`${mc.title} ${mc.description||''}`.slice(0,500));
+            if(names.length){
+              const memHits=[];
+              for(const n of names.slice(0,3)){
+                const rel=db.listRelevantMemories(user.id,n).slice(0,2);
+                for(const m of rel)memHits.push(`${n}: ${String(m.content||'').slice(0,120)}`);
+              }
+              if(memHits.length)attendeeCtx=`What you know about the people involved:\n${memHits.join('\n')}`;
+            }
+          }catch(e){}
+          let emailCtx='';
+          try{
+            if(db.getConnector(user.id,'gmail')){
+              const {searchEmails}=await import('./src/gmail.js');
+              const q=mc.title.split(/\s+/).slice(0,4).join(' ');
+              const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:q,max:3});
+              if(res.emails?.length)emailCtx=`Recent related emails:\n${res.emails.map((e)=>`- From ${e.from}: "${e.subject}" (${e.snippet.slice(0,100)})`).join('\n')}`;
+            }
+          }catch(e){}
+          const ctxParts=[`Meeting: "${mc.title}" at ${whenStr}${mc.location?` (${mc.location})`:''}${mc.description?`\nDetails: ${mc.description.slice(0,300)}`:''}`];
+          if(attendeeCtx)ctxParts.push(attendeeCtx);
+          if(emailCtx)ctxParts.push(emailCtx);
+          genPrompt=`Write a concise meeting prep briefing (3-4 sentences, plain text). Include: who they're meeting and any relevant context you have, related recent emails or notes if any, and one practical suggestion for the meeting. Sound like a helpful assistant giving a quick heads-up, not a calendar alert. Do not mention that this is automated.\n\n${ctxParts.join('\n\n')}`;
+          db.setSetting(mc.prepKey,'1');
         }else{
           // Gentle nudge about someone they haven't mentioned in 2+ weeks
           let nudgeCtx='';
@@ -533,9 +605,70 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
     }
   }
+  async function runEmailTriage(nowMs){
+    // Urgent email pushes: conservative, max 1 per 4 hours per user
+    const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
+    for(const user of db.listUsers()){
+      if(user.disabled)continue;
+      let gmailRow=null;
+      try{gmailRow=db.getConnector(user.id,'gmail');}catch(e){}
+      if(!gmailRow)continue;
+      const preferences=db.getPreferences(user.id);
+      if(isQuietHours(preferences,nowMs))continue;
+      const timeZone=preferences.time_zone||'America/New_York';
+      // Max 1 urgent push per 4 hours
+      const lastUrgent=db.getSetting(`email_urgent_last_${user.id}`);
+      if(lastUrgent&&nowMs-new Date(lastUrgent).valueOf()<4*3600_000)continue;
+      // Don't interrupt recently active users
+      const lastUserMsg=db.lastUserMessageAt(user.id);
+      if(lastUserMsg&&nowMs-new Date(lastUserMsg).valueOf()<60*60_000)continue;
+
+      const today=todayInZone(timeZone,nowMs);
+      try{
+        const {searchEmails}=await import('./src/gmail.js');
+        const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:'is:unread newer_than:2h',max:10});
+        const candidates=(res.emails||[]).filter((e)=>{
+          const from=String(e.from||'');
+          const subj=String(e.subject||'');
+          if(NEWSLETTER_RE.test(from))return false;
+          if(/unsubscribe/i.test(subj))return false;
+          return true;
+        }).slice(0,5);
+        if(!candidates.length)continue;
+
+        // Let the AI decide if any are truly urgent
+        const decidePrompt=`You are triaging unread emails from the last 2 hours for ${user.display_name||'the user'}. Be very conservative — only flag something as urgent if it's a direct question needing a timely reply, time-sensitive (deadline today/tomorrow), or from a real person about something important. Newsletters, promos, receipts, and FYIs are NOT urgent.\n\nEmails:\n${candidates.map((e,i)=>`${i+1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet.slice(0,150)}`).join('\n')}\n\nRespond with ONLY the number of the single most urgent email (e.g. "2"), or "NONE" if nothing is urgent enough to interrupt them.`;
+        const {text:decision}=await model.respond({buddyName,userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const pick=parseInt(decision.trim(),10);
+        if(!Number.isInteger(pick)||pick<1||pick>candidates.length)continue;
+        const urgent=candidates[pick-1];
+
+        if(!db.claimProactiveSlot(user.id,today))continue;
+        const genPrompt=`Write a brief heads-up (2 sentences, plain text) about an urgent email for ${user.display_name||'the user'}. Summarize what it's about and suggest one concrete action (e.g. reply, check the attachment). Sound natural, not alarming. Do not mention that this is automated.\n\nFrom: ${urgent.from}\nSubject: ${urgent.subject}\nPreview: ${urgent.snippet.slice(0,200)}`;
+        const {text}=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
+        await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
+      }catch(error){
+        db.addEvent(user.id,'email_triage_failed','Could not triage emails.',error.message);
+      }
+    }
+  }
+  // Shared helper: fetch a light email digest for the morning briefing (no AI call here — the briefing prompt weaves it in)
+  async function getMorningEmailDigest(userId){
+    try{
+      if(!db.getConnector(userId,'gmail'))return '';
+      const {searchEmails}=await import('./src/gmail.js');
+      const res=await searchEmails(()=>connectors.getValidToken(userId,'gmail'),{query:'is:unread newer_than:24h',max:10});
+      const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
+      const items=(res.emails||[]).filter((e)=>!NEWSLETTER_RE.test(String(e.from||''))&&!/unsubscribe/i.test(String(e.subject||'')));
+      if(!items.length)return '';
+      const top=items.slice(0,3).map((e)=>`"${e.subject}" from ${e.from.split('<')[0].trim().slice(0,40)}`).join('; ');
+      return `\n\nEmail digest: ${items.length} unread in the last day. Most important: ${top}. Mention the most relevant one briefly if it fits naturally.`;
+    }catch(e){return '';}
+  }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);}
     finally{proactiveBusy=false;}
   }
 
@@ -660,7 +793,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName,model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
-        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),goals:db.listGoals(me),routines:db.listRoutines(me),projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:db.getPreferences(me),contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
+        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
         if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:db.listCalendarFeeds(userId).map(publicFeed)});
