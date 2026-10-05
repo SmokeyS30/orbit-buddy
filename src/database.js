@@ -12,6 +12,26 @@ function ensureColumn(db, table, name, definition) {
   if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 
+// Count consecutive calendar days ending today (or yesterday if today has no entry).
+// dates: YYYY-MM-DD strings, most recent first. todayStr: YYYY-MM-DD.
+function countConsecutiveDays(dates, todayStr) {
+  if (!dates.length || !todayStr) return 0;
+  const set = new Set(dates);
+  const dayMs = 86400_000;
+  const parse = (d) => { const [y, m, dd] = d.split('-').map(Number); return Date.UTC(y, m - 1, dd); };
+  let cursor = parse(todayStr);
+  // Allow the streak to start yesterday (today's completion may not have happened yet)
+  if (!set.has(todayStr)) cursor -= dayMs;
+  let streak = 0;
+  while (true) {
+    const key = new Date(cursor).toISOString().slice(0, 10);
+    if (!set.has(key)) break;
+    streak++;
+    cursor -= dayMs;
+  }
+  return streak;
+}
+
 function adoptOrphanMessages(db, userId) {
   let convo = db.prepare('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC LIMIT 1').get(userId);
   if (!convo) {
@@ -164,6 +184,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       person_name TEXT NOT NULL, last_mentioned_at TEXT NOT NULL, last_nudged_at TEXT,
       dismissed INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, person_name)
+    );
+    CREATE TABLE IF NOT EXISTS streak_completions (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_type TEXT NOT NULL, item_id TEXT NOT NULL, date TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, item_type, item_id, date)
     );
     CREATE TABLE IF NOT EXISTS conversation_summaries (
       conversation_id TEXT PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
@@ -354,6 +380,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesOnDate: db.prepare(`SELECT content,created_at FROM memories WHERE user_id=? AND status='approved'
       AND strftime('%m',created_at)=? AND strftime('%d',created_at)=? AND strftime('%Y',created_at)!=?
       ORDER BY created_at DESC LIMIT 5`),
+    recordStreakCompletion: db.prepare(`INSERT OR IGNORE INTO streak_completions(user_id,item_type,item_id,date,created_at) VALUES(?,?,?,?,?)`),
+    listStreakDates: db.prepare(`SELECT date FROM streak_completions WHERE user_id=? AND item_type=? AND item_id=? ORDER BY date DESC LIMIT 400`),
+    listGoalCheckinDates: db.prepare(`SELECT DISTINCT substr(created_at,1,10) AS date FROM goal_checkins WHERE user_id=? AND goal_id=? ORDER BY date DESC LIMIT 400`),
     listTasksCompletedSince: db.prepare(`SELECT * FROM tasks WHERE user_id=? AND status='completed' AND updated_at>=? ORDER BY updated_at DESC`),
     listMemoriesSince: db.prepare(`SELECT * FROM memories WHERE user_id=? AND status='approved' AND created_at>=? ORDER BY created_at DESC`),
     listGoalCheckinsSince: db.prepare(`SELECT gc.*, g.title AS goal_title FROM goal_checkins gc JOIN goals g ON g.id=gc.goal_id
@@ -548,6 +577,28 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,
     markPersonNudged(userId,personName){const now=timestamp();return s.markPersonNudged.run(now,now,userId,personName).changes>0;},
     listMemoriesOnDate(userId,month,day){const mm=String(month).padStart(2,'0');const dd=String(day).padStart(2,'0');const yyyy=String(new Date().getUTCFullYear());return s.listMemoriesOnDate.all(userId,mm,dd,yyyy).map((row)=>({...row,year:row.created_at.slice(0,4)}));},
+    recordStreakCompletion(userId,itemType,itemId,dateStr){return s.recordStreakCompletion.run(userId,itemType,itemId,dateStr,timestamp()).changes>0;},
+    // Count consecutive days with a completion, working backward from today (or yesterday if today has none).
+    // dateStrs: array of YYYY-MM-DD strings, most recent first. timeZone-aware "today" passed in.
+    getStreak(userId,itemType,itemId,todayStr){
+      const rows=s.listStreakDates.all(userId,itemType,itemId).map((r)=>r.date);
+      return countConsecutiveDays(rows,todayStr);
+    },
+    // Goals use goal_checkins history directly (no separate streak table needed).
+    getGoalStreak(userId,goalId,todayStr){
+      const rows=s.listGoalCheckinDates.all(userId,goalId).map((r)=>r.date);
+      return countConsecutiveDays(rows,todayStr);
+    },
+    // One-time backfill: seed streak_completions for goals from existing checkin history.
+    backfillGoalStreaks(userId){
+      const goals=s.listGoals.all(userId);
+      let seeded=0;
+      for(const g of goals){
+        const dates=s.listGoalCheckinDates.all(userId,g.id);
+        for(const {date} of dates){if(s.recordStreakCompletion.run(userId,'goal',g.id,date,timestamp()).changes>0)seeded++;}
+      }
+      return seeded;
+    },
     listTasksCompletedSince:(userId,sinceISO)=>s.listTasksCompletedSince.all(userId,sinceISO),
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
