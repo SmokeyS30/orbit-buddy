@@ -401,10 +401,130 @@ Only include genuine insights. If nothing meaningful, respond with [].`;
               }
               if(deepSaved>0)db.addEvent(user.id,'auto_learned',`Deep dive found ${deepSaved} long-term insight${deepSaved>1?'s':''}.`);
             }
+            // Gentle contradictions: beliefs about themselves that behavior doesn't support
+            try{
+              const contraPrompt=`Based on this user's full history, identify any gentle contradictions — things they believe about themselves that their actual behavior doesn't quite support, or stated preferences that conflict with real patterns. Be kind and observant, never judgmental.
+
+Memories:
+${memText}
+
+Examples: "says not a morning person but most productive before 9am", "says they hate planning but always feel better after organizing".
+
+Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what their behavior shows","gentleFraming":"how to lightly mention this, warmly"}. Only include genuine, well-supported contradictions. If none, respond with [].`;
+              const { text: contraText }=await model.respond({buddyName,userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const cm2=contraText.match(/\[[\s\S]*\]/);
+              if(cm2){
+                let contraSaved=0;
+                for(const c of (Array.isArray(JSON.parse(cm2[0]))?JSON.parse(cm2[0]):[]).slice(0,3)){
+                  if(!c.belief||!c.gentleFraming)continue;
+                  const content=`Believes "${String(c.belief).slice(0,150)}" but ${String(c.evidence||'behavior suggests otherwise').slice(0,200)}. Frame gently: ${String(c.gentleFraming).slice(0,200)}`;
+                  const existing=db.listRelevantMemories(user.id,content,3);
+                  if(existing.some((m)=>(m.source||'')==='auto-contradiction'))continue;
+                  db.addMemory(user.id,content,{kind:'fact',source:'auto-contradiction',confidence:Math.max(0.5,Math.min(Number(c.confidence)||0.6,0.7))});
+                  contraSaved++;
+                }
+                if(contraSaved>0)db.addEvent(user.id,'auto_learned',`Noticed ${contraSaved} gentle contradiction${contraSaved>1?'s':''}.`);
+              }
+            }catch(e){}
           }
           db.setSetting(`deep_mining_last_${user.id}`,monthKey);
         }
       }catch(error){db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
+
+      // --- Monthly: motivational profiling — what approach works best? ---
+      try{
+        const monthKey=today.slice(0,7);
+        if(db.getSetting(`motivation_last_${user.id}`)!==monthKey){
+          // Correlate check-in engagement: which check-ins got replies within 2h?
+          const events=db.listEvents(user.id,120).filter((e)=>['smart_checkin_sent','quiet_nudge_sent','weekly_review_sent'].includes(e.type));
+          const userMsgs=db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+          const engagedTypes={};
+          const totalTypes={};
+          for(const ev of events.slice(0,40)){
+            const evMs=new Date(ev.created_at).valueOf();
+            const type=/morning/i.test(ev.message||'')?'morning':/evening/i.test(ev.message||'')?'evening':/weekly/i.test(ev.message||'')?'weekly':'checkin';
+            totalTypes[type]=(totalTypes[type]||0)+1;
+            if(userMsgs.some((um)=>um>evMs&&um<evMs+2*3600_000))engagedTypes[type]=(engagedTypes[type]||0)+1;
+          }
+          const totalEvents=Object.values(totalTypes).reduce((a,b)=>a+b,0);
+          if(totalEvents>=5){
+            const engagement=Object.entries(totalTypes).map(([t,n])=>`${t}: ${engagedTypes[t]||0}/${n} engaged`).join('; ');
+            const msgSample=db.listMessages(user.id,30).filter((m)=>m.role==='user').slice(-10).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
+            const motPrompt=`What motivational style works best for this person? Base your answer on evidence.
+
+Check-in engagement (replied within 2 hours): ${engagement}
+Current briefing tone preference: ${preferences.briefing_tone||'motivational'}
+
+Recent user messages (note their style — questions? data? short? emotional?):
+${msgSample||'(none)'}
+
+Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough-love"|"calm"|"unknown","evidence":"one sentence on why"}. Use "unknown" if there isn't enough signal.`;
+            const { text: motText }=await model.respond({buddyName,userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const mm=motText.match(/\{[\s\S]*\}/);
+            if(mm){
+              const parsed=JSON.parse(mm[0]);
+              const prev=db.getMotivationProfile(user.id);
+              const newStyle=db.setMotivationProfile(user.id,parsed.style,parsed.evidence);
+              if(newStyle!=='unknown'&&newStyle!==prev.style)db.addEvent(user.id,'auto_learned',`Motivational style identified: ${newStyle}.`);
+            }
+          }
+          db.setSetting(`motivation_last_${user.id}`,monthKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
+
+      // --- Monthly: memory consolidation — merge, prune, strengthen ---
+      try{
+        const monthKey=today.slice(0,7);
+        if(db.getSetting(`consolidation_last_${user.id}`)!==monthKey){
+          const autoMems=db.listMemories(user.id).filter((m)=>String(m.source||'').startsWith('auto'));
+          if(autoMems.length>=15){
+            const memList=autoMems.slice(0,60).map((m)=>`[${m.id.slice(0,8)}] (${m.source}) ${String(m.content||'').slice(0,180)}`).join('\n');
+            const conPrompt=`Review these auto-learned memories about the user. Clean them up.
+
+${memList}
+
+Identify:
+(a) Duplicates or near-duplicates to MERGE into one clear memory
+(b) Trivial, outdated, or low-value items to REMOVE
+(c) Important themes that should be STRENGTHENED into a single clear statement
+
+Respond with a single JSON object: {"merge":[[id_prefix1, id_prefix2, "merged content"]],"remove":[id_prefix],"strengthen":[{id: id_prefix, content: "strengthened content"}]}
+Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs changing, respond with {"merge":[],"remove":[],"strengthen":[]}.`;
+            const { text: conText }=await model.respond({buddyName,userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const cm3=conText.match(/\{[\s\S]*\}/);
+            if(cm3){
+              const ops=JSON.parse(cm3[0]);
+              let opCount=0;
+              const byPrefix={};for(const m of autoMems)byPrefix[m.id.slice(0,8)]=m;
+              // Merges: delete originals, save merged with higher confidence
+              for(const [p1,p2,merged] of (ops.merge||[]).slice(0,8)){
+                if(opCount>=20)break;
+                const m1=byPrefix[String(p1)],m2=byPrefix[String(p2)];
+                if(!m1||!m2||!merged)continue;
+                db.deleteMemory(user.id,m1.id);db.deleteMemory(user.id,m2.id);
+                db.addMemory(user.id,String(merged).slice(0,500),{kind:m1.kind||'fact',source:m1.source,confidence:Math.min(0.9,Number(m1.confidence||0.6)+0.1)});
+                opCount+=2;
+              }
+              // Removes
+              for(const p of (ops.remove||[]).slice(0,8)){
+                if(opCount>=20)break;
+                const m=byPrefix[String(p)];if(!m)continue;
+                db.deleteMemory(user.id,m.id);opCount++;
+              }
+              // Strengthens: update content and bump confidence
+              for(const st of (ops.strengthen||[]).slice(0,8)){
+                if(opCount>=20)break;
+                const m=byPrefix[String(st.id)];if(!m||!st.content)continue;
+                db.deleteMemory(user.id,m.id);
+                db.addMemory(user.id,String(st.content).slice(0,500),{kind:m.kind||'fact',source:m.source,confidence:Math.min(0.95,Number(m.confidence||0.6)+0.15)});
+                opCount++;
+              }
+              if(opCount>0)db.addEvent(user.id,'auto_learned',`Consolidated memories: ${opCount} cleanup operations.`);
+            }
+          }
+          db.setSetting(`consolidation_last_${user.id}`,monthKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Memory consolidation failed.',error.message);}
 
       // --- Weekly: curiosity gaps, pattern detection, relationship depth ---
       try{
@@ -457,6 +577,47 @@ Respond with a single JSON object: {"summary":"one sentence on who this person i
                 const parsed=JSON.parse(rm[0]);
                 if(parsed.summary&&typeof parsed.summary==='string')db.updatePersonContext(user.id,name,parsed.summary,parsed.sentiment);
               }
+            }
+          }catch(e){}
+
+          // 4. Predictive insights: what does this user likely need?
+          try{
+            if(db.getSetting(`predictions_last_${user.id}`)!==weekKey){
+              const patternMems=db.listMemoriesBySource(user.id,'auto-pattern',10).map((m)=>`- ${String(m.content||'').slice(0,150)}`);
+              const routines=db.listRoutines(user.id).filter((r)=>r.enabled).map((r)=>r.title).slice(0,10);
+              const goals=db.listActiveGoals(user.id).map((g)=>`${g.title} (${g.progress||0}%)`).slice(0,10);
+              const stamps=db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+              const actPatterns=findTimePatterns(stamps,timeZone).slice(0,3).map((p)=>p.label);
+              const behaviorParts=[];
+              if(patternMems.length)behaviorParts.push(`Detected patterns:\n${patternMems.join('\n')}`);
+              if(routines.length)behaviorParts.push(`Active routines: ${routines.join(', ')}`);
+              if(goals.length)behaviorParts.push(`Active goals: ${goals.join('; ')}`);
+              if(actPatterns.length)behaviorParts.push(`Activity rhythms: ${actPatterns.join('; ')}`);
+              if(behaviorParts.length>=2){
+                const predPrompt=`Based on these patterns in the user's behavior, predict 2-3 actionable insights about what they likely need or what might happen soon. Be specific and practical, not generic.
+
+${behaviorParts.join('\n\n')}
+
+Examples of good predictions: "tends to slow down on Thursday afternoons — lighter check-ins then", "often abandons goals after 3 weeks — extra encouragement around week 3", "most creative late at night — suggest capturing ideas then".
+
+Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence":0.4-0.8,"suggestedAction":"what Orbit should do about it"}`;
+                const { text: predText }=await model.respond({buddyName,userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const pm=predText.match(/\[[\s\S]*\]/);
+                if(pm){
+                  let predSaved=0;
+                  for(const pred of (Array.isArray(JSON.parse(pm[0]))?JSON.parse(pm[0]):[]).slice(0,3)){
+                    if(!pred.prediction||typeof pred.prediction!=='string')continue;
+                    const content=`${pred.prediction.trim().slice(0,400)}${pred.suggestedAction?` → ${String(pred.suggestedAction).slice(0,200)}`:''}`;
+                    if(content.length<15)continue;
+                    const existing=db.listRelevantMemories(user.id,content,3);
+                    if(existing.some((m)=>(m.source||'')==='auto-predict'))continue;
+                    db.addMemory(user.id,content,{kind:'fact',source:'auto-predict',confidence:Math.max(0.4,Math.min(Number(pred.confidence)||0.6,0.8))});
+                    predSaved++;
+                  }
+                  if(predSaved>0)db.addEvent(user.id,'auto_learned',`Generated ${predSaved} predictive insight${predSaved>1?'s':''}.`);
+                }
+              }
+              db.setSetting(`predictions_last_${user.id}`,weekKey);
             }
           }catch(e){}
 
@@ -589,7 +750,19 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             if(streaks.length)streakCtx=`\n\nActive streaks: ${streaks.slice(0,4).join('; ')}. If one fits naturally, acknowledge it warmly (don't force it).`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}`;
+          // Predictive insights: what might they need today?
+          let predictCtx='';
+          try{
+            const preds=db.listMemoriesBySource(user.id,'auto-predict',5);
+            if(preds.length)predictCtx=`\n\nBehavioral predictions to consider: ${preds.slice(0,3).map((p)=>String(p.content||'').slice(0,200)).join('; ')}. If one is relevant today, act on it naturally.`;
+          }catch(e){}
+          // Motivational style: adapt approach to what works for this user
+          let motCtx='';
+          try{
+            const mp=db.getMotivationProfile(user.id);
+            if(mp.style&&mp.style!=='unknown')motCtx=` Motivational note: this user responds best to a ${mp.style} approach.`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -645,7 +818,22 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const gaps=db.listCuriosityGaps(user.id);
             if(gaps.length){curiosityCtx=` If it fits naturally, you could ask: "${gaps[0].question}". Don't force it.`;askedGapId=gaps[0].id;}
           }catch(e){}
-          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}`;
+          // Gentle contradiction: surface one if not mentioned in 30 days
+          let contraCtx='';let surfacedContraId=null;
+          try{
+            const contras=db.listMemoriesBySource(user.id,'auto-contradiction',5);
+            const thirtyDaysAgo=new Date(nowMs-30*86400_000).toISOString();
+            for(const c of contras){
+              const lastSurfaced=db.getSetting(`contradiction_surfaced_${user.id}_${c.id}`);
+              if(!lastSurfaced||lastSurfaced<thirtyDaysAgo){contraCtx=` If it feels natural, you could lightly note: "${String(c.content||'').slice(0,200)}". Be warm and playful, never judgmental.`;surfacedContraId=c.id;break;}
+            }
+          }catch(e){}
+          let motCtx2='';
+          try{
+            const mp2=db.getMotivationProfile(user.id);
+            if(mp2.style&&mp2.style!=='unknown')motCtx2=` This user responds best to a ${mp2.style} approach.`;
+          }catch(e){}
+          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}`;
         }
 
         const { text }=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
@@ -654,6 +842,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
         if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
         if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
+        if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
       }catch(error){
         db.releaseProactiveSlot(user.id,today);
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
