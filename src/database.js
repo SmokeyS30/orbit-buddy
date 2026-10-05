@@ -164,6 +164,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       label TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS timeline_cache (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      month_key TEXT NOT NULL,
+      narrative TEXT NOT NULL,
+      generated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, month_key)
+    );
     DROP TABLE IF EXISTS automation_tokens;
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -405,6 +412,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesSince: db.prepare(`SELECT * FROM memories WHERE user_id=? AND status='approved' AND created_at>=? ORDER BY created_at DESC`),
     listGoalCheckinsSince: db.prepare(`SELECT gc.*, g.title AS goal_title FROM goal_checkins gc JOIN goals g ON g.id=gc.goal_id
       WHERE gc.user_id=? AND gc.created_at>=? ORDER BY gc.created_at DESC`),
+    getTimelineNarrative: db.prepare('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?'),
+    setTimelineNarrative: db.prepare(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
+      ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`),
+    timelineMemories: db.prepare(`SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8`),
+    timelineConversations: db.prepare(`SELECT c.title FROM conversations c WHERE c.user_id=? AND substr(c.created_at,1,7)=? AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id) ORDER BY c.created_at DESC LIMIT 12`),
+    timelineGoalsCreated: db.prepare(`SELECT title FROM goals WHERE user_id=? AND substr(created_at,1,7)=? LIMIT 10`),
+    timelineGoalsCompleted: db.prepare(`SELECT title FROM goals WHERE user_id=? AND status='completed' AND completed_at IS NOT NULL AND substr(completed_at,1,7)=? LIMIT 10`),
+    timelineCheckinCount: db.prepare(`SELECT COUNT(*) AS n FROM goal_checkins WHERE user_id=? AND substr(created_at,1,7)=?`),
     upsertPreferences: db.prepare(`INSERT INTO user_preferences(user_id,time_zone,quiet_start,quiet_end,proactive_enabled,briefing_tone,briefing_length,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
       quiet_end=excluded.quiet_end,proactive_enabled=excluded.proactive_enabled,briefing_tone=excluded.briefing_tone,
@@ -627,6 +642,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listTasksCompletedSince:(userId,sinceISO)=>s.listTasksCompletedSince.all(userId,sinceISO),
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
+    getTimelineNarrative:(userId,monthKey)=>{const row=s.getTimelineNarrative.get(userId,monthKey);return row?row.narrative:null;},
+    setTimelineNarrative:(userId,monthKey,narrative)=>{s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());},
+    timelineMonthData(userId,monthKey){
+      return {
+        memories:s.timelineMemories.all(userId,monthKey),
+        conversations:s.timelineConversations.all(userId,monthKey),
+        goalsCreated:s.timelineGoalsCreated.all(userId,monthKey),
+        goalsCompleted:s.timelineGoalsCompleted.all(userId,monthKey),
+        checkins:s.timelineCheckinCount.get(userId,monthKey).n,
+      };
+    },
     getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
     setConversationSummary(userId,conversationId,summary,messageCount){s.upsertConversationSummary.run(conversationId,userId,summary,messageCount,timestamp());return s.getConversationSummary.get(conversationId,userId);},
     countConversationMessages:(userId,conversationId)=>s.countConversationMessages.get(conversationId,userId).count,
