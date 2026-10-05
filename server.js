@@ -472,6 +472,86 @@ Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough
         }
       }catch(error){db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
 
+      // --- Monthly: energy mapping — what energizes vs drains them? ---
+      try{
+        const monthKey=today.slice(0,7);
+        if(db.getSetting(`energy_map_last_${user.id}`)!==monthKey){
+          const memSample=db.listMemories(user.id).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+          const msgSample=db.listMessages(user.id,40).filter((m)=>m.role==='user').slice(-15).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
+          if(memSample||msgSample){
+            const energyPrompt=`Based on this person's memories and recent messages, identify what seems to energize them vs drain them. Ground each in specific observed behavior — things they light up talking about, complain about, avoid, or seem wiped out by. Never use clinical or diagnostic language.
+
+Memories:
+${memSample||'(none)'}
+
+Recent messages:
+${msgSample||'(none)'}
+
+Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":"observed behavior"}],"drainers":[{"activity":"what","evidence":"observed behavior"}]}, max 3 each. If there is no real signal, respond with {"energizers":[],"drainers":[]}.`;
+            const { text: energyText }=await model.respond({buddyName,userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const em2=energyText.match(/\{[\s\S]*\}/);
+            if(em2){
+              const parsed=JSON.parse(em2[0]);
+              const fmt=(arr)=>(Array.isArray(arr)?arr:[]).slice(0,3).filter((x)=>x&&x.activity).map((x)=>`${String(x.activity).slice(0,120)} (${String(x.evidence||'observed').slice(0,150)})`);
+              const energizers=fmt(parsed.energizers);const drainers=fmt(parsed.drainers);
+              if(energizers.length||drainers.length){
+                const parts=[];
+                if(energizers.length)parts.push(`Energizers: ${energizers.join('; ')}`);
+                if(drainers.length)parts.push(`Drainers: ${drainers.join('; ')}`);
+                const content=parts.join('. ');
+                const existing=db.listRelevantMemories(user.id,content,3);
+                if(!existing.some((m)=>String(m.source||'')==='auto-energy')){
+                  db.addMemory(user.id,content,{kind:'fact',source:'auto-energy',confidence:0.55});
+                  try{const prof=db.getEmotionalProfile(user.id);db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){}
+                  db.addEvent(user.id,'auto_learned','Mapped what energizes vs drains them.');
+                }
+              }
+            }
+          }
+          db.setSetting(`energy_map_last_${user.id}`,monthKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Energy mapping failed.',error.message);}
+
+      // --- Monthly: support style — what helps when they're struggling? ---
+      try{
+        const monthKey=today.slice(0,7);
+        if(db.getSetting(`support_style_last_${user.id}`)!==monthKey){
+          const STRESS_RE=/(stressed|stressing|overwhelm|frustrat|anxiou|\bsad\b|upset|angry|angrier|worried|worry|burned out|burnout|exhausted|tough day|rough day|hard day|can't take|giving up|feeling (down|low|off|blue))/i;
+          const msgs=db.listMessages(user.id,120);
+          const moments=[];
+          for(let i=0;i<msgs.length&&moments.length<3;i++){
+            const m=msgs[i];
+            if(m.role!=='user'||!STRESS_RE.test(String(m.content||'')))continue;
+            const orbitReply=msgs.slice(i+1,i+3).filter((x)=>x.role!=='user').map((x)=>`Orbit replied: ${String(x.content||'').slice(0,300)}`).join('\n');
+            const followUp=msgs.slice(i+3,i+5).filter((x)=>x.role==='user').map((x)=>`User then said: ${String(x.content||'').slice(0,300)}`).join('\n');
+            moments.push(`Moment ${moments.length+1}:\nUser: ${String(m.content||'').slice(0,300)}\n${orbitReply}${followUp?`\n${followUp}`:''}`);
+          }
+          if(moments.length>=2){
+            const supPrompt=`This person has had some hard moments. Look at how Orbit responded each time and how the user reacted afterward. Which support style did they seem to respond to best?
+
+${moments.join('\n\n')}
+
+Support styles:
+- "solutions": practical advice, action steps
+- "listening": validation, empathy, just being there
+- "questions": curious follow-up questions to help them think it through
+- "humor": lightening the mood
+- "space": backing off, keeping it brief
+
+Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"questions"|"humor"|"space"|"unknown","confidence":0.0-1.0,"evidence":"one sentence on why"}. Use "unknown" if the signal is weak or mixed.`;
+            const { text: supText }=await model.respond({buddyName,userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const sm=supText.match(/\{[\s\S]*\}/);
+            if(sm){
+              const parsed=JSON.parse(sm[0]);
+              const prof=db.getEmotionalProfile(user.id);
+              const st=db.setEmotionalProfile(user.id,parsed.preferredSupport,prof.energy_notes,parsed.evidence);
+              if(st!=='unknown'&&st!==prof.support_style)db.addEvent(user.id,'auto_learned',`Learned their preferred support style: ${st}.`);
+            }
+          }
+          db.setSetting(`support_style_last_${user.id}`,monthKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Support style learning failed.',error.message);}
+
       // --- Monthly: memory consolidation — merge, prune, strengthen ---
       try{
         const monthKey=today.slice(0,7);
@@ -621,6 +701,49 @@ Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence
             }
           }catch(e){}
 
+          // 5. Emotional baseline: how have they been feeling this week?
+          try{
+            if(db.getSetting(`emotion_baseline_last_${user.id}`)!==weekKey){
+              const weekAgoMs=nowMs-7*86400_000;
+              const weekMsgs=db.listMessages(user.id,60).filter((m)=>new Date(m.created_at).valueOf()>weekAgoMs);
+              const userWeekMsgs=weekMsgs.filter((m)=>m.role==='user');
+              if(userWeekMsgs.length>=5){
+                const convoSample=weekMsgs.slice(-24).map((m)=>`${m.role==='user'?'User':'Orbit'}: ${String(m.content||'').slice(0,250)}`).join('\n');
+                const emoPrompt=`Based on these recent conversations, assess this person's overall emotional tone for the week. Be conservative — only flag real signals, not noise. Never use clinical or diagnostic language (no "depression", "anxiety disorder", etc.) — just describe what you observe in plain human terms.
+
+Recent conversation:
+${convoSample}
+
+Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"low","confidence":0.0-1.0,"notableShifts":"brief description of any significant change from their usual, or empty string"}. Only claim a tone if the evidence is reasonable; when unsure, use "steady".`;
+                const { text: emoText }=await model.respond({buddyName,userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const em=emoText.match(/\{[\s\S]*\}/);
+                if(em){
+                  const parsed=JSON.parse(em[0]);
+                  const validTones=['upbeat','steady','flat','stressed','low'];
+                  const tone=validTones.includes(parsed.tone)?parsed.tone:'steady';
+                  const conf=Math.max(0.3,Math.min(Number(parsed.confidence)||0.5,0.9));
+                  const shifts=String(parsed.notableShifts||'').trim().slice(0,300);
+                  // Compare with last week's tone to catch meaningful shifts
+                  const prevMems=db.listMemoriesBySource(user.id,'auto-emotion',1);
+                  let prevTone=null;
+                  if(prevMems.length){const tm=/tone:\s*(upbeat|steady|flat|stressed|low)/i.exec(String(prevMems[0].content||''));if(tm)prevTone=tm[1].toLowerCase();}
+                  const rank={upbeat:4,steady:3,flat:2,stressed:1,low:0};
+                  const content=`Emotional tone this week: ${tone}.${shifts?` Notable: ${shifts}`:''}`;
+                  db.addMemory(user.id,content,{kind:'fact',source:'auto-emotion',confidence:conf});
+                  if(prevTone&&prevTone!==tone){
+                    const improved=rank[tone]>rank[prevTone];
+                    const bigShift=Math.abs(rank[tone]-rank[prevTone])>=2;
+                    const fellOff=(rank[prevTone]>=3&&rank[tone]<=1);
+                    const bouncedBack=(rank[prevTone]<=1&&rank[tone]>=3);
+                    if(bigShift||fellOff||bouncedBack)
+                      db.addEvent(user.id,'auto_learned',`Emotional tone shifted from ${prevTone} to ${tone}${improved?' — trending up':' — keeping it gentle'}.`);
+                  }
+                }
+              }
+              db.setSetting(`emotion_baseline_last_${user.id}`,weekKey);
+            }
+          }catch(e){}
+
           db.setSetting(`deep_learning_last_${user.id}`,weekKey);
         }
       }catch(error){db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
@@ -700,6 +823,33 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
         // Generate the appropriate check-in
         let genPrompt;let nudgedPerson=null;let askedGapId=null;
+        // Emotional attunement context: current tone, shifts, energy, support style
+        const emoCtx={tone:null,toneConf:0,shiftNote:'',energyNote:'',supportStyle:'unknown'};
+        try{
+          const emoMems=db.listMemoriesBySource(user.id,'auto-emotion',2);
+          if(emoMems.length){
+            const tm=/tone:\s*(upbeat|steady|flat|stressed|low)/i.exec(String(emoMems[0].content||''));
+            if(tm){emoCtx.tone=tm[1].toLowerCase();emoCtx.toneConf=Number(emoMems[0].confidence)||0.5;
+              const nm=/Notable:\s*(.+?)(?:\.|$)/i.exec(String(emoMems[0].content||''));
+              if(nm)emoCtx.shiftNote=nm[1].trim().slice(0,200);}
+          }
+          const energyMems=db.listMemoriesBySource(user.id,'auto-energy',1);
+          if(energyMems.length)emoCtx.energyNote=String(energyMems[0].content||'').slice(0,250);
+          const eprof=db.getEmotionalProfile(user.id);
+          if(eprof.support_style&&eprof.support_style!=='unknown')emoCtx.supportStyle=eprof.support_style;
+        }catch(e){}
+        const emoDown=emoCtx.tone&&['flat','stressed','low'].includes(emoCtx.tone)&&emoCtx.toneConf>=0.5;
+        // Build natural emotional guidance (never "my emotional analysis shows")
+        let emoGuide='';
+        try{
+          if(emoCtx.tone&&emoCtx.toneConf>=0.5){
+            if(emoCtx.tone==='upbeat')emoGuide=` They've seemed upbeat lately — let that warmth come through.`;
+            else if(emoCtx.tone==='steady')emoGuide=` They've seemed steady lately.`;
+            else emoGuide=` They've seemed ${emoCtx.tone} lately${emoCtx.shiftNote?` — ${emoCtx.shiftNote}`:''} — keep it extra warm and unhurried, no pressure, no piling on.`;
+            if(emoCtx.energyNote)emoGuide+=` Energy patterns you've noticed: ${emoCtx.energyNote}.`;
+            if(emoDown&&emoCtx.supportStyle!=='unknown')emoGuide+=` When they're struggling, they respond best when you lean toward ${emoCtx.supportStyle} (over other approaches).`;
+          }
+        }catch(e){}
         if(decisionClean==='MORNING'){
           // Fetch real weather and calendar data so the briefing has actual details
           let weatherCtx='';
@@ -762,14 +912,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const mp=db.getMotivationProfile(user.id);
             if(mp.style&&mp.style!=='unknown')motCtx=` Motivational note: this user responds best to a ${mp.style} approach.`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}`;
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${emoGuide}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
             const agenda=await getBriefingAgenda(db,user.id,2,timeZone);
             if(agenda)tomorrowCtx=`\n\nCalendar data (today + tomorrow):\n${agenda}\nUse this for the tomorrow preview if anything is scheduled.`;
           }catch(e){}
-          genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}`;
+          genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}${emoGuide}`;
         }else if(decisionClean==='MEETING_PREP'){
           // Gather context: attendees, related memories, recent emails
           const mc=meetingCandidate;
@@ -833,7 +983,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const mp2=db.getMotivationProfile(user.id);
             if(mp2.style&&mp2.style!=='unknown')motCtx2=` This user responds best to a ${mp2.style} approach.`;
           }catch(e){}
-          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}`;
+          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}${emoGuide}`;
         }
 
         const { text }=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
