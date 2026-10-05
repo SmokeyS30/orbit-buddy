@@ -5,57 +5,117 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Privacy Policy — Orbit Buddy</title>
 <style>
-body{font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto;padding:24px;line-height:1.6;color:#1a1a1a}
-h1{font-size:1.8em}h2{font-size:1.2em;margin-top:1.8em;color:#333}
+body{font-family:-apple-system,system-ui,sans-serif;max-width:760px;margin:0 auto;padding:24px;line-height:1.7;color:#1a1a1a}
+h1{font-size:1.8em}h2{font-size:1.2em;margin-top:2em;color:#333}
 .muted{color:#666;font-size:.9em}
+li{margin-bottom:.4em}
 </style>
 </head>
 <body>
 <h1>Privacy Policy — Orbit Buddy</h1>
 <p class="muted">Last updated: October 5, 2026</p>
 
-<p>Orbit Buddy ("the app") is a personal AI companion. This policy explains what data the app collects, how it is used, and your rights.</p>
+<p>Orbit Buddy ("the app," "we") is a personal AI companion application. Your privacy matters to us. This policy describes in detail what information we collect, why we collect it, how we use and protect it, and the choices you have.</p>
 
-<h2>Data We Collect</h2>
+<h2>1. Information We Collect</h2>
+
+<h3>1.1 Information you provide directly</h3>
 <ul>
-<li><strong>Account information:</strong> email address and display name you provide at registration.</li>
-<li><strong>Conversations:</strong> messages you send to Orbit Buddy and its replies, stored so it can remember context across sessions.</li>
-<li><strong>Memories, goals, tasks, and routines:</strong> information you ask the app to remember or track.</li>
-<li><strong>Calendar feeds:</strong> if you add iCal feed URLs, the app periodically fetches public event data from those URLs.</li>
-<li><strong>Gmail (optional):</strong> if you connect your Google account, the app can send email on your behalf and search or read your inbox, only when you ask it to. Gmail data is never used for advertising and is never shared with third parties.</li>
+<li><strong>Account credentials:</strong> When you register, we collect your email address, a display name, and a password. Passwords are hashed using scrypt with a unique salt per user; plain-text passwords are never stored.</li>
+<li><strong>Conversations:</strong> Every message you send to Orbit Buddy and every reply it generates is stored in our database. This enables the app to maintain context across sessions and provide personalized responses.</li>
+<li><strong>Memories:</strong> Facts, preferences, and observations you ask the app to remember (or that you approve from its suggestions) are stored as structured memories linked to your account.</li>
+<li><strong>Goals, tasks, routines, and projects:</strong> Any goals you set, tasks you create, routines you schedule, and projects you track — including titles, descriptions, due dates, progress, and completion status — are stored.</li>
+<li><strong>Follow-ups:</strong> Reminders you schedule, including their descriptions and due dates.</li>
+<li><strong>Uploaded files and artifacts:</strong> Documents or content you create or upload within the app.</li>
 </ul>
 
-<h2>How We Use Your Data</h2>
+<h3>1.2 Information from connected services</h3>
 <ul>
-<li>To provide the app's core features: conversational AI, reminders, briefings, and connected-service actions you request.</li>
-<li>Gmail access is used solely to perform the email actions you explicitly request (sending, searching, reading). The app does not scan your inbox in the background.</li>
-<li>We do not sell your data. We do not share your data with third parties except as required to operate the service (hosting provider, AI model provider for generating replies).</li>
+<li><strong>Calendar (iCal feeds):</strong> If you add iCal feed URLs in the Connections tab, the app periodically fetches event data (titles, times, locations) from those URLs to display your schedule and include it in briefings. Feed URLs are encrypted at rest and never logged.</li>
+<li><strong>Gmail (OAuth, optional):</strong> If you connect your Google account, the app receives an OAuth access token and refresh token. With your permission, the app can:
+  <ul>
+    <li>Send email on your behalf (<code>gmail.send</code> scope) — only after you review the exact recipient, subject, and body and explicitly confirm.</li>
+    <li>Search and read your inbox (<code>gmail.readonly</code> scope) — only when you ask a question about your email.</li>
+  </ul>
+  The app does not download, index, or analyze your entire mailbox. It accesses only the specific messages needed to fulfill your immediate request.
+</li>
+<li><strong>Push notifications:</strong> If you enable push notifications, we store a push subscription endpoint linked to your device so the server can deliver notifications you have opted into (e.g., reminders, check-ins).</li>
 </ul>
 
-<h2>Data Storage and Security</h2>
+<h3>1.3 Automatically collected information</h3>
 <ul>
-<li>Passwords are hashed with scrypt; they are never stored in plain text.</li>
-<li>OAuth tokens and calendar feed URLs are encrypted at rest.</li>
-<li>All traffic uses HTTPS. Authentication uses secure, HTTP-only cookies with CSRF protection.</li>
+<li><strong>Usage metadata:</strong> Timestamps of your activity (last login, last message sent) used for features like smart check-ins (which avoid notifying you if you were recently active).</li>
+<li><strong>Device information:</strong> Basic user-agent strings from your browser for session management and security.</li>
+<li><strong>Approximate location:</strong> Your timezone preference (which you can set) is used to schedule notifications at appropriate local times. We do not track your GPS location.</li>
 </ul>
 
-<h2>Data Retention and Deletion</h2>
+<h2>2. How We Use Your Information</h2>
 <ul>
-<li>You can delete individual memories, conversations, goals, and tasks at any time from within the app.</li>
-<li>Disconnecting Gmail in the Connections tab immediately deletes your stored Gmail tokens.</li>
-<li>To delete your entire account and all associated data, contact the developer (see below).</li>
+<li><strong>Core functionality:</strong> To operate the AI companion — generating replies, maintaining conversation context, tracking your goals and tasks, and delivering reminders and briefings.</li>
+<li><strong>Personalization:</strong> Memories and past conversations are used to tailor responses to your preferences, habits, and history.</li>
+<li><strong>Connected-service actions:</strong> Gmail and calendar data is used solely to perform the specific actions you request. For example, searching your inbox when you ask "find that email from John," or including today's events in your morning briefing.</li>
+<li><strong>Service improvement (aggregate only):</strong> We may review anonymized, aggregate usage patterns (e.g., which features are popular) to improve the app. Individual conversation content is never used for this purpose.</li>
 </ul>
 
-<h2>Google API Disclosure</h2>
-<p>Orbit Buddy's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements. Specifically:</p>
+<p><strong>We do not:</strong></p>
 <ul>
-<li>The app requests the <code>gmail.send</code> and <code>gmail.readonly</code> scopes.</li>
-<li>Gmail data is used only to provide user-facing email features you request.</li>
-<li>Gmail data is never used to develop, improve, or train generalized AI models.</li>
-<li>Gmail data is never transferred to third parties except as necessary to provide the requested feature (sending via Google's own API).</li>
+<li>Sell your personal information to anyone.</li>
+<li>Use your data for advertising or marketing by third parties.</li>
+<li>Share your conversations, emails, or memories with third parties except as described in Section 4.</li>
+<li>Use your Gmail data to develop, improve, or train generalized artificial intelligence or machine learning models.</li>
 </ul>
 
-<h2>Contact</h2>
-<p>For privacy questions or data deletion requests, contact the developer through the app's Safety tab or at the support address listed on the homepage.</p>
+<h2>3. Google API Services User Data Policy</h2>
+<p>Orbit Buddy's use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements:</p>
+<ul>
+<li>The app requests the <code>gmail.send</code> and <code>gmail.readonly</code> scopes. These are the minimum scopes necessary for the email features described above.</li>
+<li>Data received from Google APIs is used only to provide or improve the user-facing features you request.</li>
+<li>Google user data is not used for serving advertisements.</li>
+<li>Google user data is not transferred to third parties except as necessary to provide the requested feature (e.g., sending an email through Google's own Gmail API at your direction), to comply with applicable law, or as part of a merger or acquisition with user notice.</li>
+<li>The app does not allow humans to read Google user data except: (a) with your affirmative agreement, (b) as necessary for security purposes such as investigating abuse, (c) to comply with applicable law, or (d) for the app's internal operations where the data has been aggregated and anonymized.</li>
+</ul>
+
+<h2>4. Third-Party Services We Use</h2>
+<ul>
+<li><strong>Hosting:</strong> The app is hosted on Render. Your data resides on Render's infrastructure.</li>
+<li><strong>AI model provider:</strong> Your conversation messages are sent to our AI model provider (OpenAI) to generate replies. We do not send your stored memories or emails to the model provider except as needed for the immediate conversation context.</li>
+<li><strong>Google:</strong> When you use Gmail features, requests are sent to Google's Gmail API using your OAuth token.</li>
+<li><strong>Weather, news, and other public data:</strong> The app fetches public data (weather forecasts, news headlines, stock prices) from third-party APIs. No personal information is sent with these requests beyond a location you specify.</li>
+</ul>
+
+<h2>5. Data Security</h2>
+<ul>
+<li>All traffic between your device and our servers uses HTTPS (TLS).</li>
+<li>Passwords are hashed with scrypt; plain-text passwords are never stored or logged.</li>
+<li>OAuth tokens, calendar feed URLs, and other credentials are encrypted at rest using AES-256-GCM with a server-side encryption key.</li>
+<li>Authentication uses secure, HTTP-only, SameSite=Strict cookies with CSRF protection.</li>
+<li>Rate limiting is enforced per user to mitigate abuse.</li>
+</ul>
+
+<h2>6. Data Retention</h2>
+<ul>
+<li>Conversations, memories, goals, tasks, and other user data are retained until you delete them.</li>
+<li>You can delete individual items at any time from within the app (Memories tab, Goals tab, chat history, etc.).</li>
+<li>Disconnecting a connected service (e.g., Gmail) in the Connections tab immediately and permanently deletes the associated OAuth tokens from our database.</li>
+<li>Push notification subscriptions are deleted when you disable notifications or remove the app.</li>
+</ul>
+
+<h2>7. Your Rights and Choices</h2>
+<ul>
+<li><strong>Access:</strong> You can view all of your stored data from within the app (chat history, Memories tab, Goals tab, etc.).</li>
+<li><strong>Correction:</strong> You can edit or update your profile, memories, goals, and tasks at any time.</li>
+<li><strong>Deletion:</strong> You can delete individual items at any time. To delete your entire account and all associated data, contact us (see Section 9).</li>
+<li><strong>Withdraw consent:</strong> Disconnecting Gmail or removing a calendar feed immediately stops all access to that service and deletes stored credentials.</li>
+<li><strong>Opt out of proactive messages:</strong> You can disable smart check-ins and notifications in your preferences or quiet-hour settings.</li>
+</ul>
+
+<h2>8. Children's Privacy</h2>
+<p>Orbit Buddy is not directed at children under 13, and we do not knowingly collect personal information from children under 13.</p>
+
+<h2>9. Contact Us</h2>
+<p>For privacy questions, data access requests, or account/data deletion requests, contact the developer through the app's Safety tab or via the support link on the <a href="/welcome.html">homepage</a>.</p>
+
+<h2>10. Changes to This Policy</h2>
+<p>We may update this policy from time to time. Material changes will be communicated through the app. Continued use after changes constitutes acceptance.</p>
 </body>
 </html>
