@@ -10,6 +10,7 @@ import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { isQuietHours, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
+import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -207,7 +208,7 @@ export function createOrbitServer(options={}) {
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
   function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production}));return csrf;}
-  function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role};}
+  function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
   const chatQueues=new Map();
@@ -488,6 +489,23 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
+      if(req.method==='POST'&&url.pathname==='/api/demo/start'){
+        if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
+        try{cleanupExpiredDemos(db);}catch{}
+        const user=db.createDemoUser();
+        seedDemoData(db,user.id);
+        const csrf=createSession(user,req,res);
+        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/demo/start'){
+        if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
+        // Clean up expired demos opportunistically
+        try{cleanupExpiredDemos(db);}catch{}
+        const user=db.createDemoUser();
+        seedDemoData(db,user.id);
+        const csrf=createSession(user,req,res);
+        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
+      }
       if(req.method==='POST'&&url.pathname==='/api/registration-request'){
         if(hourlyLimited(req,3,'reg-request'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
         const body=await readJson(req);const name=cleanText(body.name,80,'name');const email=safeEmail(body.email);
@@ -587,6 +605,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
+          // Demo users are capped on messages
+          if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
           const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
           const userMsg=db.addMessage(userId,conversation.id,'user',message);db.touchConversation(userId,conversation.id);
@@ -639,9 +659,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const taskMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/(approve|cancel)$/);if(req.method==='POST'&&taskMatch){const task=db.getTask(userId,taskMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});const action=taskMatch[2];const status=action==='approve'?(task.schedule_at?'scheduled':'queued'):'cancelled';db.setTaskStatus(userId,task.id,status);db.addEvent(userId,`task_${action}d`,`${action==='approve'?'Approved':'Cancelled'} “${task.title}”.`);if(action==='approve')setImmediate(runDueTasks);return json(res,200,{...task,status});}
         const artifactMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='GET'&&artifactMatch){const artifact=db.getArtifact(userId,artifactMatch[1]);if(!artifact)throw Object.assign(new Error('Artifact not found.'),{status:404});if(artifact.mime_type==='text/markdown'&&url.searchParams.get('format')==='pdf'){const pdf=await markdownToPdfBuffer(artifact.content);res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':`inline; filename="${artifact.name.replace(/\.md$/,'.pdf').replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(pdf);}if(artifact.mime_type==='text/markdown'){const autoPrint=url.searchParams.get('print')==='1';const printUrl=`${publicBase||''}/api/artifacts/${artifact.id}?print=1`;const html=markdownToHtml(artifact.content,autoPrint,printUrl);res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});return res.end(html);}res.writeHead(200,{'Content-Type':artifact.mime_type,'Content-Disposition':`attachment; filename="${artifact.name.replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(artifact.content);}
         if(req.method==='GET'&&url.pathname==='/api/push/public-key')return json(res,200,{configured:push.configured,publicKey:push.publicKey});
-        if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/push/unsubscribe'){const body=await readJson(req);db.deletePush(userId,String(body.endpoint||''));return json(res,200,{ok:true});}
-        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
@@ -665,7 +685,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
   return {server,db,runDueTasks,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }
