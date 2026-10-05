@@ -8,7 +8,7 @@ import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAg
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { extractPersonNames, isQuietHours, isoWeekKey, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
+import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import {
@@ -152,6 +152,10 @@ export function stripSuggestMarkers(text){
 }
 export function stripModelMarkers(text){return stripSuggestMarkers(stripFollowUpMarkers(text));}
 // Quiet-nudge timing: idle >48h since the user's last message, and no nudge in the last 7 days.
+// Detects when the user is correcting a misunderstanding — a high-value learning signal.
+export function isCorrectionMessage(text){
+  return /\b(actually,|i meant|correction:|not quite|no,?\s+that'?s (wrong|not right)|you'?re (wrong|mistaken)|let me rephrase|what i meant was|i misspoke)/i.test(String(text||''));
+}
 export function quietNudgeDue(lastActivityAt,lastNudgeAt,nowMs){
   if(!lastActivityAt)return false;
   const idleMs=nowMs-new Date(lastActivityAt).valueOf();
@@ -359,6 +363,106 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       }catch(error){
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
+
+      // --- Monthly deep dive: mine full history for long arcs ---
+      try{
+        const monthKey=today.slice(0,7);
+        if(db.getSetting(`deep_mining_last_${user.id}`)!==monthKey){
+          const allMemories=db.listMemories(user.id).slice(0,100);
+          if(allMemories.length>=10){
+            const memText=allMemories.map((m)=>`- (${String(m.created_at||'').slice(0,4)}) ${String(m.content||'').slice(0,200)}`).join('\n');
+            const deepPrompt=`Analyze this user's full history — all their saved memories. Identify long-term patterns, not recent events.
+
+Memories:
+${memText}
+
+Look for:
+(a) recurring themes they keep returning to,
+(b) opinions or preferences that have changed over time (old vs new),
+(c) long-term goals they're working toward,
+(d) things they care deeply about, based on frequency and emotional weight.
+
+Respond with a JSON array, max 10. Each: {"type":"theme"|"evolution"|"goal"|"passion","content":"one clear sentence","confidence":0.6-0.9}
+Only include genuine insights. If nothing meaningful, respond with [].`;
+            const { text: deepText }=await model.respond({buddyName,userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const dm=deepText.match(/\[[\s\S]*\]/);
+            if(dm){
+              const insights=JSON.parse(dm[0]);
+              let deepSaved=0;
+              const kindMap={theme:'fact',evolution:'preference',goal:'goal',passion:'preference'};
+              for(const insight of (Array.isArray(insights)?insights:[]).slice(0,10)){
+                if(!insight.content||typeof insight.content!=='string')continue;
+                const content=insight.content.trim().slice(0,500);
+                if(content.length<10)continue;
+                const existing=db.listRelevantMemories(user.id,content,3);
+                if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
+                db.addMemory(user.id,content,{kind:kindMap[insight.type]||'fact',source:'auto-deep',confidence:Math.max(0.6,Math.min(Number(insight.confidence)||0.7,0.9))});
+                deepSaved++;
+              }
+              if(deepSaved>0)db.addEvent(user.id,'auto_learned',`Deep dive found ${deepSaved} long-term insight${deepSaved>1?'s':''}.`);
+            }
+          }
+          db.setSetting(`deep_mining_last_${user.id}`,monthKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
+
+      // --- Weekly: curiosity gaps, pattern detection, relationship depth ---
+      try{
+        const weekKey=isoWeekKey(timeZone,nowMs);
+        if(db.getSetting(`deep_learning_last_${user.id}`)!==weekKey){
+          // 1. Proactive curiosity: what don't we know yet?
+          try{
+            const memSample=db.listMemories(user.id).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+            const curPrompt=`Based on this user's memories, what are 2-3 genuine gaps in your understanding — things a close friend would know but you don't yet? Focus on what would help you be a better companion, not trivia.
+
+Memories:
+${memSample||'(none yet)'}
+
+Respond with a JSON array, max 3: {"question":"the natural question you'd ask","context":"why knowing this matters","priority":1-3}`;
+            const { text: curText }=await model.respond({buddyName,userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const cm=curText.match(/\[[\s\S]*\]/);
+            if(cm){
+              for(const gap of (Array.isArray(JSON.parse(cm[0]))?JSON.parse(cm[0]):[]).slice(0,3)){
+                db.addCuriosityGap(user.id,gap);
+              }
+            }
+          }catch(e){}
+
+          // 2. Pattern detection: when is the user active?
+          try{
+            const stamps=db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+            for(const p of findTimePatterns(stamps,timeZone).slice(0,3)){
+              const content=`${p.label} (${p.count} of last ${p.total} messages)`;
+              const existing=db.listRelevantMemories(user.id,content,3);
+              if(existing.some((m)=>(m.source||'')==='auto-pattern'&&m.content.toLowerCase().includes(p.label.toLowerCase().slice(0,20))))continue;
+              db.addMemory(user.id,content,{kind:'fact',source:'auto-pattern',confidence:0.6});
+            }
+          }catch(e){}
+
+          // 3. Relationship depth: enrich context for recently-mentioned people
+          try{
+            const weekAgo=new Date(nowMs-7*86400_000).toISOString();
+            for(const name of db.recentlyMentionedPeople(user.id,weekAgo).slice(0,3)){
+              const mentions=db.listMessages(user.id,60).filter((m)=>String(m.content||'').toLowerCase().includes(name.toLowerCase())).slice(-6).map((m)=>`${m.role}: ${String(m.content||'').slice(0,300)}`).join('\n');
+              if(!mentions)continue;
+              const relPrompt=`How does the user talk about ${name}? Summarize the relationship context in one sentence and classify the sentiment.
+
+Recent mentions:
+${mentions}
+
+Respond with a single JSON object: {"summary":"one sentence on who this person is to the user and what's going on","sentiment":"positive"|"neutral"|"mixed"}`;
+              const { text: relText }=await model.respond({buddyName,userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const rm=relText.match(/\{[\s\S]*\}/);
+              if(rm){
+                const parsed=JSON.parse(rm[0]);
+                if(parsed.summary&&typeof parsed.summary==='string')db.updatePersonContext(user.id,name,parsed.summary,parsed.sentiment);
+              }
+            }
+          }catch(e){}
+
+          db.setSetting(`deep_learning_last_${user.id}`,weekKey);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
     }
   }
   async function runSmartCheckins(nowMs){
@@ -434,7 +538,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
 
         // Generate the appropriate check-in
-        let genPrompt;let nudgedPerson=null;
+        let genPrompt;let nudgedPerson=null;let askedGapId=null;
         if(decisionClean==='MORNING'){
           // Fetch real weather and calendar data so the briefing has actual details
           let weatherCtx='';
@@ -524,16 +628,24 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           genPrompt=`Write a concise meeting prep briefing (3-4 sentences, plain text). Include: who they're meeting and any relevant context you have, related recent emails or notes if any, and one practical suggestion for the meeting. Sound like a helpful assistant giving a quick heads-up, not a calendar alert. Do not mention that this is automated.\n\n${ctxParts.join('\n\n')}`;
           db.setSetting(mc.prepKey,'1');
         }else{
-          // Gentle nudge about someone they haven't mentioned in 2+ weeks
+          // Gentle nudge about someone they haven't mentioned in 2+ weeks (with relationship context)
           let nudgeCtx='';
           try{
             const stale=db.getStalePeople(user.id,14);
             if(stale.length){
               nudgedPerson=stale[0].person_name;
-              nudgeCtx=` You haven't mentioned ${nudgedPerson} in a while. Include a brief, natural nudge about them (e.g. "have you talked to ${nudgedPerson} lately?").`;
+              let relCtx='';
+              try{const pc=db.getPersonContext(user.id,nudgedPerson);if(pc&&pc.context_summary)relCtx=` (${String(pc.context_summary).slice(0,120)})`;}catch(e){}
+              nudgeCtx=` You haven't mentioned ${nudgedPerson} in a while${relCtx}. Include a brief, natural nudge about them (e.g. "have you talked to ${nudgedPerson} lately?").`;
             }
           }catch(e){}
-          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}`;
+          // Proactive curiosity: weave in one genuine question if it fits naturally
+          let curiosityCtx='';
+          try{
+            const gaps=db.listCuriosityGaps(user.id);
+            if(gaps.length){curiosityCtx=` If it fits naturally, you could ask: "${gaps[0].question}". Don't force it.`;askedGapId=gaps[0].id;}
+          }catch(e){}
+          genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}`;
         }
 
         const { text }=await model.respond({buddyName,userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
@@ -541,6 +653,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
         if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
+        if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
       }catch(error){
         db.releaseProactiveSlot(user.id,today);
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
@@ -807,6 +920,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
           const userMsg=db.addMessage(userId,conversation.id,'user',message);db.touchConversation(userId,conversation.id);
+          const isCorrection=isCorrectionMessage(message);
           enqueueChatReply(conversation.id,async()=>{
             if(!db.getConversation(userId,conversation.id))return;
             const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
@@ -827,6 +941,33 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);db.addMessage(userId,conversation.id,'assistant',connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?');}
             streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
             await maybeRefreshConversationSummary(user,conversation);
+            if(isCorrection){
+              // Learn from the correction without blocking: figure out what was wrong and save the fix
+              setImmediate(async()=>{
+                try{
+                  const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
+                  const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
+                  const { text: fixText }=await model.respond({buddyName,userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
+
+Conversation:
+${hist}
+
+Respond with a single JSON object: {"content":"one clear sentence capturing the corrected understanding","confidence":0.85-0.95}`,memories:[],goals:[],history:[],userTimeZone:tzNow,taskMode:true});
+                  const fm=fixText.match(/\{[\s\S]*\}/);
+                  if(fm){
+                    const parsed=JSON.parse(fm[0]);
+                    const content=String(parsed.content||'').trim().slice(0,500);
+                    if(content.length>=10){
+                      const existing=db.listRelevantMemories(userId,content,3);
+                      if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
+                        db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
+                        db.addEvent(userId,'correction_learned','Learned from a user correction.');
+                      }
+                    }
+                  }
+                }catch(e){db.addEvent(userId,'correction_learn_failed','Could not learn from a correction.',e.message);}
+              });
+            }
           });
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
