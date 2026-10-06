@@ -417,6 +417,66 @@
           </p>
           <div id="followups-list" class="card-list"></div>
         </section>
+        <section class="section-gap">
+          <h2>Important personal dates</h2>
+          <p class="muted">
+            Birthdays, anniversaries, and any special date worth remembering —
+            not appointments. Orbit will nudge you before and on the day.
+          </p>
+          <form id="personal-date-form" class="panel form-card">
+            <div class="form-grid two">
+              <label>Label<input
+                id="pdate-label"
+                maxlength="120"
+                required
+                placeholder="Mom's birthday"
+              /></label>
+              <label>Type<select id="pdate-type">
+                <option value="birthday">Birthday</option>
+                <option value="anniversary">Anniversary</option>
+                <option value="other">Other</option>
+              </select></label>
+            </div>
+            <div class="form-grid three">
+              <label>Month<select id="pdate-month">
+                <option value="1">January</option>
+                <option value="2">February</option>
+                <option value="3">March</option>
+                <option value="4">April</option>
+                <option value="5">May</option>
+                <option value="6">June</option>
+                <option value="7">July</option>
+                <option value="8">August</option>
+                <option value="9">September</option>
+                <option value="10">October</option>
+                <option value="11">November</option>
+                <option value="12">December</option>
+              </select></label>
+              <label>Day<input
+                id="pdate-day"
+                type="number"
+                min="1"
+                max="31"
+                required
+                placeholder="12"
+              /></label>
+              <label>Year <span class="muted">(optional)</span><input
+                id="pdate-year"
+                type="number"
+                min="1900"
+                max="2100"
+                placeholder="1990"
+              /></label>
+            </div>
+            <label>Notes <span class="muted">(optional)</span><input
+              id="pdate-notes"
+              maxlength="500"
+              placeholder="Loves gardening — good gift idea"
+            /></label>
+            <div class="actions"><button class="primary">Add date</button></div>
+          </form>
+          <div id="personal-dates-list" class="card-list"></div>
+        </section>
       </section>
       <section id="timeline" class="view">
         <div class="split-heading">
