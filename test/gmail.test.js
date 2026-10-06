@@ -22,7 +22,7 @@ function mockGmailApi(responses) {
 }
 
 test('gmail tools are registered in TOOL_DEFINITIONS', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 23);
+  assert.equal(TOOL_DEFINITIONS.length, 24);
   const names = TOOL_DEFINITIONS.map((t) => t.name).sort();
   assert.ok(names.includes('gmail_send'));
   assert.ok(names.includes('gmail_search'));

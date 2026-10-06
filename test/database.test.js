@@ -424,3 +424,44 @@ test('listMemoriesBySource filters auto-predict and auto-contradiction', () => {
   assert.equal(contras.length, 1);
   db.close();
 });
+
+test('personal dates CRUD with validation', () => {
+  const { db, user } = fixture();
+  const bday = db.addPersonalDate(user.id, { label: "Mom's birthday", month: 6, day: 12, type: 'birthday' });
+  assert.equal(bday.label, "Mom's birthday");
+  assert.equal(bday.month, 6);
+  assert.equal(bday.day, 12);
+  assert.equal(bday.type, 'birthday');
+  assert.equal(bday.year, null);
+  const anniv = db.addPersonalDate(user.id, { label: 'Our anniversary', month: 9, day: 3, year: 2018, type: 'anniversary', notes: 'Nice dinner' });
+  assert.equal(anniv.year, 2018);
+  const other = db.addPersonalDate(user.id, { label: 'Dad memorial', month: 11, day: 20, type: 'other' });
+  assert.equal(other.type, 'other');
+  // Invalid type falls back to other
+  const weird = db.addPersonalDate(user.id, { label: 'Weird', month: 1, day: 1, type: 'party' });
+  assert.equal(weird.type, 'other');
+  const all = db.listPersonalDates(user.id);
+  assert.equal(all.length, 4);
+  // Ordered by month, day
+  assert.equal(all[0].label, 'Weird');
+  assert.equal(all[1].label, "Mom's birthday");
+  // Update
+  const updated = db.updatePersonalDate(user.id, bday.id, { notes: 'Likes gardening' });
+  assert.ok(updated.notes.includes('gardening'));
+  // Validation
+  assert.throws(() => db.addPersonalDate(user.id, { label: 'x', month: 13, day: 1 }), /month must be 1-12/);
+  assert.throws(() => db.addPersonalDate(user.id, { label: 'x', month: 2, day: 30 }), /day must be/);
+  assert.throws(() => db.addPersonalDate(user.id, { label: '   ', month: 1, day: 1 }), /label is required/);
+  assert.throws(() => db.addPersonalDate(user.id, { label: 'x', month: 4, day: 31 }), /day must be/);
+  // Feb 29 allowed
+  const leap = db.addPersonalDate(user.id, { label: 'Leap day', month: 2, day: 29, type: 'birthday' });
+  assert.equal(leap.day, 29);
+  // Delete
+  assert.equal(db.deletePersonalDate(user.id, bday.id), true);
+  assert.equal(db.getPersonalDate(user.id, bday.id), null);
+  assert.equal(db.deletePersonalDate(user.id, 'nonexistent'), false);
+  // Isolation
+  const second = db.createUser({ email: 'pd2@example.com', displayName: 'Two', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+  assert.deepEqual(db.listPersonalDates(second.id), []);
+  db.close();
+});

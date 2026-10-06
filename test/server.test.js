@@ -287,3 +287,40 @@ test('door token opens registration once, then expires', async (t) => {
   app.db.addDoorToken(hashToken('expired'), new Date(Date.now() - 60_000).toISOString());
   assert.equal((await post('expired')).status, 403);
 });
+
+test('personal dates API: create, list, snapshot, delete', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const headers = authHeaders(auth);
+  // Create
+  let res = await fetch(`${base}/api/personal-dates`, { method: 'POST', headers, body: JSON.stringify({ label: "Mom's birthday", month: 6, day: 12, type: 'birthday' }) });
+  assert.equal(res.status, 201);
+  const created = await res.json();
+  assert.equal(created.label, "Mom's birthday");
+  // Invalid
+  res = await fetch(`${base}/api/personal-dates`, { method: 'POST', headers, body: JSON.stringify({ label: 'Bad', month: 13, day: 1 }) });
+  assert.equal(res.status, 400);
+  // List
+  res = await fetch(`${base}/api/personal-dates`, { headers });
+  assert.equal(res.status, 200);
+  const listed = await res.json();
+  assert.equal(listed.dates.length, 1);
+  // Snapshot includes personalDates
+  res = await fetch(`${base}/api/snapshot`, { headers });
+  assert.equal(res.status, 200);
+  const snap = await res.json();
+  assert.ok(Array.isArray(snap.personalDates));
+  assert.equal(snap.personalDates.length, 1);
+  assert.equal(snap.personalDates[0].label, "Mom's birthday");
+  // Delete
+  res = await fetch(`${base}/api/personal-dates/${created.id}`, { method: 'DELETE', headers });
+  assert.equal(res.status, 200);
+  res = await fetch(`${base}/api/personal-dates`, { headers });
+  assert.equal((await res.json()).dates.length, 0);
+  // Delete nonexistent
+  res = await fetch(`${base}/api/personal-dates/nonexistent-id`, { method: 'DELETE', headers });
+  assert.equal(res.status, 404);
+  // Unauthenticated
+  res = await fetch(`${base}/api/personal-dates`);
+  assert.equal(res.status, 401);
+});

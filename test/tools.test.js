@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 23);
+  assert.equal(TOOL_DEFINITIONS.length, 24);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_read', 'gmail_search', 'gmail_send', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_read', 'gmail_search', 'gmail_send', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -364,6 +364,25 @@ test('save_memory validates and saves via ctx', async () => {
   assert.deepEqual(ctx.calls[0], ['addMemory', 'user-1', 'Edward likes Earl Grey', { kind: 'fact', source: 'explicit' }]);
   await assert.rejects(() => executeTool('save_memory', { content: '   ' }, {}, ctx), /content is required/);
   await assert.rejects(() => executeTool('save_memory', { content: 'x' }, {}, null), /not available in this context/);
+
+test('save_personal_date validates and saves any meaningful date', async () => {
+  const { openDatabase } = await import('../src/database.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-pd-'));
+  const db = openDatabase(path.join(dir, 't.sqlite'));
+  const user = db.createUser({ email: 'pd@example.com', displayName: 'PD', passwordHash: 'h', passwordSalt: 's', role: 'owner' });
+  const ctx = { db, userId: user.id };
+  const { result } = await executeTool('save_personal_date', { label: "Mom's birthday", month: 6, day: 12, type: 'birthday' }, {}, ctx);
+  assert.equal(result.label, "Mom's birthday");
+  assert.ok(result.date.includes('June'));
+  const { result: r2 } = await executeTool('save_personal_date', { label: '1 year sober', month: 3, day: 4, type: 'other', notes: 'Huge milestone' }, {}, ctx);
+  assert.equal(r2.type, 'other');
+  await assert.rejects(() => executeTool('save_personal_date', { label: 'Bad', month: 13, day: 1 }, {}, ctx), /month must be 1-12/);
+  await assert.rejects(() => executeTool('save_personal_date', { label: 'Bad', month: 2, day: 30 }, {}, ctx), /day must be/);
+  await assert.rejects(() => executeTool('save_personal_date', { label: '   ', month: 1, day: 1 }, {}, ctx), /label is required/);
+  await assert.rejects(() => executeTool('save_personal_date', { label: 'x', month: 1, day: 1 }, {}, null), /not available in this context/);
+  db.close();
+});
 });
 
 test('save_memory truncates long content at 2000 chars', async () => {

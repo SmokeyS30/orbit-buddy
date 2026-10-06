@@ -83,3 +83,39 @@ test('findTimePatterns stays quiet on flat distributions', async () => {
   assert.deepEqual(findTimePatterns([1, 2, 3], 'America/New_York'), [], 'too few samples');
   assert.deepEqual(findTimePatterns([], 'America/New_York'), [], 'empty input');
 });
+
+test('nextPersonalDateOccurrence computes days until with wraparound', async () => {
+  const { nextPersonalDateOccurrence, ordinalSuffix } = await import('../src/intelligence.js');
+  const tz = 'America/New_York';
+  // Fixed "now": Oct 6, 2026 12:00 UTC = Oct 6 08:00 EDT
+  const nowMs = Date.UTC(2026, 9, 6, 12, 0, 0);
+  // Same day
+  let r = nextPersonalDateOccurrence(10, 6, tz, nowMs);
+  assert.equal(r.daysUntil, 0);
+  assert.equal(r.occurrenceYear, 2026);
+  // Tomorrow
+  r = nextPersonalDateOccurrence(10, 7, tz, nowMs);
+  assert.equal(r.daysUntil, 1);
+  // 7 days out
+  r = nextPersonalDateOccurrence(10, 13, tz, nowMs);
+  assert.equal(r.daysUntil, 7);
+  // Past date wraps to next year
+  r = nextPersonalDateOccurrence(10, 5, tz, nowMs);
+  assert.equal(r.occurrenceYear, 2027);
+  assert.ok(r.daysUntil > 300);
+  // Feb 29 on non-leap year -> Feb 28
+  r = nextPersonalDateOccurrence(2, 29, tz, Date.UTC(2026, 0, 15, 12, 0, 0));
+  assert.equal(r.nextDate, '2026-02-28');
+  // Feb 29 on leap year stays Feb 29
+  r = nextPersonalDateOccurrence(2, 29, tz, Date.UTC(2028, 0, 15, 12, 0, 0));
+  assert.equal(r.nextDate, '2028-02-29');
+  // Ordinals
+  assert.equal(ordinalSuffix(1), '1st');
+  assert.equal(ordinalSuffix(2), '2nd');
+  assert.equal(ordinalSuffix(3), '3rd');
+  assert.equal(ordinalSuffix(10), '10th');
+  assert.equal(ordinalSuffix(11), '11th');
+  assert.equal(ordinalSuffix(21), '21st');
+  assert.equal(ordinalSuffix(22), '22nd');
+  assert.equal(ordinalSuffix(23), '23rd');
+});
