@@ -177,13 +177,29 @@ export async function parseResponsesStream(body, onToken) {
 }
 
 export function createModelClient(env = process.env) {
-  const apiKey = env.OPENAI_API_KEY?.trim();
-  const model = normalizeModelName(env.OPENAI_MODEL) || DEFAULT_MODEL;
-  const configuredFallbacks = String(env.OPENAI_FALLBACK_MODELS || env.OPENAI_FALLBACK_MODEL || DEFAULT_MODEL).split(',');
-  const fallbackModels = uniqueModels([...configuredFallbacks, DEFAULT_MODEL, ...COMPATIBILITY_MODELS]).filter((name) => name !== model);
+  const azureEndpoint = env.AZURE_OPENAI_ENDPOINT?.trim().replace(/\/+$/, '');
+  const azureApiKey = env.AZURE_OPENAI_API_KEY?.trim();
+  const azureDeployment = env.AZURE_OPENAI_DEPLOYMENT?.trim();
+  const usingAzure = Boolean(azureEndpoint && azureApiKey && azureDeployment);
+  const apiKey = usingAzure ? azureApiKey : env.OPENAI_API_KEY?.trim();
+  const model = normalizeModelName(usingAzure ? azureDeployment : env.OPENAI_MODEL) || DEFAULT_MODEL;
+  const configuredFallbacks = String(
+    usingAzure
+      ? env.AZURE_OPENAI_FALLBACK_DEPLOYMENTS || ''
+      : env.OPENAI_FALLBACK_MODELS || env.OPENAI_FALLBACK_MODEL || DEFAULT_MODEL
+  ).split(',');
+  const fallbackModels = uniqueModels([
+    ...configuredFallbacks,
+    ...(usingAzure ? [] : [DEFAULT_MODEL, ...COMPATIBILITY_MODELS])
+  ]).filter((name) => name !== model);
   const fallbackModel = fallbackModels[0] || null;
-  const baseUrl = validateBaseUrl(env.OPENAI_BASE_URL, env.ALLOW_INSECURE_MODEL_URL === 'true');
-  const health = { state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, availableTextModelCount: null, connectionLatencyMs: null, lastFirstTokenMs: null, lastResponseMs: null, lastError: null, checkedAt: null };
+  const baseUrl = validateBaseUrl(
+    usingAzure ? `${azureEndpoint}/openai/v1` : env.OPENAI_BASE_URL,
+    env.ALLOW_INSECURE_MODEL_URL === 'true'
+  );
+  const authHeaders = usingAzure ? { 'api-key': apiKey } : { Authorization: `Bearer ${apiKey}` };
+  const provider = usingAzure ? 'azure-openai' : 'openai';
+  const health = { provider, state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, availableTextModelCount: null, connectionLatencyMs: null, lastFirstTokenMs: null, lastResponseMs: null, lastError: null, checkedAt: null };
   const configuredConnectionTtl = Number(env.OPENAI_CONNECTION_CHECK_TTL_MS);
   const connectionCheckTtlMs = Number.isFinite(configuredConnectionTtl)
     ? Math.max(5_000, Math.min(configuredConnectionTtl, 5 * 60_000))
@@ -211,7 +227,7 @@ export function createModelClient(env = process.env) {
       const startedAt = Date.now();
       try {
         const response = await fetch(`${baseUrl}/models`, {
-          headers: { Authorization: `Bearer ${apiKey}` },
+          headers: authHeaders,
           signal: AbortSignal.timeout(5_000)
         });
         const payload = await response.json().catch(() => ({}));
@@ -219,13 +235,13 @@ export function createModelClient(env = process.env) {
         const available = new Set((payload.data || []).map((entry) => entry?.id).filter(Boolean));
         discoveredModels = rankAvailableTextModels([...available]);
         health.availableTextModelCount = discoveredModels.length;
-        const selected = uniqueModels([model, ...fallbackModels, ...discoveredModels]).find((name) => available.has(name));
+        const selected = uniqueModels([model, ...fallbackModels, ...(usingAzure ? [] : discoveredModels)]).find((name) => available.has(name));
         health.checkedAt = new Date().toISOString();
         if (!selected) {
           preferredModel = model;
           health.state = 'model_access';
           health.activeModel = null;
-          health.lastError = `The OpenAI project does not list ${model} or Orbit's compatible fallback models.`;
+          health.lastError = `The ${usingAzure ? 'Azure OpenAI resource' : 'OpenAI project'} does not list ${model} or Orbit's configured fallback models.`;
           return { ...health };
         }
         preferredModel = selected;
@@ -338,7 +354,7 @@ export function createModelClient(env = process.env) {
         const response = await fetch(`${baseUrl}/responses`, {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${apiKey}`,
+            ...authHeaders,
             'Content-Type': 'application/json'
           },
           body: JSON.stringify(requestPayload(modelInput, modelName)),
@@ -362,7 +378,7 @@ export function createModelClient(env = process.env) {
         const response = await fetch(`${baseUrl}/responses`, {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${apiKey}`,
+            ...authHeaders,
             'Content-Type': 'application/json',
             Accept: 'text/event-stream'
           },

@@ -16,8 +16,14 @@ variable "storage_account_name" {
   default     = "orbitbuddystorage"
 }
 
+variable "azure_openai_account_name" {
+  description = "Globally unique Azure OpenAI account and endpoint name"
+  type        = string
+  default     = "orbit-buddy-openai"
+}
+
 variable "container_image" {
   description = "Docker image for Orbit. Build and push yours, then set this."
   type        = string
-  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:e3407c062ebd7c63de73f05af492569ccb570d7253c654d3d59cb3120bc9506f"
+  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:1b5838bcf60df7f75b42fe543bee937483e1d3feadf3debe425c44a416b2d653"
 }

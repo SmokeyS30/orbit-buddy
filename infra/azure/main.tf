@@ -58,6 +58,66 @@ resource "azurerm_log_analytics_workspace" "orbit" {
   retention_in_days   = 30
 }
 
+# --- Azure OpenAI: Orbit's private model endpoint ---
+# Model deployments are added only after Azure reports which model versions are
+# available to this subscription and region. Keys stay in Container Apps secrets
+# and are never written to Terraform state or source control.
+resource "azurerm_cognitive_account" "orbit_openai" {
+  name                          = var.azure_openai_account_name
+  location                      = azurerm_resource_group.orbit.location
+  resource_group_name           = azurerm_resource_group.orbit.name
+  kind                          = "OpenAI"
+  sku_name                      = "S0"
+  custom_subdomain_name         = var.azure_openai_account_name
+  local_auth_enabled            = true
+  public_network_access_enabled = true
+
+  tags = {
+    application = "orbit-buddy"
+    managed_by  = "terraform"
+  }
+}
+
+resource "azurerm_cognitive_deployment" "orbit_openai_primary" {
+  # Newest online model with nonzero quota in this subscription today.
+  # Upgrade this to gpt-6.1-sol after Azure grants GlobalStandard quota.
+  name                 = "gpt-5.4-mini"
+  cognitive_account_id = azurerm_cognitive_account.orbit_openai.id
+  rai_policy_name      = "Microsoft.DefaultV2"
+
+  model {
+    format  = "OpenAI"
+    name    = "gpt-5.4-mini"
+    version = "2026-03-17"
+  }
+
+  scale {
+    type     = "DataZoneStandard"
+    capacity = 10
+  }
+
+  version_upgrade_option = "OnceNewDefaultVersionAvailable"
+}
+
+resource "azurerm_cognitive_deployment" "orbit_openai_fallback" {
+  name                 = "gpt-5-mini"
+  cognitive_account_id = azurerm_cognitive_account.orbit_openai.id
+  rai_policy_name      = "Microsoft.DefaultV2"
+
+  model {
+    format  = "OpenAI"
+    name    = "gpt-5-mini"
+    version = "2025-08-07"
+  }
+
+  scale {
+    type     = "GlobalStandard"
+    capacity = 10
+  }
+
+  version_upgrade_option = "OnceNewDefaultVersionAvailable"
+}
+
 # Storage mount so the container can reach Azure Files
 resource "azurerm_container_app_environment_storage" "orbit_data" {
   name                         = "orbit-data"
@@ -107,6 +167,22 @@ resource "azurerm_container_app" "orbit" {
       env {
         name        = "OPENAI_API_KEY"
         secret_name = "openai-api-key"
+      }
+      env {
+        name  = "AZURE_OPENAI_ENDPOINT"
+        value = azurerm_cognitive_account.orbit_openai.endpoint
+      }
+      env {
+        name  = "AZURE_OPENAI_DEPLOYMENT"
+        value = azurerm_cognitive_deployment.orbit_openai_primary.name
+      }
+      env {
+        name  = "AZURE_OPENAI_FALLBACK_DEPLOYMENTS"
+        value = azurerm_cognitive_deployment.orbit_openai_fallback.name
+      }
+      env {
+        name        = "AZURE_OPENAI_API_KEY"
+        secret_name = "azure-openai-api-key"
       }
       env {
         name        = "BRAVE_SEARCH_API_KEY"

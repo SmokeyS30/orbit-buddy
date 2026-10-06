@@ -164,6 +164,42 @@ test('respond without tools keeps the single-request behavior', async (t) => {
   assert.equal(requests, 1);
 });
 
+test('Azure OpenAI settings take precedence and use the v1 endpoint with a configured fallback', async (t) => {
+  const requests = [];
+  const stub = http.createServer((req, res) => {
+    requests.push({ url: req.url, apiKey: req.headers['api-key'], authorization: req.headers.authorization });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (req.url === '/openai/v1/models') {
+      res.end(JSON.stringify({ data: [{ id: 'gpt-5.4-mini' }, { id: 'gpt-5-mini' }] }));
+      return;
+    }
+    req.resume();
+    req.on('end', () => res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Azure connected.' }] }] })));
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'standard-key-kept-for-rollback',
+    AZURE_OPENAI_API_KEY: 'azure-key',
+    AZURE_OPENAI_ENDPOINT: `http://127.0.0.1:${stub.address().port}`,
+    AZURE_OPENAI_DEPLOYMENT: 'gpt-5.4-mini',
+    AZURE_OPENAI_FALLBACK_DEPLOYMENTS: 'gpt-5-mini',
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+
+  const health = await model.checkConnection();
+  const response = await model.respond({ buddyName: 'Orbit', message: 'Hi' });
+
+  assert.equal(health.provider, 'azure-openai');
+  assert.equal(health.state, 'ready');
+  assert.equal(health.primaryModel, 'gpt-5.4-mini');
+  assert.deepEqual(health.fallbackModels, ['gpt-5-mini']);
+  assert.equal(response.text, 'Azure connected.');
+  assert.deepEqual(requests.map((request) => request.url), ['/openai/v1/models', '/openai/v1/responses']);
+  assert.ok(requests.every((request) => request.apiKey === 'azure-key'));
+  assert.ok(requests.every((request) => request.authorization === undefined));
+});
+
 test('GPT-6 responses use a stable prompt-cache breakpoint', async (t) => {
   let sent;
   const stub = http.createServer((req, res) => {
