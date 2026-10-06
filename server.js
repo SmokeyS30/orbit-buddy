@@ -10,6 +10,7 @@ import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
+import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
@@ -749,6 +750,66 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
       }catch(error){db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
     }
   }
+
+  // --- Conversation import: analyze an uploaded ChatGPT/etc export in the
+  // background, extracting durable facts as memory suggestions for review.
+  // The raw export is never persisted — only approved suggestions survive.
+  // payload is passed in-memory only — the raw export is never persisted.
+  async function processImportJob(userId,id,parsed){
+    const row=db.getImportJob(userId,id);
+    if(!row||row.status!=='processing')return;
+    try{
+      const extracted=extractMessages(parsed);
+      if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
+      const chunks=chunkMessages(extracted.messages,20);
+      if(!chunks.length)throw new Error('Nothing substantial to learn from in this export.');
+      // Cap chunks to bound cost on huge exports
+      const work=chunks.slice(0,60);
+      db.updateImportJob(userId,id,{total_chunks:work.length});
+      const prefs=db.getPreferences(userId);
+      const timeZone=prefs.time_zone||'America/New_York';
+      const user=db.getUserById(userId);
+      let added=0;
+      for(let i=0;i<work.length;i++){
+        const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
+        try{
+          const { text }=await model.respond({buddyName:'Orbit',userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+            message:`Extract durable facts about this user from these past AI conversations.
+
+Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
+
+Conversation:
+${convoText}
+
+Respond with a JSON array of insights, max 6: [{"content":"brief clear fact","kind":"fact"|"preference"|"goal"|"relationship"|"decision","confidence":0.0-1.0}]
+Only include what's clearly supported — skip one-off questions, transient topics, and anything uncertain. If nothing durable, respond with [].`});
+          const jm=text.match(/\[[\s\S]*\]/);
+          if(jm){
+            const insights=JSON.parse(jm[0]);
+            if(Array.isArray(insights)){
+              for(const ins of insights.slice(0,6)){
+                const content=String(ins.content||'').trim().slice(0,500);
+                if(content.length<10)continue;
+                // Dedupe against existing memories and already-suggested items
+                const existing=db.listRelevantMemories(userId,content,3);
+                if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
+                const sug=db.listMemorySuggestions(userId);
+                if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
+                db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
+                added++;
+              }
+            }
+          }
+        }catch(e){/* one bad chunk shouldn't kill the job */}
+        db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
+      }
+      db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
+      db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
+    }catch(error){
+      db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
+      db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+    }
+  }
   async function runSmartCheckins(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
@@ -1460,6 +1521,36 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
         if(req.method==='POST'&&url.pathname==='/api/conversations'){const body=await readJson(req);const raw=String(body.title||'').trim();const title=raw?cleanText(raw,80,'title'):'New chat';return json(res,201,db.createConversation(userId,title));}
         const convoMatch=url.pathname.match(/^\/api\/conversations\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&convoMatch){if(!db.deleteConversation(userId,convoMatch[1]))throw Object.assign(new Error('Conversation not found.'),{status:404});return json(res,200,{ok:true});}
+        if(req.method==='GET'&&url.pathname==='/api/import/status'){
+          return json(res,200,{jobs:db.listImportJobs(userId)});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
+          // Accept raw JSON body OR multipart file upload. 10MB limit.
+          const contentType=req.headers['content-type']||'';
+          let parsed=null,filename='upload.json';
+          const chunks=[];let size=0;
+          for await(const chunk of req){size+=chunk.length;if(size>10*1024*1024)throw Object.assign(new Error('File is too large (10MB max).'),{status:413});chunks.push(chunk);}
+          const raw=Buffer.concat(chunks);
+          if(!raw.length)throw Object.assign(new Error('No file uploaded.'),{status:400});
+          if(contentType.includes('multipart/form-data')){
+            const text=parseMultipartFile(raw,contentType);
+            if(!text)throw Object.assign(new Error('Could not read the uploaded file.'),{status:400});
+            const fnMatch=/filename="([^"]{1,200})"/.exec(raw.toString('latin1').slice(0,2000));
+            if(fnMatch)filename=fnMatch[1];
+            try{parsed=JSON.parse(text);}catch{throw Object.assign(new Error('Uploaded file must be valid JSON.'),{status:400});}
+          }else{
+            try{parsed=JSON.parse(raw.toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});}
+            filename=String(parsed.filename||'upload.json').slice(0,200);
+            if(parsed.data)parsed=parsed.data;
+          }
+          const extracted=extractMessages(parsed);
+          if(!extracted||!extracted.messages.length)throw Object.assign(new Error('No conversation messages found. Upload a ChatGPT export (conversations.json) or a {messages:[...]} file.'),{status:422});
+          const job=db.createImportJob(userId,filename);
+          db.addEvent(userId,'import_started',`Started analyzing ${extracted.messages.length} imported messages.`);
+          // Process in background — raw export lives in memory only, never persisted.
+          setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));
+          return json(res,202,{job:{id:job.id,status:job.status},messages:extracted.messages.length,format:extracted.format});
+        }
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
