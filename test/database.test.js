@@ -493,3 +493,16 @@ test('personal dates gift nagging fields', () => {
   assert.equal(untoggled.gift_nag, 1); // gift_nag preserved when only giftDone passed
   db.close();
 });
+
+test('buddy_name defaults to null and can be set per user', () => {
+  const { db, user } = fixture();
+  assert.equal(db.getPreferences(user.id).buddy_name, null);
+  assert.equal(db.setBuddyName(user.id, '  Rex  '), 'Rex');
+  assert.equal(db.getPreferences(user.id).buddy_name, 'Rex');
+  // Per-user isolation
+  const second = db.createUser({ email: 'member2@example.com', displayName: 'M', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+  assert.equal(db.getPreferences(second.id).buddy_name, null);
+  // Empty rejected
+  assert.throws(() => db.setBuddyName(user.id, '   '), /1-40 characters/);
+  db.close();
+});
