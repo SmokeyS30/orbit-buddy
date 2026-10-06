@@ -212,6 +212,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       evidence TEXT,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS personal_dates (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      label TEXT NOT NULL, month INTEGER NOT NULL, day INTEGER NOT NULL, year INTEGER,
+      type TEXT NOT NULL DEFAULT 'other', notes TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_personal_dates_user ON personal_dates(user_id);
     CREATE INDEX IF NOT EXISTS idx_curiosity_user ON curiosity_gaps(user_id, dismissed, asked_at);
     CREATE TABLE IF NOT EXISTS streak_completions (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -352,6 +359,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeFollowUp: db.prepare("UPDATE follow_ups SET status='completed',completed_at=?,next_attempt_at=NULL,last_error=NULL WHERE id=? AND user_id=? AND status='scheduled'"),
     failFollowUp: db.prepare("UPDATE follow_ups SET attempt_count=attempt_count+1,next_attempt_at=?,last_error=? WHERE id=? AND user_id=? AND status='scheduled'"),
     deleteFollowUp: db.prepare('DELETE FROM follow_ups WHERE id=? AND user_id=?'),
+    addPersonalDate: db.prepare(`INSERT INTO personal_dates(id,user_id,label,month,day,year,type,notes,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`),
+    listPersonalDates: db.prepare('SELECT * FROM personal_dates WHERE user_id=? ORDER BY month,day,label'),
+    getPersonalDate: db.prepare('SELECT * FROM personal_dates WHERE id=? AND user_id=?'),
+    updatePersonalDate: db.prepare('UPDATE personal_dates SET label=?,month=?,day=?,year=?,type=?,notes=?,updated_at=? WHERE id=? AND user_id=?'),
+    deletePersonalDate: db.prepare('DELETE FROM personal_dates WHERE id=? AND user_id=?'),
     addGoal: db.prepare(`INSERT INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at)
       VALUES(?,?,?,?,'active',?,0,?,?,?, ?,NULL)`),
     getGoal: db.prepare('SELECT * FROM goals WHERE id=? AND user_id=?'),
@@ -575,6 +588,38 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeFollowUp:(userId,id)=>s.completeFollowUp.run(timestamp(),id,userId).changes>0,
     failFollowUp:(userId,id,error,retryMs=15*60_000)=>s.failFollowUp.run(new Date(Date.now()+retryMs).toISOString(),String(error||'').slice(0,1000),id,userId).changes>0,
     deleteFollowUp:(userId,id)=>s.deleteFollowUp.run(id,userId).changes>0,
+    addPersonalDate(userId,{label,month,day,year=null,type='other',notes=null}){
+      const m=Math.floor(Number(month)),d=Math.floor(Number(day));
+      if(!Number.isInteger(m)||m<1||m>12)throw new Error('month must be 1-12.');
+      if(!Number.isInteger(d)||d<1||d>31)throw new Error('day must be 1-31.');
+      const daysInMonth=[31,29,31,30,31,30,31,31,30,31,30,31][m-1];
+      if(d>daysInMonth)throw new Error(`day must be 1-${daysInMonth} for that month.`);
+      const y=year==null?null:Math.floor(Number(year));
+      if(y!==null&&(!Number.isInteger(y)||y<1900||y>2100))throw new Error('year must be 1900-2100.');
+      const cleanType=['birthday','anniversary','other'].includes(type)?type:'other';
+      const now=timestamp();
+      const row={id:randomUUID(),user_id:userId,label:String(label||'').trim().slice(0,120),month:m,day:d,year:y,type:cleanType,notes:notes?String(notes).trim().slice(0,500):null,created_at:now,updated_at:now};
+      if(!row.label)throw new Error('label is required.');
+      s.addPersonalDate.run(row.id,row.user_id,row.label,row.month,row.day,row.year,row.type,row.notes,row.created_at,row.updated_at);
+      return row;
+    },
+    listPersonalDates:(userId)=>s.listPersonalDates.all(userId),
+    getPersonalDate:(userId,id)=>s.getPersonalDate.get(id,userId)||null,
+    updatePersonalDate(userId,id,{label,month,day,year,type,notes}={}){
+      const current=s.getPersonalDate.get(id,userId);if(!current)return null;
+      const m=month===undefined?current.month:Math.floor(Number(month));
+      const d=day===undefined?current.day:Math.floor(Number(day));
+      if(m<1||m>12||d<1||d>31)throw new Error('month must be 1-12 and day 1-31.');
+      const daysInMonth=[31,29,31,30,31,30,31,31,30,31,30,31][m-1];
+      if(d>daysInMonth)throw new Error(`day must be 1-${daysInMonth} for that month.`);
+      const y=year===undefined?current.year:(year==null?null:Math.floor(Number(year)));
+      const cleanType=type===undefined?current.type:(['birthday','anniversary','other'].includes(type)?type:'other');
+      const next={label:label===undefined?current.label:String(label).trim().slice(0,120),month:m,day:d,year:y,type:cleanType,notes:notes===undefined?current.notes:(notes?String(notes).trim().slice(0,500):null)};
+      if(!next.label)throw new Error('label is required.');
+      s.updatePersonalDate.run(next.label,next.month,next.day,next.year,next.type,next.notes,timestamp(),id,userId);
+      return s.getPersonalDate.get(id,userId);
+    },
+    deletePersonalDate:(userId,id)=>s.deletePersonalDate.run(id,userId).changes>0,
     addGoal(userId,{title,description=null,priority=2,targetDate=null,nextStep=null}){const now=timestamp();const row={id:randomUUID(),user_id:userId,title,description:description||null,status:'active',priority:normalizePriority(priority),progress:0,target_date:targetDate?validDateString(targetDate):null,next_step:nextStep||null,created_at:now,updated_at:now,completed_at:null};s.addGoal.run(row.id,row.user_id,row.title,row.description,row.priority,row.target_date,row.next_step,row.created_at,row.updated_at);return row;},
     getGoal:(userId,id)=>s.getGoal.get(id,userId)||null,
     listGoals:(userId)=>s.listGoals.all(userId),

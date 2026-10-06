@@ -405,6 +405,22 @@ export function toolProposeMemory(args = {}, ctx = null) {
   return { id: suggestion.id, content, kind, note: 'Proposed for the user to approve or dismiss.' };
 }
 
+export function toolSavePersonalDate(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'save_personal_date');
+  const label = cleanArg(args.label, 120, 'label');
+  const month = Math.floor(Number(args.month));
+  const day = Math.floor(Number(args.day));
+  if (!Number.isInteger(month) || month < 1 || month > 12) throw new Error('month must be 1-12.');
+  if (!Number.isInteger(day) || day < 1 || day > 31) throw new Error('day must be 1-31.');
+  const year = args.year == null || args.year === '' ? null : Math.floor(Number(args.year));
+  if (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100)) throw new Error('year must be 1900-2100.');
+  const type = ['birthday', 'anniversary', 'other'].includes(args.type) ? args.type : 'other';
+  const notes = args.notes ? String(args.notes).trim().slice(0, 500) : null;
+  const saved = db.addPersonalDate(userId, { label, month, day, year, type, notes });
+  const monthName = new Date(2000, month - 1, 1).toLocaleString('en-US', { month: 'long' });
+  return { id: saved.id, label: saved.label, date: `${monthName} ${day}`, type: saved.type, note: 'Saved to important personal dates. Orbit will nudge before and on the day.' };
+}
+
 export function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
@@ -722,6 +738,24 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'save_personal_date',
+    description: 'Save any meaningful personal date to the user\u2019s Important personal dates \u2014 birthdays, anniversaries, graduations, memorials, sobriety milestones, gotcha days, or anything else that matters to them. NOT for appointments (doctor visits etc). Orbit will nudge them before and on the day. Only call when the user mentions a date worth remembering or asks you to save one. Always tell the user what you saved in your visible reply.',
+    parameters: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'What to call it, e.g. "Mom\u2019s birthday", "Our anniversary", "Dad\u2019s memorial", "1 year sober".' },
+        month: { type: 'integer', description: 'Month 1-12.' },
+        day: { type: 'integer', description: 'Day 1-31.' },
+        year: { type: 'integer', description: 'Year (optional; include for anniversaries where the count matters, e.g. wedding year).' },
+        type: { type: 'string', enum: ['birthday', 'anniversary', 'other'], description: 'Use birthday or anniversary when it fits, otherwise other (graduations, memorials, milestones, etc).' },
+        notes: { type: 'string', description: 'Optional note, e.g. gift ideas.' }
+      },
+      required: ['label', 'month', 'day'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'propose_memory',
     description: 'Propose a durable fact, preference, goal, project detail, decision, or relationship detail for the user to approve. Use this instead of save_memory when the user did not explicitly ask you to remember it. Do not propose transient or sensitive details.',
     parameters: {
@@ -903,6 +937,7 @@ const TOOL_SUMMARIES = {
   get_sports: (args) => String(args.league || 'nfl').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
+  save_personal_date: (args) => `${String(args.label || '').slice(0, 60)} (${args.month}/${args.day})`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
   create_goal: (args) => String(args.title || '').slice(0, 80),
@@ -960,6 +995,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'save_memory': {
       const result = toolSaveMemory(clean, ctx);
       return { result, summary: String(clean.content || '').slice(0, 80) };
+    }
+    case 'save_personal_date': {
+      const result = toolSavePersonalDate(clean, ctx);
+      return { result, summary: `${String(clean.label || '').slice(0, 60)} (${clean.month}/${clean.day})` };
     }
     case 'propose_memory': {
       const result = toolProposeMemory(clean, ctx);

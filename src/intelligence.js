@@ -25,6 +25,38 @@ export function todayInZone(timeZone, nowMs = Date.now()) {
   return new Date(nowMs).toLocaleDateString('en-CA', { timeZone: validTimeZone(timeZone) });
 }
 
+// Personal dates: days until the next occurrence of a month/day, handling year
+// wraparound and Feb 29 (celebrated Feb 28 in non-leap years). Returns
+// { daysUntil, nextDate: 'YYYY-MM-DD', occurrenceYear }.
+export function nextPersonalDateOccurrence(month, day, timeZone, nowMs = Date.now()) {
+  const zone = validTimeZone(timeZone);
+  const todayStr = todayInZone(zone, nowMs);
+  const [ty, tm, td] = todayStr.split('-').map(Number);
+  const isLeap = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const effDay = (m, d, y) => (m === 2 && d === 29 && !isLeap(y) ? 28 : d);
+  const toMs = (y, m, d) => Date.UTC(y, m - 1, d);
+  const todayMs = toMs(ty, tm, td);
+  for (let y = ty; y <= ty + 1; y++) {
+    const ed = effDay(month, day, y);
+    const ms = toMs(y, month, ed);
+    if (ms >= todayMs) {
+      return {
+        daysUntil: Math.round((ms - todayMs) / 86400_000),
+        nextDate: `${y}-${String(month).padStart(2, '0')}-${String(ed).padStart(2, '0')}`,
+        occurrenceYear: y
+      };
+    }
+  }
+  // Fallback (should not happen): next year
+  const ed = effDay(month, day, ty + 1);
+  return { daysUntil: 366, nextDate: `${ty + 1}-${String(month).padStart(2, '0')}-${String(ed).padStart(2, '0')}`, occurrenceYear: ty + 1 };
+}
+
+export function ordinalSuffix(n) {
+  const s = ['th', 'st', 'nd', 'rd'], v = n % 100;
+  return n + (s[(v - 20) % 10] || s[v] || s[0]);
+}
+
 export function validDateString(value) {
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
   if (!match) return null;
