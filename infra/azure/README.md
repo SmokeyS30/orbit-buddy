@@ -1,0 +1,76 @@
+# Orbit Buddy on Azure (Terraform)
+
+Deploys Orbit to Azure Container Apps with auto-scaling (0–3 replicas) and persistent SQLite storage.
+
+## One-time setup (on your Mac)
+
+```bash
+# Install Terraform and Azure CLI
+brew install terraform azure-cli
+
+# Log into Azure
+az login
+```
+
+## Build and push the Docker image
+
+```bash
+cd /path/to/orbit-buddy
+docker build -t ghcr.io/smokeys30/orbit-buddy:latest .
+docker push ghcr.io/smokeys30/orbit-buddy:latest
+```
+
+(Or use any registry — just update `container_image` in `variables.tf`.)
+
+## Deploy
+
+```bash
+cd ~/workspace/orbit-azure
+terraform init
+terraform apply
+```
+
+First apply takes ~5–10 minutes. Terraform will print the app URL when done.
+
+## Add your secrets (after first deploy)
+
+```bash
+RG="orbit-buddy-rg"
+az containerapp secret set -g $RG -n orbit-buddy \
+  --secrets \
+    openai-api-key="YOUR_KEY" \
+    brave-search-api-key="YOUR_KEY" \
+    data-encryption-key="$(openssl rand -hex 32)" \
+    gmail-client-id="YOUR_ID" \
+    gmail-client-secret="YOUR_SECRET"
+```
+
+Then wire them as env vars (Azure portal → Container App → Containers → Environment variables),
+or add them to `main.tf` as `secretRef` entries.
+
+**Important:** if you already have an Orbit database on Render, copy the SQLite file
+into the Azure Files share before going live, or you'll start with a fresh database.
+Generate a NEW `data-encryption-key` only if starting fresh — if migrating, reuse
+the existing `DATA_ENCRYPTION_KEY` from Render.
+
+## Updating
+
+```bash
+docker build -t ghcr.io/smokeys30/orbit-buddy:latest .
+docker push ghcr.io/smokeys30/orbit-buddy:latest
+az containerapp update -g orbit-buddy-rg -n orbit-buddy \
+  --image ghcr.io/smokeys30/orbit-buddy:latest
+```
+
+No Terraform needed for image updates.
+
+## Tear down
+
+```bash
+terraform destroy
+```
+
+## Cost estimate
+
+~$20–30/month: Container Apps (pay-per-use, scales to zero when idle) + Storage + Log Analytics.
+The biggest cost is the Container Apps Environment's baseline (~$10/mo even at zero replicas).
