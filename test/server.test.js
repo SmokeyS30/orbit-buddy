@@ -320,6 +320,33 @@ test('personal dates API: create, list, snapshot, delete', async (t) => {
   // Delete nonexistent
   res = await fetch(`${base}/api/personal-dates/nonexistent-id`, { method: 'DELETE', headers });
   assert.equal(res.status, 404);
+});
+
+test('personal dates PATCH: gift_nag and gift_done', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const headers = authHeaders(auth);
+  // Birthday auto-nags
+  let res = await fetch(`${base}/api/personal-dates`, { method: 'POST', headers, body: JSON.stringify({ label: "Mom's birthday", month: 6, day: 12, type: 'birthday' }) });
+  assert.equal(res.status, 201);
+  const created = await res.json();
+  assert.equal(created.gift_nag, 1);
+  assert.equal(created.gift_done, 0);
+  // Other type does not auto-nag
+  res = await fetch(`${base}/api/personal-dates`, { method: 'POST', headers, body: JSON.stringify({ label: 'Dad memorial', month: 11, day: 20, type: 'other' }) });
+  const other = await res.json();
+  assert.equal(other.gift_nag, 0);
+  // PATCH: mark gift done
+  res = await fetch(`${base}/api/personal-dates/${created.id}`, { method: 'PATCH', headers, body: JSON.stringify({ giftDone: true }) });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).gift_done, 1);
+  // PATCH: enable gift nag on other-type date
+  res = await fetch(`${base}/api/personal-dates/${other.id}`, { method: 'PATCH', headers, body: JSON.stringify({ giftNag: true }) });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).gift_nag, 1);
+  // PATCH nonexistent
+  res = await fetch(`${base}/api/personal-dates/nonexistent-id`, { method: 'PATCH', headers, body: JSON.stringify({ giftDone: true }) });
+  assert.equal(res.status, 404);
   // Unauthenticated
   res = await fetch(`${base}/api/personal-dates`);
   assert.equal(res.status, 401);

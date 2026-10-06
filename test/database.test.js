@@ -465,3 +465,31 @@ test('personal dates CRUD with validation', () => {
   assert.deepEqual(db.listPersonalDates(second.id), []);
   db.close();
 });
+
+test('personal dates gift nagging fields', () => {
+  const { db, user } = fixture();
+  // gift_nag defaults by type: birthday/anniversary auto-nag, other does not
+  const bday = db.addPersonalDate(user.id, { label: "Mom's birthday", month: 6, day: 12, type: 'birthday' });
+  assert.equal(bday.gift_nag, 1);
+  assert.equal(bday.gift_done, 0);
+  const anniv = db.addPersonalDate(user.id, { label: 'Our anniversary', month: 9, day: 3, type: 'anniversary' });
+  assert.equal(anniv.gift_nag, 1);
+  const other = db.addPersonalDate(user.id, { label: 'Dad memorial', month: 11, day: 20, type: 'other' });
+  assert.equal(other.gift_nag, 0);
+  // Explicit override
+  const quiet = db.addPersonalDate(user.id, { label: 'Quiet birthday', month: 1, day: 5, type: 'birthday', giftNag: false });
+  assert.equal(quiet.gift_nag, 0);
+  const naggy = db.addPersonalDate(user.id, { label: 'Big milestone', month: 2, day: 14, type: 'other', giftNag: true });
+  assert.equal(naggy.gift_nag, 1);
+  // markGiftDone stops nagging
+  assert.equal(db.markGiftDone(user.id, bday.id), true);
+  assert.equal(db.getPersonalDate(user.id, bday.id).gift_done, 1);
+  assert.equal(db.markGiftDone(user.id, 'nonexistent'), false);
+  // updatePersonalDate can toggle gift fields
+  const toggled = db.updatePersonalDate(user.id, other.id, { giftNag: true });
+  assert.equal(toggled.gift_nag, 1);
+  const untoggled = db.updatePersonalDate(user.id, other.id, { giftDone: true });
+  assert.equal(untoggled.gift_done, 1);
+  assert.equal(untoggled.gift_nag, 1); // gift_nag preserved when only giftDone passed
+  db.close();
+});

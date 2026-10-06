@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 24);
+  assert.equal(TOOL_DEFINITIONS.length, 26);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_read', 'gmail_search', 'gmail_send', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -381,6 +381,51 @@ test('save_personal_date validates and saves any meaningful date', async () => {
   await assert.rejects(() => executeTool('save_personal_date', { label: 'Bad', month: 2, day: 30 }, {}, ctx), /day must be/);
   await assert.rejects(() => executeTool('save_personal_date', { label: '   ', month: 1, day: 1 }, {}, ctx), /label is required/);
   await assert.rejects(() => executeTool('save_personal_date', { label: 'x', month: 1, day: 1 }, {}, null), /not available in this context/);
+  // giftNag param: explicit override, and type-based default
+  const { result: r3 } = await executeTool('save_personal_date', { label: 'Quiet day', month: 4, day: 2, type: 'birthday', giftNag: false }, {}, ctx);
+  assert.equal(db.getPersonalDate(user.id, r3.id).gift_nag, 0);
+  const { result: r4 } = await executeTool('save_personal_date', { label: 'Big day', month: 5, day: 6, type: 'other', giftNag: true }, {}, ctx);
+  assert.equal(db.getPersonalDate(user.id, r4.id).gift_nag, 1);
+  db.close();
+});
+
+test('mark_gift_done fuzzy-matches and stops nagging', async () => {
+  const { openDatabase } = await import('../src/database.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-gift-'));
+  const db = openDatabase(path.join(dir, 't.sqlite'));
+  const user = db.createUser({ email: 'gift@example.com', displayName: 'G', passwordHash: 'h', passwordSalt: 's', role: 'owner' });
+  const ctx = { db, userId: user.id };
+  db.addPersonalDate(user.id, { label: "Mom's birthday", month: 6, day: 12, type: 'birthday' });
+  db.addPersonalDate(user.id, { label: "Dad's birthday", month: 8, day: 3, type: 'birthday' });
+  // Exact match (case-insensitive)
+  const { result } = await executeTool('mark_gift_done', { label: "mom's BIRTHDAY" }, {}, ctx);
+  assert.equal(result.label, "Mom's birthday");
+  assert.equal(db.getPersonalDate(user.id, result.id).gift_done, 1);
+  // Substring fuzzy match
+  const { result: r2 } = await executeTool('mark_gift_done', { label: 'dad' }, {}, ctx);
+  assert.equal(r2.label, "Dad's birthday");
+  // No match
+  await assert.rejects(() => executeTool('mark_gift_done', { label: 'nobody' }, {}, ctx), /No important personal date found/);
+  await assert.rejects(() => executeTool('mark_gift_done', { label: 'x' }, {}, null), /not available in this context/);
+  db.close();
+});
+
+test('enable_gift_reminder turns on nagging for other-type dates', async () => {
+  const { openDatabase } = await import('../src/database.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-gifton-'));
+  const db = openDatabase(path.join(dir, 't.sqlite'));
+  const user = db.createUser({ email: 'gifton@example.com', displayName: 'G', passwordHash: 'h', passwordSalt: 's', role: 'owner' });
+  const ctx = { db, userId: user.id };
+  const d = db.addPersonalDate(user.id, { label: 'Dad memorial', month: 11, day: 20, type: 'other' });
+  assert.equal(d.gift_nag, 0);
+  const { result } = await executeTool('enable_gift_reminder', { label: 'memorial' }, {}, ctx);
+  assert.equal(result.label, 'Dad memorial');
+  const after = db.getPersonalDate(user.id, d.id);
+  assert.equal(after.gift_nag, 1);
+  assert.equal(after.gift_done, 0);
+  await assert.rejects(() => executeTool('enable_gift_reminder', { label: 'nobody' }, {}, ctx), /No important personal date found/);
   db.close();
 });
 });
