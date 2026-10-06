@@ -102,7 +102,7 @@ resource "azurerm_container_app" "orbit" {
 
       volume_mounts {
         name = "orbit-data"
-        path = "/var/data"
+        path = "/backup"
       }
 
       liveness_probe {
