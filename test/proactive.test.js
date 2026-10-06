@@ -188,7 +188,8 @@ test('snapshot includes streaks for routines and goals', async (t) => {
   assert.equal(res.status, 201);
   const goal = await res.json();
   // Record streak completions directly
-  const today = new Date().toISOString().slice(0, 10);
+  const { todayInZone } = await import('../src/intelligence.js');
+  const today = todayInZone('America/New_York', Date.now());
   app.db.recordStreakCompletion(auth.userId, 'routine', routine.id, today);
   res = await fetch(`${base}/api/snapshot`, { headers });
   assert.equal(res.status, 200);
