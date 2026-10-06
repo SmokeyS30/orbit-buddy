@@ -246,7 +246,21 @@ async function pollAccessStatus(email){
 }
 $('#registration-toggle').addEventListener('click',async()=>{try{const open=!state.setup?.registrationOpen;await api('/api/admin/registration',{method:'POST',body:JSON.stringify({open})});await refresh();toast(open?'Registration is open.':'Registration is closed.');}catch(error){toast(error.message);}});$('#resume-button').addEventListener('click',async()=>{if(prompt('Type RESUME to restart Orbit work:')!=='RESUME')return;try{await api('/api/admin/resume',{method:'POST',body:JSON.stringify({confirm:'RESUME'})});await refresh();toast('Orbit resumed.');}catch(error){toast(error.message);}});
 activateView(location.hash.slice(1)||'today',{updateHash:false});
-if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});}// PWA: launch fade + offline indicator
+if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});
+  // Auto-reload when a new app version activates
+  navigator.serviceWorker.addEventListener('message',(event)=>{
+    if(event.data&&event.data.type==='SW_UPDATED'){
+      // Don't yank the screen while they're typing — wait for a pause
+      const doReload=()=>location.reload();
+      if(typeof isComposing==='function'&&isComposing()){setTimeout(()=>{if(!isComposing())doReload();else setTimeout(doReload,10000);},5000);}
+      else doReload();
+    }
+  });
+  // Proactively check for updates every 5 min and when the app becomes visible
+  const checkSWUpdate=()=>{navigator.serviceWorker.ready.then((reg)=>reg.update().catch(()=>{})).catch(()=>{});};
+  setInterval(checkSWUpdate,5*60*1000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)checkSWUpdate();});
+}// PWA: launch fade + offline indicator
 (function(){
   const banner=document.getElementById('offline-banner');
   const sync=()=>{if(banner)banner.classList.toggle('hidden',navigator.onLine);};
