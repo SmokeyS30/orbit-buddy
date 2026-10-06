@@ -267,6 +267,39 @@ test('model access failure falls back to the configured starter model', async (t
   assert.equal(model.diagnostics().activeModel, 'gpt-6-luna');
 });
 
+test('temporary primary-model overload falls back immediately to the next configured model', async (t) => {
+  const attempted = [];
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const sent = JSON.parse(body);
+      attempted.push(sent.model);
+      const overloaded = sent.model === 'gpt-6-astra';
+      res.writeHead(overloaded ? 503 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(overloaded
+        ? { error: { code: 'server_error', message: 'Our servers are currently overloaded. Please try again later.' } }
+        : { output: [{ type: 'message', content: [{ type: 'output_text', text: 'Sol fallback worked.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key',
+    OPENAI_MODEL: 'gpt-6-astra',
+    OPENAI_FALLBACK_MODELS: 'gpt-6.1-sol,gpt-6-luna',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+
+  const response = await model.respond({ buddyName: 'Orbit', message: 'Hello', tools: true });
+
+  assert.equal(response.text, 'Sol fallback worked.');
+  assert.deepEqual(attempted, ['gpt-6-astra', 'gpt-6.1-sol']);
+  assert.equal(model.diagnostics().state, 'fallback');
+  assert.equal(model.diagnostics().activeModel, 'gpt-6.1-sol');
+});
+
 test('model access fallback continues to the compatibility model', async (t) => {
   const attempted = [];
   const stub = http.createServer((req, res) => {

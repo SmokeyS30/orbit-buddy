@@ -4,6 +4,8 @@ import { todayInZone, validTimeZone } from './intelligence.js';
 const DEFAULT_MODEL = 'gpt-6-luna';
 const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const MAX_TOOL_ITERATIONS = 4;
+const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
+const MAX_TRANSIENT_MODEL_ATTEMPTS = 3;
 
 function normalizeModelName(value) {
   const name = String(value || '').trim();
@@ -204,6 +206,14 @@ export function createModelClient(env = process.env) {
   const connectionCheckTtlMs = Number.isFinite(configuredConnectionTtl)
     ? Math.max(5_000, Math.min(configuredConnectionTtl, 5 * 60_000))
     : 60_000;
+  const configuredFirstResponseTimeout = Number(env.OPENAI_FIRST_RESPONSE_TIMEOUT_MS);
+  const firstResponseTimeoutMs = Number.isFinite(configuredFirstResponseTimeout)
+    ? Math.max(5_000, Math.min(configuredFirstResponseTimeout, 30_000))
+    : 15_000;
+  const configuredResponseTimeout = Number(env.OPENAI_RESPONSE_TIMEOUT_MS);
+  const responseTimeoutMs = Number.isFinite(configuredResponseTimeout)
+    ? Math.max(30_000, Math.min(configuredResponseTimeout, 180_000))
+    : 90_000;
   let preferredModel = model;
   let discoveredModels = [];
   let connectionCheckInFlight = null;
@@ -349,24 +359,45 @@ export function createModelClient(env = process.env) {
         };
       };
 
+      const startModelRequest = async (modelInput, modelName, extra = {}) => {
+        const controller = new AbortController();
+        const firstResponseTimer = setTimeout(() => controller.abort(), firstResponseTimeoutMs);
+        let responseTimer = null;
+        try {
+          const response = await fetch(`${baseUrl}/responses`, {
+            method: 'POST',
+            headers: {
+              ...authHeaders,
+              'Content-Type': 'application/json',
+              ...(extra.stream ? { Accept: 'text/event-stream' } : {})
+            },
+            body: JSON.stringify(requestPayload(modelInput, modelName, extra)),
+            signal: controller.signal
+          });
+          clearTimeout(firstResponseTimer);
+          responseTimer = setTimeout(() => controller.abort(), responseTimeoutMs);
+          return { response, stop: () => clearTimeout(responseTimer) };
+        } catch (error) {
+          clearTimeout(firstResponseTimer);
+          if (responseTimer) clearTimeout(responseTimer);
+          throw error;
+        }
+      };
+
       const requestModel = async (modelInput, modelName) => {
         const startedAt = Date.now();
-        const response = await fetch(`${baseUrl}/responses`, {
-          method: 'POST',
-          headers: {
-            ...authHeaders,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(requestPayload(modelInput, modelName)),
-          signal: AbortSignal.timeout(90_000)
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) {
-          throw modelRequestError(response, payload, modelName);
+        const request = await startModelRequest(modelInput, modelName);
+        try {
+          const payload = await request.response.json().catch(() => ({}));
+          if (!request.response.ok) {
+            throw modelRequestError(request.response, payload, modelName);
+          }
+          health.lastFirstTokenMs = null;
+          health.lastResponseMs = Date.now() - startedAt;
+          return payload.output || [];
+        } finally {
+          request.stop();
         }
-        health.lastFirstTokenMs = null;
-        health.lastResponseMs = Date.now() - startedAt;
-        return payload.output || [];
       };
 
       // Streaming variant of requestModel: parses the Responses API SSE stream,
@@ -375,35 +406,31 @@ export function createModelClient(env = process.env) {
       const requestModelStream = async (modelInput, modelName) => {
         const startedAt = Date.now();
         let firstTokenMs = null;
-        const response = await fetch(`${baseUrl}/responses`, {
-          method: 'POST',
-          headers: {
-            ...authHeaders,
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream'
-          },
-          body: JSON.stringify(requestPayload(modelInput, modelName, { stream: true })),
-          signal: AbortSignal.timeout(90_000)
-        });
-        if (!response.ok) {
-          const payload = await response.json().catch(() => ({}));
-          throw modelRequestError(response, payload, modelName);
+        const request = await startModelRequest(modelInput, modelName, { stream: true });
+        try {
+          const { response } = request;
+          if (!response.ok) {
+            const payload = await response.json().catch(() => ({}));
+            throw modelRequestError(response, payload, modelName);
+          }
+          const contentType = response.headers.get('content-type') || '';
+          if (!response.body || !contentType.includes('text/event-stream')) {
+            // The endpoint ignored stream:true: parse as a regular JSON response.
+            const payload = await response.json().catch(() => ({}));
+            health.lastFirstTokenMs = Date.now() - startedAt;
+            health.lastResponseMs = health.lastFirstTokenMs;
+            return payload.output || [];
+          }
+          const output = await parseResponsesStream(response.body, (delta) => {
+            if (firstTokenMs === null && delta) firstTokenMs = Date.now() - startedAt;
+            if (onToken) onToken(delta);
+          });
+          health.lastFirstTokenMs = firstTokenMs;
+          health.lastResponseMs = Date.now() - startedAt;
+          return output;
+        } finally {
+          request.stop();
         }
-        const contentType = response.headers.get('content-type') || '';
-        if (!response.body || !contentType.includes('text/event-stream')) {
-          // The endpoint ignored stream:true: parse as a regular JSON response.
-          const payload = await response.json().catch(() => ({}));
-          health.lastFirstTokenMs = Date.now() - startedAt;
-          health.lastResponseMs = health.lastFirstTokenMs;
-          return payload.output || [];
-        }
-        const output = await parseResponsesStream(response.body, (delta) => {
-          if (firstTokenMs === null && delta) firstTokenMs = Date.now() - startedAt;
-          if (onToken) onToken(delta);
-        });
-        health.lastFirstTokenMs = firstTokenMs;
-        health.lastResponseMs = Date.now() - startedAt;
-        return output;
       };
 
       const parseArgs = (raw) => {
@@ -425,8 +452,12 @@ export function createModelClient(env = process.env) {
       let lastOutput = [];
       let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
       const callWithFallback = async (request, input) => {
-        const candidates = uniqueModels([selectedModel, ...fallbackModels, ...discoveredModels]);
+        // Only use the explicitly configured compatibility chain. The models
+        // endpoint can contain dozens of specialized models that are not safe
+        // drop-in replacements for a chat response.
+        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
         const unavailable = [];
+        let transientAttempts = 0;
         for (const candidate of candidates) {
           selectedModel = candidate;
           try {
@@ -439,8 +470,11 @@ export function createModelClient(env = process.env) {
             return output;
           } catch (error) {
             error.classification = error?.classification || classifyModelError(error);
-            if (error.classification !== 'model_access') throw error;
-            unavailable.push(selectedModel);
+            const transient = TRANSIENT_FALLBACK_CLASSES.has(error.classification);
+            if (error.classification !== 'model_access' && !transient) throw error;
+            if (transient) transientAttempts += 1;
+            unavailable.push(`${selectedModel} (${error.classification})`);
+            if (transient && transientAttempts >= MAX_TRANSIENT_MODEL_ATTEMPTS) throw error;
             if (candidate === candidates.at(-1)) throw error;
           }
         }
@@ -461,7 +495,7 @@ export function createModelClient(env = process.env) {
           failure = error;
         }
         let classification = failure?.classification || classifyModelError(failure);
-        if (stream && ['network', 'service', 'request', 'stream'].includes(classification)) {
+        if (stream && ['request', 'stream'].includes(classification)) {
           try {
             return await callWithFallback(requestModel, input);
           } catch (error) {

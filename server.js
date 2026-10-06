@@ -884,7 +884,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
 
         // Generate the appropriate check-in
-        let genPrompt;let nudgedPerson=null;let askedGapId=null;
+        let genPrompt;let nudgedPerson=null;let askedGapId=null;let surfacedContraId=null;
         // Emotional attunement context: current tone, shifts, energy, support style
         const emoCtx={tone:null,toneConf:0,shiftNote:'',energyNote:'',supportStyle:'unknown'};
         try{
@@ -1139,7 +1139,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(gaps.length){curiosityCtx=` If it fits naturally, you could ask: "${gaps[0].question}". Don't force it.`;askedGapId=gaps[0].id;}
           }catch(e){}
           // Gentle contradiction: surface one if not mentioned in 30 days
-          let contraCtx='';let surfacedContraId=null;
+          let contraCtx='';
           try{
             const contras=db.listMemoriesBySource(user.id,'auto-contradiction',5);
             const thirtyDaysAgo=new Date(nowMs-30*86400_000).toISOString();
