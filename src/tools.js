@@ -454,6 +454,29 @@ export function toolEnableGiftReminder(args = {}, ctx = null) {
   return { id: date.id, label: date.label, note: 'Gift reminders enabled — Orbit will nag until the gift is done.' };
 }
 
+// Fuzzy-match a task by title: exact (case-insensitive) wins, then substring.
+// Among substring matches, prefer the shortest (most specific) title.
+function findTask(db, userId, title) {
+  const tasks = db.listTasks(userId).filter((t) => !['completed','cancelled','failed'].includes(t.status));
+  const q = String(title || '').trim().toLowerCase();
+  if (!q || !tasks.length) return null;
+  const exact = tasks.find((t) => String(t.title || '').trim().toLowerCase() === q);
+  if (exact) return exact;
+  const hits = tasks.filter((t) => String(t.title || '').toLowerCase().includes(q));
+  if (!hits.length) return null;
+  hits.sort((a, b) => String(a.title).length - String(b.title).length);
+  return hits[0];
+}
+
+export function toolCompleteTask(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'complete_task');
+  const title = cleanArg(args.title, 120, 'title');
+  const task = findTask(db, userId, title);
+  if (!task) throw new Error(`No incomplete task found matching "${title}".`);
+  db.completeTask(userId, task.id, 'Completed via chat.', 'completed', null);
+  return { id: task.id, title: task.title, note: 'Task marked as complete — nagging stopped.' };
+}
+
 export function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
@@ -803,6 +826,19 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'complete_task',
+    description: 'Mark a task as complete when the user says it is done \u2014 e.g. "done", "finished", "I did it", "car inspection done". Matches the task by title (fuzzy). Only call when the user clearly indicates a specific task is complete.',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Title of the task. Fuzzy-matched against incomplete tasks.' }
+      },
+      required: ['title'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'enable_gift_reminder',
     description: 'Turn on gift nagging for an existing important personal date of type "other" when the user asks to be reminded about a gift for it \u2014 e.g. "remind me about a gift for Dad\u2019s memorial". Matches the date by label (fuzzy). Birthdays and anniversaries already nag automatically.',
     parameters: {
@@ -999,6 +1035,7 @@ const TOOL_SUMMARIES = {
   save_memory: (args) => String(args.content || '').slice(0, 80),
   save_personal_date: (args) => `${String(args.label || '').slice(0, 60)} (${args.month}/${args.day})`,
   mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
+  complete_task: (args) => `Task done: ${String(args.title || '').slice(0, 60)}`,
   enable_gift_reminder: (args) => `Gift reminders on: ${String(args.label || '').slice(0, 60)}`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
@@ -1065,6 +1102,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'mark_gift_done': {
       const result = toolMarkGiftDone(clean, ctx);
       return { result, summary: `Gift done: ${String(result.label || '').slice(0, 60)}` };
+    }
+    case 'complete_task': {
+      const result = toolCompleteTask(clean, ctx);
+      return { result, summary: `Task done: ${String(result.title || '').slice(0, 60)}` };
     }
     case 'enable_gift_reminder': {
       const result = toolEnableGiftReminder(clean, ctx);
