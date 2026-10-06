@@ -973,7 +973,54 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             if(giftLines.length)giftCtx=`\n\nGift reminders (the user has NOT confirmed these are handled — keep nagging until they say so): ${giftLines.join(' ')} Bring ${giftLines.length>1?'these':'this'} up naturally but unmistakably — a friend who doesn't let things slip, not a notification. Never claim a gift is handled unless the user said so.`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${datesCtx}${giftCtx}${emoGuide}`;
+          // Task deadline nagging: same escalating pattern as gift nagging, unified.
+          // Nags about incomplete tasks with due dates until they're done. Chat-driven completion via complete_task.
+          let taskDeadlineCtx='';
+          try{
+            const tasks=db.listTasks(user.id);
+            const taskLines=[];
+            for(const t of tasks){
+              if(['completed','cancelled','failed'].includes(t.status))continue;
+              if(!t.schedule_at)continue;
+              // schedule_at is ISO; compare date parts in user's timezone
+              const dueDate=String(t.schedule_at).slice(0,10);
+              if(!/^\d{4}-\d{2}-\d{2}$/.test(dueDate))continue;
+              const todayD=new Date(today+'T12:00:00Z');
+              const dueD=new Date(dueDate+'T12:00:00Z');
+              const daysUntil=Math.round((dueD-todayD)/86400000);
+              if(daysUntil>30)continue; // too far out to nag
+              // Escalation cadence mirrors gift nagging
+              const minGap=daysUntil>=15?7:(daysUntil>=8?3:1);
+              const nagKey=`task_nag_${user.id}_${t.id}`;
+              const lastNag=db.getSetting(nagKey);
+              if(lastNag===today)continue; // never twice in one day
+              if(lastNag&&minGap>1){
+                const daysSince=Math.round((todayD-new Date(lastNag+'T12:00:00Z'))/86400000);
+                if(daysSince<minGap)continue;
+              }
+              const title=String(t.title||'Untitled task').slice(0,80);
+              let line='';
+              if(daysUntil<0)line=`"${title}" was due ${Math.abs(daysUntil)} day${Math.abs(daysUntil)===1?'':'s'} ago and still isn't done — check in firmly but kindly.`;
+              else if(daysUntil===0)line=`"${title}" is due TODAY — urgent but warm, make sure they know.`;
+              else if(daysUntil===1)line=`"${title}" is due TOMORROW — last comfortable day to get it done.`;
+              else if(daysUntil<=7)line=`"${title}" is due in ${daysUntil} days — nudge directly, every day counts now.`;
+              else if(daysUntil<=14)line=`"${title}" is due in ${daysUntil} days — getting closer, keep it on their radar.`;
+              else line=`"${title}" is due in ${daysUntil} days — gentle early heads-up, no rush yet.`;
+              taskLines.push(line);
+              db.setSetting(nagKey,today);
+            }
+            if(taskLines.length)taskDeadlineCtx=`\n\nTask deadlines (incomplete tasks with due dates — keep nagging until completed or cancelled): ${taskLines.join(' ')} Bring ${taskLines.length>1?'these':'this'} up naturally — a friend who cares, not an alarm clock.`;
+          }catch(e){}
+          // Unified deadlines section: personal dates + gift reminders + task deadlines as one coherent picture
+          let upcomingCtx='';
+          try{
+            const parts=[];
+            if(datesCtx)parts.push(datesCtx.replace(/^\n\nImportant personal dates: /,''));
+            if(giftCtx)parts.push(giftCtx.replace(/^\n\nGift reminders \(the user has NOT confirmed these are handled — keep nagging until they say so\): /,'GIFT NAGGING (not done until user confirms): '));
+            if(taskDeadlineCtx)parts.push(taskDeadlineCtx.replace(/^\n\nTask deadlines \(incomplete tasks with due dates — keep nagging until completed or cancelled\): /,'TASK DEADLINES (nag until done): '));
+            if(parts.length)upcomingCtx=`\n\nWhat's coming up (weave into the briefing naturally, like a friend who pays attention — not a list, not a notification): ${parts.join(' ')}`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${upcomingCtx}${emoGuide}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
