@@ -416,9 +416,42 @@ export function toolSavePersonalDate(args = {}, ctx = null) {
   if (year !== null && (!Number.isInteger(year) || year < 1900 || year > 2100)) throw new Error('year must be 1900-2100.');
   const type = ['birthday', 'anniversary', 'other'].includes(args.type) ? args.type : 'other';
   const notes = args.notes ? String(args.notes).trim().slice(0, 500) : null;
-  const saved = db.addPersonalDate(userId, { label, month, day, year, type, notes });
+  const giftNag = args.giftNag === undefined || args.giftNag === null ? null : !!args.giftNag;
+  const saved = db.addPersonalDate(userId, { label, month, day, year, type, notes, giftNag });
   const monthName = new Date(2000, month - 1, 1).toLocaleString('en-US', { month: 'long' });
   return { id: saved.id, label: saved.label, date: `${monthName} ${day}`, type: saved.type, note: 'Saved to important personal dates. Orbit will nudge before and on the day.' };
+}
+
+// Fuzzy-match a personal date by label: exact (case-insensitive) wins, then substring.
+// Among substring matches, prefer the one whose label is shortest (most specific).
+function findPersonalDate(db, userId, label) {
+  const dates = db.listPersonalDates(userId);
+  const q = String(label || '').trim().toLowerCase();
+  if (!q || !dates.length) return null;
+  const exact = dates.find((d) => String(d.label || '').trim().toLowerCase() === q);
+  if (exact) return exact;
+  const hits = dates.filter((d) => String(d.label || '').toLowerCase().includes(q));
+  if (!hits.length) return null;
+  hits.sort((a, b) => String(a.label).length - String(b.label).length);
+  return hits[0];
+}
+
+export function toolMarkGiftDone(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'mark_gift_done');
+  const label = cleanArg(args.label, 120, 'label');
+  const date = findPersonalDate(db, userId, label);
+  if (!date) throw new Error(`No important personal date found matching "${label}".`);
+  db.markGiftDone(userId, date.id);
+  return { id: date.id, label: date.label, note: 'Gift marked as done — nagging stopped.' };
+}
+
+export function toolEnableGiftReminder(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'enable_gift_reminder');
+  const label = cleanArg(args.label, 120, 'label');
+  const date = findPersonalDate(db, userId, label);
+  if (!date) throw new Error(`No important personal date found matching "${label}".`);
+  db.updatePersonalDate(userId, date.id, { giftNag: true, giftDone: false });
+  return { id: date.id, label: date.label, note: 'Gift reminders enabled — Orbit will nag until the gift is done.' };
 }
 
 export function toolScheduleFollowUp(args = {}, ctx = null) {
@@ -748,9 +781,36 @@ export const TOOL_DEFINITIONS = [
         day: { type: 'integer', description: 'Day 1-31.' },
         year: { type: 'integer', description: 'Year (optional; include for anniversaries where the count matters, e.g. wedding year).' },
         type: { type: 'string', enum: ['birthday', 'anniversary', 'other'], description: 'Use birthday or anniversary when it fits, otherwise other (graduations, memorials, milestones, etc).' },
-        notes: { type: 'string', description: 'Optional note, e.g. gift ideas.' }
+        notes: { type: 'string', description: 'Optional note, e.g. gift ideas.' },
+        giftNag: { type: 'boolean', description: 'Nag about a gift for this date. Defaults automatically: true for birthdays and anniversaries, false for other types. Only set true for an other-type date if the user mentions wanting a gift reminder.' }
       },
       required: ['label', 'month', 'day'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'mark_gift_done',
+    description: 'Stop gift nagging for an important personal date when the user says the gift is handled \u2014 e.g. "got Mom\u2019s gift", "I bought it", "done". Matches the date by label (fuzzy). Only call when the user clearly indicates the gift is taken care of.',
+    parameters: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Label of the personal date, e.g. "Mom\u2019s birthday". Fuzzy-matched.' }
+      },
+      required: ['label'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'enable_gift_reminder',
+    description: 'Turn on gift nagging for an existing important personal date of type "other" when the user asks to be reminded about a gift for it \u2014 e.g. "remind me about a gift for Dad\u2019s memorial". Matches the date by label (fuzzy). Birthdays and anniversaries already nag automatically.',
+    parameters: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'Label of the personal date, e.g. "Dad\u2019s memorial". Fuzzy-matched.' }
+      },
+      required: ['label'],
       additionalProperties: false
     }
   },
@@ -938,6 +998,8 @@ const TOOL_SUMMARIES = {
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
   save_personal_date: (args) => `${String(args.label || '').slice(0, 60)} (${args.month}/${args.day})`,
+  mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
+  enable_gift_reminder: (args) => `Gift reminders on: ${String(args.label || '').slice(0, 60)}`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
   create_goal: (args) => String(args.title || '').slice(0, 80),
@@ -999,6 +1061,14 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'save_personal_date': {
       const result = toolSavePersonalDate(clean, ctx);
       return { result, summary: `${String(clean.label || '').slice(0, 60)} (${clean.month}/${clean.day})` };
+    }
+    case 'mark_gift_done': {
+      const result = toolMarkGiftDone(clean, ctx);
+      return { result, summary: `Gift done: ${String(result.label || '').slice(0, 60)}` };
+    }
+    case 'enable_gift_reminder': {
+      const result = toolEnableGiftReminder(clean, ctx);
+      return { result, summary: `Gift reminders on: ${String(result.label || '').slice(0, 60)}` };
     }
     case 'propose_memory': {
       const result = toolProposeMemory(clean, ctx);
