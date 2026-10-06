@@ -67,9 +67,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function preview(userId, providerId) {
-    const row = db.getConnector(userId, providerId);
-    if (!row) throw Object.assign(new Error('Connector is not connected.'), { status: 404 });
-    const token = decryptSecret(row.access_encrypted, encryptionKey);
+    const token = await getValidToken(userId, providerId);
     let url; let transform = (value) => value;
     if (providerId === 'github') { url='https://api.github.com/user/repos?per_page=20&sort=updated'; transform=(items)=>items.map((item)=>({name:item.full_name,private:item.private,url:item.html_url,updatedAt:item.updated_at})); }
     else if (providerId === 'slack') { url='https://slack.com/api/conversations.list?types=public_channel,private_channel&limit=20'; transform=(value)=>(value.channels||[]).map((item)=>({name:item.name,id:item.id,private:item.is_private})); }
