@@ -169,20 +169,12 @@ resource "azurerm_container_app" "orbit" {
         secret_name = "openai-api-key"
       }
       env {
-        name  = "AZURE_OPENAI_ENDPOINT"
-        value = azurerm_cognitive_account.orbit_openai.endpoint
+        name  = "OPENAI_MODEL"
+        value = "gpt-6-astra"
       }
       env {
-        name  = "AZURE_OPENAI_DEPLOYMENT"
-        value = azurerm_cognitive_deployment.orbit_openai_primary.name
-      }
-      env {
-        name  = "AZURE_OPENAI_FALLBACK_DEPLOYMENTS"
-        value = azurerm_cognitive_deployment.orbit_openai_fallback.name
-      }
-      env {
-        name        = "AZURE_OPENAI_API_KEY"
-        secret_name = "azure-openai-api-key"
+        name  = "OPENAI_FALLBACK_MODELS"
+        value = "gpt-6.1-sol,gpt-6-luna"
       }
       env {
         name        = "BRAVE_SEARCH_API_KEY"

@@ -3,9 +3,10 @@
 Deploys Orbit to Azure Container Apps as one always-on replica with a local
 SQLite primary and consistent backups on persistent Azure Files storage.
 
-The stack also includes an Azure OpenAI account with a primary and fallback
-model deployment. The Azure API key is stored only as a Container Apps secret;
-the original OpenAI key remains available as a rollback path.
+The stack also keeps an Azure OpenAI account with primary and fallback model
+deployments available for a future provider switch. Orbit currently uses the
+standard OpenAI API key from Container Apps secrets, with Astra first and an
+ordered model fallback configured in `main.tf`.
 
 ## One-time setup (on your Mac)
 
@@ -45,7 +46,6 @@ RG="orbit-buddy-rg"
 az containerapp secret set -g $RG -n orbit-buddy \
   --secrets \
     openai-api-key="YOUR_KEY" \
-    azure-openai-api-key="YOUR_AZURE_OPENAI_KEY" \
     brave-search-api-key="YOUR_KEY" \
     data-encryption-key="$(openssl rand -hex 32)" \
     gmail-client-id="YOUR_ID" \
