@@ -939,7 +939,41 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             if(dateLines.length)datesCtx=`\n\nImportant personal dates: ${dateLines.join(' ')} Mention ${dateLines.length>1?'these':'this'} warmly and naturally in the briefing — not as a bullet list, just woven in like a friend would.`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${datesCtx}${emoGuide}`;
+          // Gift nagging: escalating reminders until the user says the gift is handled.
+          // Automatic for birthdays/anniversaries (gift_nag defaults by type); chat-driven for other types.
+          let giftCtx='';
+          try{
+            const pdates=db.listPersonalDates(user.id);
+            const giftLines=[];
+            for(const pd of pdates){
+              if(!pd.gift_nag||pd.gift_done)continue;
+              if(String(pd.created_at||'').slice(0,10)===today)continue; // conservative: not the day it was added
+              const occ=nextPersonalDateOccurrence(pd.month,pd.day,timeZone,nowMs);
+              const d=occ.daysUntil;
+              if(d<0||d>30)continue;
+              // Escalation cadence: weekly far out, every 3 days mid-range, daily in the last week
+              const minGap=d>=15?7:(d>=8?3:1);
+              const nagKey=`gift_nag_${user.id}_${pd.id}`;
+              const lastNag=db.getSetting(nagKey);
+              if(lastNag===today)continue; // never twice in one day
+              if(lastNag&&minGap>1){
+                const daysSince=Math.round((new Date(today+'T12:00:00Z')-new Date(lastNag+'T12:00:00Z'))/86400000);
+                if(daysSince<minGap)continue;
+              }
+              const monthName=new Date(2000,pd.month-1,1).toLocaleString('en-US',{month:'long'});
+              const dateStr=`${monthName} ${pd.day}`;
+              let line='';
+              if(d===0)line=`${pd.label} is TODAY (${dateStr}) — urgent: have you gotten the gift? If the user hasn't mentioned it, press gently but firmly.`;
+              else if(d===1)line=`${pd.label} is TOMORROW (${dateStr}) — gift status check: this is the last comfortable day to get one.`;
+              else if(d<=7)line=`${pd.label} is in ${d} days (${dateStr}) and no gift is sorted yet — nudge directly, every day counts now.`;
+              else if(d<=14)line=`${pd.label} is in ${d} days (${dateStr}) — gift reminder, getting closer.`;
+              else line=`${pd.label} is in ${d} days (${dateStr}) — gentle early heads-up about the gift, no rush yet.`;
+              giftLines.push(line);
+              db.setSetting(nagKey,today);
+            }
+            if(giftLines.length)giftCtx=`\n\nGift reminders (the user has NOT confirmed these are handled — keep nagging until they say so): ${giftLines.join(' ')} Bring ${giftLines.length>1?'these':'this'} up naturally but unmistakably — a friend who doesn't let things slip, not a notification. Never claim a gift is handled unless the user said so.`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${datesCtx}${giftCtx}${emoGuide}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -1384,8 +1418,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
         const followUpMatch=url.pathname.match(/^\/api\/follow-ups\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&followUpMatch){if(!db.deleteFollowUp(userId,followUpMatch[1]))throw Object.assign(new Error('Follow-up not found.'),{status:404});db.addEvent(userId,'followup_deleted','Removed a scheduled follow-up.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/personal-dates'){return json(res,200,{dates:db.listPersonalDates(userId)});}
-        if(req.method==='POST'&&url.pathname==='/api/personal-dates'){const body=await readJson(req);try{const saved=db.addPersonalDate(userId,{label:body.label,month:body.month,day:body.day,year:body.year??null,type:body.type,notes:body.notes??null});db.addEvent(userId,'personal_date_added',`Saved “${saved.label}” to important personal dates.`);return json(res,201,saved);}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
-        const personalDateMatch=url.pathname.match(/^\/api\/personal-dates\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&personalDateMatch){if(!db.deletePersonalDate(userId,personalDateMatch[1]))throw Object.assign(new Error('Personal date not found.'),{status:404});db.addEvent(userId,'personal_date_deleted','Removed an important personal date.');return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/personal-dates'){const body=await readJson(req);try{const saved=db.addPersonalDate(userId,{label:body.label,month:body.month,day:body.day,year:body.year??null,type:body.type,notes:body.notes??null,giftNag:body.giftNag??null});db.addEvent(userId,'personal_date_added',`Saved “${saved.label}” to important personal dates.`);return json(res,201,saved);}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
+        const personalDateMatch=url.pathname.match(/^\/api\/personal-dates\/([0-9a-f-]+)$/);
+        if(personalDateMatch&&req.method==='PATCH'){const body=await readJson(req);const patch={};if(body.giftNag!==undefined)patch.giftNag=!!body.giftNag;if(body.giftDone!==undefined)patch.giftDone=!!body.giftDone;if(body.label!==undefined)patch.label=body.label;if(body.notes!==undefined)patch.notes=body.notes;try{const updated=db.updatePersonalDate(userId,personalDateMatch[1],patch);if(!updated)throw Object.assign(new Error('Personal date not found.'),{status:404});return json(res,200,updated);}catch(e){throw Object.assign(new Error(e.message),{status:e.status||400});}}
+        if(req.method==='DELETE'&&personalDateMatch){if(!db.deletePersonalDate(userId,personalDateMatch[1]))throw Object.assign(new Error('Personal date not found.'),{status:404});db.addEvent(userId,'personal_date_deleted','Removed an important personal date.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/preferences')return json(res,200,{preferences:db.getPreferences(userId)});
         if(req.method==='POST'&&url.pathname==='/api/preferences'){const body=await readJson(req);const preferences=db.setPreferences(userId,body);db.addEvent(userId,'preferences_updated','Updated timezone, quiet hours, or proactive check-in preferences.');return json(res,200,{preferences});}
         if(req.method==='POST'&&url.pathname==='/api/goals'){const body=await readJson(req);const targetDate=body.targetDate?validDateString(body.targetDate):null;if(body.targetDate&&!targetDate)throw Object.assign(new Error('targetDate must be YYYY-MM-DD.'),{status:400});const goal=db.addGoal(userId,{title:cleanText(body.title,120,'title'),description:optionalText(body.description,1000),priority:normalizePriority(body.priority),targetDate,nextStep:optionalText(body.nextStep,500)});db.addEvent(userId,'goal_created',`Started tracking goal “${goal.title}”.`);return json(res,201,goal);}
