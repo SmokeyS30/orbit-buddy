@@ -164,6 +164,45 @@ $('#new-routine-button').addEventListener('click',()=>$('#routine-form').classLi
 $('#new-project-button').addEventListener('click',()=>$('#project-form').classList.remove('hidden'));$('#cancel-project').addEventListener('click',()=>$('#project-form').classList.add('hidden'));$('#project-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const steps=$('#project-steps').value.split('\n').map((title)=>title.trim()).filter(Boolean).map((title)=>({title}));await api('/api/projects',{method:'POST',body:JSON.stringify({title:$('#project-title').value,description:$('#project-description').value,priority:Number($('#project-priority').value),targetDate:$('#project-target').value||null,steps})});event.target.reset();$('#project-priority').value='2';event.target.classList.add('hidden');await refresh();toast('Project created.');}catch(error){toast(error.message);}});
 $('#name-form').addEventListener('submit',async(event)=>{event.preventDefault();const name=$('#name-input').value.trim();if(!name)return;try{await api('/api/memories',{method:'POST',body:JSON.stringify({content:`My name is ${name}.`})});$('#name-dialog').close();await refresh();toast(`Nice to meet you, ${name}.`);}catch(error){toast(error.message);}});
 $('#memory-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/memories',{method:'POST',body:JSON.stringify({content:$('#memory-input').value,kind:$('#memory-kind').value})});event.target.reset();await refresh();toast('Memory saved.');}catch(error){toast(error.message);}});
+let importPollTimer=null;
+async function pollImportStatus(){
+  try{
+    const {jobs}=await api('/api/import/status');
+    const job=(jobs||[])[0];
+    const el=$('#import-status');
+    if(!el)return;
+    if(!job){el.textContent='';return;}
+    if(job.status==='processing'){
+      const total=job.total_chunks||'?';
+      el.textContent=`Analyzing… ${job.done_chunks}/${total} chunks, ${job.suggestions_added} suggestions so far.`;
+    }else if(job.status==='done'){
+      el.textContent=`Done — ${job.suggestions_added} suggestion${job.suggestions_added===1?'':'s'} ready for review below.`;
+      if(importPollTimer){clearInterval(importPollTimer);importPollTimer=null;}
+      await refresh();
+    }else if(job.status==='failed'){
+      el.textContent=`Import failed: ${job.error||'unknown error'}`;
+      if(importPollTimer){clearInterval(importPollTimer);importPollTimer=null;}
+    }
+  }catch(_){}
+}
+$('#import-upload').addEventListener('click',async()=>{
+  const input=$('#import-file');
+  const file=input.files&&input.files[0];
+  const el=$('#import-status');
+  if(!file){toast('Choose a JSON export file first.');return;}
+  if(file.size>10*1024*1024){toast('File is too large (10MB max).');return;}
+  el.textContent='Reading file…';
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    el.textContent='Uploading…';
+    const res=await api('/api/import/conversations',{method:'POST',body:JSON.stringify({filename:file.name,data})});
+    el.textContent=`Analyzing ${res.messages} messages…`;
+    if(importPollTimer)clearInterval(importPollTimer);
+    importPollTimer=setInterval(pollImportStatus,3000);
+    pollImportStatus();
+  }catch(error){el.textContent='';toast(error.message);}
+});
 $('#personal-date-form').addEventListener('submit',async(event)=>{event.preventDefault();const label=$('#pdate-label').value.trim();const month=Number($('#pdate-month').value);const day=Number($('#pdate-day').value);const yearRaw=$('#pdate-year').value.trim();const year=yearRaw?Number(yearRaw):null;if(!label){toast('A label is required.');return;}if(!(month>=1&&month<=12)){toast('Pick a valid month.');return;}if(!(day>=1&&day<=31)){toast('Day must be between 1 and 31.');return;}try{await api('/api/personal-dates',{method:'POST',body:JSON.stringify({label,month,day,year,type:$('#pdate-type').value,notes:$('#pdate-notes').value.trim()||null})});event.target.reset();await refresh();toast('Date saved.');}catch(error){toast(error.message);}});
 $('#preferences-form').addEventListener('input',()=>{preferencesDirty=true;});$('#preferences-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/preferences',{method:'POST',body:JSON.stringify({timeZone:$('#preference-timezone').value,quietStart:$('#preference-quiet-start').value,quietEnd:$('#preference-quiet-end').value,proactiveEnabled:$('#preference-proactive').checked,briefingTone:$('#preference-briefing-tone').value,briefingLength:$('#preference-briefing-length').value})});preferencesDirty=false;await refresh();toast('Preferences saved.');}catch(error){toast(error.message);}});
 async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;try{if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
