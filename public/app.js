@@ -251,7 +251,7 @@ if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addE
   navigator.serviceWorker.addEventListener('message',(event)=>{
     if(event.data&&event.data.type==='SW_UPDATED'){
       // Don't yank the screen while they're typing — wait for a pause
-      const doReload=()=>location.reload();
+      const doReload=()=>{try{if(typeof toast==='function')toast('Updating Orbit…');}catch(_){}setTimeout(()=>location.reload(),1200);};
       if(typeof isComposing==='function'&&isComposing()){setTimeout(()=>{if(!isComposing())doReload();else setTimeout(doReload,10000);},5000);}
       else doReload();
     }
