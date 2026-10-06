@@ -8,7 +8,7 @@ import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAg
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
+import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import {
@@ -912,7 +912,34 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const mp=db.getMotivationProfile(user.id);
             if(mp.style&&mp.style!=='unknown')motCtx=` Motivational note: this user responds best to a ${mp.style} approach.`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${emoGuide}`;
+          // Important personal dates: nudge 7 days out, 1 day out, and on the day
+          let datesCtx='';
+          try{
+            const pdates=db.listPersonalDates(user.id);
+            const dateLines=[];
+            for(const pd of pdates){
+              // Conservative: don't nudge about dates added today
+              if(String(pd.created_at||'').slice(0,10)===today)continue;
+              const occ=nextPersonalDateOccurrence(pd.month,pd.day,timeZone,nowMs);
+              if(![7,1,0].includes(occ.daysUntil))continue;
+              const nudgeKey=`personal_date_nudged_${user.id}_${pd.id}_${occ.nextDate}`;
+              if(db.getSetting(nudgeKey))continue; // already nudged for this occurrence
+              const monthName=new Date(2000,pd.month-1,1).toLocaleString('en-US',{month:'long'});
+              const dateStr=`${monthName} ${pd.day}`;
+              let line='';
+              if(occ.daysUntil===7)line=`Heads up: ${pd.label} is in a week (${dateStr}).`;
+              else if(occ.daysUntil===1)line=`Reminder: ${pd.label} is tomorrow (${dateStr}).`;
+              else{
+                line=`Today is ${pd.label}!`;
+                if(pd.type==='anniversary'&&pd.year)line=`Today is ${pd.label} — the ${ordinalSuffix(occ.occurrenceYear-pd.year)} anniversary!`;
+                else if(pd.type==='birthday'&&pd.year)line=`Today is ${pd.label} — turning ${occ.occurrenceYear-pd.year}!`;
+              }
+              dateLines.push(line);
+              db.setSetting(nudgeKey,'1');
+            }
+            if(dateLines.length)datesCtx=`\n\nImportant personal dates: ${dateLines.join(' ')} Mention ${dateLines.length>1?'these':'this'} warmly and naturally in the briefing — not as a bullet list, just woven in like a friend would.`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${datesCtx}${emoGuide}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -1245,7 +1272,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName,model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
-        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
+        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
@@ -1356,6 +1383,9 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
         const followUpMatch=url.pathname.match(/^\/api\/follow-ups\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&followUpMatch){if(!db.deleteFollowUp(userId,followUpMatch[1]))throw Object.assign(new Error('Follow-up not found.'),{status:404});db.addEvent(userId,'followup_deleted','Removed a scheduled follow-up.');return json(res,200,{ok:true});}
+        if(req.method==='GET'&&url.pathname==='/api/personal-dates'){return json(res,200,{dates:db.listPersonalDates(userId)});}
+        if(req.method==='POST'&&url.pathname==='/api/personal-dates'){const body=await readJson(req);try{const saved=db.addPersonalDate(userId,{label:body.label,month:body.month,day:body.day,year:body.year??null,type:body.type,notes:body.notes??null});db.addEvent(userId,'personal_date_added',`Saved “${saved.label}” to important personal dates.`);return json(res,201,saved);}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
+        const personalDateMatch=url.pathname.match(/^\/api\/personal-dates\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&personalDateMatch){if(!db.deletePersonalDate(userId,personalDateMatch[1]))throw Object.assign(new Error('Personal date not found.'),{status:404});db.addEvent(userId,'personal_date_deleted','Removed an important personal date.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/preferences')return json(res,200,{preferences:db.getPreferences(userId)});
         if(req.method==='POST'&&url.pathname==='/api/preferences'){const body=await readJson(req);const preferences=db.setPreferences(userId,body);db.addEvent(userId,'preferences_updated','Updated timezone, quiet hours, or proactive check-in preferences.');return json(res,200,{preferences});}
         if(req.method==='POST'&&url.pathname==='/api/goals'){const body=await readJson(req);const targetDate=body.targetDate?validDateString(body.targetDate):null;if(body.targetDate&&!targetDate)throw Object.assign(new Error('targetDate must be YYYY-MM-DD.'),{status:400});const goal=db.addGoal(userId,{title:cleanText(body.title,120,'title'),description:optionalText(body.description,1000),priority:normalizePriority(body.priority),targetDate,nextStep:optionalText(body.nextStep,500)});db.addEvent(userId,'goal_created',`Started tracking goal “${goal.title}”.`);return json(res,201,goal);}
