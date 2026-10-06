@@ -122,3 +122,4 @@ See [SECURITY.md](SECURITY.md) before adding any connector or tool. Contribution
 - Orbit cannot run arbitrary work directly on an iPhone or control a Mac. A future local device agent must be separately installed and explicitly constrained to approved folders and capabilities.
 
 The goal is not unlimited autonomy. The goal is a dependable buddy whose access is understandable, reviewable, backed up, and easy to revoke.
+
