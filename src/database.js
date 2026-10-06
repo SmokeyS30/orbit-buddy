@@ -49,7 +49,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   try { fs.chmodSync(path.dirname(filePath), 0o700); } catch (_) {}
   const db = new DatabaseSync(filePath);
   try { fs.chmodSync(filePath, 0o600); } catch (_) {}
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  // WAL mode doesn't work on network filesystems (e.g. Azure Files) — fall back to DELETE
+  try {
+    db.exec('PRAGMA journal_mode = WAL;');
+  } catch (_) {
+    db.exec('PRAGMA journal_mode = DELETE;');
+  }
+  db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   const protectSecret = (value) => {
     const text = String(value || '');
     if (!text || text.startsWith('enc:v1:') || !encryptionKey) return text;
