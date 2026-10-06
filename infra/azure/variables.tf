@@ -19,5 +19,5 @@ variable "storage_account_name" {
 variable "container_image" {
   description = "Docker image for Orbit. Build and push yours, then set this."
   type        = string
-  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:77df3db60f948bcc820cccd5fef881b434d0e861b8f447216d2c4c3141ddb590"
+  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:e3407c062ebd7c63de73f05af492569ccb570d7253c654d3d59cb3120bc9506f"
 }

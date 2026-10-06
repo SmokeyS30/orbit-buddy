@@ -164,6 +164,50 @@ test('respond without tools keeps the single-request behavior', async (t) => {
   assert.equal(requests, 1);
 });
 
+test('GPT-6 responses use a stable prompt-cache breakpoint', async (t) => {
+  let sent;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      sent = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Hello.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6-luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+
+  await model.respond({ buddyName: 'Orbit', userName: 'Owner', message: 'Hi' });
+
+  assert.deepEqual(sent.prompt_cache_options, { mode: 'implicit', ttl: '30m' });
+  assert.deepEqual(sent.input[0].content[0].prompt_cache_breakpoint, { mode: 'explicit' });
+  assert.equal(sent.input[1].role, 'developer');
+  assert.match(sent.input[1].content, /Owner/);
+});
+
+test('earlier fallback models omit GPT-6 prompt-cache controls', async (t) => {
+  let sent;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      sent = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Hello.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-5.4-mini', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+
+  await model.respond({ buddyName: 'Orbit', message: 'Hi' });
+
+  assert.equal(sent.prompt_cache_options, undefined);
+  assert.equal(sent.input[0].content[0].prompt_cache_breakpoint, undefined);
+});
+
 test('model access failure falls back to the configured starter model', async (t) => {
   let requests = 0;
   const stub = http.createServer((req, res) => {
@@ -242,6 +286,29 @@ test('connection check validates the key without generating tokens and selects a
   assert.equal(status.state, 'fallback');
   assert.equal(status.activeModel, 'gpt-6-luna');
   assert.deepEqual(status.fallbackModels, ['gpt-6-luna', 'gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini']);
+});
+
+test('connection checks share one in-flight request and reuse the fresh result', async (t) => {
+  let requests = 0;
+  const stub = http.createServer((req, res) => {
+    requests += 1;
+    setTimeout(() => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: [{ id: 'gpt-6-luna' }] }));
+    }, 40);
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6-luna', OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+
+  const [first, second] = await Promise.all([model.checkConnection(), model.checkConnection()]);
+  const cached = await model.checkConnection();
+
+  assert.equal(requests, 1);
+  assert.equal(first.state, 'ready');
+  assert.equal(second.state, 'ready');
+  assert.equal(cached.state, 'ready');
+  assert.ok(model.diagnostics().connectionLatencyMs >= 30);
 });
 
 test('connection check identifies a revoked key without a generation request', async (t) => {
