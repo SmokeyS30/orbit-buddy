@@ -25,5 +25,5 @@ variable "azure_openai_account_name" {
 variable "container_image" {
   description = "Docker image for Orbit. Build and push yours, then set this."
   type        = string
-  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:1b5838bcf60df7f75b42fe543bee937483e1d3feadf3debe425c44a416b2d653"
+  default     = "ghcr.io/smokeys30/orbit-buddy@sha256:5d6621c6700e92c3d154762759d550d37b834a1b2cc16c6d81f272248fc8ce77"
 }
