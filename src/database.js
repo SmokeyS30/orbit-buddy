@@ -293,6 +293,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
+  ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -470,6 +471,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET time_zone=excluded.time_zone,quiet_start=excluded.quiet_start,
       quiet_end=excluded.quiet_end,proactive_enabled=excluded.proactive_enabled,briefing_tone=excluded.briefing_tone,
       briefing_length=excluded.briefing_length,updated_at=excluded.updated_at`),
+    setBuddyName: db.prepare('UPDATE user_preferences SET buddy_name=?, updated_at=? WHERE user_id=?'),
     getConversationSummary: db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?'),
     upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
       VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
@@ -689,6 +691,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
+    setBuddyName(userId,name){this.getPreferences(userId);const clean=String(name||'').trim().slice(0,40);if(!clean)throw new Error('Provide a name for your buddy (1-40 characters).');s.setBuddyName.run(clean,timestamp(),userId);return clean;},
     trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
     dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,

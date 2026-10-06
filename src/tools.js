@@ -477,6 +477,14 @@ export function toolCompleteTask(args = {}, ctx = null) {
   return { id: task.id, title: task.title, note: 'Task marked as complete — nagging stopped.' };
 }
 
+export function toolSetBuddyName(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'set_buddy_name');
+  const name = String(args.name || '').trim().slice(0, 40);
+  if (!name) throw new Error('Provide a name for your buddy (1-40 characters).');
+  db.setBuddyName(userId, name);
+  return { name, note: `Your buddy's name is now "${name}".` };
+}
+
 export function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
@@ -650,6 +658,19 @@ export async function toolReadCalendar(args = {}, ctx = null) {
 }
 
 export const TOOL_DEFINITIONS = [
+  {
+    type: 'function',
+    name: 'set_buddy_name',
+    description: 'Set a personal name for the AI buddy when the user says what they would like to call it — e.g. "call you Luna", "your name is Rex", "I\'ll call you Buddy". Only call when the user clearly gives the buddy a name.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'The name the user chose for their buddy (1-40 characters).' }
+      },
+      required: ['name'],
+      additionalProperties: false
+    }
+  },
   {
     type: 'function',
     name: 'get_datetime',
@@ -1036,6 +1057,7 @@ const TOOL_SUMMARIES = {
   save_personal_date: (args) => `${String(args.label || '').slice(0, 60)} (${args.month}/${args.day})`,
   mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
   complete_task: (args) => `Task done: ${String(args.title || '').slice(0, 60)}`,
+  set_buddy_name: (args) => `Named buddy: ${String(args.name || '').slice(0, 40)}`,
   enable_gift_reminder: (args) => `Gift reminders on: ${String(args.label || '').slice(0, 60)}`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
@@ -1106,6 +1128,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'complete_task': {
       const result = toolCompleteTask(clean, ctx);
       return { result, summary: `Task done: ${String(result.title || '').slice(0, 60)}` };
+    }
+    case 'set_buddy_name': {
+      const result = toolSetBuddyName(clean, ctx);
+      return { result, summary: `Named buddy: ${String(result.name || '').slice(0, 40)}` };
     }
     case 'enable_gift_reminder': {
       const result = toolEnableGiftReminder(clean, ctx);
