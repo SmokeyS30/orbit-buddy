@@ -9,6 +9,7 @@ BACKUP_DIR="${BACKUP_DIR:-/backup}"
 DB_FILE="$DATA_DIR/orbit.sqlite"
 BACKUP_FILE="$BACKUP_DIR/orbit.sqlite"
 BACKUP_TMP="$BACKUP_DIR/orbit.sqlite.tmp"
+LOCAL_BACKUP_TMP="$DATA_DIR/orbit.sqlite.backup.tmp"
 LEGACY_BACKUP_FILE="$BACKUP_DIR/orbit/orbit.sqlite"
 BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-60}"
 
@@ -28,7 +29,10 @@ fi
 
 backup_database() {
   [ -s "$DB_FILE" ] || return 0
-  node src/sqlite-file-backup.js "$DB_FILE" "$BACKUP_TMP" \
+  # Azure Files cannot be opened as a SQLite backup destination. First create
+  # the consistent snapshot on local disk, then copy the completed file.
+  node src/sqlite-file-backup.js "$DB_FILE" "$LOCAL_BACKUP_TMP" \
+    && cp "$LOCAL_BACKUP_TMP" "$BACKUP_TMP" \
     && mv "$BACKUP_TMP" "$BACKUP_FILE"
 }
 
