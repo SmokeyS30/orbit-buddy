@@ -5,29 +5,59 @@
 set -e
 
 DATA_DIR="${DATA_DIR:-/var/data/orbit}"
-BACKUP_DIR="/backup"
-DB_FILE="$DATA_DIR/orbit.db"
-BACKUP_FILE="$BACKUP_DIR/orbit.db"
+BACKUP_DIR="${BACKUP_DIR:-/backup}"
+DB_FILE="$DATA_DIR/orbit.sqlite"
+BACKUP_FILE="$BACKUP_DIR/orbit.sqlite"
+BACKUP_TMP="$BACKUP_DIR/orbit.sqlite.tmp"
+LEGACY_BACKUP_FILE="$BACKUP_DIR/orbit/orbit.sqlite"
+BACKUP_INTERVAL_SECONDS="${BACKUP_INTERVAL_SECONDS:-60}"
 
-mkdir -p "$DATA_DIR"
+mkdir -p "$DATA_DIR" "$BACKUP_DIR"
 
-# Restore from backup if local DB is missing and a backup exists
-if [ ! -f "$DB_FILE" ] && [ -f "$BACKUP_FILE" ]; then
-  echo "Restoring database from backup..."
-  cp "$BACKUP_FILE" "$DB_FILE"
+# Restore only a non-empty backup. The legacy path covers the original Azure
+# deployment, which mounted the share directly at /var/data.
+if [ ! -s "$DB_FILE" ]; then
+  if [ -s "$BACKUP_FILE" ]; then
+    echo "Restoring database from Azure Files backup..."
+    cp "$BACKUP_FILE" "$DB_FILE"
+  elif [ -s "$LEGACY_BACKUP_FILE" ]; then
+    echo "Restoring database from legacy Azure Files location..."
+    cp "$LEGACY_BACKUP_FILE" "$DB_FILE"
+  fi
 fi
 
-# Background backup loop: copy DB to Azure Files every 5 minutes
+backup_database() {
+  [ -s "$DB_FILE" ] || return 0
+  node src/sqlite-file-backup.js "$DB_FILE" "$BACKUP_TMP" \
+    && mv "$BACKUP_TMP" "$BACKUP_FILE"
+}
+
+# Use SQLite's online backup API instead of copying a live WAL database.
 (
   while true; do
-    sleep 300
-    if [ -f "$DB_FILE" ]; then
-      cp "$DB_FILE" "$BACKUP_FILE.tmp" 2>/dev/null && mv "$BACKUP_FILE.tmp" "$BACKUP_FILE" 2>/dev/null || true
-    fi
+    sleep "$BACKUP_INTERVAL_SECONDS"
+    backup_database || echo "Warning: scheduled database backup failed" >&2
   done
 ) &
+BACKUP_PID=$!
 
-# Final backup on shutdown
-trap 'echo "Backing up database..."; cp "$DB_FILE" "$BACKUP_FILE" 2>/dev/null || true; exit 0' TERM INT
+node server.js &
+APP_PID=$!
 
-exec node server.js
+forward_shutdown() {
+  trap - TERM INT
+  kill -TERM "$APP_PID" 2>/dev/null || true
+}
+
+trap forward_shutdown TERM INT
+
+APP_STATUS=0
+wait "$APP_PID" || APP_STATUS=$?
+
+kill "$BACKUP_PID" 2>/dev/null || true
+wait "$BACKUP_PID" 2>/dev/null || true
+
+echo "Saving final database backup..."
+backup_database || echo "Warning: final database backup failed" >&2
+
+exit "$APP_STATUS"

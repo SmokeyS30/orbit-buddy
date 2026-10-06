@@ -7,3 +7,10 @@ coverage/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+# Terraform working files and local state (may contain secrets)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log

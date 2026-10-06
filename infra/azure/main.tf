@@ -14,14 +14,20 @@ provider "azurerm" {
   features {}
 }
 
+locals {
+  app_name              = "orbit-buddy"
+  azure_public_base_url = "https://${local.app_name}.${azurerm_container_app_environment.orbit.default_domain}"
+}
+
 # --- Resource group: everything lives here, one bill, one place ---
 resource "azurerm_resource_group" "orbit" {
   name     = var.resource_group_name
   location = var.location
 }
 
-# --- Storage: Azure Files share for the SQLite database ---
-# This is Orbit's persistent disk. Survives redeploys and scaling events.
+# --- Storage: Azure Files share for SQLite backups ---
+# SQLite runs on local container storage for reliable file locking. Consistent
+# online backups are written here and restored whenever a new replica starts.
 resource "azurerm_storage_account" "orbit" {
   name                     = var.storage_account_name
   resource_group_name      = azurerm_resource_group.orbit.name
@@ -64,15 +70,17 @@ resource "azurerm_container_app_environment_storage" "orbit_data" {
 
 # --- The app itself ---
 resource "azurerm_container_app" "orbit" {
-  name                         = "orbit-buddy"
+  name                         = local.app_name
   container_app_environment_id = azurerm_container_app_environment.orbit.id
   resource_group_name          = azurerm_resource_group.orbit.name
   revision_mode                = "Single" # one active version at a time
+  workload_profile_name        = "Consumption"
 
-  # --- Auto-scaling: 0 when idle, up to 3 under load ---
+  # A local SQLite primary requires exactly one always-on replica. The Azure
+  # Files backup survives revision replacements and container restarts.
   template {
-    min_replicas = 0
-    max_replicas = 3
+    min_replicas = 1
+    max_replicas = 1
 
     container {
       name   = "orbit-buddy"
@@ -94,11 +102,28 @@ resource "azurerm_container_app" "orbit" {
       }
       env {
         name  = "PUBLIC_BASE_URL"
-        value = var.public_base_url
+        value = local.azure_public_base_url
       }
-      # Secrets are set after first apply — see README.
-      # OPENAI_API_KEY, BRAVE_SEARCH_API_KEY, DATA_ENCRYPTION_KEY,
-      # GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET
+      env {
+        name        = "OPENAI_API_KEY"
+        secret_name = "openai-api-key"
+      }
+      env {
+        name        = "BRAVE_SEARCH_API_KEY"
+        secret_name = "brave-search-api-key"
+      }
+      env {
+        name        = "DATA_ENCRYPTION_KEY"
+        secret_name = "data-encryption-key"
+      }
+      env {
+        name        = "GMAIL_CLIENT_ID"
+        secret_name = "gmail-client-id"
+      }
+      env {
+        name        = "GMAIL_CLIENT_SECRET"
+        secret_name = "gmail-client-secret"
+      }
 
       volume_mounts {
         name = "orbit-data"
@@ -133,5 +158,11 @@ resource "azurerm_container_app" "orbit" {
       latest_revision = true
       percentage      = 100
     }
+  }
+
+  # Secrets are entered with Azure CLI or the portal and must never be stored in
+  # Terraform state or source control. Terraform manages their environment refs.
+  lifecycle {
+    ignore_changes = [secret]
   }
 }

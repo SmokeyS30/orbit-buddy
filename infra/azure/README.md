@@ -1,6 +1,7 @@
 # Orbit Buddy on Azure (Terraform)
 
-Deploys Orbit to Azure Container Apps with auto-scaling (0–3 replicas) and persistent SQLite storage.
+Deploys Orbit to Azure Container Apps as one always-on replica with a local
+SQLite primary and consistent backups on persistent Azure Files storage.
 
 ## One-time setup (on your Mac)
 
@@ -20,7 +21,8 @@ docker build -t ghcr.io/smokeys30/orbit-buddy:latest .
 docker push ghcr.io/smokeys30/orbit-buddy:latest
 ```
 
-(Or use any registry — just update `container_image` in `variables.tf`.)
+(Or use any registry. For repeatable deployments, update `container_image` in
+`variables.tf` to the pushed image digest rather than a mutable `latest` tag.)
 
 ## Deploy
 
@@ -30,7 +32,7 @@ terraform init
 terraform apply
 ```
 
-First apply takes ~5–10 minutes. Terraform will print the app URL when done.
+First apply takes ~5–10 minutes. Terraform prints the stable app URL when done.
 
 ## Add your secrets (after first deploy)
 
@@ -45,11 +47,12 @@ az containerapp secret set -g $RG -n orbit-buddy \
     gmail-client-secret="YOUR_SECRET"
 ```
 
-Then wire them as env vars (Azure portal → Container App → Containers → Environment variables),
-or add them to `main.tf` as `secretRef` entries.
+Terraform already wires these secret names to the container environment. Secret
+values stay outside source control and Terraform state.
 
-**Important:** if you already have an Orbit database on Render, copy the SQLite file
-into the Azure Files share before going live, or you'll start with a fresh database.
+**Important:** if you already have an Orbit database on Render, upload the SQLite
+file as `orbit.sqlite` at the root of the `orbit-data` Azure Files share before
+going live, or you'll start with a fresh database.
 Generate a NEW `data-encryption-key` only if starting fresh — if migrating, reuse
 the existing `DATA_ENCRYPTION_KEY` from Render.
 
@@ -72,5 +75,7 @@ terraform destroy
 
 ## Cost estimate
 
-~$20–30/month: Container Apps (pay-per-use, scales to zero when idle) + Storage + Log Analytics.
-The biggest cost is the Container Apps Environment's baseline (~$10/mo even at zero replicas).
+The exact price varies by Azure region and usage. This configuration keeps one
+Consumption replica running because scaling a stateful SQLite app to zero can
+discard changes made since its last backup. Check Azure Cost Management for the
+current measured cost.

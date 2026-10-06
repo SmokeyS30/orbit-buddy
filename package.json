@@ -10,7 +10,7 @@
     "start": "node server.js",
     "dev": "NODE_ENV=development node --watch server.js",
     "test": "node --test",
-    "check": "node --check server.js && node --check src/database.js && node --check src/intelligence.js && node --check src/model.js && node --check src/proactive.js && node --check src/tools.js && node --check public/app.js && node --check public/sw.js && npm test"
+    "check": "node --check server.js && node --check src/database.js && node --check src/intelligence.js && node --check src/model.js && node --check src/proactive.js && node --check src/sqlite-file-backup.js && node --check src/tools.js && node --check public/app.js && node --check public/sw.js && npm test"
   },
   "dependencies": {
     "@capacitor/cli": "^8.5.2",

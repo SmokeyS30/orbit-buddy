@@ -1,6 +1,6 @@
 output "app_url" {
   description = "Public URL of the deployed Orbit app"
-  value       = "https://${azurerm_container_app.orbit.latest_revision_fqdn}"
+  value       = local.azure_public_base_url
 }
 
 output "resource_group" {
