@@ -45,9 +45,10 @@ function adoptOrphanMessages(db, userId) {
 
 export function openDatabase(filePath, { encryptionKey = null } = {}) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  fs.chmodSync(path.dirname(filePath), 0o700);
+  // chmod is best-effort: network filesystems (e.g. Azure Files) don't support it
+  try { fs.chmodSync(path.dirname(filePath), 0o700); } catch (_) {}
   const db = new DatabaseSync(filePath);
-  fs.chmodSync(filePath, 0o600);
+  try { fs.chmodSync(filePath, 0o600); } catch (_) {}
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   const protectSecret = (value) => {
     const text = String(value || '');
