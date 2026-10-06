@@ -37,7 +37,9 @@ terraform init
 terraform apply
 ```
 
-First apply takes ~5–10 minutes. Terraform prints the stable app URL when done.
+First apply takes ~5–10 minutes. The production app is available at
+`https://orbitbuddy.app`; Azure's generated hostname remains available for
+health checks and disaster recovery.
 
 ## Add your secrets (after first deploy)
 
@@ -60,6 +62,11 @@ file as `orbit.sqlite` at the root of the `orbit-data` Azure Files share before
 going live, or you'll start with a fresh database.
 Generate a NEW `data-encryption-key` only if starting fresh — if migrating, reuse
 the existing `DATA_ENCRYPTION_KEY` from Render.
+
+The `orbitbuddy.app` managed-certificate binding is maintained by Azure CLI and
+protected from removal by Terraform's lifecycle rule in `main.tf`. Keep the
+Cloudflare apex A record DNS-only and pointed at the Container Apps environment
+static IP so Azure can continue to validate and renew the managed certificate.
 
 ## Updating
 

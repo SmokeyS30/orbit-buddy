@@ -16,7 +16,7 @@ provider "azurerm" {
 
 locals {
   app_name              = "orbit-buddy"
-  azure_public_base_url = "https://${local.app_name}.${azurerm_container_app_environment.orbit.default_domain}"
+  azure_public_base_url = "https://orbitbuddy.app"
 }
 
 # --- Resource group: everything lives here, one bill, one place ---
@@ -229,8 +229,10 @@ resource "azurerm_container_app" "orbit" {
   }
 
   # Secrets are entered with Azure CLI or the portal and must never be stored in
-  # Terraform state or source control. Terraform manages their environment refs.
+  # Terraform state or source control. The managed certificate is intentionally
+  # bound out of band so Azure can validate and renew it without putting
+  # certificate material in this repository.
   lifecycle {
-    ignore_changes = [secret]
+    ignore_changes = [secret, ingress[0].custom_domain]
   }
 }
