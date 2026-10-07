@@ -597,7 +597,7 @@ function validDateStr(value) {
   return `${y}-${mo}-${d}`;
 }
 
-import { sendEmail, searchEmails, readEmail } from './gmail.js';
+import { sendEmail, searchEmails, readEmail, trashEmail } from './gmail.js';
 
 function gmailContext(ctx, tool) {
   const { db, userId } = writeContext(ctx, tool);
@@ -627,6 +627,13 @@ export async function toolGmailRead(args = {}, ctx = null) {
   const { gmail } = gmailContext(ctx, 'gmail_read');
   const query = cleanArg(args.query, 200, 'query');
   return readEmail(() => gmail.getToken(), { query });
+}
+
+export async function toolGmailDelete(args = {}, ctx = null) {
+  const { gmail } = gmailContext(ctx, 'gmail_delete');
+  const id = cleanArg(args.id, 100, 'id');
+  const result = await trashEmail(() => gmail.getToken(), { id });
+  return { ...result, note: 'Email moved to trash (recoverable for 30 days).' };
 }
 
 export async function toolReadCalendar(args = {}, ctx = null) {
@@ -1039,6 +1046,19 @@ export const TOOL_DEFINITIONS = [
       required: ['query'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'gmail_delete',
+    description: 'Move an email to trash (recoverable for 30 days). Takes a Gmail message ID from gmail_search or gmail_read. ALWAYS show the user the email subject/sender and ask for explicit confirmation before calling this.',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Gmail message ID of the email to trash.' }
+      },
+      required: ['id'],
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1070,7 +1090,8 @@ const TOOL_SUMMARIES = {
   read_calendar: (args) => String(args.date || 'today').slice(0, 40),
   gmail_send: (args) => `${String(args.to || '').slice(0, 40)}: ${String(args.subject || '').slice(0, 40)}`,
   gmail_search: (args) => String(args.query || '').slice(0, 80),
-  gmail_read: (args) => String(args.query || '').slice(0, 80)
+  gmail_read: (args) => String(args.query || '').slice(0, 80),
+  gmail_delete: (args) => `Trash email: ${String(args.id || '').slice(0, 40)}`
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -1184,6 +1205,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'gmail_read': {
       const result = await toolGmailRead(clean, ctx);
       return { result, summary: String(clean.query || '').slice(0, 80) };
+    }
+    case 'gmail_delete': {
+      const result = await toolGmailDelete(clean, ctx);
+      return { result, summary: `Trashed email ${String(clean.id || '').slice(0, 40)}` };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }

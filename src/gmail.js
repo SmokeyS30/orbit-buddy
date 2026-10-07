@@ -74,3 +74,10 @@ export async function readEmail(getToken, { query }) {
     date: headers.date || '', body: bodyText.slice(0, 5000)
   };
 }
+
+// Move an email to trash (recoverable for 30 days) by message ID
+export async function trashEmail(getToken, { id }) {
+  if (!id) throw new Error('A message ID is required.');
+  await apiFetch(getToken, `/messages/${encodeURIComponent(id)}/trash`, { method: 'POST' });
+  return { trashed: true, id };
+}
