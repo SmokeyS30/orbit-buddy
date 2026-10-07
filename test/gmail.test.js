@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sendEmail, searchEmails, readEmail } from '../src/gmail.js';
-import { toolGmailSend, toolGmailSearch, TOOL_DEFINITIONS, executeTool } from '../src/tools.js';
+import { toolGmailDelete, toolGmailSend, toolGmailSearch, TOOL_DEFINITIONS, executeTool } from '../src/tools.js';
 
 // Mock getToken that returns a fake token
 const mockGetToken = async () => 'fake-token';
@@ -22,11 +22,12 @@ function mockGmailApi(responses) {
 }
 
 test('gmail tools are registered in TOOL_DEFINITIONS', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 28);
+  assert.equal(TOOL_DEFINITIONS.length, 29);
   const names = TOOL_DEFINITIONS.map((t) => t.name).sort();
   assert.ok(names.includes('gmail_send'));
   assert.ok(names.includes('gmail_search'));
   assert.ok(names.includes('gmail_read'));
+  assert.ok(names.includes('gmail_delete'));
 });
 
 test('sendEmail validates inputs', async () => {
@@ -75,11 +76,26 @@ test('toolGmailSearch throws when Gmail not connected', async () => {
   await assert.rejects(() => toolGmailSearch({ query: 'test' }, ctx), /not connected/);
 });
 
-test('executeTool routes gmail tools', async () => {
-  const restore = mockGmailApi([['/messages/send', { id: 'msg456' }]]);
-  try {
-    const ctx = { db: {}, userId: 'u1', gmail: { getToken: mockGetToken } };
-    const { result } = await executeTool('gmail_send', { to: 'test@example.com', subject: 'Hi', body: 'Hello' }, {}, ctx);
-    assert.equal(result.sent, true);
-  } finally { restore(); }
+test('gmail write tools create approvals without calling Gmail', async () => {
+  const approvals = [];
+  const db = { addApproval: (_userId, value) => { approvals.push(value); return { id: `a${approvals.length}`, status: 'pending', ...value }; } };
+  const ctx = { db, userId: 'u1', messageId: 'm1', gmail: { getToken: mockGetToken } };
+
+  const sent = await toolGmailSend({ to: 'test@example.com', subject: 'Hi', body: 'Hello' }, ctx);
+  assert.equal(sent.status, 'pending');
+  assert.equal(approvals[0].kind, 'gmail_send');
+  assert.equal(approvals[0].payload.to, 'test@example.com');
+
+  const deleted = await toolGmailDelete({ id: 'msg456', subject: 'Old note', from: 'sender@example.com' }, ctx);
+  assert.equal(deleted.status, 'pending');
+  assert.equal(approvals[1].kind, 'gmail_delete');
+  assert.equal(approvals[1].payload.id, 'msg456');
+});
+
+test('executeTool routes Gmail writes to the approval gate', async () => {
+  const db = { addApproval: (_userId, value) => ({ id: 'a1', status: 'pending', ...value }) };
+  const ctx = { db, userId: 'u1', gmail: { getToken: mockGetToken } };
+  const { result } = await executeTool('gmail_send', { to: 'test@example.com', subject: 'Hi', body: 'Hello' }, {}, ctx);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.kind, 'gmail_send');
 });

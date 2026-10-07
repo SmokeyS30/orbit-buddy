@@ -597,7 +597,7 @@ function validDateStr(value) {
   return `${y}-${mo}-${d}`;
 }
 
-import { sendEmail, searchEmails, readEmail, trashEmail } from './gmail.js';
+import { searchEmails, readEmail } from './gmail.js';
 
 function gmailContext(ctx, tool) {
   const { db, userId } = writeContext(ctx, tool);
@@ -606,15 +606,22 @@ function gmailContext(ctx, tool) {
 }
 
 export async function toolGmailSend(args = {}, ctx = null) {
-  const { gmail } = gmailContext(ctx, 'gmail_send');
-  const result = await sendEmail(() => gmail.getToken(), {
+  const { db, userId } = gmailContext(ctx, 'gmail_send');
+  const payload = {
     to: cleanArg(args.to, 500, 'to'),
     subject: cleanArg(args.subject, 200, 'subject'),
     body: cleanArg(args.body, 10000, 'body'),
     cc: args.cc ? cleanArg(args.cc, 500, 'cc') : undefined,
     bcc: args.bcc ? cleanArg(args.bcc, 500, 'bcc') : undefined
+  };
+  const approval = db.addApproval(userId, {
+    kind: 'gmail_send',
+    title: `Send email to ${payload.to}`,
+    summary: payload.subject,
+    payload,
+    sourceMessageId: ctx?.messageId || null
   });
-  return { ...result, note: 'Email sent via Gmail.' };
+  return { ...approval, note: 'Email prepared for approval. Nothing is sent until the user approves it in Approvals.' };
 }
 
 export async function toolGmailSearch(args = {}, ctx = null) {
@@ -630,10 +637,18 @@ export async function toolGmailRead(args = {}, ctx = null) {
 }
 
 export async function toolGmailDelete(args = {}, ctx = null) {
-  const { gmail } = gmailContext(ctx, 'gmail_delete');
+  const { db, userId } = gmailContext(ctx, 'gmail_delete');
   const id = cleanArg(args.id, 100, 'id');
-  const result = await trashEmail(() => gmail.getToken(), { id });
-  return { ...result, note: 'Email moved to trash (recoverable for 30 days).' };
+  const subject = args.subject ? cleanArg(args.subject, 300, 'subject') : null;
+  const from = args.from ? cleanArg(args.from, 300, 'from') : null;
+  const approval = db.addApproval(userId, {
+    kind: 'gmail_delete',
+    title: `Move “${subject || 'email'}” to trash`,
+    summary: from ? `From ${from}` : `Gmail message ${id}`,
+    payload: { id, subject, from },
+    sourceMessageId: ctx?.messageId || null
+  });
+  return { ...approval, note: 'Email prepared for approval. Nothing is moved until the user approves it in Approvals.' };
 }
 
 export async function toolReadCalendar(args = {}, ctx = null) {
@@ -1006,7 +1021,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'gmail_send',
-    description: 'Send an email via the user\'s connected Gmail. ALWAYS show the user the exact recipient, subject, and body and get their explicit confirmation before calling this. Never send without confirmation.',
+    description: 'Prepare an email for the user\'s approval. This creates an approval item and never sends immediately. Use only when the user asks to send an email, and tell them to review it in Approvals.',
     parameters: {
       type: 'object',
       properties: {
@@ -1050,11 +1065,13 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'gmail_delete',
-    description: 'Move an email to trash (recoverable for 30 days). Takes a Gmail message ID from gmail_search or gmail_read. ALWAYS show the user the email subject/sender and ask for explicit confirmation before calling this.',
+    description: 'Prepare a request to move an email to trash (recoverable for 30 days). This creates an approval item and never moves mail immediately. Use the message ID, subject, and sender returned by Gmail search.',
     parameters: {
       type: 'object',
       properties: {
-        id: { type: 'string', description: 'Gmail message ID of the email to trash.' }
+        id: { type: 'string', description: 'Gmail message ID of the email to trash.' },
+        subject: { type: 'string', description: 'Email subject shown to the user during approval.' },
+        from: { type: 'string', description: 'Email sender shown to the user during approval.' }
       },
       required: ['id'],
       additionalProperties: false

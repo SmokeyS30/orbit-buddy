@@ -202,6 +202,24 @@ test('projects and approval decisions are isolated by user', () => {
   db.close();
 });
 
+test('approval execution is claimed atomically before an external action', () => {
+  const { db, user } = fixture();
+  const approval = db.addApproval(user.id, {
+    kind: 'gmail_send',
+    title: 'Send email',
+    summary: 'Release update',
+    payload: { to: 'person@example.com', subject: 'Update', body: 'Ready.' }
+  });
+  assert.equal(db.claimApproval(user.id, approval.id).id, approval.id);
+  assert.equal(db.claimApproval(user.id, approval.id), null);
+  assert.equal(db.resolveApproval(user.id, approval.id, 'rejected'), null);
+  const executed = db.finishApproval(user.id, approval.id, 'executed', { result: { sent: true } });
+  assert.equal(executed.status, 'executed');
+  assert.equal(executed.execution_started_at, null);
+  assert.equal(executed.result.sent, true);
+  db.close();
+});
+
 test('tracks people mentions and finds stale ones for nudges', () => {
   const { db, user, filePath } = fixture();
   db.trackPersonMention(user.id, 'Mom');

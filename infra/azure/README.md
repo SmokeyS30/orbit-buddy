@@ -1,7 +1,11 @@
 # Orbit Buddy on Azure (Terraform)
 
 Deploys Orbit to Azure Container Apps as one always-on replica with a local
-SQLite primary and consistent backups on persistent Azure Files storage.
+SQLite primary and consistent backups on persistent Azure Files storage. The
+container refreshes the current backup every 15 seconds, retains up to 168
+hourly/shutdown snapshots, and forces a snapshot during graceful
+shutdown. Keep a separate portable backup and periodically test restoration;
+the Azure Files share is recovery storage, not an independent off-site backup.
 
 The stack also keeps an Azure OpenAI account with primary and fallback model
 deployments available for a future provider switch. Orbit currently uses the
@@ -50,6 +54,7 @@ az containerapp secret set -g $RG -n orbit-buddy \
     openai-api-key="YOUR_KEY" \
     brave-search-api-key="YOUR_KEY" \
     data-encryption-key="$(openssl rand -hex 32)" \
+    backup-encryption-key="$(openssl rand -hex 32)" \
     gmail-client-id="YOUR_ID" \
     gmail-client-secret="YOUR_SECRET"
 ```

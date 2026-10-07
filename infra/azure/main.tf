@@ -185,6 +185,10 @@ resource "azurerm_container_app" "orbit" {
         secret_name = "data-encryption-key"
       }
       env {
+        name        = "BACKUP_ENCRYPTION_KEY"
+        secret_name = "backup-encryption-key"
+      }
+      env {
         name        = "GMAIL_CLIENT_ID"
         secret_name = "gmail-client-id"
       }

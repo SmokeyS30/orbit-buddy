@@ -5,6 +5,10 @@
 
 name: Deploy to Azure
 
+concurrency:
+  group: orbit-buddy-production
+  cancel-in-progress: false
+
 on:
   push:
     branches: [main]
@@ -13,7 +17,20 @@ on:
       - '**.md'
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm audit --omit=dev --audit-level=high
+
   build-and-deploy:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

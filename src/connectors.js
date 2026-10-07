@@ -8,7 +8,7 @@ const providers = {
     authorize: 'https://accounts.google.com/o/oauth2/v2/auth',
     token: 'https://oauth2.googleapis.com/token',
     profile: 'https://www.googleapis.com/oauth2/v2/userinfo',
-    // send + readonly: Orbit can send mail and read/search the inbox, but not delete or modify.
+    // Send, read/search, and move explicitly approved messages to trash.
     scope: 'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify',
     clientId: 'GMAIL_CLIENT_ID',
     clientSecret: 'GMAIL_CLIENT_SECRET',

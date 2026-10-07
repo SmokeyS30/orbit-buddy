@@ -1,7 +1,14 @@
+# syntax=docker/dockerfile:1
 FROM node:24-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+RUN --mount=type=secret,id=proxy_ca \
+    if [ -s /run/secrets/proxy_ca ]; then \
+      NODE_EXTRA_CA_CERTS=/run/secrets/proxy_ca npm ci --omit=dev --ignore-scripts; \
+    else \
+      npm ci --omit=dev --ignore-scripts; \
+    fi \
+    && npm cache clean --force
 COPY server.js ./
 COPY src ./src
 COPY public ./public

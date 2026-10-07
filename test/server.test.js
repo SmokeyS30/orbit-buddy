@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
+import { encryptSecret, readEncryptionKey } from '../src/security.js';
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-server-'));
@@ -148,6 +149,59 @@ test('calendar approvals create a downloadable calendar file and can be rejected
   const rejected = await fetch(`${base}/api/approvals/${rejectedApproval.id}/reject`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
   assert.equal(rejected.status, 200);
   assert.equal((await rejected.json()).status, 'rejected');
+});
+
+test('Gmail writes happen only after a server-side approval', async (t) => {
+  const secret = 'test-encryption-key-with-32-chars';
+  const { app, base } = await fixture({ DATA_ENCRYPTION_KEY: secret, GMAIL_CLIENT_ID: 'client', GMAIL_CLIENT_SECRET: 'secret' });
+  t.after(() => app.close());
+  const auth = await register(base);
+  const userId = auth.body.user.id;
+  app.db.saveConnector(userId, 'gmail', {
+    accessEncrypted: encryptSecret('gmail-access-token', readEncryptionKey(secret)),
+    scopes: 'gmail.send gmail.modify',
+    expiresAt: new Date(Date.now() + 60 * 60_000).toISOString()
+  });
+  const approval = app.db.addApproval(userId, {
+    kind: 'gmail_send',
+    title: 'Send email to person@example.com',
+    summary: 'Release update',
+    payload: { to: 'person@example.com', subject: 'Release update', body: 'Orbit is ready.' }
+  });
+  let gmailCalls = 0;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    if(String(url).includes('gmail.googleapis.com')){
+      gmailCalls += 1;
+      assert.equal(options.method, 'POST');
+      return { ok: true, json: async () => ({ id: 'gmail-message-1' }) };
+    }
+    return originalFetch(url, options);
+  };
+  t.after(() => { global.fetch = originalFetch; });
+
+  assert.equal(gmailCalls, 0);
+  const approved = await fetch(`${base}/api/approvals/${approval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(approved.status, 200);
+  const body = await approved.json();
+  assert.equal(body.approval.status, 'executed');
+  assert.equal(body.approval.result.sent, true);
+  assert.equal(gmailCalls, 1);
+  assert.equal((await fetch(`${base}/api/approvals/${approval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' })).status, 409);
+  assert.equal(gmailCalls, 1);
+
+  const deleteApproval = app.db.addApproval(userId, {
+    kind: 'gmail_delete',
+    title: 'Move old note to trash',
+    summary: 'From sender@example.com',
+    payload: { id: 'gmail-message-2', subject: 'Old note', from: 'sender@example.com' }
+  });
+  const deleted = await fetch(`${base}/api/approvals/${deleteApproval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(deleted.status, 200);
+  const deletedBody = await deleted.json();
+  assert.equal(deletedBody.approval.status, 'executed');
+  assert.equal(deletedBody.approval.result.trashed, true);
+  assert.equal(gmailCalls, 2);
 });
 
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {

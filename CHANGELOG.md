@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- Gated every Azure production deployment on the full test suite and a production dependency audit, with serialized deployments.
+- Moved Gmail send and move-to-trash actions behind atomic server-side approvals and added clear review details in the Approvals UI.
+- Reduced the Azure SQLite recovery-point window and added 168 retained versioned snapshots plus a forced graceful-shutdown snapshot.
+- Updated production, connector, backup, and security documentation to match the active Azure deployment.
+- Fixed stale tool-definition assertions after the Gmail delete tool was added.
+
 ## 0.5.1
 
 - Fixed quiet-hour time fields overlapping on narrow Safety layouts.

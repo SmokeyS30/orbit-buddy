@@ -1,6 +1,6 @@
 {
   "name": "orbit-buddy",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "A privacy-first, self-hostable persistent AI buddy for the web, Mac, and iPhone.",
   "type": "module",
   "engines": {

@@ -143,7 +143,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       kind TEXT NOT NULL, title TEXT NOT NULL, summary TEXT NOT NULL, payload_json TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','executed','rejected','failed')),
-      source_message_id TEXT, result_json TEXT, last_error TEXT,
+      source_message_id TEXT, result_json TEXT, last_error TEXT, execution_started_at TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reviewed_at TEXT
     );
     CREATE TABLE IF NOT EXISTS tasks (
@@ -301,6 +301,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
+  ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -420,7 +421,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,?,'pending',?,NULL,NULL,?,?,NULL)`),
     getApproval: db.prepare('SELECT * FROM approvals WHERE id=? AND user_id=?'),
     listApprovals: db.prepare("SELECT * FROM approvals WHERE user_id=? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,created_at DESC,rowid DESC LIMIT 200"),
-    resolveApproval: db.prepare("UPDATE approvals SET status=?,result_json=?,last_error=?,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'"),
+    claimApproval: db.prepare("UPDATE approvals SET execution_started_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending' AND (execution_started_at IS NULL OR execution_started_at<=?)"),
+    resolveApproval: db.prepare("UPDATE approvals SET status=?,result_json=?,last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending' AND execution_started_at IS NULL"),
+    finishApproval: db.prepare("UPDATE approvals SET status=?,result_json=?,last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending' AND execution_started_at IS NOT NULL"),
     lastUserMessage: db.prepare("SELECT MAX(created_at) AS last_at FROM messages WHERE user_id=? AND role='user'"),
     getQuietNudge: db.prepare('SELECT last_quiet_nudge_at FROM proactive_state WHERE user_id=?'),
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
@@ -689,7 +692,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addApproval(userId,{kind,title,summary,payload={},sourceMessageId=null}){const now=timestamp();const row={id:randomUUID(),user_id:userId,kind:String(kind||'proposal').slice(0,60),title,summary,payload_json:JSON.stringify(payload),status:'pending',source_message_id:sourceMessageId,result_json:null,last_error:null,created_at:now,updated_at:now,reviewed_at:null};s.addApproval.run(row.id,row.user_id,row.kind,row.title,row.summary,row.payload_json,row.source_message_id,row.created_at,row.updated_at);return {...row,payload};},
     getApproval(userId,id){const row=s.getApproval.get(id,userId);if(!row)return null;let payload={},result=null;try{payload=JSON.parse(row.payload_json||'{}');}catch{}try{result=row.result_json?JSON.parse(row.result_json):null;}catch{}return {...row,payload,result};},
     listApprovals(userId){return s.listApprovals.all(userId).map((row)=>{let payload={},result=null;try{payload=JSON.parse(row.payload_json||'{}');}catch{}try{result=row.result_json?JSON.parse(row.result_json):null;}catch{}return {...row,payload,result};});},
+    claimApproval(userId,id){const at=timestamp();const staleBefore=new Date(Date.now()-10*60_000).toISOString();if(!s.claimApproval.run(at,at,id,userId,staleBefore).changes)return null;return this.getApproval(userId,id);},
     resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
+    finishApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','failed'].includes(status))return null;const at=timestamp();if(!s.finishApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),

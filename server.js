@@ -12,6 +12,7 @@ import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDa
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
+import { sendEmail, trashEmail } from './src/gmail.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -1584,7 +1585,45 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         const projectStepsMatch=url.pathname.match(/^\/api\/projects\/([0-9a-f-]+)\/steps$/);if(projectStepsMatch&&req.method==='POST'){const body=await readJson(req);const dueDate=body.dueDate?validDateString(body.dueDate):null;if(body.dueDate&&!dueDate)throw Object.assign(new Error('dueDate must be YYYY-MM-DD.'),{status:400});const step=db.addProjectStep(userId,projectStepsMatch[1],{title:cleanText(body.title,160,'title'),details:optionalText(body.details,1000),dueDate});if(!step)throw Object.assign(new Error('Project not found.'),{status:404});db.addEvent(userId,'project_step_added',`Added project step “${step.title}”.`);return json(res,201,step);}
         const projectStepMatch=url.pathname.match(/^\/api\/project-steps\/([0-9a-f-]+)$/);if(projectStepMatch&&req.method==='PATCH'){const body=await readJson(req);if(body.status!==undefined&&!['planned','in_progress','blocked','completed'].includes(body.status))throw Object.assign(new Error('status is not valid.'),{status:400});if(body.dueDate&&!validDateString(body.dueDate))throw Object.assign(new Error('dueDate must be YYYY-MM-DD.'),{status:400});const step=db.updateProjectStep(userId,projectStepMatch[1],{title:body.title===undefined?undefined:cleanText(body.title,160,'title'),details:body.details===undefined?undefined:optionalText(body.details,1000),status:body.status,dueDate:body.dueDate});if(!step)throw Object.assign(new Error('Project step not found.'),{status:404});db.addEvent(userId,'project_step_updated',`Updated “${step.title}” (${step.status}).`);return json(res,200,step);}
         if(projectStepMatch&&req.method==='DELETE'){if(!db.deleteProjectStep(userId,projectStepMatch[1]))throw Object.assign(new Error('Project step not found.'),{status:404});db.addEvent(userId,'project_step_deleted','Deleted a project step.');return json(res,200,{ok:true});}
-        const approvalMatch=url.pathname.match(/^\/api\/approvals\/([0-9a-f-]+)\/(approve|reject)$/);if(approvalMatch&&req.method==='POST'){const approval=db.getApproval(userId,approvalMatch[1]);if(!approval)throw Object.assign(new Error('Approval item not found.'),{status:404});if(approval.status!=='pending')throw Object.assign(new Error('Approval item was already reviewed.'),{status:409});if(approvalMatch[2]==='reject'){const rejected=db.resolveApproval(userId,approval.id,'rejected');db.addEvent(userId,'approval_rejected',`Rejected “${approval.title}”.`);return json(res,200,rejected);}if(approval.kind!=='calendar_event')throw Object.assign(new Error('This approval type is not supported.'),{status:400});const content=calendarEventIcs(approval);const artifact=db.addArtifact(userId,{name:`${artifactName(approval.payload.title).replace(/\.md$/,'.ics')}`,mimeType:'text/calendar; charset=utf-8',content});const executed=db.resolveApproval(userId,approval.id,'executed',{result:{artifactId:artifact.id}});db.addEvent(userId,'approval_executed',`Approved calendar file “${approval.payload.title}”.`);return json(res,200,{approval:executed,artifact});}
+        const approvalMatch=url.pathname.match(/^\/api\/approvals\/([0-9a-f-]+)\/(approve|reject)$/);
+        if(approvalMatch&&req.method==='POST'){
+          const approval=db.getApproval(userId,approvalMatch[1]);
+          if(!approval)throw Object.assign(new Error('Approval item not found.'),{status:404});
+          if(approval.status!=='pending')throw Object.assign(new Error('Approval item was already reviewed.'),{status:409});
+          if(approvalMatch[2]==='reject'){
+            if(approval.execution_started_at)throw Object.assign(new Error('Approval item is being executed.'),{status:409});
+            const rejected=db.resolveApproval(userId,approval.id,'rejected');
+            if(!rejected)throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
+            db.addEvent(userId,'approval_rejected',`Rejected “${approval.title}”.`);
+            return json(res,200,rejected);
+          }
+          if(!['calendar_event','gmail_send','gmail_delete'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
+          if((approval.kind==='gmail_send'||approval.kind==='gmail_delete')&&paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});
+          if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
+          try{
+            if(approval.kind==='calendar_event'){
+              const content=calendarEventIcs(approval);
+              const artifact=db.addArtifact(userId,{name:`${artifactName(approval.payload.title).replace(/\.md$/,'.ics')}`,mimeType:'text/calendar; charset=utf-8',content});
+              const executed=db.finishApproval(userId,approval.id,'executed',{result:{artifactId:artifact.id}});
+              db.addEvent(userId,'approval_executed',`Approved calendar file “${approval.payload.title}”.`);
+              return json(res,200,{approval:executed,artifact});
+            }
+            if(approval.kind==='gmail_send'){
+              const result=await sendEmail(()=>connectors.getValidToken(userId,'gmail'),approval.payload);
+              const executed=db.finishApproval(userId,approval.id,'executed',{result});
+              db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
+              return json(res,200,{approval:executed});
+            }
+            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
+            const executed=db.finishApproval(userId,approval.id,'executed',{result});
+            db.addEvent(userId,'approval_executed','Moved an approved Gmail message to trash.');
+            return json(res,200,{approval:executed});
+          }catch(error){
+            db.finishApproval(userId,approval.id,'failed',{error:error?.message||'Approval execution failed.'});
+            db.addEvent(userId,'approval_failed',`Could not execute “${approval.title}”.`);
+            throw error;
+          }
+        }
         if(req.method==='POST'&&url.pathname==='/api/tasks'){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(userRateLimited(userId,'tasks'))throw Object.assign(new Error('Too many task requests. Try again shortly.'),{status:429});const body=await readJson(req);const risk=body.risk==='external'?'external':'internal';const recurrence=['daily','weekly'].includes(body.recurrence)?body.recurrence:'none';let scheduleAt=null;if(body.scheduleAt){const date=new Date(body.scheduleAt);if(Number.isNaN(date.valueOf()))throw Object.assign(new Error('scheduleAt must be valid.'),{status:400});scheduleAt=date.toISOString();}const task=db.addTask(userId,{title:cleanText(body.title,120,'title'),prompt:cleanText(body.prompt,6000,'prompt'),risk,scheduleAt,recurrence});db.addEvent(userId,'task_created',`Created “${task.title}”.`,risk==='external'?'Waiting for approval.':null);setImmediate(runDueTasks);return json(res,201,task);}
         const taskDeleteMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&taskDeleteMatch){const task=db.getTask(userId,taskDeleteMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});db.deleteTask(userId,task.id);db.addEvent(userId,'task_deleted',`Deleted \u201c${task.title}\u201d.`);return json(res,200,{deleted:true});}
             const taskMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/(approve|cancel)$/);if(req.method==='POST'&&taskMatch){const task=db.getTask(userId,taskMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});const action=taskMatch[2];const status=action==='approve'?(task.schedule_at?'scheduled':'queued'):'cancelled';db.setTaskStatus(userId,task.id,status);db.addEvent(userId,`task_${action}d`,`${action==='approve'?'Approved':'Cancelled'} “${task.title}”.`);if(action==='approve')setImmediate(runDueTasks);return json(res,200,{...task,status});}

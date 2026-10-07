@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 28);
+  assert.equal(TOOL_DEFINITIONS.length, 29);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_buddy_name', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_buddy_name', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
