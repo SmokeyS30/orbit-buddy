@@ -9,6 +9,7 @@
 - Reduced the Azure SQLite recovery-point window and added 168 retained versioned snapshots plus a forced graceful-shutdown snapshot.
 - Updated production, connector, backup, and security documentation to match the active Azure deployment.
 - Fixed stale tool-definition assertions after the Gmail delete tool was added.
+- Updated the Capacitor toolchain's transitive UUID dependency to clear its moderate security advisory.
 
 ## 0.5.1
 
