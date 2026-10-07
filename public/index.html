@@ -393,22 +393,6 @@
             </p>
           </div>
         </div>
-        <form id="memory-form" class="panel memory-form">
-          <input
-            id="memory-input"
-            maxlength="2000"
-            required
-            placeholder="Remember that I prefer concise weekly plans…"
-          /><select id="memory-kind" aria-label="Memory type">
-            <option value="fact">Fact</option>
-            <option value="preference">Preference</option>
-            <option value="goal">Goal</option>
-            <option value="project">Project</option>
-            <option value="decision">Decision</option>
-            <option value="relationship">Relationship</option></select
-          ><button class="primary">Save</button>
-        </form>
-        <div id="memory-list" class="card-list"></div>
         <section class="section-gap">
           <h2>Import past conversations</h2>
           <p class="muted">
@@ -426,6 +410,22 @@
             <p class="hint" id="import-status" aria-live="polite"></p>
           </div>
         </section>
+        <form id="memory-form" class="panel memory-form">
+          <input
+            id="memory-input"
+            maxlength="2000"
+            required
+            placeholder="Remember that I prefer concise weekly plans…"
+          /><select id="memory-kind" aria-label="Memory type">
+            <option value="fact">Fact</option>
+            <option value="preference">Preference</option>
+            <option value="goal">Goal</option>
+            <option value="project">Project</option>
+            <option value="decision">Decision</option>
+            <option value="relationship">Relationship</option></select
+          ><button class="primary">Save</button>
+        </form>
+        <div id="memory-list" class="card-list"></div>
         <section class="section-gap">
           <h2>Scheduled follow-ups</h2>
           <p class="muted">
