@@ -1,3 +1,4 @@
+// Orbit Buddy frontend v2.1 - optimistic chat send
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
 let activeConversationId=null;try{activeConversationId=localStorage.getItem('orbit-convo');}catch(_){}
 let preferencesDirty=false;
