@@ -384,8 +384,8 @@ export function toolCreateTask(args = {}, ctx = null) {
     status: task.status,
     risk: task.risk,
     note: task.status === 'waiting_approval'
-      ? 'Created, waiting for the owner to approve it in the Tasks tab.'
-      : 'Created.'
+      ? 'Created and saved, waiting for the owner to approve it in the Tasks tab.'
+      : 'Created and saved successfully. The task is in the Tasks tab and will run as scheduled.'
   };
 }
 
@@ -394,7 +394,7 @@ export function toolSaveMemory(args = {}, ctx = null) {
   const content = cleanArg(args.content, 2000, 'content');
   const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
   try { for (const name of extractPersonNames(content)) db.trackPersonMention(userId, name); } catch (e) {}
-  return { id: memory.id, content: memory.content, note: 'Saved. The user can delete it in the Memories tab.' };
+  return { id: memory.id, content: memory.content, note: 'Saved successfully. The user can delete it in the Memories tab.' };
 }
 
 export function toolProposeMemory(args = {}, ctx = null) {
