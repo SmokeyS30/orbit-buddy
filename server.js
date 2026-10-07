@@ -1,3 +1,4 @@
+// Auto-deploy pipeline test
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -884,7 +885,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
 
         // Generate the appropriate check-in
-        let genPrompt;let nudgedPerson=null;let askedGapId=null;let surfacedContraId=null;
+        let genPrompt;let nudgedPerson=null;let askedGapId=null;
         // Emotional attunement context: current tone, shifts, energy, support style
         const emoCtx={tone:null,toneConf:0,shiftNote:'',energyNote:'',supportStyle:'unknown'};
         try{
@@ -1139,7 +1140,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(gaps.length){curiosityCtx=` If it fits naturally, you could ask: "${gaps[0].question}". Don't force it.`;askedGapId=gaps[0].id;}
           }catch(e){}
           // Gentle contradiction: surface one if not mentioned in 30 days
-          let contraCtx='';
+          let contraCtx='';let surfacedContraId=null;
           try{
             const contras=db.listMemoriesBySource(user.id,'auto-contradiction',5);
             const thirtyDaysAgo=new Date(nowMs-30*86400_000).toISOString();
@@ -1304,12 +1305,21 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
-    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,provider:modelStatus.provider,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
+    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
 
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
+        try{cleanupExpiredDemos(db);}catch{}
+        const user=db.createDemoUser();
+        seedDemoData(db,user.id);
+        const csrf=createSession(user,req,res);
+        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/demo/start'){
+        if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
+        // Clean up expired demos opportunistically
         try{cleanupExpiredDemos(db);}catch{}
         const user=db.createDemoUser();
         seedDemoData(db,user.id);
