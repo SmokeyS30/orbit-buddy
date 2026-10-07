@@ -31,7 +31,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/orbit-buddy:latest
+          tags: ghcr.io/smokeys30/orbit-buddy:latest
 
       - name: Log in to Azure
         uses: azure/login@v2
@@ -43,4 +43,4 @@ jobs:
           az containerapp update \
             -g orbit-buddy-rg \
             -n orbit-buddy \
-            --image ghcr.io/${{ github.repository_owner }}/orbit-buddy:latest
+            --image ghcr.io/smokeys30/orbit-buddy:latest
