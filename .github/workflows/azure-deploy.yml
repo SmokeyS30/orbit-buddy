@@ -31,7 +31,9 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/smokeys30/orbit-buddy:latest
+          tags: |
+            ghcr.io/smokeys30/orbit-buddy:latest
+            ghcr.io/smokeys30/orbit-buddy:${{ github.sha }}
 
       - name: Log in to Azure
         uses: azure/login@v2
@@ -43,4 +45,4 @@ jobs:
           az containerapp update \
             -g orbit-buddy-rg \
             -n orbit-buddy \
-            --image ghcr.io/smokeys30/orbit-buddy:latest
+            --image ghcr.io/smokeys30/orbit-buddy:${{ github.sha }}
