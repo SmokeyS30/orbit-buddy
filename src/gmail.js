@@ -45,6 +45,7 @@ export async function searchEmails(getToken, { query, max = 5 }) {
     const full = await apiFetch(getToken, `/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`);
     const headers = Object.fromEntries((full.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
     results.push({
+      id: m.id,
       from: headers.from || '', subject: headers.subject || '(no subject)',
       date: headers.date || '', snippet: full.snippet || ''
     });
