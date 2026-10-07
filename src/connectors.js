@@ -97,7 +97,16 @@ export function createConnectorService(env, db, encryptionKey) {
     });
     const res = await fetch(provider.token, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(30_000) });
     const tokens = await res.json().catch(() => ({}));
-    if (!res.ok || !tokens.access_token) throw Object.assign(new Error(`${provider.label} token refresh failed. Please reconnect.`), { status: 502 });
+    if (!res.ok || !tokens.access_token) {
+      const googleError = tokens.error || tokens.error_description || `HTTP ${res.status}`;
+      console.error(`${providerId} token refresh failed:`, googleError);
+      // invalid_grant = refresh token revoked/expired — clear the dead connection so the UI shows Connect, not a broken Preview
+      if (tokens.error === 'invalid_grant') {
+        try { db.deleteConnector(userId, providerId); } catch (_) {}
+        throw Object.assign(new Error(`${provider.label} session expired. Please reconnect.`), { status: 401 });
+      }
+      throw Object.assign(new Error(`${provider.label} token refresh failed (${googleError}). Please reconnect.`), { status: 502 });
+    }
     db.saveConnector(userId, providerId, {
       accessEncrypted: encryptSecret(tokens.access_token, encryptionKey),
       refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : row.refresh_encrypted,
