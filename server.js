@@ -230,6 +230,9 @@ export function createOrbitServer(options={}) {
         try{
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
+          // Strip stale "check the calendar first / suppress if absent" clauses from old reminder prompts.
+          // Tasks run without tool access, so these conditions can never be satisfied and only cause hedging.
+          taskMessage=taskMessage.replace(/\s*check (?:today'?s|the) calendar first[^.]*\./gi,'').replace(/\s*suppress (?:this reminder )?if[^.]*\./gi,'').trim();
           if(/^\[nudge\]\s*morning briefing/i.test(task.title||'')){
             try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
