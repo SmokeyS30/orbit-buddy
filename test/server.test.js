@@ -29,7 +29,7 @@ test('health and setup are public while private data requires a session', async 
   assert.match(appScript.headers.get('cache-control'), /no-cache/);
   const health = await fetch(`${base}/healthz`);
   assert.equal(health.status, 200);
-  assert.deepEqual((await health.json()).ai, { configured: false, provider: 'openai', state: 'demo', primaryModel: 'gpt-6-luna', activeModel: 'gpt-6-luna', availableTextModelCount: null });
+  assert.deepEqual((await health.json()).ai, { configured: false, state: 'demo', primaryModel: 'gpt-6-luna', activeModel: 'gpt-6-luna', availableTextModelCount: null });
   assert.equal((await fetch(`${base}/api/auth/setup-status`)).status, 200);
   assert.equal((await fetch(`${base}/api/status`)).status, 401);
   const auth = await register(base);
