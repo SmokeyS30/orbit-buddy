@@ -457,7 +457,7 @@ export async function toolEnableGiftReminder(args = {}, ctx = null) {
 // Fuzzy-match a task by title: exact (case-insensitive) wins, then substring.
 // Among substring matches, prefer the shortest (most specific) title.
 async function findTask(db, userId, title) {
-  const tasks = (await db.listTasks(userId)).filter((t) => !['completed','cancelled','failed'].includes(t.status));
+  const tasks = await db.listTasks(userId).filter((t) => !['completed','cancelled','failed'].includes(t.status));
   const q = String(title || '').trim().toLowerCase();
   if (!q || !tasks.length) return null;
   const exact = tasks.find((t) => String(t.title || '').trim().toLowerCase() === q);
