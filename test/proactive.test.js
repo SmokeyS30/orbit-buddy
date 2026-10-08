@@ -65,7 +65,7 @@ test('follow-up sweep checks in on due events only', async (t) => {
   assert.ok(events.some((e) => e.type === 'followup_sent'), 'followup_sent event logged');
 });
 
-test.skip('quiet nudge fires after 48h idle, then cools down', async (t) => { // TODO: Fix cooldown bug - nudge fires twice
+test('quiet nudge fires after 48h idle, then cools down', async (t) => { // TODO: Fix cooldown bug - nudge fires twice
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
   app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
