@@ -802,6 +802,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       await run('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)', id, name, email, note || null, timestamp());
       return get('SELECT * FROM access_requests WHERE id=?', id);
     },
+    getAccessRequest: async (id) => get('SELECT * FROM access_requests WHERE id=?', id),
     listAccessRequests: async () => all('SELECT * FROM access_requests ORDER BY created_at DESC,id DESC LIMIT 100'),
     dismissAccessRequest: async (id) => (await run('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL', timestamp(), id)).changes > 0,
 

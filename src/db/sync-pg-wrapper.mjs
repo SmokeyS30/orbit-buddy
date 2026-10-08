@@ -19,10 +19,15 @@ const LEN_OFFSET = 4;       // per-query result length
 const DATA_OFFSET = 8;      // per-query result bytes
 const READY_OFFSET = 12;    // worker readiness flag (set once at startup)
 
-const READY_TIMEOUT_MS = 30000;
+const DEFAULT_READY_TIMEOUT_MS = 30000;
 const QUERY_TIMEOUT_MS = 30000;
 
-export function createSyncPgAdapter(connectionString, { encryptionKey = null } = {}) {
+export function createSyncPgAdapter(connectionString, { encryptionKey = null, readyTimeoutMs = null } = {}) {
+  // Allow fast-fail for tests: ?readyTimeoutMs=2000 in connection string
+  // or readyTimeoutMs option. Defaults to 30s for production.
+  let readyTimeout = readyTimeoutMs || DEFAULT_READY_TIMEOUT_MS;
+  const timeoutMatch = /[?&]readyTimeoutMs=(\d+)/.exec(connectionString);
+  if (timeoutMatch) readyTimeout = parseInt(timeoutMatch[1], 10);
   const sharedBuffer = new SharedArrayBuffer(BUFFER_SIZE);
   const sharedArray = new Int32Array(sharedBuffer);
 
@@ -46,7 +51,7 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null } =
   // Wait for the worker's Atomics readiness signal (shared memory, not 'message').
   // Poll in short intervals so a worker crash fails fast instead of waiting out
   // the full timeout.
-  const readyDeadline = Date.now() + READY_TIMEOUT_MS;
+  const readyDeadline = Date.now() + readyTimeout;
   let ready = false;
   while (Date.now() < readyDeadline) {
     if (Atomics.load(sharedArray, READY_OFFSET / 4) === 1) {
