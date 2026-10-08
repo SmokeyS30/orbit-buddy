@@ -24,6 +24,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # PostgreSQL 16 service: the integration test must run (not skip) as
+    # part of the deployment gate. Deployment is blocked until it passes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orbit_test
+          POSTGRES_PASSWORD: orbit_test_pw
+          POSTGRES_DB: orbit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orbit_test -d orbit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://orbit_test:orbit_test_pw@localhost:5432/orbit_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -133,10 +151,14 @@ jobs:
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
               BODY=$(curl -s -m 15 https://orbitbuddy.app/healthz)
-              echo "$BODY" | grep -q '"ok":true' && {
-                echo "public_ok=true" >> $GITHUB_OUTPUT
-                exit 0
-              }
+              # Require: ok=true, AI ready (or safe state), database postgres+ready.
+              # This detects accidental SQLite fallback.
+              echo "$BODY" | grep -q '"ok":true' || continue
+              echo "$BODY" | grep -q '"driver":"postgres"' || { echo "FAIL: database driver is not postgres"; continue; }
+              echo "$BODY" | grep -q '"state":"ready"' || { echo "FAIL: database state is not ready"; continue; }
+              echo "public_ok=true" >> $GITHUB_OUTPUT
+              echo "Verified: ok=true, database=postgres/ready"
+              exit 0
             fi
             sleep 10
           done
