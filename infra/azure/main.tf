@@ -1,5 +1,13 @@
 # Orbit Buddy on Azure Container Apps
 # One `terraform apply` deploys everything. Run `terraform destroy` to tear it down.
+#
+# EXTERNALLY MANAGED RESOURCES (not in Terraform state):
+# - PostgreSQL Flexible Server `orbit-buddy-pg` (orbit-buddy-rg, Central US):
+#   Created manually. Holds production data. Terraform does NOT manage it to
+#   prevent accidental replacement/deletion. The Container App references it
+#   via the `database-url` secret (DATABASE_URL env var).
+# - Secrets in the Container App (database-url, openai-api-key, etc.):
+#   Managed manually via Azure Portal/CLI, referenced by secret_name.
 
 terraform {
   required_providers {
@@ -195,6 +203,18 @@ resource "azurerm_container_app" "orbit" {
       env {
         name        = "GMAIL_CLIENT_SECRET"
         secret_name = "gmail-client-secret"
+      }
+      # PostgreSQL: DATABASE_URL references the database-url secret.
+      # The PostgreSQL server itself is externally managed (created manually,
+      # not by Terraform) to avoid accidental replacement. See comment below.
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+      # Durable encrypted backups go to the Azure Files mount at /backup.
+      env {
+        name  = "BACKUP_DIR"
+        value = "/backup"
       }
 
       volume_mounts {
