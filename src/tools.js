@@ -365,7 +365,7 @@ export async function toolDeepResearch(args = {}, env = process.env) {
   return out.slice(0, 30000);
 }
 
-export async async function toolCreateTask(args = {}, ctx = null) {
+export async function toolCreateTask(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_task');
   const title = cleanArg(args.title, 120, 'title');
   const prompt = cleanArg(args.prompt, 6000, 'prompt');
@@ -389,7 +389,7 @@ export async async function toolCreateTask(args = {}, ctx = null) {
   };
 }
 
-export async async function toolSaveMemory(args = {}, ctx = null) {
+export async function toolSaveMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_memory');
   const content = cleanArg(args.content, 2000, 'content');
   const memory = await db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
@@ -397,7 +397,7 @@ export async async function toolSaveMemory(args = {}, ctx = null) {
   return { id: memory.id, content: memory.content, note: 'Saved successfully. The user can delete it in the Memories tab.' };
 }
 
-export async async function toolProposeMemory(args = {}, ctx = null) {
+export async function toolProposeMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'propose_memory');
   const content = cleanArg(args.content, 500, 'content');
   const kind = normalizeMemoryKind(args.kind);
@@ -405,7 +405,7 @@ export async async function toolProposeMemory(args = {}, ctx = null) {
   return { id: suggestion.id, content, kind, note: 'Proposed for the user to approve or dismiss.' };
 }
 
-export async async function toolSavePersonalDate(args = {}, ctx = null) {
+export async function toolSavePersonalDate(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_personal_date');
   const label = cleanArg(args.label, 120, 'label');
   const month = Math.floor(Number(args.month));
@@ -436,7 +436,7 @@ async function findPersonalDate(db, userId, label) {
   return hits[0];
 }
 
-export async async function toolMarkGiftDone(args = {}, ctx = null) {
+export async function toolMarkGiftDone(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'mark_gift_done');
   const label = cleanArg(args.label, 120, 'label');
   const date = await findPersonalDate(db, userId, label);
@@ -445,7 +445,7 @@ export async async function toolMarkGiftDone(args = {}, ctx = null) {
   return { id: date.id, label: date.label, note: 'Gift marked as done — nagging stopped.' };
 }
 
-export async async function toolEnableGiftReminder(args = {}, ctx = null) {
+export async function toolEnableGiftReminder(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'enable_gift_reminder');
   const label = cleanArg(args.label, 120, 'label');
   const date = await findPersonalDate(db, userId, label);
@@ -468,7 +468,7 @@ async function findTask(db, userId, title) {
   return hits[0];
 }
 
-export async async function toolCompleteTask(args = {}, ctx = null) {
+export async function toolCompleteTask(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'complete_task');
   const title = cleanArg(args.title, 120, 'title');
   const task = await findTask(db, userId, title);
@@ -477,7 +477,7 @@ export async async function toolCompleteTask(args = {}, ctx = null) {
   return { id: task.id, title: task.title, note: 'Task marked as complete — nagging stopped.' };
 }
 
-export async async function toolSetBuddyName(args = {}, ctx = null) {
+export async function toolSetBuddyName(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'set_buddy_name');
   const name = String(args.name || '').trim().slice(0, 40);
   if (!name) throw new Error('Provide a name for your buddy (1-40 characters).');
@@ -485,7 +485,7 @@ export async async function toolSetBuddyName(args = {}, ctx = null) {
   return { name, note: `Your buddy's name is now "${name}".` };
 }
 
-export async async function toolScheduleFollowUp(args = {}, ctx = null) {
+export async function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
   const dueDate = validDateStr(args.date);
@@ -495,7 +495,7 @@ export async async function toolScheduleFollowUp(args = {}, ctx = null) {
   return { id: followUp.id, description, date: dueDate, priority, note: 'Scheduled. The user can remove it from Memory.' };
 }
 
-export async async function toolCreateGoal(args = {}, ctx = null) {
+export async function toolCreateGoal(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_goal');
   const title = cleanArg(args.title, 120, 'title');
   const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
@@ -506,7 +506,7 @@ export async async function toolCreateGoal(args = {}, ctx = null) {
   return { id: goal.id, title: goal.title, priority: goal.priority, targetDate: goal.target_date, note: 'Goal created. Progress stays user-controlled.' };
 }
 
-export async async function toolUpdateGoal(args = {}, ctx = null) {
+export async function toolUpdateGoal(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'update_goal');
   const goalId = cleanArg(args.goalId, 80, 'goalId');
   const progressValue = Number(args.progress);
@@ -521,7 +521,7 @@ export async async function toolUpdateGoal(args = {}, ctx = null) {
   return { id: goal.id, title: goal.title, progress: goal.progress, status: goal.status, nextStep: goal.next_step, note: 'Goal updated.' };
 }
 
-export async async function toolCreateProject(args = {}, ctx = null) {
+export async function toolCreateProject(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_project');
   const title = cleanArg(args.title, 120, 'title');
   const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
@@ -540,7 +540,7 @@ export async async function toolCreateProject(args = {}, ctx = null) {
   return { id: project.id, title: project.title, steps: project.steps.map((step) => ({ id: step.id, title: step.title, status: step.status })), note: 'Project created. Progress remains user-controlled.' };
 }
 
-export async async function toolUpdateProjectStep(args = {}, ctx = null) {
+export async function toolUpdateProjectStep(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'update_project_step');
   const stepId = cleanArg(args.stepId, 80, 'stepId');
   const status = ['planned', 'in_progress', 'blocked', 'completed'].includes(args.status) ? args.status : null;
@@ -550,7 +550,7 @@ export async async function toolUpdateProjectStep(args = {}, ctx = null) {
   return { id: step.id, title: step.title, status: step.status, note: 'Project step updated from the user’s explicit report.' };
 }
 
-export function toolProposeCalendarEvent(args = {}, ctx = null) {
+export async function toolProposeCalendarEvent(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'propose_calendar_event');
   const title = cleanArg(args.title, 160, 'title');
   const start = new Date(args.startAt);
@@ -573,7 +573,7 @@ export function toolProposeCalendarEvent(args = {}, ctx = null) {
   return { approvalId: approval.id, status: 'pending', ...payload, note: 'Calendar event proposed. Nothing is added until the user approves it in Approvals.' };
 }
 
-export function toolCreateRoutine(args = {}, ctx = null) {
+export async function toolCreateRoutine(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_routine');
   const title = cleanArg(args.title, 120, 'title');
   const prompt = cleanArg(args.prompt, 2000, 'prompt');
