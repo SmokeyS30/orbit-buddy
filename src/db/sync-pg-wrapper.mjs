@@ -73,11 +73,13 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
 
   let nextId = 1;
 
-  return new Proxy({}, {
+  return new Proxy({ driver: 'postgres' }, {
     get(target, method) {
       if (method === 'close') {
         return () => { worker.terminate(); };
       }
+      // Expose the driver identifier as a plain property, not a DB method.
+      if (method === 'driver') return target.driver;
       if (typeof method !== 'string') return undefined;
 
       return (...args) => {
