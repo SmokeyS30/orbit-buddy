@@ -365,7 +365,7 @@ export async function toolDeepResearch(args = {}, env = process.env) {
   return out.slice(0, 30000);
 }
 
-export async function toolCreateTask(args = {}, ctx = null) {
+export function toolCreateTask(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_task');
   const title = cleanArg(args.title, 120, 'title');
   const prompt = cleanArg(args.prompt, 6000, 'prompt');
@@ -377,7 +377,7 @@ export async function toolCreateTask(args = {}, ctx = null) {
     if (Number.isNaN(date.valueOf())) throw new Error('scheduleAt must be a valid date.');
     scheduleAt = date.toISOString();
   }
-  const task = await db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence });
+  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence });
   return {
     id: task.id,
     title: task.title,
@@ -389,23 +389,23 @@ export async function toolCreateTask(args = {}, ctx = null) {
   };
 }
 
-export async function toolSaveMemory(args = {}, ctx = null) {
+export function toolSaveMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_memory');
   const content = cleanArg(args.content, 2000, 'content');
-  const memory = await db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
-  try { for (const name of extractPersonNames(content)) await db.trackPersonMention(userId, name); } catch (e) {}
+  const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
+  try { for (const name of extractPersonNames(content)) db.trackPersonMention(userId, name); } catch (e) {}
   return { id: memory.id, content: memory.content, note: 'Saved successfully. The user can delete it in the Memories tab.' };
 }
 
-export async function toolProposeMemory(args = {}, ctx = null) {
+export function toolProposeMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'propose_memory');
   const content = cleanArg(args.content, 500, 'content');
   const kind = normalizeMemoryKind(args.kind);
-  const suggestion = await db.addMemorySuggestion(userId, content, { kind, confidence: 0.7 });
+  const suggestion = db.addMemorySuggestion(userId, content, { kind, confidence: 0.7 });
   return { id: suggestion.id, content, kind, note: 'Proposed for the user to approve or dismiss.' };
 }
 
-export async function toolSavePersonalDate(args = {}, ctx = null) {
+export function toolSavePersonalDate(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_personal_date');
   const label = cleanArg(args.label, 120, 'label');
   const month = Math.floor(Number(args.month));
@@ -417,15 +417,15 @@ export async function toolSavePersonalDate(args = {}, ctx = null) {
   const type = ['birthday', 'anniversary', 'other'].includes(args.type) ? args.type : 'other';
   const notes = args.notes ? String(args.notes).trim().slice(0, 500) : null;
   const giftNag = args.giftNag === undefined || args.giftNag === null ? null : !!args.giftNag;
-  const saved = await db.addPersonalDate(userId, { label, month, day, year, type, notes, giftNag });
+  const saved = db.addPersonalDate(userId, { label, month, day, year, type, notes, giftNag });
   const monthName = new Date(2000, month - 1, 1).toLocaleString('en-US', { month: 'long' });
   return { id: saved.id, label: saved.label, date: `${monthName} ${day}`, type: saved.type, note: 'Saved to important personal dates. Orbit will nudge before and on the day.' };
 }
 
 // Fuzzy-match a personal date by label: exact (case-insensitive) wins, then substring.
 // Among substring matches, prefer the one whose label is shortest (most specific).
-async function findPersonalDate(db, userId, label) {
-  const dates = await db.listPersonalDates(userId);
+function findPersonalDate(db, userId, label) {
+  const dates = db.listPersonalDates(userId);
   const q = String(label || '').trim().toLowerCase();
   if (!q || !dates.length) return null;
   const exact = dates.find((d) => String(d.label || '').trim().toLowerCase() === q);
@@ -436,28 +436,28 @@ async function findPersonalDate(db, userId, label) {
   return hits[0];
 }
 
-export async function toolMarkGiftDone(args = {}, ctx = null) {
+export function toolMarkGiftDone(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'mark_gift_done');
   const label = cleanArg(args.label, 120, 'label');
-  const date = await findPersonalDate(db, userId, label);
+  const date = findPersonalDate(db, userId, label);
   if (!date) throw new Error(`No important personal date found matching "${label}".`);
-  await db.markGiftDone(userId, date.id);
+  db.markGiftDone(userId, date.id);
   return { id: date.id, label: date.label, note: 'Gift marked as done — nagging stopped.' };
 }
 
-export async function toolEnableGiftReminder(args = {}, ctx = null) {
+export function toolEnableGiftReminder(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'enable_gift_reminder');
   const label = cleanArg(args.label, 120, 'label');
-  const date = await findPersonalDate(db, userId, label);
+  const date = findPersonalDate(db, userId, label);
   if (!date) throw new Error(`No important personal date found matching "${label}".`);
-  await db.updatePersonalDate(userId, date.id, { giftNag: true, giftDone: false });
+  db.updatePersonalDate(userId, date.id, { giftNag: true, giftDone: false });
   return { id: date.id, label: date.label, note: 'Gift reminders enabled — Orbit will nag until the gift is done.' };
 }
 
 // Fuzzy-match a task by title: exact (case-insensitive) wins, then substring.
 // Among substring matches, prefer the shortest (most specific) title.
-async function findTask(db, userId, title) {
-  const tasks = await db.listTasks(userId).filter((t) => !['completed','cancelled','failed'].includes(t.status));
+function findTask(db, userId, title) {
+  const tasks = db.listTasks(userId).filter((t) => !['completed','cancelled','failed'].includes(t.status));
   const q = String(title || '').trim().toLowerCase();
   if (!q || !tasks.length) return null;
   const exact = tasks.find((t) => String(t.title || '').trim().toLowerCase() === q);
@@ -468,45 +468,45 @@ async function findTask(db, userId, title) {
   return hits[0];
 }
 
-export async function toolCompleteTask(args = {}, ctx = null) {
+export function toolCompleteTask(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'complete_task');
   const title = cleanArg(args.title, 120, 'title');
-  const task = await findTask(db, userId, title);
+  const task = findTask(db, userId, title);
   if (!task) throw new Error(`No incomplete task found matching "${title}".`);
-  await db.completeTask(userId, task.id, 'Completed via chat.', 'completed', null);
+  db.completeTask(userId, task.id, 'Completed via chat.', 'completed', null);
   return { id: task.id, title: task.title, note: 'Task marked as complete — nagging stopped.' };
 }
 
-export async function toolSetBuddyName(args = {}, ctx = null) {
+export function toolSetBuddyName(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'set_buddy_name');
   const name = String(args.name || '').trim().slice(0, 40);
   if (!name) throw new Error('Provide a name for your buddy (1-40 characters).');
-  await db.setBuddyName(userId, name);
+  db.setBuddyName(userId, name);
   return { name, note: `Your buddy's name is now "${name}".` };
 }
 
-export async function toolScheduleFollowUp(args = {}, ctx = null) {
+export function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
   const dueDate = validDateStr(args.date);
   if (!dueDate) throw new Error('date must be YYYY-MM-DD.');
   const priority = normalizePriority(args.priority);
-  const followUp = await db.addFollowUp(userId, { description, dueDate, priority, sourceMessageId: ctx.messageId || null });
+  const followUp = db.addFollowUp(userId, { description, dueDate, priority, sourceMessageId: ctx.messageId || null });
   return { id: followUp.id, description, date: dueDate, priority, note: 'Scheduled. The user can remove it from Memory.' };
 }
 
-export async function toolCreateGoal(args = {}, ctx = null) {
+export function toolCreateGoal(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_goal');
   const title = cleanArg(args.title, 120, 'title');
   const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
   const targetDate = args.targetDate ? validDateString(args.targetDate) : null;
   if (args.targetDate && !targetDate) throw new Error('targetDate must be YYYY-MM-DD.');
   const nextStep = typeof args.nextStep === 'string' && args.nextStep.trim() ? args.nextStep.trim().slice(0, 500) : null;
-  const goal = await db.addGoal(userId, { title, description, priority: normalizePriority(args.priority), targetDate, nextStep });
+  const goal = db.addGoal(userId, { title, description, priority: normalizePriority(args.priority), targetDate, nextStep });
   return { id: goal.id, title: goal.title, priority: goal.priority, targetDate: goal.target_date, note: 'Goal created. Progress stays user-controlled.' };
 }
 
-export async function toolUpdateGoal(args = {}, ctx = null) {
+export function toolUpdateGoal(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'update_goal');
   const goalId = cleanArg(args.goalId, 80, 'goalId');
   const progressValue = Number(args.progress);
@@ -516,12 +516,12 @@ export async function toolUpdateGoal(args = {}, ctx = null) {
   if (args.status !== undefined && !status) throw new Error('status must be active, paused, or completed.');
   const nextStep = args.nextStep === undefined ? undefined : String(args.nextStep || '').trim().slice(0, 500);
   const note = typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 1000) : null;
-  const goal = await db.updateGoal(userId, goalId, { progress, status, nextStep, note });
+  const goal = db.updateGoal(userId, goalId, { progress, status, nextStep, note });
   if (!goal) throw new Error('Goal not found.');
   return { id: goal.id, title: goal.title, progress: goal.progress, status: goal.status, nextStep: goal.next_step, note: 'Goal updated.' };
 }
 
-export async function toolCreateProject(args = {}, ctx = null) {
+export function toolCreateProject(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_project');
   const title = cleanArg(args.title, 120, 'title');
   const description = typeof args.description === 'string' && args.description.trim() ? args.description.trim().slice(0, 1000) : null;
@@ -536,21 +536,21 @@ export async function toolCreateProject(args = {}, ctx = null) {
       dueDate
     };
   }) : [];
-  const project = await db.addProject(userId, { title, description, priority: normalizePriority(args.priority), targetDate, steps });
+  const project = db.addProject(userId, { title, description, priority: normalizePriority(args.priority), targetDate, steps });
   return { id: project.id, title: project.title, steps: project.steps.map((step) => ({ id: step.id, title: step.title, status: step.status })), note: 'Project created. Progress remains user-controlled.' };
 }
 
-export async function toolUpdateProjectStep(args = {}, ctx = null) {
+export function toolUpdateProjectStep(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'update_project_step');
   const stepId = cleanArg(args.stepId, 80, 'stepId');
   const status = ['planned', 'in_progress', 'blocked', 'completed'].includes(args.status) ? args.status : null;
   if (!status) throw new Error('status must be planned, in_progress, blocked, or completed.');
-  const step = await db.updateProjectStep(userId, stepId, { status, details: args.note === undefined ? undefined : String(args.note || '').slice(0, 1000) });
+  const step = db.updateProjectStep(userId, stepId, { status, details: args.note === undefined ? undefined : String(args.note || '').slice(0, 1000) });
   if (!step) throw new Error('Project step not found.');
   return { id: step.id, title: step.title, status: step.status, note: 'Project step updated from the user’s explicit report.' };
 }
 
-export async function toolProposeCalendarEvent(args = {}, ctx = null) {
+export function toolProposeCalendarEvent(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'propose_calendar_event');
   const title = cleanArg(args.title, 160, 'title');
   const start = new Date(args.startAt);
@@ -565,7 +565,7 @@ export async function toolProposeCalendarEvent(args = {}, ctx = null) {
     location: typeof args.location === 'string' && args.location.trim() ? args.location.trim().slice(0, 300) : null,
     notes: typeof args.notes === 'string' && args.notes.trim() ? args.notes.trim().slice(0, 1000) : null
   };
-  const approval = await db.addApproval(userId, {
+  const approval = db.addApproval(userId, {
     kind: 'calendar_event', title: `Add “${title}” to a calendar`,
     summary: `${start.toISOString()} to ${end.toISOString()} (${timeZone})`, payload,
     sourceMessageId: ctx?.messageId || null
@@ -573,7 +573,7 @@ export async function toolProposeCalendarEvent(args = {}, ctx = null) {
   return { approvalId: approval.id, status: 'pending', ...payload, note: 'Calendar event proposed. Nothing is added until the user approves it in Approvals.' };
 }
 
-export async function toolCreateRoutine(args = {}, ctx = null) {
+export function toolCreateRoutine(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_routine');
   const title = cleanArg(args.title, 120, 'title');
   const prompt = cleanArg(args.prompt, 2000, 'prompt');
@@ -584,7 +584,7 @@ export async function toolCreateRoutine(args = {}, ctx = null) {
   const requestedDay = Number(args.dayOfWeek);
   if (cadence === 'weekly' && (!Number.isInteger(requestedDay) || requestedDay < 0 || requestedDay > 6)) throw new Error('dayOfWeek must be an integer from 0 (Sunday) through 6 (Saturday).');
   const dayOfWeek = cadence === 'weekly' ? requestedDay : null;
-  const routine = await db.addRoutine(userId, { title, prompt, kind, cadence, timeLocal, dayOfWeek });
+  const routine = db.addRoutine(userId, { title, prompt, kind, cadence, timeLocal, dayOfWeek });
   return { id: routine.id, title: routine.title, kind, cadence, timeLocal, dayOfWeek, note: 'Routine created. It follows your timezone and quiet-hour settings.' };
 }
 
@@ -614,7 +614,7 @@ export async function toolGmailSend(args = {}, ctx = null) {
     cc: args.cc ? cleanArg(args.cc, 500, 'cc') : undefined,
     bcc: args.bcc ? cleanArg(args.bcc, 500, 'bcc') : undefined
   };
-  const approval = await db.addApproval(userId, {
+  const approval = db.addApproval(userId, {
     kind: 'gmail_send',
     title: `Send email to ${payload.to}`,
     summary: payload.subject,
@@ -641,7 +641,7 @@ export async function toolGmailDelete(args = {}, ctx = null) {
   const id = cleanArg(args.id, 100, 'id');
   const subject = args.subject ? cleanArg(args.subject, 300, 'subject') : null;
   const from = args.from ? cleanArg(args.from, 300, 'from') : null;
-  const approval = await db.addApproval(userId, {
+  const approval = db.addApproval(userId, {
     kind: 'gmail_delete',
     title: `Move “${subject || 'email'}” to trash`,
     summary: from ? `From ${from}` : `Gmail message ${id}`,
