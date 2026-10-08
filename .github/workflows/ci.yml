@@ -8,6 +8,24 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # PostgreSQL 16 service for the integration test (no Azure service needed).
+    # The test connects via TEST_DATABASE_URL; it no longer skips in CI.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orbit_test
+          POSTGRES_PASSWORD: orbit_test_pw
+          POSTGRES_DB: orbit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orbit_test -d orbit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://orbit_test:orbit_test_pw@localhost:5432/orbit_test?sslmode=disable
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

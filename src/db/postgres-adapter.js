@@ -64,10 +64,28 @@ async function adoptOrphanMessages({ get, run }, userId) {
 }
 
 export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
+  // Azure Database for PostgreSQL presents a certificate chaining to the
+  // DigiCert Global Root CA, which is in Node.js's default trust store.
+  // We require full verification: the connection string must specify
+  // sslmode=verify-full (or verify-ca), and we never disable verification.
+  // If sslmode is absent, we append verify-full explicitly.
+  // Exception: sslmode=disable is honored for local test containers.
+  let connectionString = databaseUrl;
+  const sslDisabled = /sslmode=disable/.test(connectionString);
+  if (!sslDisabled) {
+    // Upgrade sslmode=require to verify-full for explicit certificate
+    // verification. Azure's cert chains to DigiCert Global Root CA.
+    connectionString = connectionString.replace(/sslmode=require/, 'sslmode=verify-full');
+    if (!/sslmode=/.test(connectionString)) {
+      connectionString += (connectionString.includes('?') ? '&' : '?') + 'sslmode=verify-full';
+    }
+  }
   const pool = new Pool({
-    connectionString: databaseUrl,
-    // Azure Database for PostgreSQL requires SSL
-    ssl: databaseUrl.includes('sslmode=require') ? { rejectUnauthorized: false } : undefined,
+    connectionString,
+    // ssl: true makes node-postgres verify the server certificate against
+    // the default CA store. rejectUnauthorized is NOT disabled.
+    // Disabled only for local test containers (sslmode=disable).
+    ssl: sslDisabled ? false : true,
     max: 10, // connection pool size
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 5000,
