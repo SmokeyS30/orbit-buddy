@@ -3,10 +3,10 @@
 #   AZURE_CREDENTIALS - output of: az ad sp create-for-rbac --name orbit-deploy --role contributor --scopes /subscriptions/YOUR_SUBSCRIPTION_ID --sdk-auth
 #   GHCR_TOKEN - GitHub personal access token with write:packages scope
 #
-# Deployment safety: after pushing the new image, this workflow waits for the
-# new revision to become healthy, tests the public /healthz endpoint, and
-# automatically restores 100% traffic to the previous healthy revision if the
-# new revision fails any check.
+# Deployment safety (single-revision mode): before pushing the new image, this
+# workflow captures the currently-deployed image. After deployment it waits for
+# the new revision to become healthy and tests the public /healthz endpoint.
+# If verification fails, it rolls back by redeploying the previous image.
 
 name: Deploy to Azure
 
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       new_revision: ${{ steps.deploy.outputs.new_revision }}
-      prev_revision: ${{ steps.deploy.outputs.prev_revision }}
+      prev_image: ${{ steps.deploy.outputs.prev_image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,18 +65,20 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy new revision (no traffic yet)
+      - name: Deploy new image
         id: deploy
         run: |
-          # Record the currently-active healthy revision for rollback
-          PREV=$(az containerapp revision list \
+          # Capture the currently-deployed image for rollback.
+          # In single-revision mode there is only one active revision;
+          # rollback means redeploying this image, not shifting traffic weights.
+          PREV_IMAGE=$(az containerapp show \
             -g orbit-buddy-rg -n orbit-buddy \
-            --query "[?properties.active && properties.healthState=='Healthy'].name | [0]" -o tsv)
-          echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
-          echo "Previous healthy revision: $PREV"
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "prev_image=$PREV_IMAGE" >> $GITHUB_OUTPUT
+          echo "Previous image: $PREV_IMAGE"
 
-          # Deploy the new image. Container Apps creates a new revision;
-          # traffic stays on the old revision until we explicitly shift it.
+          # Deploy the new image. Container Apps creates a new revision
+          # and replaces the old one (single-revision mode).
           az containerapp update \
             -g orbit-buddy-rg \
             -n orbit-buddy \
@@ -91,7 +93,7 @@ jobs:
           echo "new_revision=$NEW" >> $GITHUB_OUTPUT
           echo "New revision: $NEW"
 
-  verify-and-cutover:
+  verify:
     needs: build-and-deploy
     runs-on: ubuntu-latest
     steps:
@@ -126,8 +128,6 @@ jobs:
         id: public
         if: steps.health.outputs.healthy == 'true'
         run: |
-          # The new revision isn't receiving traffic yet; test via its direct URL.
-          # Fall back to the public endpoint after traffic shift.
           for i in $(seq 1 5); do
             CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://orbitbuddy.app/healthz || echo "000")
             echo "Attempt $i: HTTP $CODE"
@@ -145,26 +145,20 @@ jobs:
       - name: Rollback on failure
         if: steps.health.outputs.healthy != 'true' || steps.public.outputs.public_ok != 'true'
         run: |
-          PREV="${{ needs.build-and-deploy.outputs.prev_revision }}"
+          PREV_IMAGE="${{ needs.build-and-deploy.outputs.prev_image }}"
           NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "::error::New revision $NEW failed verification. Restoring traffic to $PREV."
-          # Deactivate the failed revision so it stops restart-looping
-          az rest --method post \
-            --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/orbit-buddy-rg/providers/Microsoft.App/containerApps/orbit-buddy/revisions/$NEW/deactivate?api-version=2024-03-01" \
-            --body '{}' --headers "Content-Type=application/json" --output none || true
-          # Ensure previous revision has 100% traffic
-          az containerapp ingress traffic set \
+          echo "::error::New revision $NEW failed verification. Redeploying previous image $PREV_IMAGE."
+          # In single-revision mode, rollback = redeploy the previous image.
+          # This creates a new revision from the known-good image.
+          az containerapp update \
             -g orbit-buddy-rg -n orbit-buddy \
-            --revision-weight "$PREV=100" --output none
-          echo "::error::Rolled back to $PREV"
+            --image "$PREV_IMAGE" \
+            --output none
+          echo "::error::Rollback initiated: redeployed $PREV_IMAGE"
           exit 1
 
-      - name: Shift traffic to new revision
+      - name: Deployment verified
         if: steps.health.outputs.healthy == 'true' && steps.public.outputs.public_ok == 'true'
         run: |
           NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "New revision verified. Shifting 100% traffic to $NEW."
-          az containerapp ingress traffic set \
-            -g orbit-buddy-rg -n orbit-buddy \
-            --revision-weight "$NEW=100" --output none
-          echo "Traffic shifted to $NEW"
+          echo "Deployment verified. Revision $NEW is healthy and serving traffic."
