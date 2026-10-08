@@ -28,13 +28,13 @@ export function createConnectorService(env, db, encryptionKey) {
     }));
   }
 
-  async function begin(userId, providerId, origin) {
+  function begin(userId, providerId, origin) {
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
     if (!encryptionKey || !env[provider.clientId] || !env[provider.clientSecret]) throw Object.assign(new Error(`${provider.label} OAuth is not configured.`), { status: 503 });
     const state = randomToken(32); const verifier = provider.pkce ? randomToken(48) : null;
     const redirectUri = `${origin}/api/connectors/${providerId}/callback`;
-    await db.addOauthState({ stateHash: hashToken(state), userId, provider: providerId, codeVerifier: verifier, redirectUri, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() });
+    db.addOauthState({ stateHash: hashToken(state), userId, provider: providerId, codeVerifier: verifier, redirectUri, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() });
     const url = new URL(provider.authorize);
     url.searchParams.set('client_id', env[provider.clientId]); url.searchParams.set('redirect_uri', redirectUri);
     url.searchParams.set('scope', provider.scope); url.searchParams.set('state', state);
@@ -46,7 +46,7 @@ export function createConnectorService(env, db, encryptionKey) {
 
   async function complete(providerId, code, state) {
     const provider = providers[providerId];
-    const oauthState = await db.consumeOauthState(hashToken(state));
+    const oauthState = db.consumeOauthState(hashToken(state));
     if (!provider || !oauthState || oauthState.provider !== providerId) throw Object.assign(new Error('OAuth state is invalid or expired.'), { status: 400 });
     const params = new URLSearchParams({ code, client_id: env[provider.clientId], client_secret: env[provider.clientSecret], redirect_uri: oauthState.redirect_uri, grant_type: 'authorization_code' });
     if (oauthState.code_verifier) params.set('code_verifier', oauthState.code_verifier);
@@ -56,7 +56,7 @@ export function createConnectorService(env, db, encryptionKey) {
     if (!tokenResponse.ok || !accessToken || tokens.ok === false) throw Object.assign(new Error('OAuth token exchange failed.'), { status: 502 });
     const profileResponse = await fetch(provider.profile, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'User-Agent': 'Orbit-Buddy' }, signal: AbortSignal.timeout(20_000) });
     const profile = await profileResponse.json().catch(() => ({}));
-    await db.saveConnector(oauthState.user_id, providerId, {
+    db.saveConnector(oauthState.user_id, providerId, {
       accessEncrypted: encryptSecret(accessToken, encryptionKey),
       refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : null,
       scopes: tokens.scope || provider.scope,
@@ -82,7 +82,7 @@ export function createConnectorService(env, db, encryptionKey) {
   async function getValidToken(userId, providerId) {
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
-    const row = await db.getConnector(userId, providerId);
+    const row = db.getConnector(userId, providerId);
     if (!row) throw Object.assign(new Error(`${provider.label} is not connected.`), { status: 404 });
     // If token isn't expiring soon (5 min buffer), use it as-is
     if (row.expires_at && new Date(row.expires_at).valueOf() - Date.now() > 5 * 60_000) {
@@ -102,12 +102,12 @@ export function createConnectorService(env, db, encryptionKey) {
       console.error(`${providerId} token refresh failed:`, googleError);
       // invalid_grant = refresh token revoked/expired — clear the dead connection so the UI shows Connect, not a broken Preview
       if (tokens.error === 'invalid_grant') {
-        try { await db.deleteConnector(userId, providerId); } catch (_) {}
+        try { db.deleteConnector(userId, providerId); } catch (_) {}
         throw Object.assign(new Error(`${provider.label} session expired. Please reconnect.`), { status: 401 });
       }
       throw Object.assign(new Error(`${provider.label} token refresh failed (${googleError}). Please reconnect.`), { status: 502 });
     }
-    await db.saveConnector(userId, providerId, {
+    db.saveConnector(userId, providerId, {
       accessEncrypted: encryptSecret(tokens.access_token, encryptionKey),
       refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : row.refresh_encrypted,
       scopes: row.scopes,
