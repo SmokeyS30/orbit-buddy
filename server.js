@@ -811,8 +811,8 @@ Only include what's clearly supported — skip one-off questions, transient topi
       await db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
       await db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      (await db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error)).slice(0,300)});
-      (await db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error)).slice(0,200));
+      await db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
+      await db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
