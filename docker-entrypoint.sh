@@ -2,7 +2,15 @@
 # Orbit Buddy container entrypoint
 # SQLite runs on local disk (fast, reliable locking).
 # Azure Files mount at /backup is used for backup/restore only.
+# When DATABASE_URL is set, PostgreSQL is used and all SQLite
+# restore/backup logic is skipped.
 set -e
+
+# PostgreSQL mode: skip SQLite entirely
+if [ -n "$DATABASE_URL" ]; then
+  echo "[entrypoint] DATABASE_URL set — using PostgreSQL, skipping SQLite restore/backup"
+  exec node server.js
+fi
 
 DATA_DIR="${DATA_DIR:-/var/data/orbit}"
 BACKUP_DIR="${BACKUP_DIR:-/backup}"
