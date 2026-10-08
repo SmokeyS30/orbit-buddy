@@ -1309,6 +1309,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
     if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
+    if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
+      const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
+      try{
+        const html=fs.readFileSync(path.join(publicRoot,file),'utf8');
+        res.setHeader('Content-Type','text/html; charset=utf-8');
+        res.writeHead(200);res.end(html);return;
+      }catch{return json(res,404,{error:'Not found.'});}
+    }
 
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});

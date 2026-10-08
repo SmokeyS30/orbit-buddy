@@ -8,6 +8,7 @@ const BUFFER_SIZE = 10 * 1024 * 1024;
 const FLAG_OFFSET = 0;
 const LEN_OFFSET = 4;
 const DATA_OFFSET = 8;
+const READY_OFFSET = 12;
 
 async function main() {
   const db = await openPostgres(workerData.connectionString, {
@@ -45,6 +46,11 @@ async function main() {
   });
   
   parentPort.postMessage({ ready: true });
+
+  // Signal readiness via shared memory (the main thread is blocked in
+  // Atomics.wait and cannot receive 'message' events during startup).
+  Atomics.store(sharedArray, READY_OFFSET / 4, 1);
+  Atomics.notify(sharedArray, READY_OFFSET / 4, 1);
 }
 
 main().catch(err => {

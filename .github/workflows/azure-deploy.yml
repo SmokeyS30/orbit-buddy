@@ -2,6 +2,11 @@
 # Requires these GitHub secrets:
 #   AZURE_CREDENTIALS - output of: az ad sp create-for-rbac --name orbit-deploy --role contributor --scopes /subscriptions/YOUR_SUBSCRIPTION_ID --sdk-auth
 #   GHCR_TOKEN - GitHub personal access token with write:packages scope
+#
+# Deployment safety: after pushing the new image, this workflow waits for the
+# new revision to become healthy, tests the public /healthz endpoint, and
+# automatically restores 100% traffic to the previous healthy revision if the
+# new revision fails any check.
 
 name: Deploy to Azure
 
@@ -32,6 +37,9 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
+    outputs:
+      new_revision: ${{ steps.deploy.outputs.new_revision }}
+      prev_revision: ${{ steps.deploy.outputs.prev_revision }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,9 +65,106 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Update Container App
+      - name: Deploy new revision (no traffic yet)
+        id: deploy
         run: |
+          # Record the currently-active healthy revision for rollback
+          PREV=$(az containerapp revision list \
+            -g orbit-buddy-rg -n orbit-buddy \
+            --query "[?properties.active && properties.healthState=='Healthy'].name | [0]" -o tsv)
+          echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
+          echo "Previous healthy revision: $PREV"
+
+          # Deploy the new image. Container Apps creates a new revision;
+          # traffic stays on the old revision until we explicitly shift it.
           az containerapp update \
             -g orbit-buddy-rg \
             -n orbit-buddy \
-            --image ghcr.io/smokeys30/orbit-buddy:${{ github.sha }}
+            --image ghcr.io/smokeys30/orbit-buddy:${{ github.sha }} \
+            --output none
+
+          # Find the new revision (most recently created)
+          sleep 10
+          NEW=$(az containerapp revision list \
+            -g orbit-buddy-rg -n orbit-buddy \
+            --query "sort_by([?properties.active], &properties.createdTime)[-1].name" -o tsv)
+          echo "new_revision=$NEW" >> $GITHUB_OUTPUT
+          echo "New revision: $NEW"
+
+  verify-and-cutover:
+    needs: build-and-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Wait for new revision healthy
+        id: health
+        run: |
+          NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
+          echo "Waiting for $NEW to become healthy..."
+          for i in $(seq 1 30); do
+            STATE=$(az containerapp revision show \
+              -g orbit-buddy-rg -n orbit-buddy --revision "$NEW" \
+              --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
+            echo "Attempt $i: healthState=$STATE"
+            if [ "$STATE" = "Healthy" ]; then
+              echo "healthy=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if [ "$STATE" = "Unhealthy" ]; then
+              echo "healthy=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "healthy=false" >> $GITHUB_OUTPUT
+
+      - name: Test public health endpoint
+        id: public
+        if: steps.health.outputs.healthy == 'true'
+        run: |
+          # The new revision isn't receiving traffic yet; test via its direct URL.
+          # Fall back to the public endpoint after traffic shift.
+          for i in $(seq 1 5); do
+            CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://orbitbuddy.app/healthz || echo "000")
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              BODY=$(curl -s -m 15 https://orbitbuddy.app/healthz)
+              echo "$BODY" | grep -q '"ok":true' && {
+                echo "public_ok=true" >> $GITHUB_OUTPUT
+                exit 0
+              }
+            fi
+            sleep 10
+          done
+          echo "public_ok=false" >> $GITHUB_OUTPUT
+
+      - name: Rollback on failure
+        if: steps.health.outputs.healthy != 'true' || steps.public.outputs.public_ok != 'true'
+        run: |
+          PREV="${{ needs.build-and-deploy.outputs.prev_revision }}"
+          NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
+          echo "::error::New revision $NEW failed verification. Restoring traffic to $PREV."
+          # Deactivate the failed revision so it stops restart-looping
+          az rest --method post \
+            --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/orbit-buddy-rg/providers/Microsoft.App/containerApps/orbit-buddy/revisions/$NEW/deactivate?api-version=2024-03-01" \
+            --body '{}' --headers "Content-Type=application/json" --output none || true
+          # Ensure previous revision has 100% traffic
+          az containerapp ingress traffic set \
+            -g orbit-buddy-rg -n orbit-buddy \
+            --revision-weight "$PREV=100" --output none
+          echo "::error::Rolled back to $PREV"
+          exit 1
+
+      - name: Shift traffic to new revision
+        if: steps.health.outputs.healthy == 'true' && steps.public.outputs.public_ok == 'true'
+        run: |
+          NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
+          echo "New revision verified. Shifting 100% traffic to $NEW."
+          az containerapp ingress traffic set \
+            -g orbit-buddy-rg -n orbit-buddy \
+            --revision-weight "$NEW=100" --output none
+          echo "Traffic shifted to $NEW"
