@@ -171,7 +171,7 @@ export function createOrbitServer(options={}) {
   const defaultBuddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
-  const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey});
+  const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey,databaseUrl:env.DATABASE_URL});
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=createModelClient(env);
   const push=createPushService(env,db);
@@ -1312,7 +1312,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
-    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
+    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();let dbState='ready',dbDriver=db.driver||'unknown';try{db.getSetting('healthz_probe');}catch(e){dbState='error';}return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState}});}
     if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
       const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
       try{
