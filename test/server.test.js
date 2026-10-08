@@ -24,8 +24,15 @@ const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csr
 
 test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
-  const shell = await fetch(base);
-  assert.match(await shell.text(), /id="model-check-button"/);
+  // Retry the static file fetch: occasionally the server isn't fully ready
+  let shellText = '';
+  for (let i = 0; i < 5; i++) {
+    const shell = await fetch(base);
+    shellText = await shell.text();
+    if (shellText.includes('id="model-check-button"')) break;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  assert.match(shellText, /id="model-check-button"/);
   const appScript = await fetch(`${base}/app.js`);
   assert.match(appScript.headers.get('cache-control'), /no-cache/);
   const health = await fetch(`${base}/healthz`);

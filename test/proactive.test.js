@@ -77,17 +77,28 @@ test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   // One chat message, then 3 days pass: nudge fires once.
   const chat = await fetch(`${base}/api/chat`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ message: 'hello' }) });
   assert.equal(chat.status, 202);
-  // The reply now lands in the background; wait for it before the nudge checks.
-  const landed = Date.now();
-  while (Date.now() - landed < 8000) {
+  // The reply now lands in the background; wait for it to fully land before the nudge checks.
+  // Wait for a stable count: poll until the count stops increasing for 1 second.
+  let lastCount = -1;
+  let stableSince = Date.now();
+  const waitStart = Date.now();
+  while (Date.now() - waitStart < 15000) {
     const c = app.db.ensureDefaultConversation(auth.userId);
-    if (app.db.listConversationMessages(auth.userId, c.id, 20).some((m) => m.role === 'assistant')) break;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    const count = app.db.listConversationMessages(auth.userId, c.id, 20).filter((m) => m.role === 'assistant').length;
+    if (count === lastCount) {
+      if (Date.now() - stableSince > 1000 && count > 0) break;
+    } else {
+      lastCount = count;
+      stableSince = Date.now();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  assert.ok(lastCount > 0, 'chat reply landed');
+  const beforeNudge = assistants().length;
   const future = Date.now() + 3 * 24 * 3600_000;
   await app.runProactiveChecks(future);
   const afterFirst = assistants().length;
-  assert.ok(afterFirst >= 1, 'quiet nudge message saved');
+  assert.equal(afterFirst, beforeNudge + 1, 'exactly one quiet nudge message saved');
   assert.ok(app.db.getLastQuietNudgeAt(auth.userId), 'nudge timestamp recorded');
   // Second run inside the cooldown window: no duplicate.
   await app.runProactiveChecks(future + 3600_000);
