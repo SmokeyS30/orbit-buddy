@@ -34,7 +34,7 @@ function publicFeed(feed) { return { id:feed.id,label:feed.label,url:maskFeedUrl
 async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} }
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
 function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
-async function markdownToHtml(md,autoPrint,printUrl){
+function markdownToHtml(md,autoPrint,printUrl){
   const esc=(s)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const inline=(s)=>esc(s).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/`([^`]+)`/g,'<code>$1</code>');
   const lines=String(md||'').split('\n');
@@ -53,7 +53,7 @@ async function markdownToHtml(md,autoPrint,printUrl){
     : `<div class="toolbar"><a href="/#files">Done</a><button onclick="sharePrint()">Print</button></div><script>${shareJs}</script>`;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
 }
-async function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
+function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
 function pdfEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)').replace(/[\u2018\u2019]/g,"'").replace(/[\u201c\u201d]/g,'"').replace(/\u2014/g,'--').replace(/\u2013/g,'-').replace(/\u2022/g,'*').replace(/[^\x20-\x7e]/g,'?');}
 function wrapPdfText(text,size){
   const maxChars=Math.max(20,Math.floor(500/(size*0.55)));
@@ -172,7 +172,7 @@ export function createOrbitServer(options={}) {
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
   const db=openDatabase(options.dbPath||path.join(dataDir,'orbit.sqlite'),{encryptionKey});
-  async function buddyNameFor(userId){try{const p=await db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
+  function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=createModelClient(env);
   const push=createPushService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
@@ -183,7 +183,7 @@ export function createOrbitServer(options={}) {
   async function reliabilityFor(userId){
     const events=await db.listEvents(userId,200);const since=Date.now()-7*24*60*60_000;const recent=events.filter((event)=>new Date(event.created_at).valueOf()>=since);
     const count=(type)=>recent.filter((event)=>event.type===type).length;const chats={successful:count('chat'),failed:count('chat_failed')};const tasks={successful:count('task_completed'),failed:count('task_failed')};
-    const attempts=chats.successful+chats.failed;return {windowDays:7,model:model.diagnostics(),chat:{...chats,successRate:attempts?Math.round(chats.successful/attempts*100):null},background:tasks,pendingApprovals:await db.listApprovals(userId).filter(async (item)=>item.status==='pending').length+await db.listTasks(userId).filter((task)=>task.status==='waiting_approval').length,recentFailures:recent.filter((event)=>event.type.endsWith('_failed')).slice(0,8).map(({id,type,message,created_at})=>({id,type,message,created_at}))};
+    const attempts=chats.successful+chats.failed;return {windowDays:7,model:model.diagnostics(),chat:{...chats,successRate:attempts?Math.round(chats.successful/attempts*100):null},background:tasks,pendingApprovals:(await db.listApprovals(userId)).filter((item)=>item.status==='pending').length+(await db.listTasks(userId)).filter((task)=>task.status==='waiting_approval').length,recentFailures:recent.filter((event)=>event.type.endsWith('_failed')).slice(0,8).map(({id,type,message,created_at})=>({id,type,message,created_at}))};
   }
 
   const requestLog=new Map();
@@ -192,9 +192,9 @@ export function createOrbitServer(options={}) {
   function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
   function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
-  const paused=async ()=>await db.getSetting('system_paused','false')==='true';
-  const setPaused=async (value)=>await db.setSetting('system_paused',value?'true':'false');
-  const registrationOpen=async ()=>await db.getSetting('registration_open','false')==='true';
+  const paused=()=>db.getSetting('system_paused','false')==='true';
+  const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
+  const registrationOpen=()=>db.getSetting('registration_open','false')==='true';
   async function checkDoorLeftOpen(){
     await db.pruneDoorTokens();
     if(!registrationOpen())return;
@@ -202,7 +202,7 @@ export function createOrbitServer(options={}) {
     if(!openedAt||Date.now()-new Date(openedAt).valueOf()<60*60_000)return;
     const lastNudge=await db.getSetting('registration_nudge_at');
     if(lastNudge&&new Date(lastNudge).valueOf()>=new Date(openedAt).valueOf())return;
-    const owner=await db.listUsers().find(async (u)=>u.role==='owner');
+    const owner=await db.listUsers().find((u)=>u.role==='owner');
     if(!owner)return;
     await db.setSetting('registration_nudge_at',new Date().toISOString());
     await db.addEvent(owner.id,'registration_nudge','Registration has been open for over an hour.');
@@ -374,7 +374,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       try{
         const monthKey=today.slice(0,7);
         if(await db.getSetting(`deep_mining_last_${user.id}`)!==monthKey){
-          const allMemories=await db.listMemories(user.id).slice(0,100);
+          const allMemories=(await db.listMemories(user.id)).slice(0,100);
           if(allMemories.length>=10){
             const memText=allMemories.map((m)=>`- (${String(m.created_at||'').slice(0,4)}) ${String(m.content||'').slice(0,200)}`).join('\n');
             const deepPrompt=`Analyze this user's full history — all their saved memories. Identify long-term patterns, not recent events.
@@ -401,7 +401,7 @@ Only include genuine insights. If nothing meaningful, respond with [].`;
                 const content=insight.content.trim().slice(0,500);
                 if(content.length<10)continue;
                 const existing=await db.listRelevantMemories(user.id,content,3);
-                if(existing.some(async (m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
+                if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 await db.addMemory(user.id,content,{kind:kindMap[insight.type]||'fact',source:'auto-deep',confidence:Math.max(0.6,Math.min(Number(insight.confidence)||0.7,0.9))});
                 deepSaved++;
               }
@@ -425,7 +425,7 @@ Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what
                   if(!c.belief||!c.gentleFraming)continue;
                   const content=`Believes "${String(c.belief).slice(0,150)}" but ${String(c.evidence||'behavior suggests otherwise').slice(0,200)}. Frame gently: ${String(c.gentleFraming).slice(0,200)}`;
                   const existing=await db.listRelevantMemories(user.id,content,3);
-                  if(existing.some(async (m)=>(m.source||'')==='auto-contradiction'))continue;
+                  if(existing.some((m)=>(m.source||'')==='auto-contradiction'))continue;
                   await db.addMemory(user.id,content,{kind:'fact',source:'auto-contradiction',confidence:Math.max(0.5,Math.min(Number(c.confidence)||0.6,0.7))});
                   contraSaved++;
                 }
@@ -442,8 +442,8 @@ Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what
         const monthKey=today.slice(0,7);
         if(await db.getSetting(`motivation_last_${user.id}`)!==monthKey){
           // Correlate check-in engagement: which check-ins got replies within 2h?
-          const events=await db.listEvents(user.id,120).filter((e)=>['smart_checkin_sent','quiet_nudge_sent','weekly_review_sent'].includes(e.type));
-          const userMsgs=await db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+          const events=(await db.listEvents(user.id,120)).filter((e)=>['smart_checkin_sent','quiet_nudge_sent','weekly_review_sent'].includes(e.type));
+          const userMsgs=(await db.listMessages(user.id,200)).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
           const engagedTypes={};
           const totalTypes={};
           for(const ev of events.slice(0,40)){
@@ -454,8 +454,8 @@ Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what
           }
           const totalEvents=Object.values(totalTypes).reduce((a,b)=>a+b,0);
           if(totalEvents>=5){
-            const engagement=Object.entries(totalTypes).map(async ([t,n])=>`${t}: ${engagedTypes[t]||0}/${n} engaged`).join('; ');
-            const msgSample=await db.listMessages(user.id,30).filter((m)=>m.role==='user').slice(-10).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
+            const engagement=Object.entries(totalTypes).map(([t,n])=>`${t}: ${engagedTypes[t]||0}/${n} engaged`).join('; ');
+            const msgSample=(await db.listMessages(user.id,30)).filter((m)=>m.role==='user').slice(-10).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
             const motPrompt=`What motivational style works best for this person? Base your answer on evidence.
 
 Check-in engagement (replied within 2 hours): ${engagement}
@@ -482,8 +482,8 @@ Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough
       try{
         const monthKey=today.slice(0,7);
         if(await db.getSetting(`energy_map_last_${user.id}`)!==monthKey){
-          const memSample=await db.listMemories(user.id).slice(0,40).map(async (m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
-          const msgSample=await db.listMessages(user.id,40).filter((m)=>m.role==='user').slice(-15).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
+          const memSample=(await db.listMemories(user.id)).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+          const msgSample=(await db.listMessages(user.id,40)).filter((m)=>m.role==='user').slice(-15).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
           if(memSample||msgSample){
             const energyPrompt=`Based on this person's memories and recent messages, identify what seems to energize them vs drain them. Ground each in specific observed behavior — things they light up talking about, complain about, avoid, or seem wiped out by. Never use clinical or diagnostic language.
 
@@ -506,7 +506,7 @@ Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":
                 if(drainers.length)parts.push(`Drainers: ${drainers.join('; ')}`);
                 const content=parts.join('. ');
                 const existing=await db.listRelevantMemories(user.id,content,3);
-                if(!existing.some(async (m)=>String(m.source||'')==='auto-energy')){
+                if(!existing.some((m)=>String(m.source||'')==='auto-energy')){
                   await db.addMemory(user.id,content,{kind:'fact',source:'auto-energy',confidence:0.55});
                   try{const prof=await db.getEmotionalProfile(user.id);await db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){}
                   await db.addEvent(user.id,'auto_learned','Mapped what energizes vs drains them.');
@@ -562,7 +562,7 @@ Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"
       try{
         const monthKey=today.slice(0,7);
         if(await db.getSetting(`consolidation_last_${user.id}`)!==monthKey){
-          const autoMems=await db.listMemories(user.id).filter((m)=>String(m.source||'').startsWith('auto'));
+          const autoMems=(await db.listMemories(user.id)).filter((m)=>String(m.source||'').startsWith('auto'));
           if(autoMems.length>=15){
             const memList=autoMems.slice(0,60).map((m)=>`[${m.id.slice(0,8)}] (${m.source}) ${String(m.content||'').slice(0,180)}`).join('\n');
             const conPrompt=`Review these auto-learned memories about the user. Clean them up.
@@ -588,7 +588,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
                 const m1=byPrefix[String(p1)],m2=byPrefix[String(p2)];
                 if(!m1||!m2||!merged)continue;
                 await db.deleteMemory(user.id,m1.id);await db.deleteMemory(user.id,m2.id);
-                await db.addMemory(user.id,String(merged).slice(0,500),{kind:m1.kind||'fact',source:m1.source,confidence:Math.min(0.9,Number(m1.confidence||0.6)+0.1)});
+                (await db.addMemory(user.id,String(merged)).slice(0,500),{kind:m1.kind||'fact',source:m1.source,confidence:Math.min(0.9,Number(m1.confidence||0.6)+0.1)});
                 opCount+=2;
               }
               // Removes
@@ -602,7 +602,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
                 if(opCount>=20)break;
                 const m=byPrefix[String(st.id)];if(!m||!st.content)continue;
                 await db.deleteMemory(user.id,m.id);
-                await db.addMemory(user.id,String(st.content).slice(0,500),{kind:m.kind||'fact',source:m.source,confidence:Math.min(0.95,Number(m.confidence||0.6)+0.15)});
+                (await db.addMemory(user.id,String(st.content)).slice(0,500),{kind:m.kind||'fact',source:m.source,confidence:Math.min(0.95,Number(m.confidence||0.6)+0.15)});
                 opCount++;
               }
               if(opCount>0)await db.addEvent(user.id,'auto_learned',`Consolidated memories: ${opCount} cleanup operations.`);
@@ -618,7 +618,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
         if(await db.getSetting(`deep_learning_last_${user.id}`)!==weekKey){
           // 1. Proactive curiosity: what don't we know yet?
           try{
-            const memSample=await db.listMemories(user.id).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+            const memSample=(await db.listMemories(user.id)).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
             const curPrompt=`Based on this user's memories, what are 2-3 genuine gaps in your understanding — things a close friend would know but you don't yet? Focus on what would help you be a better companion, not trivia.
 
 Memories:
@@ -636,7 +636,7 @@ Respond with a JSON array, max 3: {"question":"the natural question you'd ask","
 
           // 2. Pattern detection: when is the user active?
           try{
-            const stamps=await db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+            const stamps=(await db.listMessages(user.id,200)).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
             for(const p of findTimePatterns(stamps,timeZone).slice(0,3)){
               const content=`${p.label} (${p.count} of last ${p.total} messages)`;
               const existing=await db.listRelevantMemories(user.id,content,3);
@@ -648,8 +648,8 @@ Respond with a JSON array, max 3: {"question":"the natural question you'd ask","
           // 3. Relationship depth: enrich context for recently-mentioned people
           try{
             const weekAgo=new Date(nowMs-7*86400_000).toISOString();
-            for(const name of await db.recentlyMentionedPeople(user.id,weekAgo).slice(0,3)){
-              const mentions=await db.listMessages(user.id,60).filter((m)=>String(m.content||'').toLowerCase().includes(name.toLowerCase())).slice(-6).map((m)=>`${m.role}: ${String(m.content||'').slice(0,300)}`).join('\n');
+            for(const name of (await db.recentlyMentionedPeople(user.id,weekAgo)).slice(0,3)){
+              const mentions=(await db.listMessages(user.id,60)).filter((m)=>String(m.content||'').toLowerCase().includes(name.toLowerCase())).slice(-6).map((m)=>`${m.role}: ${String(m.content||'').slice(0,300)}`).join('\n');
               if(!mentions)continue;
               const relPrompt=`How does the user talk about ${name}? Summarize the relationship context in one sentence and classify the sentiment.
 
@@ -669,10 +669,10 @@ Respond with a single JSON object: {"summary":"one sentence on who this person i
           // 4. Predictive insights: what does this user likely need?
           try{
             if(await db.getSetting(`predictions_last_${user.id}`)!==weekKey){
-              const patternMems=await db.listMemoriesBySource(user.id,'auto-pattern',10).map(async (m)=>`- ${String(m.content||'').slice(0,150)}`);
-              const routines=await db.listRoutines(user.id).filter(async (r)=>r.enabled).map(async (r)=>r.title).slice(0,10);
-              const goals=await db.listActiveGoals(user.id).map(async (g)=>`${g.title} (${g.progress||0}%)`).slice(0,10);
-              const stamps=await db.listMessages(user.id,200).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
+              const patternMems=(await db.listMemoriesBySource(user.id,'auto-pattern',10)).map((m)=>`- ${String(m.content||'').slice(0,150)}`);
+              const routines=(await db.listRoutines(user.id)).filter((r)=>r.enabled).map((r)=>r.title).slice(0,10);
+              const goals=(await db.listActiveGoals(user.id)).map((g)=>`${g.title} (${g.progress||0}%)`).slice(0,10);
+              const stamps=(await db.listMessages(user.id,200)).filter((m)=>m.role==='user').map((m)=>new Date(m.created_at).valueOf());
               const actPatterns=findTimePatterns(stamps,timeZone).slice(0,3).map((p)=>p.label);
               const behaviorParts=[];
               if(patternMems.length)behaviorParts.push(`Detected patterns:\n${patternMems.join('\n')}`);
@@ -696,7 +696,7 @@ Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence
                     const content=`${pred.prediction.trim().slice(0,400)}${pred.suggestedAction?` → ${String(pred.suggestedAction).slice(0,200)}`:''}`;
                     if(content.length<15)continue;
                     const existing=await db.listRelevantMemories(user.id,content,3);
-                    if(existing.some(async (m)=>(m.source||'')==='auto-predict'))continue;
+                    if(existing.some((m)=>(m.source||'')==='auto-predict'))continue;
                     await db.addMemory(user.id,content,{kind:'fact',source:'auto-predict',confidence:Math.max(0.4,Math.min(Number(pred.confidence)||0.6,0.8))});
                     predSaved++;
                   }
@@ -711,7 +711,7 @@ Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence
           try{
             if(await db.getSetting(`emotion_baseline_last_${user.id}`)!==weekKey){
               const weekAgoMs=nowMs-7*86400_000;
-              const weekMsgs=await db.listMessages(user.id,60).filter((m)=>new Date(m.created_at).valueOf()>weekAgoMs);
+              const weekMsgs=(await db.listMessages(user.id,60)).filter((m)=>new Date(m.created_at).valueOf()>weekAgoMs);
               const userWeekMsgs=weekMsgs.filter((m)=>m.role==='user');
               if(userWeekMsgs.length>=5){
                 const convoSample=weekMsgs.slice(-24).map((m)=>`${m.role==='user'?'User':'Orbit'}: ${String(m.content||'').slice(0,250)}`).join('\n');
@@ -799,7 +799,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
                 const existing=await db.listRelevantMemories(userId,content,3);
                 if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 const sug=await db.listMemorySuggestions(userId);
-                if(sug.some(async (m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
+                if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 await db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
                 added++;
               }
@@ -811,8 +811,8 @@ Only include what's clearly supported — skip one-off questions, transient topi
       await db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
       await db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      await db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
-      await db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+      (await db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error)).slice(0,300)});
+      (await db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error)).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
@@ -946,7 +946,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           let flashbackCtx='';
           try{
             const [,lm,ld]=localDateTimeParts(timeZone,nowMs).date.split('-').map(Number);
-            const flashbacks=await db.listMemoriesOnDate(user.id,lm,ld).slice(0,2);
+            const flashbacks=(await db.listMemoriesOnDate(user.id,lm,ld)).slice(0,2);
             if(flashbacks.length)flashbackCtx=`\n\nOn this day in the past: ${flashbacks.map((f)=>`in ${f.year}, ${f.content.slice(0,200)}`).join(' | ')}. Weave in a brief, warm throwback reference if one fits naturally.`;
           }catch(e){}
           // Email digest for Gmail-connected users
@@ -956,7 +956,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           let streakCtx='';
           try{
             const streaks=[];
-            for(const r of await db.listRoutines(user.id).filter(async (r)=>r.enabled&&['daily','weekdays'].includes(r.cadence))){
+            for(const r of (await db.listRoutines(user.id)).filter((r)=>r.enabled&&['daily','weekdays'].includes(r.cadence))){
               const n=await db.getStreak(user.id,'routine',r.id,today);
               if(n>=2)streaks.push(`${n}-day streak on "${r.title}"`);
             }
@@ -1104,7 +1104,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(names.length){
               const memHits=[];
               for(const n of names.slice(0,3)){
-                const rel=await db.listRelevantMemories(user.id,n).slice(0,2);
+                const rel=(await db.listRelevantMemories(user.id,n)).slice(0,2);
                 for(const m of rel)memHits.push(`${n}: ${String(m.content||'').slice(0,120)}`);
               }
               if(memHits.length)attendeeCtx=`What you know about the people involved:\n${memHits.join('\n')}`;
@@ -1212,7 +1212,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const tasks=await db.listTasksCompletedSince(user.id,sinceISO);
       const checkins=await db.listGoalCheckinsSince(user.id,sinceISO);
       const memories=await db.listMemoriesSince(user.id,sinceISO);
-      const userMessages=await db.listMessages(user.id,200).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
+      const userMessages=(await db.listMessages(user.id,200)).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
       if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){await db.releaseProactiveSlot(user.id,today);continue;}
 
       try{
@@ -1354,7 +1354,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const email=safeEmail(url.searchParams.get('email')||'');
         if(!email)throw Object.assign(new Error('Email required.'),{status:400});
         const user=await db.getUserByEmail(email);
-        const requests=await db.listAccessRequests().filter(r=>r.email===email);
+        const requests=(await db.listAccessRequests()).filter(r=>r.email===email);
         const latest=requests[0];
         let status='none';
         if(user&&!user.disabled)status='approved';
@@ -1379,7 +1379,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);const token=String(body.token||'');
         if(!await db.consumeDoorToken(hashToken(token)))throw Object.assign(new Error('This link has expired or was already used.'),{status:403});
         await db.setSetting('registration_open','true');await db.setSetting('registration_opened_at',new Date().toISOString());
-        const owner=await db.listUsers().find(async (u)=>u.role==='owner');
+        const owner=await db.listUsers().find((u)=>u.role==='owner');
         if(owner)await db.addEvent(owner.id,'registration_opened','Opened registration from a push action.');
         return json(res,200,{open:true});
       }
@@ -1419,7 +1419,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)await db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName:buddyNameFor(user.user_id||user.id),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();await db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
-        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?await db.getConversation(me,requested):null;if(!active)active=await db.ensureDefaultConversation(me);const summary=await db.getConversationSummary(me,active.id);const prefs=await db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(await db.listRoutines(me).map(async (r)=>[r.id,await db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(await db.listGoals(me).map(async (g)=>[g.id,await db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:await db.listConversations(me),activeConversation:active,messages:await db.listConversationMessages(me,active.id),memories:await db.listMemories(me),memorySuggestions:await db.listMemorySuggestions(me),followUps:await db.listFollowUps(me),personalDates:await db.listPersonalDates(me),goals:await db.listGoals(me),routines:await db.listRoutines(me),streaks,projects:await db.listProjects(me),approvals:await db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:await db.listTasks(me),events:await db.listEvents(me),artifacts:await db.listArtifacts(me),connectors:await db.listConnectors(me),calendarFeeds:await db.listCalendarFeeds(me).map(publicFeed)});}
+        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?await db.getConversation(me,requested):null;if(!active)active=await db.ensureDefaultConversation(me);const summary=await db.getConversationSummary(me,active.id);const prefs=await db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries((await db.listRoutines(me)).map((r)=>[r.id,await db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries((await db.listGoals(me)).map((g)=>[g.id,await db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:await db.listConversations(me),activeConversation:active,messages:await db.listConversationMessages(me,active.id),memories:await db.listMemories(me),memorySuggestions:await db.listMemorySuggestions(me),followUps:await db.listFollowUps(me),personalDates:await db.listPersonalDates(me),goals:await db.listGoals(me),routines:await db.listRoutines(me),streaks,projects:await db.listProjects(me),approvals:await db.listApprovals(me),reliability:await reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:await db.listTasks(me),events:await db.listEvents(me),artifacts:await db.listArtifacts(me),connectors:await db.listConnectors(me),calendarFeeds:(await db.listCalendarFeeds(me)).map(publicFeed)});}
         const userId=user.user_id||user.id;
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
@@ -1461,7 +1461,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           return json(res,200,{months:out});
         }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!await db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
-        if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:await db.listCalendarFeeds(userId).map(publicFeed)});
+        if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:(await db.listCalendarFeeds(userId)).map(publicFeed)});
         if(req.method==='POST'&&url.pathname==='/api/calendar-feeds'){const body=await readJson(req);const label=cleanText(body.label,60,'label');const feedUrl=normalizeFeedUrl(cleanText(body.url,2000,'url'));let text;try{text=await fetchFeedText(feedUrl);}catch(error){throw Object.assign(new Error(`Could not read that calendar: ${error.message}`),{status:400});}const vevents=parseIcs(text);if(!vevents.length)throw Object.assign(new Error('That URL did not return a readable calendar (no events found).'),{status:400});const feed=await db.addCalendarFeed(userId,{label,url:feedUrl});await db.addEvent(userId,'calendar_feed_added',`Connected calendar \u201c${label}\u201d (${vevents.length} events found).`);return json(res,201,{feed:publicFeed(feed),eventsFound:vevents.length});}
         const feedMatch=url.pathname.match(/^\/api\/calendar-feeds\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&feedMatch){if(!await db.deleteCalendarFeed(userId,feedMatch[1]))throw Object.assign(new Error('Calendar feed not found.'),{status:404});dropFeedCache(feedMatch[1]);await db.addEvent(userId,'calendar_feed_removed','Removed a calendar feed.');return json(res,200,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/chat'){
@@ -1477,7 +1477,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(!await db.getConversation(userId,conversation.id))return;
             const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
             try{
-              const history=await db.listConversationMessages(userId,conversation.id,24).filter(async (m)=>m.id!==userMsg.id);
+              const history=(await db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
               const preferences=await db.getPreferences(userId);const summary=await db.getConversationSummary(userId,conversation.id);
               const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
               let needsBuddyName=false;
@@ -1486,7 +1486,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
                 if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;await db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
               }
               const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,
-                memories:await db.listRelevantMemories(userId,message),goals:await db.listActiveGoals(userId),projects:await db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+                memories:await db.listRelevantMemories(userId,message),goals:await db.listActiveGoals(userId),projects:(await db.listProjects(userId)).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
                 tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
                   gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
                 onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
@@ -1503,7 +1503,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               // Learn from the correction without blocking: figure out what was wrong and save the fix
               setImmediate(async()=>{
                 try{
-                  const hist=await db.listConversationMessages(userId,conversation.id,10).map(async (m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
+                  const hist=(await db.listConversationMessages(userId,conversation.id,10)).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
                   const tzNow=await db.getPreferences(userId).time_zone||'America/New_York';
                   const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
 
@@ -1517,7 +1517,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
                     const content=String(parsed.content||'').trim().slice(0,500);
                     if(content.length>=10){
                       const existing=await db.listRelevantMemories(userId,content,3);
-                      if(!existing.some(async (m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
+                      if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
                         await db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
                         await db.addEvent(userId,'correction_learned','Learned from a user correction.');
                       }
