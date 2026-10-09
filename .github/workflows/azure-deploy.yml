@@ -75,7 +75,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push image
+            - name: Bump service worker cache version
+        run: |
+          VER="orbit-buddy-$(echo $GITHUB_SHA | cut -c1-7)"
+          sed -i "s/const CACHE = 'orbit-buddy-v[^']*';/const CACHE = '$VER';/" public/sw.js
+          grep -n "const CACHE" public/sw.js
+
+- name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: .
