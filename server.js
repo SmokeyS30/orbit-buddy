@@ -1314,6 +1314,21 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   // otherwise they fall back to the local dataDir. This keeps portable
   // encrypted backups off ephemeral container storage in production.
   const backupDir = env.BACKUP_DIR || null;
+  function backupStatus(){
+    if(!env.BACKUP_ENCRYPTION_KEY)return{configured:false,state:'disabled'};
+    let lastSuccess=null,lastError=null,expectedFiles=1;
+    try{lastSuccess=db.getSetting('last_automatic_backup')||null;}catch{}
+    try{lastError=db.getSetting('last_backup_error')||null;}catch{}
+    try{expectedFiles=Math.max(1,db.listUsers().length);}catch{}
+    const directory=backupDir||path.join(dataDir,'backups');
+    let fileCount=0;
+    try{fileCount=fs.readdirSync(directory).filter((name)=>name.endsWith('.orbitbackup')).length;}catch{}
+    const today=new Date().toISOString().slice(0,10);
+    const yesterday=new Date(Date.now()-24*60*60_000).toISOString().slice(0,10);
+    const fresh=lastSuccess===today||lastSuccess===yesterday;
+    const state=lastError?'error':!lastSuccess?'pending':!fresh?'stale':fileCount<expectedFiles?'missing':'ready';
+    return{configured:true,state,lastSuccess,lastError:lastError||null,fileCount,expectedFiles};
+  }
   async function runBackups(){
     if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;
     const today=new Date().toISOString().slice(0,10);
@@ -1352,7 +1367,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       try{db.getSetting('healthz_probe');}catch(e){dbState='error';}
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState}});
+      const backup=backupStatus();
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
     }
     if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
       const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
@@ -1683,10 +1699,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,12*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);db.restoreUser(userId,bundle);db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
         if(req.method==='GET'&&url.pathname==='/api/admin/backup-status'){
           requireOwner(user);
-          let lastSuccess=null,lastError=null;
-          try{lastSuccess=db.getSetting('last_automatic_backup')||null;}catch{}
-          try{lastError=db.getSetting('last_backup_error')||null;}catch{}
-          return json(res,200,{ok:true,configured:!!env.BACKUP_ENCRYPTION_KEY,backupDir:backupDir||null,lastSuccess,lastError: lastError||null});
+          return json(res,200,{ok:true,backupDir:backupDir||null,...backupStatus()});
         }
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}

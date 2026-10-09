@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Published production images with GitHub's short-lived repository token instead of a stored GHCR personal access token.
+- Added a scheduled public health monitor covering PostgreSQL readiness and durable encrypted-backup freshness.
+- Reported a safe backup state from `/healthz` while keeping detailed backup diagnostics owner-only.
+- Aligned Azure documentation and probe thresholds with the PostgreSQL production deployment.
+
 ## 0.6.0
 
 - Gated every Azure production deployment on the full test suite and a production dependency audit, with serialized deployments.
