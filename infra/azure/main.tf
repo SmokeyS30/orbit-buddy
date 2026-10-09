@@ -33,9 +33,9 @@ resource "azurerm_resource_group" "orbit" {
   location = var.location
 }
 
-# --- Storage: Azure Files share for SQLite backups ---
-# SQLite runs on local container storage for reliable file locking. Consistent
-# online backups are written here and restored whenever a new replica starts.
+# --- Storage: Azure Files share for encrypted application backups ---
+# Production data lives in PostgreSQL. Orbit writes daily encrypted portable
+# backups here so they survive revision replacements and container restarts.
 resource "azurerm_storage_account" "orbit" {
   name                     = var.storage_account_name
   resource_group_name      = azurerm_resource_group.orbit.name
@@ -144,8 +144,9 @@ resource "azurerm_container_app" "orbit" {
   revision_mode                = "Single" # one active version at a time
   workload_profile_name        = "Consumption"
 
-  # A local SQLite primary requires exactly one always-on replica. The Azure
-  # Files backup survives revision replacements and container restarts.
+  # Keep one always-on replica until the in-process background scheduler is
+  # proven safe for multi-replica execution. Azure Files retains encrypted
+  # application backups across revision replacements and container restarts.
   template {
     min_replicas = 1
     max_replicas = 1
@@ -247,7 +248,7 @@ resource "azurerm_container_app" "orbit" {
         transport               = "HTTP"
         interval_seconds        = 10
         timeout                 = 5
-        failure_count_threshold = 12
+        failure_count_threshold = 10
       }
     }
 

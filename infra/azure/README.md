@@ -1,11 +1,10 @@
 # Orbit Buddy on Azure (Terraform)
 
-Deploys Orbit to Azure Container Apps as one always-on replica with a local
-SQLite primary and consistent backups on persistent Azure Files storage. The
-container refreshes the current backup every 15 seconds, retains up to 168
-hourly/shutdown snapshots, and forces a snapshot during graceful
-shutdown. Keep a separate portable backup and periodically test restoration;
-the Azure Files share is recovery storage, not an independent off-site backup.
+Deploys Orbit to Azure Container Apps as one always-on replica backed by Azure
+PostgreSQL Flexible Server. Orbit writes daily encrypted per-user backups to
+persistent Azure Files storage and retains the latest seven per user. Keep a
+separate portable backup and periodically test restoration; the Azure Files
+share is recovery storage, not an independent off-site backup.
 
 The stack also keeps an Azure OpenAI account with primary and fallback model
 deployments available for a future provider switch. Orbit currently uses the
@@ -62,11 +61,11 @@ az containerapp secret set -g $RG -n orbit-buddy \
 Terraform already wires these secret names to the container environment. Secret
 values stay outside source control and Terraform state.
 
-**Important:** if you already have an Orbit database on Render, upload the SQLite
-file as `orbit.sqlite` at the root of the `orbit-data` Azure Files share before
-going live, or you'll start with a fresh database.
-Generate a NEW `data-encryption-key` only if starting fresh — if migrating, reuse
-the existing `DATA_ENCRYPTION_KEY` from Render.
+**Important:** production data is stored in the externally managed PostgreSQL
+server referenced by the `database-url` Container App secret. Migrate and verify
+that database before changing production traffic. Generate a new
+`data-encryption-key` only when starting fresh; migrations must retain the
+existing key so encrypted connector data remains readable.
 
 The `orbitbuddy.app` managed-certificate binding is maintained by Azure CLI and
 protected from removal by Terraform's lifecycle rule in `main.tf`. Keep the
@@ -93,6 +92,5 @@ terraform destroy
 ## Cost estimate
 
 The exact price varies by Azure region and usage. This configuration keeps one
-Consumption replica running because scaling a stateful SQLite app to zero can
-discard changes made since its last backup. Check Azure Cost Management for the
-current measured cost.
+Consumption replica running so scheduled and proactive work continues after
+clients disconnect. Check Azure Cost Management for the current measured cost.

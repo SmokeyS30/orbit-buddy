@@ -3,7 +3,7 @@
 #   AZURE_CLIENT_ID - Entra app (service principal) client ID for OIDC federated auth
 #   AZURE_TENANT_ID - Azure AD tenant ID
 #   AZURE_SUBSCRIPTION_ID - Azure subscription ID
-#   GHCR_TOKEN - GitHub personal access token with write:packages scope
+# Container images are published with the short-lived repository GITHUB_TOKEN.
 #
 # Deployment safety (single-revision mode): before pushing the new image, this
 # workflow captures the currently-deployed image. After deployment it waits for
@@ -60,6 +60,7 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      packages: write
     outputs:
       new_revision: ${{ steps.deploy.outputs.new_revision }}
       prev_image: ${{ steps.deploy.outputs.prev_image }}
@@ -71,7 +72,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ github.token }}
 
       - name: Build and push image
         uses: docker/build-push-action@v5

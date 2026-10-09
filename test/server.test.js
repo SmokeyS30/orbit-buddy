@@ -440,6 +440,18 @@ test('/healthz ok reflects DB state', async (t) => {
   assert.equal(res.status, 200);
   assert.ok(body.database);
   assert.ok(body.ai);
+  assert.deepEqual(body.backup, { configured: false, state: 'disabled' });
+});
+
+test('/healthz reports a fresh durable encrypted backup', async (t) => {
+  const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-backup-health-'));
+  fs.writeFileSync(path.join(backupDir, 'orbit-test.orbitbackup'), 'encrypted-test-fixture');
+  const { app, base } = await fixture({ BACKUP_ENCRYPTION_KEY: 'a'.repeat(32), BACKUP_DIR: backupDir });
+  t.after(() => app.close());
+  app.db.setSetting('last_automatic_backup', new Date().toISOString().slice(0, 10));
+  const res = await fetch(`${base}/healthz`);
+  assert.equal(res.status, 200);
+  assert.deepEqual((await res.json()).backup, { configured: true, state: 'ready' });
 });
 
 test('rate limiting uses x-forwarded-for behind proxy', async (t) => {
