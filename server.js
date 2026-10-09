@@ -187,7 +187,18 @@ export function createOrbitServer(options={}) {
   }
 
   const requestLog=new Map();
-  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  function getClientIp(req){
+    // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
+    // Take the leftmost (original client) IP, validate format to prevent header injection.
+    const fwd=req.headers['x-forwarded-for'];
+    if(fwd){
+      const ip=String(fwd).split(',')[0].trim();
+      // Basic IPv4/IPv6 validation
+      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
+    }
+    return req.socket.remoteAddress||'unknown';
+  }
+  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
   function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
@@ -1303,7 +1314,21 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   // otherwise they fall back to the local dataDir. This keeps portable
   // encrypted backups off ephemeral container storage in production.
   const backupDir = env.BACKUP_DIR || null;
-  async function runBackups(){if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;const today=new Date().toISOString().slice(0,10);if(db.getSetting('last_automatic_backup')===today)return;backupBusy=true;try{for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,backupDir,passphrase:env.BACKUP_ENCRYPTION_KEY});db.setSetting('last_automatic_backup',today);}finally{backupBusy=false;}}
+  async function runBackups(){
+    if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;
+    const today=new Date().toISOString().slice(0,10);
+    try{if(db.getSetting('last_automatic_backup')===today)return;}catch(e){console.error('Backup check failed:',e.message);}
+    backupBusy=true;
+    try{
+      for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,backupDir,passphrase:env.BACKUP_ENCRYPTION_KEY});
+      try{db.setSetting('last_automatic_backup',today);db.setSetting('last_backup_error','');}catch(e){console.error('Backup status update failed:',e.message);}
+      console.log(`Automated backup completed for ${today}`);
+    }catch(e){
+      // Log safely without exposing key material or backup contents
+      console.error('Automated backup failed:',e.message);
+      try{db.setSetting('last_backup_error',String(e.message).slice(0,200));}catch{}
+    }finally{backupBusy=false;}
+  }
 
   const server=http.createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
@@ -1312,7 +1337,23 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
-    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();let dbState='ready',dbDriver=db.driver||'unknown';try{db.getSetting('healthz_probe');}catch(e){dbState='error';}return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState}});}
+    // Shallow liveness: Node process is alive (no DB check to avoid restart loops)
+    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy'});}
+    // Readiness: PostgreSQL must be reachable
+    if(url.pathname==='/readyz'){
+      let dbState='ready';const dbDriver=db.driver||'unknown';
+      try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
+      const ok=dbState==='ready';
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',database:{driver:dbDriver,state:dbState}});
+    }
+    if(url.pathname==='/healthz'){
+      const modelStatus=model.diagnostics();
+      let dbState='ready';const dbDriver=db.driver||'unknown';
+      try{db.getSetting('healthz_probe');}catch(e){dbState='error';}
+      const ok=dbState==='ready';
+      // AI status reported separately; DB failure sets ok=false and 503
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState}});
+    }
     if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
       const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
       try{
@@ -1326,15 +1367,6 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
-        try{cleanupExpiredDemos(db);}catch{}
-        const user=db.createDemoUser();
-        seedDemoData(db,user.id);
-        const csrf=createSession(user,req,res);
-        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/demo/start'){
-        if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
-        // Clean up expired demos opportunistically
         try{cleanupExpiredDemos(db);}catch{}
         const user=db.createDemoUser();
         seedDemoData(db,user.id);
@@ -1649,6 +1681,13 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const payload=await encryptPortable(db.exportUser(userId),body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
         if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,12*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);db.restoreUser(userId,bundle);db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/backup-status'){
+          requireOwner(user);
+          let lastSuccess=null,lastError=null;
+          try{lastSuccess=db.getSetting('last_automatic_backup')||null;}catch{}
+          try{lastError=db.getSetting('last_backup_error')||null;}catch{}
+          return json(res,200,{ok:true,configured:!!env.BACKUP_ENCRYPTION_KEY,backupDir:backupDir||null,lastSuccess,lastError: lastError||null});
+        }
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
