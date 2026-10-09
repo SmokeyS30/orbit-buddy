@@ -149,7 +149,7 @@ resource "azurerm_container_app" "orbit" {
   # application backups across revision replacements and container restarts.
   template {
     min_replicas = 1
-    max_replicas = 1
+    max_replicas = 2
 
     container {
       name   = "orbit-buddy"
