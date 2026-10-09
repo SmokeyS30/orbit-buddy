@@ -223,9 +223,31 @@ resource "azurerm_container_app" "orbit" {
       }
 
       liveness_probe {
-        path      = "/healthz"
-        port      = 3000
-        transport = "HTTP"
+        path                    = "/livez"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 30
+        timeout                 = 5
+        failure_count_threshold = 3
+      }
+
+      readiness_probe {
+        path                    = "/readyz"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 15
+        timeout                 = 10
+        failure_count_threshold = 3
+        success_count_threshold = 1
+      }
+
+      startup_probe {
+        path                    = "/livez"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 10
+        timeout                 = 5
+        failure_count_threshold = 12
       }
     }
 

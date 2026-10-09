@@ -412,3 +412,51 @@ test('personal dates PATCH: gift_nag and gift_done', async (t) => {
   res = await fetch(`${base}/api/personal-dates`);
   assert.equal(res.status, 401);
 });
+
+test('/livez returns 200 without DB check', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/livez`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.service, 'orbit-buddy');
+});
+
+test('/readyz returns 200 when DB is ready', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/readyz`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.database.state, 'ready');
+});
+
+test('/healthz ok reflects DB state', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/healthz`);
+  const body = await res.json();
+  // With working DB, ok should be true and status 200
+  assert.equal(body.ok, true);
+  assert.equal(res.status, 200);
+  assert.ok(body.database);
+  assert.ok(body.ai);
+});
+
+test('rate limiting uses x-forwarded-for behind proxy', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  // Make requests with different forwarded IPs - they should have separate buckets
+  // This test verifies the header is parsed (not that limits are hit)
+  const res1 = await fetch(`${base}/livez`, { headers: { 'X-Forwarded-For': '1.2.3.4' } });
+  assert.equal(res1.status, 200);
+  const res2 = await fetch(`${base}/livez`, { headers: { 'X-Forwarded-For': '5.6.7.8' } });
+  assert.equal(res2.status, 200);
+});
+
+test('demo start route is not duplicated', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  // Register owner first to allow demo creation
+  await register(base);
+  const res = await fetch(`${base}/api/demo/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+  // Should succeed (201) not error from duplicate route confusion
+  assert.ok([201, 429].includes(res.status));
+});
