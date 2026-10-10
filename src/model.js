@@ -195,6 +195,7 @@ export function createModelClient(env = process.env) {
     ...(usingAzure ? [] : [DEFAULT_MODEL, ...COMPATIBILITY_MODELS])
   ]).filter((name) => name !== model);
   const fallbackModel = fallbackModels[0] || null;
+  const complexModel = normalizeModelName(process.env.OPENAI_COMPLEX_MODEL || 'gpt-6.1-sol');
   const baseUrl = validateBaseUrl(
     usingAzure ? `${azureEndpoint}/openai/v1` : env.OPENAI_BASE_URL,
     env.ALLOW_INSECURE_MODEL_URL === 'true'
@@ -452,12 +453,14 @@ export function createModelClient(env = process.env) {
       ];
       const toolCalls = [];
       let lastOutput = [];
-      let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
+      
+      const needsComplexModel=String(message||'').length>800||/(think (hard|deeply|carefully)|complex|analyze|detailed analysis|step.by.step|compare and contrast|pros and cons|research)/i.test(String(message||'')); let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;Model = (() => {__NL__  const msg = String(message || '');__NL__  if (msg.length > 800) return true;__NL__  const complexSignals = /(think (hard|deeply|carefully)|complex|analyze|detailed analysis|step.by.step|compare and contrast|pros and cons|research)/i;__NL__  if (complexSignals.test(msg)) return true;__NL__  return false;__NL__})();__NL__const effectiveModel = needsComplexModel && complexModel ? complexModel : model;__NL__// Complexity-based routing: escalate to the stronger model for complex work__NL__// Complexity-based routing: escalate to the stronger model for complex work__NL__const needsComplexModel = (() => {__NL__const needsComplexModel=String(message||'').length>800||/(think (hard|deeply|carefully)|complex|analyze|detailed analysis|step.by.step|compare and contrast|pros and cons|research)/i.test(String(message||'')); let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
       const callWithFallback = async (request, input) => {
         // Only use the explicitly configured compatibility chain. The models
         // endpoint can contain dozens of specialized models that are not safe
         // drop-in replacements for a chat response.
-        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
+        const candidates = uniqueModels([needsComplexModel && complexModel ? complexModel : selectedModel, ...fallbackModels]);
+        
         const unavailable = [];
         let transientAttempts = 0;
         for (const candidate of candidates) {
