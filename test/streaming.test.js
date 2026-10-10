@@ -39,6 +39,39 @@ test('parseResponsesStream rebuilds text and calls onToken per delta', async () 
   assert.deepEqual(output[0].content, [{ type: 'output_text', text: 'Hello world' }]);
 });
 
+test('streaming tokens strip full chained citation markers', async () => {
+  const tokens = [];
+  await parseResponsesStream(sseBody([
+    sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } }),
+    sse({ type: 'response.output_text.delta', output_index: 0, delta: 'Answer ≡cite1≡turn2≡search3≡ done' }),
+    'data: [DONE]\n\n'
+  ]), (delta) => tokens.push(delta));
+
+  assert.deepEqual(tokens, ['Answer  done']);
+});
+
+test('non-streaming responses strip full chained citation markers', async (t) => {
+  const stub = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Answer ≡cite1≡turn2≡search3≡ done' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key',
+    OPENAI_MODEL: 'test-model',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+
+  const result = await model.respond({ buddyName: 'Orbit', message: 'Hello' });
+
+  assert.equal(result.text, 'Answer  done');
+});
+
 test('parseResponsesStream reconstructs function calls', async () => {
   const output = await parseResponsesStream(sseBody([
     sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'web_search' } }),

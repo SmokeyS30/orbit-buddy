@@ -93,7 +93,7 @@ function extractText(payload) {
       if (content.type === 'output_text' && typeof content.text === 'string') parts.push(content.text);
     }
   }
-  return parts.join('\n').trim().replace(/≡[^≡]*≡/g, '');
+  return parts.join('\n').trim().replace(/≡(?:[^≡]*≡)+/g, '');
 }
 
 // Parses a Responses API server-sent-events stream, rebuilding the output items
@@ -140,7 +140,7 @@ export async function parseResponsesStream(body, onToken) {
     } else if (type === 'response.output_text.delta') {
       const item = getItem(event.output_index);
       item._text = (item._text || '') + String(event.delta || '');
-      if (onToken) onToken(String(event.delta || '').replace(/≡[^≡]*≡/g, ''));
+      if (onToken) onToken(String(event.delta || '').replace(/≡(?:[^≡]*≡)+/g, ''));
     } else if (type === 'response.function_call_arguments.delta') {
       const item = getItem(event.output_index);
       item.arguments = (item.arguments || '') + String(event.delta || '');
