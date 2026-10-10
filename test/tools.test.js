@@ -164,6 +164,66 @@ test('respond without tools keeps the single-request behavior', async (t) => {
   assert.equal(requests, 1);
 });
 
+test('messages longer than 800 characters use the complex model without making it sticky', async (t) => {
+  const attempted = [];
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      attempted.push(JSON.parse(body).model);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Hello.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key',
+    OPENAI_MODEL: 'gpt-6-luna',
+    OPENAI_COMPLEX_MODEL: 'sol',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+
+  await model.respond({ buddyName: 'Orbit', message: 'x'.repeat(800) });
+  await model.respond({ buddyName: 'Orbit', message: 'x'.repeat(801) });
+  await model.respond({ buddyName: 'Orbit', message: 'short again' });
+
+  assert.deepEqual(attempted, ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-luna']);
+});
+
+test('complex-model routing falls back through the primary model normally', async (t) => {
+  const attempted = [];
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      const sent = JSON.parse(body);
+      attempted.push(sent.model);
+      const unavailable = sent.model === 'gpt-6.1-sol';
+      res.writeHead(unavailable ? 404 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(unavailable
+        ? { error: { code: 'model_not_found', message: 'Project does not have access to this model.' } }
+        : { output: [{ type: 'message', content: [{ type: 'output_text', text: 'Luna fallback worked.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key',
+    OPENAI_MODEL: 'gpt-6-luna',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`,
+    ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+
+  const response = await model.respond({ buddyName: 'Orbit', message: 'x'.repeat(801) });
+
+  assert.equal(response.text, 'Luna fallback worked.');
+  assert.deepEqual(attempted, ['gpt-6.1-sol', 'gpt-6-luna']);
+  assert.equal(model.diagnostics().state, 'fallback');
+  assert.equal(model.diagnostics().activeModel, 'gpt-6-luna');
+});
+
 test('Azure OpenAI settings take precedence and use the v1 endpoint with a configured fallback', async (t) => {
   const requests = [];
   const stub = http.createServer((req, res) => {
