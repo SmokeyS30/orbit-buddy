@@ -123,10 +123,71 @@ function tokenize(value) {
     .map((token) => token.length > 3 && token.endsWith('s') && !token.endsWith('ss') ? token.slice(0, -1) : token);
 }
 
+// Episodic recall: human-readable "last mentioned X ago" label for a memory.
+// Uses last_mentioned_at when available, falling back to confirmation/update/create times.
+export function lastMentionedLabel(memory, nowMs = Date.now()) {
+  const ts = memory.last_mentioned_at || memory.last_confirmed_at || memory.updated_at || memory.created_at;
+  if (!ts) return null;
+  const days = Math.max(0, Math.floor((nowMs - new Date(ts).valueOf()) / 86400_000));
+  if (days === 0) return 'earlier today';
+  if (days === 1) return 'yesterday';
+  if (days < 7) return `${days} days ago`;
+  if (days < 30) { const w = Math.floor(days / 7); return w === 1 ? 'a week ago' : `${w} weeks ago`; }
+  if (days < 365) { const m = Math.floor(days / 30); return m === 1 ? 'a month ago' : `${m} months ago`; }
+  const y = Math.floor(days / 365); return y === 1 ? 'a year ago' : `${y} years ago`;
+}
+
+const NEGATION_WORDS = new Set(['not', 'no', 'never', "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't", "can't", "cannot", "won't", "shouldn't", "wouldn't", "couldn't", "haven't", "hasn't", "hadn't", 'none', 'neither', 'nor']);
+
+function hasNegation(text) {
+  const lower = String(text || '').toLowerCase();
+  for (const neg of NEGATION_WORDS) {
+    if (lower.includes(neg)) return true;
+  }
+  return false;
+}
+
+// Contradiction detection: finds an existing memory that the new content likely
+// contradicts, via keyword overlap plus negation-polarity mismatch.
+// Returns { contradicted, confidence } or null. Never auto-deletes.
+export function detectContradiction(newContent, existingMemories) {
+  const newTokens = new Set(tokenize(newContent));
+  if (newTokens.size < 3) return null;
+  const newNegated = hasNegation(newContent);
+  let best = null;
+  let bestScore = 0;
+  for (const memory of existingMemories || []) {
+    if (!memory || memory.status === 'archived' || memory.superseded_by) continue;
+    const memTokens = new Set(tokenize(memory.content));
+    if (memTokens.size < 3) continue;
+    // Only flag when negation polarity differs (one affirms, the other denies).
+    if (hasNegation(memory.content) === newNegated) continue;
+    const overlap = [...newTokens].filter((t) => memTokens.has(t)).length;
+    const similarity = overlap / Math.min(newTokens.size, memTokens.size);
+    if (similarity >= 0.5 && similarity > bestScore) {
+      bestScore = similarity;
+      best = memory;
+    }
+  }
+  return best ? { contradicted: best, confidence: bestScore } : null;
+}
+
+// Memory decay: relevance fades 5% per week of inactivity, floored at 0.1.
+// Called by applyMemoryDecay during the daily learning cycle.
+export function calculateRelevance(memory, nowMs = Date.now()) {
+  const current = Number.isFinite(Number(memory.relevance_score)) ? Number(memory.relevance_score) : 1.0;
+  const ts = memory.last_mentioned_at || memory.last_confirmed_at || memory.updated_at || memory.created_at;
+  if (!ts) return Math.max(0.1, Math.min(1.0, current));
+  const weeksInactive = Math.max(0, (nowMs - new Date(ts).valueOf()) / (86400_000 * 7));
+  const decayed = current * Math.pow(0.95, weeksInactive);
+  return Math.max(0.1, Math.min(1.0, decayed));
+}
+
 export function rankMemories(memories, query, limit = 8, nowMs = Date.now()) {
   const wanted = new Set(tokenize(query));
   return (memories || [])
     .filter((memory) => memory.status !== 'archived')
+    .filter((memory) => !memory.superseded_by)
     .filter((memory) => !memory.expires_at || new Date(memory.expires_at).valueOf() > nowMs)
     .map((memory, index) => {
       const tokens = tokenize(memory.content);
@@ -136,7 +197,8 @@ export function rankMemories(memories, query, limit = 8, nowMs = Date.now()) {
       const recency = Math.max(0, 2 - Math.log10(ageDays + 1));
       const confidence = Number.isFinite(Number(memory.confidence)) ? Number(memory.confidence) : 1;
       const kindBoost = ['preference', 'goal', 'project', 'decision'].includes(memory.kind) ? 0.5 : 0;
-      return { memory, score: exact + overlap * 3 + recency + confidence + kindBoost - index * 0.001 };
+      const relevance = Number.isFinite(Number(memory.relevance_score)) ? Number(memory.relevance_score) : 1;
+      return { memory, score: exact + overlap * 3 + recency + confidence + kindBoost + relevance - index * 0.001 };
     })
     .sort((a, b) => b.score - a.score)
     .slice(0, Math.max(1, Math.min(Number(limit) || 8, 20)))

@@ -1,5 +1,5 @@
 import { TOOL_DEFINITIONS, executeTool, summarizeToolCall } from './tools.js';
-import { todayInZone, validTimeZone } from './intelligence.js';
+import { lastMentionedLabel, todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
 const DEFAULT_COMPLEX_MODEL = 'gpt-6.1-sol';
@@ -321,7 +321,11 @@ export function createModelClient(env = process.env) {
       }
 
       const memoryText = memories.length
-        ? memories.map((entry, index) => `${index + 1}. [${entry.kind || 'fact'}] ${entry.content}`).join('\n')
+        ? memories.map((entry, index) => {
+            const when = lastMentionedLabel(entry);
+            const episodic = when ? ` (last mentioned ${when})` : '';
+            return `${index + 1}. [${entry.kind || 'fact'}]${episodic} ${entry.content}`;
+          }).join('\n')
         : 'No user-approved memories are stored.';
       const recentHistory = history.slice(-16).map((entry) => ({ role: entry.role, content: entry.content }));
       const goalText = goals.length
@@ -348,6 +352,8 @@ export function createModelClient(env = process.env) {
         `- For "remind me before my [calendar event]" requests: you CAN do this. Use read_calendar to find the event and its time, then use create_task with scheduleAt set to the reminder time (event start minus the lead time the user asked for, e.g. 15 minutes before). If the event recurs daily or weekly, set the task recurrence to match. Never say you can't set reminders for calendar events — this is fully supported. Write the task prompt as a simple unconditional reminder (e.g. ‘Remind Edward: CIT187 starts in 5 minutes at 11 AM Eastern.’). Do NOT add ‘check the calendar first’ or ‘suppress if absent’ conditions — tasks run without tool access, so the reminder would be wrongly withheld.`,
         `- When discussing goals or projects, proactively share momentum: completion percentage, pace ("at this rate you'll finish by..."), and what's next. If they're behind, don't just report it — propose a specific catch-up plan. Turn passive tracking into active coaching.`,
         `- Connect the dots across context. If the weather is bad and the user has free time, suggest indoor activities. If they have a gap before a meeting, suggest productive uses. If their routine is off-pattern (e.g. usually studies at 9am but hasn't today), gently check in. Be helpful, not creepy — one suggestion at a time, easy to dismiss.`,
+        `- Connect memories across conversations: when you reference a stored memory, note how it relates to other memories when relevant ("this ties into your goal of..."). Don't just recite facts — weave them together naturally.`,
+        `- Volunteer relevant memories proactively: if a stored memory is highly relevant to what the user is discussing but hasn't come up yet, mention it naturally ("by the way, you told me..."). Don't wait to be asked — but keep it to one volunteered memory at a time, easy to dismiss.`,
         `- For local recommendations (restaurants, movies, events), use web_search with the user's location (Brewster, MA / Cape Cod) for current, relevant results.`,
         `- Write tools need a clear ask: only call create_task or save_memory when the user plainly asked for a task/reminder or to remember something — never speculatively, never as a side effect of answering a question.`,
         `- If the user shares a durable preference, goal, project detail, decision, or relationship detail without asking you to remember it, use propose_memory at most twice. Never propose transient, highly sensitive, or already-stored details.`,

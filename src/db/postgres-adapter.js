@@ -21,7 +21,7 @@
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
-import { normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
+import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 
 const { Pool } = pg;
 const timestamp = () => new Date().toISOString();
@@ -274,14 +274,44 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       const row = { id: randomUUID(), user_id: userId, content, created_at: now, updated_at: now,
         kind: normalizeMemoryKind(options.kind), source: String(options.source||'user').slice(0, 40), status: 'approved',
         confidence: Math.max(0, Math.min(Number(options.confidence ?? 1), 1)), expires_at: options.expiresAt || null, last_confirmed_at: now };
-      await run(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`,
+      await run(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, NULL, 1.0, NULL)`,
         row.id, row.user_id, row.content, row.created_at, row.updated_at, row.kind, row.source, row.confidence, row.expires_at, row.last_confirmed_at);
+      // Contradiction detection: mark the old memory as superseded (kept for history, excluded from context).
+      try {
+        const contradiction = detectContradiction(content, await all("SELECT * FROM memories WHERE user_id=? AND status='approved'", userId));
+        if (contradiction && contradiction.contradicted && contradiction.contradicted.id !== row.id) {
+          await run('UPDATE memories SET superseded_by=?,updated_at=? WHERE id=? AND user_id=?', row.id, now, contradiction.contradicted.id, userId);
+          row.superseded = contradiction.contradicted.id;
+        }
+      } catch {}
       return row;
     },
     listMemories: async (userId) => all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
     async listRelevantMemories(userId, query, limit=8) {
-      return rankMemories(await all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId), query, limit);
+      const ranked = rankMemories(await all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId), query, limit);
+      // Episodic recall: stamp last_mentioned_at whenever a memory is used in context.
+      if (ranked.length) {
+        const now = timestamp();
+        for (const memory of ranked) await run('UPDATE memories SET last_mentioned_at=? WHERE id=? AND user_id=?', now, memory.id, userId);
+      }
+      return ranked;
+    },
+    // Memory decay: recalculate relevance scores based on inactivity.
+    // Run during the daily learning cycle.
+    async applyMemoryDecay(userId) {
+      const nowMs = Date.now();
+      const memories = await all("SELECT * FROM memories WHERE user_id=? AND status='approved'", userId);
+      let updated = 0;
+      for (const memory of memories) {
+        const newScore = calculateRelevance(memory, nowMs);
+        const current = Number.isFinite(Number(memory.relevance_score)) ? Number(memory.relevance_score) : 1.0;
+        if (Math.abs(newScore - current) > 0.01) {
+          await run('UPDATE memories SET relevance_score=? WHERE id=? AND user_id=?', newScore, memory.id, userId);
+          updated++;
+        }
+      }
+      return updated;
     },
     deleteMemory: async (userId, id) => (await run('DELETE FROM memories WHERE id=? AND user_id=?', id, userId)).changes > 0,
     async addMemorySuggestion(userId, content, options={}) {
