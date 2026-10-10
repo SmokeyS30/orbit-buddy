@@ -93,7 +93,7 @@ function extractText(payload) {
       if (content.type === 'output_text' && typeof content.text === 'string') parts.push(content.text);
     }
   }
-  return parts.join('\n').trim();
+  return parts.join('\n').trim().replace(/≡[^≡]*≡/g, '');
 }
 
 // Parses a Responses API server-sent-events stream, rebuilding the output items
