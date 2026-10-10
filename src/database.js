@@ -282,6 +282,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'memories', 'last_mentioned_at', 'TEXT');
   ensureColumn(db, 'memories', 'relevance_score', 'REAL NOT NULL DEFAULT 1.0');
   ensureColumn(db, 'memories', 'superseded_by', 'TEXT');
+  ensureColumn(db, 'memories', 'embedding', 'TEXT');
   ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
   ensureColumn(db, 'memory_suggestions', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
   ensureColumn(db, 'follow_ups', 'priority', 'INTEGER NOT NULL DEFAULT 2');
@@ -366,8 +367,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
-    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL)`),
+    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL, ?)`),
     listMemories: db.prepare("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,rowid DESC LIMIT 100"),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
     addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES (?,?,?,?,?,?)'),
@@ -600,8 +601,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const now=timestamp();
       const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now,
         kind:normalizeMemoryKind(options.kind),source:String(options.source||'user').slice(0,40),status:'approved',
-        confidence:Math.max(0,Math.min(Number(options.confidence??1),1)),expires_at:options.expiresAt||null,last_confirmed_at:now};
-      s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at);
+        confidence:Math.max(0,Math.min(Number(options.confidence??1),1)),expires_at:options.expiresAt||null,last_confirmed_at:now,
+        embedding:options.embedding||null};
+      s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at,row.embedding);
       // Contradiction detection: if the new memory conflicts with an existing one,
       // mark the old one as superseded (kept for history, excluded from context).
       try {

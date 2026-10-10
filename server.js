@@ -10,6 +10,8 @@ import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
+import { searchMessages, formatSearchResults } from './src/conversation-search.js';
+import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
@@ -1627,6 +1629,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         }
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
+        if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20);return json(res,200,{results:formatSearchResults(results)});}
+        const timelineMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)\/timeline$/);if(req.method==='GET'&&timelineMatch){const timeline=buildTimeline(timelineMatch[1],db.listMemories(userId));if(!timeline.length)throw Object.assign(new Error('Memory not found.'),{status:404});return json(res,200,{timeline:formatTimeline(timeline)});}
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
         const followUpMatch=url.pathname.match(/^\/api\/follow-ups\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&followUpMatch){if(!db.deleteFollowUp(userId,followUpMatch[1]))throw Object.assign(new Error('Follow-up not found.'),{status:404});db.addEvent(userId,'followup_deleted','Removed a scheduled follow-up.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/personal-dates'){return json(res,200,{dates:db.listPersonalDates(userId)});}
