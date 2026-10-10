@@ -326,6 +326,8 @@ export function createOrbitServer(options={}) {
       const lastLearned=db.getSetting(`last_learning_${user.id}`);
       if(lastLearned&&lastLearned.slice(0,10)===today)continue;
 
+      // Memory decay: fade relevance of unused memories (runs once daily per user)
+      try{db.applyMemoryDecay(user.id);}catch(e){}
       // Get recent messages (last 24h, up to 40)
       const messages=db.listMessages(user.id,40);
       const cutoff=nowMs-24*3600_000;
