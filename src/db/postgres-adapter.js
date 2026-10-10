@@ -95,6 +95,16 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
   const client = await pool.connect();
   try {
     await client.query('SELECT 1');
+    // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
+    const migrations = [
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_mentioned_at TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding TEXT',
+    ];
+    for (const sql of migrations) {
+      try { await client.query(sql); } catch (e) { /* column may already exist */ }
+    }
   } finally {
     client.release();
   }
