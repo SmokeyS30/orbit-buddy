@@ -707,7 +707,7 @@ test('Brave does not retry auth failures', async (t) => {
 
 test('tool loop requests a text summary after exhausting iterations on tool calls', async (t) => {
   let requests = 0;
-  let fifthHadTools = null;
+  let thirdHadTools = null;
   const stub = http.createServer((req, res) => {
     let body = '';
     req.on('data', (chunk) => { body += chunk; });
@@ -715,11 +715,11 @@ test('tool loop requests a text summary after exhausting iterations on tool call
       requests += 1;
       const sent = JSON.parse(body);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      if (requests <= 4) {
+      if (requests <= 2) {
         res.end(JSON.stringify({ output: [{ type: 'function_call', call_id: `call_${requests}`, name: 'get_datetime', arguments: '{}' }] }));
       } else {
-        fifthHadTools = !!sent.tools;
-        res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Done — created 4 tasks.' }] }] }));
+        thirdHadTools = !!sent.tools;
+        res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Done — created 2 tasks.' }] }] }));
       }
     });
   });
@@ -732,10 +732,10 @@ test('tool loop requests a text summary after exhausting iterations on tool call
     ALLOW_INSECURE_MODEL_URL: 'true'
   });
   const { text, toolCalls } = await model.respond({ buddyName: 'Orbit', message: 'Do many things', tools: true });
-  assert.equal(text, 'Done — created 4 tasks.');
-  assert.equal(toolCalls.length, 4);
-  assert.equal(requests, 5);
-  assert.equal(fifthHadTools, false);
+  assert.equal(text, 'Done — created 2 tasks.');
+  assert.equal(toolCalls.length, 2);
+  assert.equal(requests, 3);
+  assert.equal(thirdHadTools, false);
 });
 
 test('deep_research requires a topic', async () => {
