@@ -3,7 +3,7 @@ import { todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
 const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
-const MAX_TOOL_ITERATIONS = 4;
+const MAX_TOOL_ITERATIONS = 2;
 const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
 const MAX_TRANSIENT_MODEL_ATTEMPTS = 3;
 
@@ -353,7 +353,7 @@ export function createModelClient(env = process.env) {
         return {
           model: modelName,
           store: false,
-          max_output_tokens: 1200,
+          max_output_tokens: 600,
           ...(tools ? { tools: TOOL_DEFINITIONS } : {}),
           ...(modernCache ? { prompt_cache_options: { mode: 'implicit', ttl: '30m' } } : {}),
           input: modernCache ? modelInput : withoutCacheBreakpoints(modelInput),
