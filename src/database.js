@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
-import { normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
+import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -279,6 +279,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'memories', 'confidence', 'REAL NOT NULL DEFAULT 1');
   ensureColumn(db, 'memories', 'expires_at', 'TEXT');
   ensureColumn(db, 'memories', 'last_confirmed_at', 'TEXT');
+  ensureColumn(db, 'memories', 'last_mentioned_at', 'TEXT');
+  ensureColumn(db, 'memories', 'relevance_score', 'REAL NOT NULL DEFAULT 1.0');
+  ensureColumn(db, 'memories', 'superseded_by', 'TEXT');
   ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
   ensureColumn(db, 'memory_suggestions', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
   ensureColumn(db, 'follow_ups', 'priority', 'INTEGER NOT NULL DEFAULT 2');
@@ -363,8 +366,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
-    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)`),
+    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL)`),
     listMemories: db.prepare("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,rowid DESC LIMIT 100"),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
     addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES (?,?,?,?,?,?)'),
@@ -599,10 +602,41 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         kind:normalizeMemoryKind(options.kind),source:String(options.source||'user').slice(0,40),status:'approved',
         confidence:Math.max(0,Math.min(Number(options.confidence??1),1)),expires_at:options.expiresAt||null,last_confirmed_at:now};
       s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at);
+      // Contradiction detection: if the new memory conflicts with an existing one,
+      // mark the old one as superseded (kept for history, excluded from context).
+      try {
+        const contradiction=detectContradiction(content,s.listMemories.all(userId));
+        if(contradiction&&contradiction.contradicted&&contradiction.contradicted.id!==row.id){
+          db.prepare("UPDATE memories SET superseded_by=?,updated_at=? WHERE id=? AND user_id=?").run(row.id,now,contradiction.contradicted.id,userId);
+          row.superseded=contradiction.contradicted.id;
+        }
+      } catch {}
       return row;
     },
     listMemories: (userId) => s.listMemories.all(userId),
-    listRelevantMemories(userId,query,limit=8){return rankMemories(s.listMemories.all(userId),query,limit);},
+    listRelevantMemories(userId,query,limit=8){
+      const ranked=rankMemories(s.listMemories.all(userId),query,limit);
+      // Episodic recall: stamp last_mentioned_at whenever a memory is used in context.
+      if(ranked.length){
+        const now=timestamp();
+        const touch=db.prepare("UPDATE memories SET last_mentioned_at=? WHERE id=? AND user_id=?");
+        for(const memory of ranked) touch.run(now,memory.id,userId);
+      }
+      return ranked;
+    },
+    // Memory decay: recalculate relevance scores based on inactivity.
+    // Run during the daily learning cycle.
+    applyMemoryDecay(userId){
+      const nowMs=Date.now();
+      const update=db.prepare("UPDATE memories SET relevance_score=? WHERE id=? AND user_id=?");
+      let updated=0;
+      for(const memory of s.listMemories.all(userId)){
+        const newScore=calculateRelevance(memory,nowMs);
+        const current=Number.isFinite(Number(memory.relevance_score))?Number(memory.relevance_score):1.0;
+        if(Math.abs(newScore-current)>0.01){update.run(newScore,memory.id,userId);updated++;}
+      }
+      return updated;
+    },
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
     addMemorySuggestion(userId,content,options={}){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),

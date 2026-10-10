@@ -63,6 +63,9 @@ CREATE TABLE IF NOT EXISTS memories (
   confidence DOUBLE PRECISION NOT NULL DEFAULT 1,
   expires_at TEXT,
   last_confirmed_at TEXT,
+  last_mentioned_at TEXT,
+  relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+  superseded_by TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
