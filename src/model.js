@@ -85,15 +85,30 @@ function validateBaseUrl(value, allowInsecure) {
   return url.toString().replace(/\/$/, '');
 }
 
+const CITATION_START = '\uE200';
+const CITATION_END = '\uE201';
+
+export function stripCitationMarkers(value) {
+  return String(value || '')
+    // OpenAI search citations use private-use delimiters, for example:
+    // \uE200cite\uE202turn0search0\uE202turn0search1\uE201.
+    .replace(/\uE200[\s\S]*?(?:\uE201|$)/g, '')
+    // Retain compatibility with the legacy marker form handled by earlier releases.
+    .replace(/≡(?:[^≡]*≡)+/g, '');
+}
+
 function extractText(payload) {
-  if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text.trim();
+  if (typeof payload.output_text === 'string') {
+    const directText = stripCitationMarkers(payload.output_text).trim();
+    if (directText) return directText;
+  }
   const parts = [];
   for (const item of payload.output || []) {
     for (const content of item.content || []) {
       if (content.type === 'output_text' && typeof content.text === 'string') parts.push(content.text);
     }
   }
-  return parts.join('\n').trim().replace(/≡(?:[^≡]*≡)+/g, '');
+  return stripCitationMarkers(parts.join('\n')).trim();
 }
 
 // Parses a Responses API server-sent-events stream, rebuilding the output items
@@ -104,6 +119,21 @@ export async function parseResponsesStream(body, onToken) {
   const decoder = new TextDecoder();
   const items = new Map();
   const order = [];
+  let insideCitation = false;
+  const emitVisibleText = (delta) => {
+    let visible = '';
+    for (const character of String(delta || '')) {
+      if (insideCitation) {
+        if (character === CITATION_END) insideCitation = false;
+      } else if (character === CITATION_START) {
+        insideCitation = true;
+      } else {
+        visible += character;
+      }
+    }
+    const clean = stripCitationMarkers(visible);
+    if (clean && onToken) onToken(clean);
+  };
   const getItem = (index) => {
     if (!items.has(index)) {
       items.set(index, {});
@@ -140,7 +170,7 @@ export async function parseResponsesStream(body, onToken) {
     } else if (type === 'response.output_text.delta') {
       const item = getItem(event.output_index);
       item._text = (item._text || '') + String(event.delta || '');
-      if (onToken) onToken(String(event.delta || '').replace(/≡(?:[^≡]*≡)+/g, ''));
+      emitVisibleText(event.delta);
     } else if (type === 'response.function_call_arguments.delta') {
       const item = getItem(event.output_index);
       item.arguments = (item.arguments || '') + String(event.delta || '');
@@ -174,7 +204,7 @@ export async function parseResponsesStream(body, onToken) {
   return order.map((index) => {
     const item = items.get(index);
     const { _text, ...clean } = item;
-    if (clean.type === 'message') clean.content = [{ type: 'output_text', text: _text || '' }];
+    if (clean.type === 'message') clean.content = [{ type: 'output_text', text: stripCitationMarkers(_text) }];
     return clean;
   });
 }

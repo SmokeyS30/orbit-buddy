@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { parseResponsesStream, createModelClient } from '../src/model.js';
+import { parseResponsesStream, createModelClient, stripCitationMarkers } from '../src/model.js';
 import { createOrbitServer } from '../server.js';
 
 function sseBody(chunks) {
@@ -39,23 +39,32 @@ test('parseResponsesStream rebuilds text and calls onToken per delta', async () 
   assert.deepEqual(output[0].content, [{ type: 'output_text', text: 'Hello world' }]);
 });
 
-test('streaming tokens strip full chained citation markers', async () => {
+test('streaming tokens strip real citation marker chains split across deltas', async () => {
   const tokens = [];
-  await parseResponsesStream(sseBody([
+  const output = await parseResponsesStream(sseBody([
     sse({ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_1' } }),
-    sse({ type: 'response.output_text.delta', output_index: 0, delta: 'Answer ≡cite1≡turn2≡search3≡ done' }),
+    sse({ type: 'response.output_text.delta', output_index: 0, delta: 'Answer \uE200ci' }),
+    sse({ type: 'response.output_text.delta', output_index: 0, delta: 'te\uE202turn0sea' }),
+    sse({ type: 'response.output_text.delta', output_index: 0, delta: 'rch0\uE202turn0search1\uE201 done' }),
     'data: [DONE]\n\n'
   ]), (delta) => tokens.push(delta));
 
-  assert.deepEqual(tokens, ['Answer  done']);
+  assert.equal(tokens.join(''), 'Answer  done');
+  assert.equal(output[0].content[0].text, 'Answer  done');
 });
 
-test('non-streaming responses strip full chained citation markers', async (t) => {
+test('non-streaming responses strip real and legacy citation marker chains', async (t) => {
+  let calls = 0;
   const stub = http.createServer((req, res) => {
     req.resume();
     req.on('end', () => {
+      calls += 1;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Answer ≡cite1≡turn2≡search3≡ done' }] }] }));
+      if (calls === 1) {
+        res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Answer \uE200cite\uE202turn0search0\uE202turn0search1\uE201 done' }] }] }));
+      } else {
+        res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Answer ≡cite1≡turn2≡search3≡ done' }] }] }));
+      }
     });
   });
   await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
@@ -67,9 +76,12 @@ test('non-streaming responses strip full chained citation markers', async (t) =>
     ALLOW_INSECURE_MODEL_URL: 'true'
   });
 
-  const result = await model.respond({ buddyName: 'Orbit', message: 'Hello' });
+  const directResult = await model.respond({ buddyName: 'Orbit', message: 'Hello' });
+  const legacyResult = await model.respond({ buddyName: 'Orbit', message: 'Hello again' });
 
-  assert.equal(result.text, 'Answer  done');
+  assert.equal(directResult.text, 'Answer  done');
+  assert.equal(legacyResult.text, 'Answer  done');
+  assert.equal(stripCitationMarkers('Before \uE200cite\uE202turn0search0\uE201 after'), 'Before  after');
 });
 
 test('parseResponsesStream reconstructs function calls', async () => {
