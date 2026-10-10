@@ -2,6 +2,7 @@ import { TOOL_DEFINITIONS, executeTool, summarizeToolCall } from './tools.js';
 import { todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
+const DEFAULT_COMPLEX_MODEL = 'gpt-6.1-sol';
 const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const MAX_TOOL_ITERATIONS = 2;
 const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
@@ -185,6 +186,7 @@ export function createModelClient(env = process.env) {
   const usingAzure = Boolean(azureEndpoint && azureApiKey && azureDeployment);
   const apiKey = usingAzure ? azureApiKey : env.OPENAI_API_KEY?.trim();
   const model = normalizeModelName(usingAzure ? azureDeployment : env.OPENAI_MODEL) || DEFAULT_MODEL;
+  const complexModel = normalizeModelName(env.OPENAI_COMPLEX_MODEL) || DEFAULT_COMPLEX_MODEL;
   const configuredFallbacks = String(
     usingAzure
       ? env.AZURE_OPENAI_FALLBACK_DEPLOYMENTS || ''
@@ -452,23 +454,30 @@ export function createModelClient(env = process.env) {
       ];
       const toolCalls = [];
       let lastOutput = [];
-      let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
+      const useComplexModel = String(message || '').length > 800;
+      const routeTargetModel = useComplexModel ? complexModel : model;
+      let selectedModel = useComplexModel ? complexModel : preferredModel;
       const callWithFallback = async (request, input) => {
         // Only use the explicitly configured compatibility chain. The models
         // endpoint can contain dozens of specialized models that are not safe
         // drop-in replacements for a chat response.
-        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
+        const candidates = uniqueModels([
+          selectedModel,
+          ...(useComplexModel ? [model] : []),
+          ...fallbackModels
+        ]);
         const unavailable = [];
         let transientAttempts = 0;
         for (const candidate of candidates) {
           selectedModel = candidate;
           try {
             const output = await request(input, selectedModel);
-            preferredModel = selectedModel;
-            health.state = selectedModel === model ? 'ready' : 'fallback';
+            if (!useComplexModel || selectedModel !== complexModel) preferredModel = selectedModel;
+            const routeSucceeded = selectedModel === routeTargetModel;
+            health.state = routeSucceeded ? 'ready' : 'fallback';
             health.activeModel = selectedModel;
             health.checkedAt = new Date().toISOString();
-            health.lastError = selectedModel === model ? null : `${unavailable.join(', ') || model} unavailable; using ${selectedModel}.`;
+            health.lastError = routeSucceeded ? null : `${unavailable.join(', ') || routeTargetModel} unavailable; using ${selectedModel}.`;
             return output;
           } catch (error) {
             error.classification = error?.classification || classifyModelError(error);
