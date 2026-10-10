@@ -69,6 +69,18 @@ test('user preferences and typed memory are exposed in the snapshot', async (t) 
   assert.equal(snapshot.memories[0].kind, 'goal');
 });
 
+test('snapshot hides citation markers from previously saved assistant replies', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const userId = auth.body.user.id;
+  const conversation = app.db.ensureDefaultConversation(userId);
+  app.db.addMessage(userId, conversation.id, 'assistant', 'Saved answer \uE200cite\uE202turn0search0\uE201 remains readable.');
+
+  const snapshot = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } })).json();
+
+  assert.equal(snapshot.messages.at(-1).content, 'Saved answer  remains readable.');
+});
+
 test('goal and routine endpoints update the proactive snapshot', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
