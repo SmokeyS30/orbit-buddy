@@ -275,7 +275,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         kind: normalizeMemoryKind(options.kind), source: String(options.source||'user').slice(0, 40), status: 'approved',
         confidence: Math.max(0, Math.min(Number(options.confidence ?? 1), 1)), expires_at: options.expiresAt || null, last_confirmed_at: now };
       await run(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, NULL, 1.0, NULL)`,
         row.id, row.user_id, row.content, row.created_at, row.updated_at, row.kind, row.source, row.confidence, row.expires_at, row.last_confirmed_at);
       // Contradiction detection: mark the old memory as superseded (kept for history, excluded from context).
       try {
