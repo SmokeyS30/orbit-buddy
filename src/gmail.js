@@ -42,13 +42,18 @@ export async function searchEmails(getToken, { query, max = 5 }) {
   const messages = list.messages || [];
   const results = [];
   for (const m of messages) {
-    const full = await apiFetch(getToken, `/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`);
-    const headers = Object.fromEntries((full.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
-    results.push({
-      id: m.id,
-      from: headers.from || '', subject: headers.subject || '(no subject)',
-      date: headers.date || '', snippet: full.snippet || ''
-    });
+    try {
+      const full = await apiFetch(getToken, `/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`);
+      const headers = Object.fromEntries((full.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
+      results.push({
+        id: m.id,
+        from: headers.from || '', subject: headers.subject || '(no subject)',
+        date: headers.date || '', snippet: full.snippet || ''
+      });
+    } catch (e) {
+      // Skip messages that fail to fetch (e.g. deleted or modified between list and get)
+      console.warn(`Skipping email ${m.id}: ${e.message}`);
+    }
   }
   return { count: results.length, emails: results };
 }
