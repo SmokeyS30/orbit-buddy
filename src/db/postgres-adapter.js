@@ -97,13 +97,51 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     await client.query('SELECT 1');
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT \'legacy\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT \'approved\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 1',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_confirmed_at TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_mentioned_at TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding TEXT',
+      'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
+      'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 2',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS next_attempt_at TEXT',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_error TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_expires_at TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_error TEXT',
+      'ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_outreach_at TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_date TEXT',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS context_summary TEXT',
+      'ALTER TABLE personal_dates ADD COLUMN IF NOT EXISTS gift_nag INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE personal_dates ADD COLUMN IF NOT EXISTS gift_done INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS sentiment TEXT',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS last_context_update TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_tone TEXT NOT NULL DEFAULT \'motivational\'',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_length TEXT NOT NULL DEFAULT \'quick\'',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS buddy_name TEXT',
+      'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
     ];
-    for (const sql of migrations) {
-      try { await client.query(sql); } catch (e) { /* column may already exist */ }
+const indexMigrations = [
+      'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)',
+    ];
+    for (const sql of [...migrations, ...indexMigrations]) {
+      try { await client.query(sql); } catch (e) { /* may already exist */ }
     }
   } finally {
     client.release();
