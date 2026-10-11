@@ -207,6 +207,11 @@ export function createOrbitServer(options={}) {
   function getClientIp(req){
     // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
     // Take the leftmost (original client) IP, validate format to prevent header injection.
+    const cfIp=req.headers['cf-connecting-ip'];
+    if(cfIp){
+      const ip=String(cfIp).trim();
+      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
+    }
     const fwd=req.headers['x-forwarded-for'];
     if(fwd){
       const ip=String(fwd).split(',')[0].trim();
@@ -217,7 +222,7 @@ export function createOrbitServer(options={}) {
   }
   function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
-  function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
+  function hourlyLimited(req,limit,scope){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
   function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
   const paused=()=>db.getSetting('system_paused','false')==='true';
