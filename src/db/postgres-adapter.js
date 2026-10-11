@@ -806,6 +806,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     },
     listArtifacts: async (userId) => all('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200', userId),
     getArtifact: async (userId, id) => get('SELECT * FROM artifacts WHERE id=? AND user_id=?', id, userId),
+    deleteArtifact: async (userId, id) => { const r = await run('DELETE FROM artifacts WHERE id=? AND user_id=?', id, userId); return (r.rowCount||r.changes||0)>0; },
 
     // --- Push subscriptions ---
     savePush: async (userId, { endpoint, keys }) => {

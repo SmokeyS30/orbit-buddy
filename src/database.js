@@ -513,6 +513,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addArtifact: db.prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     listArtifacts: db.prepare('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200'),
     getArtifact: db.prepare('SELECT * FROM artifacts WHERE id=? AND user_id=?'),
+    deleteArtifact: db.prepare('DELETE FROM artifacts WHERE id=? AND user_id=?'),
     addPush: db.prepare(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
       ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`),
     listPush: db.prepare('SELECT * FROM push_subscriptions WHERE user_id=?'),
@@ -825,6 +826,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addArtifact(userId,{taskId=null,name,mimeType='text/markdown',content}) { const now=timestamp(); const size=Buffer.byteLength(content); const row={id:randomUUID(),user_id:userId,task_id:taskId,name,mime_type:mimeType,content,size_bytes:size,created_at:now}; s.addArtifact.run(row.id,row.user_id,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at); return row; },
     listArtifacts: (userId) => s.listArtifacts.all(userId),
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
+    deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
     savePush(userId,{endpoint,keys}) { s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp()); },
     listPush: (userId) => s.listPush.all(userId),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
