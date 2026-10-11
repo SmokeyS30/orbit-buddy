@@ -37,6 +37,7 @@ export async function getEmbedding(text, apiKey) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ model: EMBEDDING_MODEL, input }),
+    signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => '');

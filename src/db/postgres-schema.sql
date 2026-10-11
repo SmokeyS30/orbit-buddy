@@ -418,3 +418,6 @@ CREATE INDEX IF NOT EXISTS idx_project_steps ON project_steps(user_id, project_i
 CREATE INDEX IF NOT EXISTS idx_approvals_user ON approvals(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_people_stale ON people_mentions(user_id, dismissed, last_mentioned_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id);

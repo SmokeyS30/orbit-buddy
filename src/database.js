@@ -271,6 +271,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)');
   for (const row of db.prepare('SELECT DISTINCT user_id FROM messages WHERE conversation_id IS NULL AND user_id IS NOT NULL').all()) adoptOrphanMessages(db, row.user_id);
   ensureColumn(db, 'memories', 'user_id', 'TEXT');
   ensureColumn(db, 'memories', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
