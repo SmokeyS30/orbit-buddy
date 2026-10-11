@@ -1442,20 +1442,28 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const name=body.name&&String(body.name).trim()?cleanText(body.name,80,'name'):null;
         if(!email)throw Object.assign(new Error('Valid email required.'),{status:400});
         const id='wl_'+randomToken(12);
+        const joinedAt=new Date().toISOString();
         try{
           db.addWaitlistEntry({id,email,name});
         }catch(e){
           if(String(e.message||'').includes('UNIQUE'))throw Object.assign(new Error('This email is already on the waitlist.'),{status:409});
           throw e;
         }
+        let position=1,estimateText='about 1\u20132 weeks';
+        try{
+          position=Number(db.waitlistPosition(joinedAt))||1;
+          const perWeek=Math.max(1,parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10);
+          const weeks=Math.max(1,Math.ceil(position/perWeek));
+          estimateText=weeks===1?'about a week':`about ${weeks} weeks`;
+        }catch{}
         // Confirmation email
         try{
           const {sendEmail}=await import('./src/email.js');
           await sendEmail(process.env,{
             to:email,
             subject:'You\'re on the Orbit Buddy waitlist',
-            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion.\n\nWe're letting new users in gradually to keep things fast and stable. Most people hear back within 1–2 weeks. We'll email you the moment your spot is ready.\n\n— The Orbit Buddy team`,
-            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion.</p><p>We're letting new users in gradually to keep things fast and stable. <strong>Most people hear back within 1–2 weeks.</strong> We'll email you the moment your spot is ready.</p><p>— The Orbit Buddy team</p>`
+            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion.\n\nYou're #${position} in line. We're letting new users in gradually to keep things fast and stable, so your estimated wait is ${estimateText}. We'll email you the moment your spot is ready.\n\n— The Orbit Buddy team`,
+            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion.</p><p>We're letting new users in gradually to keep things fast and stable. <strong>You're <strong>#${position}</strong> in line, with an estimated wait of <strong>${estimateText}</strong>.</p><p>We'll email you the moment your spot is ready.</p><p>— The Orbit Buddy team</p>`
           });
         }catch{}
         // Notify owner
@@ -1476,6 +1484,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
         db.updateWaitlistStatus(id,status);
         return json(res,200,{ok:true});
+      }
+      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
+        requireOwner(req);
+        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+        requireOwner(req);
+        const body=await readJson(req);
+        const n=parseInt(body.invitesPerWeek,10);
+        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
+        db.setSetting('waitlist_invites_per_week',String(n));
+        return json(res,200,{ok:true,invitesPerWeek:n});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
