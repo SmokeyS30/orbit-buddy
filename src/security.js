@@ -7,8 +7,8 @@ export const hashToken = (value) => createHash('sha256').update(String(value)).d
 export const randomToken = (bytes = 32) => randomBytes(bytes).toString('base64url');
 
 export async function hashPassword(password, salt = randomBytes(16).toString('base64url')) {
-  if (typeof password !== 'string' || password.length < 12 || password.length > 256) {
-    throw Object.assign(new Error('Password must contain 12 to 256 characters.'), { status: 400 });
+  if (typeof password !== 'string' || password.length < 8 || password.length > 256) {
+    throw Object.assign(new Error('Password must contain 8 to 256 characters.'), { status: 400 });
   }
   const derived = await scrypt(password, salt, 64, { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
   return { hash: Buffer.from(derived).toString('base64url'), salt };
