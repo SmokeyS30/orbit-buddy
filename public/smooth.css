@@ -135,3 +135,8 @@ button:active,
     transition: none !important;
   }
 }
+
+/* File card actions */
+.card-actions{display:flex;gap:8px;align-items:center;}
+.link-button.danger{color:#ff6b6b;border:1px solid #ff6b6b55;background:transparent;padding:6px 12px;border-radius:8px;cursor:pointer;font-size:14px;}
+.link-button.danger:active{transform:scale(0.96);}
