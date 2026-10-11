@@ -894,6 +894,10 @@ const indexMigrations = [
       return row;
     },
     pruneDoorTokens: async () => { await run('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL', timestamp()); },
+    addPasswordResetToken: async (tokenHash, userId, expiresAt) => { await run('INSERT INTO password_reset_tokens VALUES (?, ?, ?, 0, ?)', tokenHash, userId, expiresAt, timestamp()); },
+    getPasswordResetToken: async (tokenHash) => get('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?', tokenHash, timestamp()),
+    markPasswordResetTokenUsed: async (tokenHash) => { const r = await run('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0', tokenHash); return (r.changes||0)>0; },
+    cleanExpiredPasswordResetTokens: async () => { await run('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1', timestamp()); },
 
     // --- Export / restore ---
     async exportUser(userId) {

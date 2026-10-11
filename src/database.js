@@ -252,6 +252,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS door_tokens (
       token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -539,7 +544,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addDoorToken: db.prepare('INSERT INTO door_tokens VALUES (?, ?, NULL, ?)'),
     consumeDoorToken: db.prepare('SELECT * FROM door_tokens WHERE token_hash=? AND used_at IS NULL AND expires_at>?'),
     useDoorToken: db.prepare('UPDATE door_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL'),
-    pruneDoorTokens: db.prepare('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL')
+    pruneDoorTokens: db.prepare('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL'),
+    addPwResetToken: db.prepare('INSERT INTO password_reset_tokens VALUES (?, ?, ?, 0, ?)'),
+    getPwResetToken: db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?'),
+    usePwResetToken: db.prepare('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0'),
+    cleanPwResetTokens: db.prepare('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1')
   };
 
   return {
@@ -845,6 +854,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     dismissAccessRequest: (id) => s.dismissAccessRequest.run(timestamp(),id).changes>0,
     addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
     consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
+    addPasswordResetToken(tokenHash,userId,expiresAt) { s.addPwResetToken.run(tokenHash,userId,expiresAt,timestamp()); },
+    getPasswordResetToken(tokenHash) { return s.getPwResetToken.get(tokenHash,timestamp()); },
+    markPasswordResetTokenUsed(tokenHash) { return s.usePwResetToken.run(tokenHash).changes>0; },
+    cleanExpiredPasswordResetTokens() { s.cleanPwResetTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
     exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {

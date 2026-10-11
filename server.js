@@ -15,6 +15,7 @@ import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
+import { sendEmail as sendResendEmail } from './src/email.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -29,6 +30,7 @@ function json(res,status,body,headers={}) { res.writeHead(status,{ 'Content-Type
 function cleanText(value,max,field) { if(typeof value!=='string'||!value.trim()) throw Object.assign(new Error(`${field} is required.`),{status:400}); return value.trim().slice(0,max); }
 function optionalText(value,max) { return typeof value==='string'&&value.trim()?value.trim().slice(0,max):null; }
 function safeEmail(value) { const email=String(value||'').trim().toLowerCase(); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254) throw Object.assign(new Error('A valid email is required.'),{status:400}); return email; }
+
 // Feed URLs are secrets (anyone holding one can read the calendar): never send
 // the full URL to the client, log it, or put it in activity events.
 function maskFeedUrl(raw) { try { const url=new URL(String(raw)); const tail=String(url.pathname||'').replace(/\/$/,'').slice(-4); return `${url.protocol}//${url.host}/\u2026${tail}`; } catch { return 'invalid url'; } }
@@ -179,6 +181,18 @@ export function createOrbitServer(options={}) {
   const model=createModelClient(env);
   const push=createPushService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
+
+  // Send a password reset email via Resend. Returns true if sent, false otherwise (never throws).
+  async function sendPasswordResetEmail({to,resetUrl}){
+    try{
+      return await sendResendEmail(env,{
+        to,
+        subject:'Reset your Orbit password',
+        text:`Someone requested a password reset for your Orbit account.\n\nReset your password here (expires in 1 hour):\n${resetUrl}\n\nIf you didn't request this, you can safely ignore this email.`,
+        html:`<p>Someone requested a password reset for your Orbit account.</p><p><a href="${resetUrl}">Reset your password</a> (expires in 1 hour).</p><p style="color:#666;font-size:.9em;">If you didn't request this, you can safely ignore this email.</p>`
+      });
+    }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
+  }
   const production=env.NODE_ENV==='production';
   const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
@@ -1474,6 +1488,40 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const recovered=user&&db.consumeRecoveryCode(hashToken(String(body.recoveryCode||'').trim().toUpperCase()));
         if(!recovered||recovered.user_id!==user.id)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});const password=await hashPassword(body.newPassword);db.updatePassword(user.id,password.hash,password.salt);db.deleteUserSessions(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
       }
+      if(req.method==='POST'&&url.pathname==='/api/auth/forgot-password'){
+        if(hourlyLimited(req,5,'forgot-pw'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);let email=null;try{email=safeEmail(body.email);}catch(_){}
+        if(email){
+          const user=db.getUserByEmail(email);
+          if(user&&!user.disabled){
+            const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();
+            db.addPasswordResetToken(hashToken(token),user.id,expiresAt);
+            db.cleanExpiredPasswordResetTokens();
+            const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;
+            const emailed=await sendPasswordResetEmail({to:email,resetUrl});
+            if(!emailed){
+              const owner=db.listUsers().find((u)=>u.role==='owner');
+              if(owner) await push.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});
+            }
+          }
+        }
+        return json(res,200,{ok:true});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/reset-password'){
+        if(hourlyLimited(req,10,'reset-pw'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);const token=String(body.token||'').trim();
+        if(!token)throw Object.assign(new Error('Reset token is required.'),{status:400});
+        const record=db.getPasswordResetToken(hashToken(token));
+        if(!record)throw Object.assign(new Error('This reset link is invalid or has expired.'),{status:400});
+        const newPassword=String(body.newPassword||'');
+        let hashed;try{ hashed=await hashPassword(newPassword); }catch(e){ throw Object.assign(new Error(e.message||'Password was not accepted.'),{status:400}); }
+        db.updatePassword(record.user_id,hashed.hash,hashed.salt);
+        db.markPasswordResetTokenUsed(hashToken(token));
+        db.deleteUserSessions(record.user_id);
+        db.addEvent(record.user_id,'password_reset','Password was reset via email link.');
+        db.cleanExpiredPasswordResetTokens();
+        return json(res,200,{ok:true});
+      }
 
       const callback=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/callback$/);
       if(req.method==='GET'&&callback){const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
@@ -1723,6 +1771,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       }
     } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';return json(res,error.status||500,{error:message}); }
 
+    if(url.pathname==='/reset-password'&&['GET','HEAD'].includes(req.method)){const resolved=path.resolve(publicRoot,'./index.html');res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);return;}
     if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});const requestPath=url.pathname==='/'?'/index.html':url.pathname;let resolved;try{resolved=path.resolve(publicRoot,`.${decodeURIComponent(requestPath)}`);}catch{return json(res,404,{error:'Not found.'});}if(!resolved.startsWith(`${publicRoot}${path.sep}`))return json(res,404,{error:'Not found.'});
     try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();const shellAsset=['index.html','app.js','sw.js'].includes(path.basename(resolved));res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':shellAsset?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
   });

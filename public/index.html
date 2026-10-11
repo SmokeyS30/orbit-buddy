@@ -730,8 +730,11 @@
           >New password<input
             id="auth-new-password"
             type="password"
-            minlength="12"
+            minlength="8"
         /></label>
+        <p id="forgot-row" class="hidden" style="text-align:right;margin:4px 0 0;">
+          <button type="button" id="show-forgot" class="ghost" style="font-size:.85em;padding:4px 8px;">Forgot password?</button>
+        </p>
         <p id="auth-error" class="error" role="alert"></p>
         <div id="auth-closed" class="hidden">
           <p>Registration is closed — ask the owner for access.</p>
@@ -763,6 +766,19 @@
           <button type="button" id="try-demo" class="ghost wide">Try the demo — no signup needed</button>
           <p class="muted" style="font-size:.8em;margin-top:8px;">Explore Orbit Buddy with sample data. Demo resets after 1 hour.</p>
         </div>
+      </form>
+    </dialog>
+    <dialog id="reset-dialog">
+      <form id="reset-form" class="login-card" method="dialog">
+        <div class="brand-mark large"><span></span></div>
+        <p class="eyebrow">PASSWORD RESET</p>
+        <h2>Set a new password</h2>
+        <p class="muted">Choose a new password for your Orbit account.</p>
+        <label>New password<input id="reset-password" type="password" minlength="8" required autocomplete="new-password" /></label>
+        <label>Confirm password<input id="reset-confirm" type="password" minlength="8" required autocomplete="new-password" /></label>
+        <p id="reset-error" class="error" role="alert"></p>
+        <p id="reset-success" class="hint hidden">Password reset! You can now <button type="button" id="reset-goto-login" class="ghost" style="font-size:1em;padding:0;">sign in</button>.</p>
+        <button id="reset-submit" class="primary wide" type="submit">Reset password</button>
       </form>
     </dialog>
     <dialog id="name-dialog">
