@@ -140,18 +140,23 @@ export async function toolFetchUrl(args = {}) {
   return { url: finalUrl, text: text.slice(0, 6000) };
 }
 
+const geoCache = new Map();
 export async function toolGetWeather(args = {}) {
   const location = String(args.location || '').trim().slice(0, 100) || 'Brewster, MA';
-  // Geocode the location (Open-Meteo, free, no key)
-  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
-  let geo;
-  try {
-    const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    const data = await res.json();
-    if (!data.results?.length) throw new Error('Location not found.');
-    geo = data.results[0];
-  } catch (e) {
-    throw new Error(`Could not find "${location}": ${e.message}`);
+  // Geocode the location (Open-Meteo, free, no key) - cached to avoid repeat lookups
+  const cacheKey = location.toLowerCase();
+  let geo = geoCache.get(cacheKey);
+  if (!geo) {
+    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
+    try {
+      const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      const data = await res.json();
+      if (!data.results?.length) throw new Error('Location not found.');
+      geo = data.results[0];
+      geoCache.set(cacheKey, geo);
+    } catch (e) {
+      throw new Error(`Could not find "${location}": ${e.message}`);
+    }
   }
   // Get weather (Fahrenheit, since user is US-based)
   const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=3`;
