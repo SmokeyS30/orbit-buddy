@@ -3,13 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
-import { createModelClient } from './src/model.js';
+import { createModelClient, stripCitationMarkers } from './src/model.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
+import { searchMessages, formatSearchResults } from './src/conversation-search.js';
+import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
@@ -152,7 +154,8 @@ export function stripSuggestMarkers(text){
   if(typeof text!=='string')return text;
   return text.replace(/\[SUGGEST_MEMORY:[^\]\n]*\]/gi,'').replace(/\n{3,}/g,'\n\n').trim();
 }
-export function stripModelMarkers(text){return stripSuggestMarkers(stripFollowUpMarkers(text));}
+export function stripModelMarkers(text){return stripCitationMarkers(stripSuggestMarkers(stripFollowUpMarkers(text)));}
+function sanitizeAssistantMessages(messages){return messages.map((message)=>message.role==='assistant'?{...message,content:stripModelMarkers(message.content)}:message);}
 // Quiet-nudge timing: idle >48h since the user's last message, and no nudge in the last 7 days.
 // Detects when the user is correcting a misunderstanding — a high-value learning signal.
 export function isCorrectionMessage(text){
@@ -171,7 +174,7 @@ export function createOrbitServer(options={}) {
   const defaultBuddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
-  const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey});
+  const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey,databaseUrl:env.DATABASE_URL});
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=createModelClient(env);
   const push=createPushService(env,db);
@@ -187,7 +190,18 @@ export function createOrbitServer(options={}) {
   }
 
   const requestLog=new Map();
-  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  function getClientIp(req){
+    // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
+    // Take the leftmost (original client) IP, validate format to prevent header injection.
+    const fwd=req.headers['x-forwarded-for'];
+    if(fwd){
+      const ip=String(fwd).split(',')[0].trim();
+      // Basic IPv4/IPv6 validation
+      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
+    }
+    return req.socket.remoteAddress||'unknown';
+  }
+  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
   function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
@@ -314,6 +328,8 @@ export function createOrbitServer(options={}) {
       const lastLearned=db.getSetting(`last_learning_${user.id}`);
       if(lastLearned&&lastLearned.slice(0,10)===today)continue;
 
+      // Memory decay: fade relevance of unused memories (runs once daily per user)
+      try{db.applyMemoryDecay(user.id);}catch(e){}
       // Get recent messages (last 24h, up to 40)
       const messages=db.listMessages(user.id,40);
       const cutoff=nowMs-24*3600_000;
@@ -1299,7 +1315,40 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
 
   let backupBusy=false;
-  async function runBackups(){if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;const today=new Date().toISOString().slice(0,10);if(db.getSetting('last_automatic_backup')===today)return;backupBusy=true;try{for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,passphrase:env.BACKUP_ENCRYPTION_KEY});db.setSetting('last_automatic_backup',today);}finally{backupBusy=false;}}
+  // Durable backups go to the Azure Files mount (BACKUP_DIR) when configured;
+  // otherwise they fall back to the local dataDir. This keeps portable
+  // encrypted backups off ephemeral container storage in production.
+  const backupDir = env.BACKUP_DIR || null;
+  function backupStatus(){
+    if(!env.BACKUP_ENCRYPTION_KEY)return{configured:false,state:'disabled'};
+    let lastSuccess=null,lastError=null,expectedFiles=1;
+    try{lastSuccess=db.getSetting('last_automatic_backup')||null;}catch{}
+    try{lastError=db.getSetting('last_backup_error')||null;}catch{}
+    try{expectedFiles=Math.max(1,db.listUsers().length);}catch{}
+    const directory=backupDir||path.join(dataDir,'backups');
+    let fileCount=0;
+    try{fileCount=fs.readdirSync(directory).filter((name)=>name.endsWith('.orbitbackup')).length;}catch{}
+    const today=new Date().toISOString().slice(0,10);
+    const yesterday=new Date(Date.now()-24*60*60_000).toISOString().slice(0,10);
+    const fresh=lastSuccess===today||lastSuccess===yesterday;
+    const state=lastError?'error':!lastSuccess?'pending':!fresh?'stale':fileCount<expectedFiles?'missing':'ready';
+    return{configured:true,state,lastSuccess,lastError:lastError||null,fileCount,expectedFiles};
+  }
+  async function runBackups(){
+    if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;
+    const today=new Date().toISOString().slice(0,10);
+    try{if(db.getSetting('last_automatic_backup')===today)return;}catch(e){console.error('Backup check failed:',e.message);}
+    backupBusy=true;
+    try{
+      for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,backupDir,passphrase:env.BACKUP_ENCRYPTION_KEY});
+      try{db.setSetting('last_automatic_backup',today);db.setSetting('last_backup_error','');}catch(e){console.error('Backup status update failed:',e.message);}
+      console.log(`Automated backup completed for ${today}`);
+    }catch(e){
+      // Log safely without exposing key material or backup contents
+      console.error('Automated backup failed:',e.message);
+      try{db.setSetting('last_backup_error',String(e.message).slice(0,200));}catch{}
+    }finally{backupBusy=false;}
+  }
 
   const server=http.createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
@@ -1308,7 +1357,24 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
     const url=new URL(req.url,'http://localhost');
-    if(url.pathname==='/healthz'){const modelStatus=model.diagnostics();return json(res,200,{ok:true,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount}});}
+    // Shallow liveness: Node process is alive (no DB check to avoid restart loops)
+    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy'});}
+    // Readiness: PostgreSQL must be reachable
+    if(url.pathname==='/readyz'){
+      let dbState='ready';const dbDriver=db.driver||'unknown';
+      try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
+      const ok=dbState==='ready';
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',database:{driver:dbDriver,state:dbState}});
+    }
+    if(url.pathname==='/healthz'){
+      const modelStatus=model.diagnostics();
+      let dbState='ready';const dbDriver=db.driver||'unknown';
+      try{db.getSetting('healthz_probe');}catch(e){dbState='error';}
+      const ok=dbState==='ready';
+      // AI status reported separately; DB failure sets ok=false and 503
+      const backup=backupStatus();
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
+    }
     if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
       const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
       try{
@@ -1322,15 +1388,6 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
-        try{cleanupExpiredDemos(db);}catch{}
-        const user=db.createDemoUser();
-        seedDemoData(db,user.id);
-        const csrf=createSession(user,req,res);
-        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/demo/start'){
-        if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
-        // Clean up expired demos opportunistically
         try{cleanupExpiredDemos(db);}catch{}
         const user=db.createDemoUser();
         seedDemoData(db,user.id);
@@ -1427,7 +1484,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName:buddyNameFor(user.user_id||user.id),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
-        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:db.listConversationMessages(me,active.id),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
+        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
@@ -1485,7 +1542,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(!db.getConversation(userId,conversation.id))return;
             const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
             try{
-              const history=db.listConversationMessages(userId,conversation.id,24).filter((m)=>m.id!==userMsg.id);
+              const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
               const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
               const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
               let needsBuddyName=false;
@@ -1572,6 +1629,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         }
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
+        if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20);return json(res,200,{results:formatSearchResults(results)});}
+        const timelineMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)\/timeline$/);if(req.method==='GET'&&timelineMatch){const timeline=buildTimeline(timelineMatch[1],db.listMemories(userId));if(!timeline.length)throw Object.assign(new Error('Memory not found.'),{status:404});return json(res,200,{timeline:formatTimeline(timeline)});}
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
         const followUpMatch=url.pathname.match(/^\/api\/follow-ups\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&followUpMatch){if(!db.deleteFollowUp(userId,followUpMatch[1]))throw Object.assign(new Error('Follow-up not found.'),{status:404});db.addEvent(userId,'followup_deleted','Removed a scheduled follow-up.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/personal-dates'){return json(res,200,{dates:db.listPersonalDates(userId)});}
@@ -1645,6 +1704,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const payload=await encryptPortable(db.exportUser(userId),body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
         if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,12*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);db.restoreUser(userId,bundle);db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/backup-status'){
+          requireOwner(user);
+          return json(res,200,{ok:true,backupDir:backupDir||null,...backupStatus()});
+        }
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}

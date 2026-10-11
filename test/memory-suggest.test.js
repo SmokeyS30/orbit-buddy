@@ -17,11 +17,12 @@ test('parseSuggestMarkers handles empty and marker-free text', async () => {
   assert.deepEqual(server.parseSuggestMarkers(null), []);
 });
 
-test('stripModelMarkers removes both marker types', async () => {
+test('stripModelMarkers removes model and citation marker types', async () => {
   const server = await import('../server.js');
-  const text = 'See you then.\n[SUGGEST_MEMORY: something to remember]\n[FOLLOWUP: call mom on 2026-10-10]';
+  const text = 'See you then. \uE200cite\uE202turn0search0\uE201\n[SUGGEST_MEMORY: something to remember]\n[FOLLOWUP: call mom on 2026-10-10]';
   const stripped = server.stripModelMarkers(text);
   assert.ok(!stripped.includes('SUGGEST_MEMORY'), 'suggest marker removed');
   assert.ok(!stripped.includes('FOLLOWUP'), 'followup marker removed');
+  assert.ok(!stripped.includes('turn0search0'), 'citation marker removed');
   assert.ok(stripped.includes('See you then.'), 'visible text kept');
 });

@@ -23,6 +23,7 @@
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
     <link rel="stylesheet" href="/mobile.css" />
+    <link rel="stylesheet" href="/smooth.css" />
     <title>Orbit Buddy</title>
   </head>
   <body>
@@ -695,7 +696,7 @@
       </section>
     </main>
 
-    <dialog id="auth-dialog" open>
+    <dialog id="auth-dialog">
       <form id="auth-form" class="login-card">
         <div class="brand-mark large"><span></span></div>
         <p class="eyebrow">WELCOME TO ORBIT</p>
@@ -787,8 +788,8 @@
       </section>
     </dialog>
     <div id="offline-banner" class="offline-banner hidden" role="status">You're offline — Orbit will reconnect when you're back.</div><div id="toast" class="toast" role="status"></div>
-    <footer style="text-align:center;padding:1rem;font-size:0.85rem;opacity:0.7;">
-      <a href="/privacy" style="color:inherit;margin:0 0.5rem;">Privacy</a>·<a href="/terms" style="color:inherit;margin:0 0.5rem;">Terms</a>
+    <footer style="display:flex;justify-content:center;align-items:center;gap:1rem;padding:1rem 1rem calc(1.5rem + env(safe-area-inset-bottom,0px));font-size:0.85rem;opacity:0.7;">
+      <a href="/privacy" style="color:inherit;padding:0.5rem;">Privacy</a><a href="/terms" style="color:inherit;padding:0.5rem;">Terms</a>
     </footer>
     <script type="module" src="/app.js"></script>
   </body>

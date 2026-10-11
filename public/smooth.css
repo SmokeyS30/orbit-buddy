@@ -1,0 +1,138 @@
+/* ===== Orbit smoothness / polish layer =====
+   Layered on top of the existing styles.css. Uses the same CSS variables
+   (--bg, --panel, --panel2, --line, --text, --muted) so it stays in the
+   dark theme. All animations respect prefers-reduced-motion. */
+
+/* ---- Smooth view/tab transitions (fade + slight slide, 200ms ease-out) ---- */
+.view.smooth-exit {
+  animation: view-exit 200ms ease-out forwards;
+}
+.view.smooth-enter {
+  animation: view-enter 200ms ease-out;
+}
+@keyframes view-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(8px); }
+}
+@keyframes view-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- Skeleton loading shimmer ---- */
+.skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 0;
+}
+.skeleton-line {
+  position: relative;
+  overflow: hidden;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  min-height: 56px;
+}
+.skeleton-line.short { min-height: 36px; width: 62%; }
+.skeleton-line::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.07),
+    transparent
+  );
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+@keyframes skeleton-shimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(100%); }
+}
+
+/* ---- Smooth scrolling on scroll containers ---- */
+.messages,
+#messages,
+.thread-bar,
+.tabs,
+.codes,
+.timeline {
+  scroll-behavior: smooth;
+}
+
+/* ---- Button press feedback (scale 0.97, fast) ---- */
+button,
+.tab,
+.thread-chip,
+.icon-button,
+.link-button {
+  transition: transform 100ms ease-out;
+}
+button:active,
+.tab:active,
+.thread-chip:active,
+.icon-button:active,
+.link-button:active {
+  transform: scale(0.97);
+}
+
+/* ---- Message appear animation (fade up, 250ms) ---- */
+.message.smooth-appear {
+  animation: msg-smooth-in 250ms ease-out;
+}
+@keyframes msg-smooth-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- Prevent layout shift: reserve space for key containers ---- */
+.messages,
+#messages {
+  min-height: 160px;
+}
+.view {
+  min-height: 40vh;
+}
+
+/* ---- Touch-optimized scrolling on the chat container ---- */
+.messages,
+#messages {
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+
+/* ---- Long-list scroll performance ---- */
+.card-list > *,
+.timeline-item,
+.message {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 88px;
+}
+
+/* ---- Honor reduced motion: strip everything above ---- */
+@media (prefers-reduced-motion: reduce) {
+  .view.smooth-exit,
+  .view.smooth-enter,
+  .message.smooth-appear,
+  .skeleton-line::after {
+    animation: none !important;
+  }
+  .messages,
+  #messages,
+  .thread-bar,
+  .tabs,
+  .codes,
+  .timeline {
+    scroll-behavior: auto !important;
+  }
+  button,
+  .tab,
+  .thread-chip,
+  .icon-button,
+  .link-button {
+    transition: none !important;
+  }
+}

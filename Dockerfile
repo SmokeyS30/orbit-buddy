@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM node:24-alpine
+LABEL org.opencontainers.image.source="https://github.com/SmokeyS30/orbit-buddy"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN --mount=type=secret,id=proxy_ca \

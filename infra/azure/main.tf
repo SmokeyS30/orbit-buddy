@@ -1,5 +1,13 @@
 # Orbit Buddy on Azure Container Apps
 # One `terraform apply` deploys everything. Run `terraform destroy` to tear it down.
+#
+# EXTERNALLY MANAGED RESOURCES (not in Terraform state):
+# - PostgreSQL Flexible Server `orbit-buddy-pg` (orbit-buddy-rg, Central US):
+#   Created manually. Holds production data. Terraform does NOT manage it to
+#   prevent accidental replacement/deletion. The Container App references it
+#   via the `database-url` secret (DATABASE_URL env var).
+# - Secrets in the Container App (database-url, openai-api-key, etc.):
+#   Managed manually via Azure Portal/CLI, referenced by secret_name.
 
 terraform {
   required_providers {
@@ -25,9 +33,9 @@ resource "azurerm_resource_group" "orbit" {
   location = var.location
 }
 
-# --- Storage: Azure Files share for SQLite backups ---
-# SQLite runs on local container storage for reliable file locking. Consistent
-# online backups are written here and restored whenever a new replica starts.
+# --- Storage: Azure Files share for encrypted application backups ---
+# Production data lives in PostgreSQL. Orbit writes daily encrypted portable
+# backups here so they survive revision replacements and container restarts.
 resource "azurerm_storage_account" "orbit" {
   name                     = var.storage_account_name
   resource_group_name      = azurerm_resource_group.orbit.name
@@ -136,11 +144,12 @@ resource "azurerm_container_app" "orbit" {
   revision_mode                = "Single" # one active version at a time
   workload_profile_name        = "Consumption"
 
-  # A local SQLite primary requires exactly one always-on replica. The Azure
-  # Files backup survives revision replacements and container restarts.
+  # Keep one always-on replica until the in-process background scheduler is
+  # proven safe for multi-replica execution. Azure Files retains encrypted
+  # application backups across revision replacements and container restarts.
   template {
     min_replicas = 1
-    max_replicas = 1
+    max_replicas = 2
 
     container {
       name   = "orbit-buddy"
@@ -196,6 +205,18 @@ resource "azurerm_container_app" "orbit" {
         name        = "GMAIL_CLIENT_SECRET"
         secret_name = "gmail-client-secret"
       }
+      # PostgreSQL: DATABASE_URL references the database-url secret.
+      # The PostgreSQL server itself is externally managed (created manually,
+      # not by Terraform) to avoid accidental replacement. See comment below.
+      env {
+        name        = "DATABASE_URL"
+        secret_name = "database-url"
+      }
+      # Durable encrypted backups go to the Azure Files mount at /backup.
+      env {
+        name  = "BACKUP_DIR"
+        value = "/backup"
+      }
 
       volume_mounts {
         name = "orbit-data"
@@ -203,9 +224,31 @@ resource "azurerm_container_app" "orbit" {
       }
 
       liveness_probe {
-        path      = "/healthz"
-        port      = 3000
-        transport = "HTTP"
+        path                    = "/livez"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 30
+        timeout                 = 5
+        failure_count_threshold = 3
+      }
+
+      readiness_probe {
+        path                    = "/readyz"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 15
+        timeout                 = 10
+        failure_count_threshold = 3
+        success_count_threshold = 1
+      }
+
+      startup_probe {
+        path                    = "/livez"
+        port                    = 3000
+        transport               = "HTTP"
+        interval_seconds        = 10
+        timeout                 = 5
+        failure_count_threshold = 10
       }
     }
 

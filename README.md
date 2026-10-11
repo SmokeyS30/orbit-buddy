@@ -10,7 +10,7 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 
 - **It follows up.** Mention an upcoming appointment, interview, trip, or deadline and Orbit notes the date, then checks in afterward to ask how it went — in chat and as a push notification.
 - **It checks in first.** Morning briefings, evening wind-downs, and a gentle nudge if you've been quiet for a couple of days keep the conversation alive without you having to start it.
-- **It's yours, privately.** Self-hostable and open source: your conversations live in your own SQLite database, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
+- **It's yours, privately.** Self-hostable and open source: your conversations live in SQLite locally or PostgreSQL in production, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
 - **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
 ## What works now
@@ -18,7 +18,7 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 - Responsive control center installable as a PWA on iPhone, Android, macOS, Windows, and Linux
 - Multi-user accounts with salted `scrypt` password hashes, 30-day secure sessions, CSRF protection, and one-time recovery codes
 - Authenticated chat through the OpenAI Responses API, with a clearly labeled demo mode when no API key is configured
-- Persistent SQLite messages, typed user-approved memories, goals with user-controlled progress, scheduled follow-ups, timezone-aware routines, tasks, generated artifacts, and audit events
+- Persistent messages in SQLite or PostgreSQL, typed user-approved memories, goals with user-controlled progress, scheduled follow-ups, timezone-aware routines, tasks, generated artifacts, and audit events
 - Immediate, scheduled, daily, and weekly background thinking tasks that continue on the server after the browser closes
 - Approval-based intelligence: Orbit can propose inferred memories for review and retrieve the most relevant approved memories for each conversation
 - Automatic follow-ups: Orbit can schedule and prioritize dated check-ins from chat, while keeping them visible and removable in Memory
@@ -128,4 +128,3 @@ See [SECURITY.md](SECURITY.md) before adding any connector or tool. Contribution
 - Orbit cannot run arbitrary work directly on an iPhone or control a Mac. A future local device agent must be separately installed and explicitly constrained to approved folders and capabilities.
 
 The goal is not unlimited autonomy. The goal is a dependable buddy whose access is understandable, reviewable, backed up, and easy to revoke.
-

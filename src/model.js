@@ -1,9 +1,10 @@
 import { TOOL_DEFINITIONS, executeTool, summarizeToolCall } from './tools.js';
-import { todayInZone, validTimeZone } from './intelligence.js';
+import { lastMentionedLabel, todayInZone, validTimeZone } from './intelligence.js';
 
 const DEFAULT_MODEL = 'gpt-6-luna';
+const DEFAULT_COMPLEX_MODEL = 'gpt-6.1-sol';
 const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
-const MAX_TOOL_ITERATIONS = 4;
+const MAX_TOOL_ITERATIONS = 2;
 const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
 const MAX_TRANSIENT_MODEL_ATTEMPTS = 3;
 
@@ -84,15 +85,30 @@ function validateBaseUrl(value, allowInsecure) {
   return url.toString().replace(/\/$/, '');
 }
 
+const CITATION_START = '\uE200';
+const CITATION_END = '\uE201';
+
+export function stripCitationMarkers(value) {
+  return String(value || '')
+    // OpenAI search citations use private-use delimiters, for example:
+    // \uE200cite\uE202turn0search0\uE202turn0search1\uE201.
+    .replace(/\uE200[\s\S]*?(?:\uE201|$)/g, '')
+    // Retain compatibility with the legacy marker form handled by earlier releases.
+    .replace(/≡(?:[^≡]*≡)+/g, '');
+}
+
 function extractText(payload) {
-  if (typeof payload.output_text === 'string' && payload.output_text.trim()) return payload.output_text.trim();
+  if (typeof payload.output_text === 'string') {
+    const directText = stripCitationMarkers(payload.output_text).trim();
+    if (directText) return directText;
+  }
   const parts = [];
   for (const item of payload.output || []) {
     for (const content of item.content || []) {
       if (content.type === 'output_text' && typeof content.text === 'string') parts.push(content.text);
     }
   }
-  return parts.join('\n').trim();
+  return stripCitationMarkers(parts.join('\n')).trim();
 }
 
 // Parses a Responses API server-sent-events stream, rebuilding the output items
@@ -103,6 +119,21 @@ export async function parseResponsesStream(body, onToken) {
   const decoder = new TextDecoder();
   const items = new Map();
   const order = [];
+  let insideCitation = false;
+  const emitVisibleText = (delta) => {
+    let visible = '';
+    for (const character of String(delta || '')) {
+      if (insideCitation) {
+        if (character === CITATION_END) insideCitation = false;
+      } else if (character === CITATION_START) {
+        insideCitation = true;
+      } else {
+        visible += character;
+      }
+    }
+    const clean = stripCitationMarkers(visible);
+    if (clean && onToken) onToken(clean);
+  };
   const getItem = (index) => {
     if (!items.has(index)) {
       items.set(index, {});
@@ -139,7 +170,7 @@ export async function parseResponsesStream(body, onToken) {
     } else if (type === 'response.output_text.delta') {
       const item = getItem(event.output_index);
       item._text = (item._text || '') + String(event.delta || '');
-      if (onToken) onToken(String(event.delta || ''));
+      emitVisibleText(event.delta);
     } else if (type === 'response.function_call_arguments.delta') {
       const item = getItem(event.output_index);
       item.arguments = (item.arguments || '') + String(event.delta || '');
@@ -173,7 +204,7 @@ export async function parseResponsesStream(body, onToken) {
   return order.map((index) => {
     const item = items.get(index);
     const { _text, ...clean } = item;
-    if (clean.type === 'message') clean.content = [{ type: 'output_text', text: _text || '' }];
+    if (clean.type === 'message') clean.content = [{ type: 'output_text', text: stripCitationMarkers(_text) }];
     return clean;
   });
 }
@@ -185,6 +216,7 @@ export function createModelClient(env = process.env) {
   const usingAzure = Boolean(azureEndpoint && azureApiKey && azureDeployment);
   const apiKey = usingAzure ? azureApiKey : env.OPENAI_API_KEY?.trim();
   const model = normalizeModelName(usingAzure ? azureDeployment : env.OPENAI_MODEL) || DEFAULT_MODEL;
+  const complexModel = normalizeModelName(env.OPENAI_COMPLEX_MODEL) || DEFAULT_COMPLEX_MODEL;
   const configuredFallbacks = String(
     usingAzure
       ? env.AZURE_OPENAI_FALLBACK_DEPLOYMENTS || ''
@@ -289,7 +321,11 @@ export function createModelClient(env = process.env) {
       }
 
       const memoryText = memories.length
-        ? memories.map((entry, index) => `${index + 1}. [${entry.kind || 'fact'}] ${entry.content}`).join('\n')
+        ? memories.map((entry, index) => {
+            const when = lastMentionedLabel(entry);
+            const episodic = when ? ` (last mentioned ${when})` : '';
+            return `${index + 1}. [${entry.kind || 'fact'}]${episodic} ${entry.content}`;
+          }).join('\n')
         : 'No user-approved memories are stored.';
       const recentHistory = history.slice(-16).map((entry) => ({ role: entry.role, content: entry.content }));
       const goalText = goals.length
@@ -316,6 +352,8 @@ export function createModelClient(env = process.env) {
         `- For "remind me before my [calendar event]" requests: you CAN do this. Use read_calendar to find the event and its time, then use create_task with scheduleAt set to the reminder time (event start minus the lead time the user asked for, e.g. 15 minutes before). If the event recurs daily or weekly, set the task recurrence to match. Never say you can't set reminders for calendar events — this is fully supported. Write the task prompt as a simple unconditional reminder (e.g. ‘Remind Edward: CIT187 starts in 5 minutes at 11 AM Eastern.’). Do NOT add ‘check the calendar first’ or ‘suppress if absent’ conditions — tasks run without tool access, so the reminder would be wrongly withheld.`,
         `- When discussing goals or projects, proactively share momentum: completion percentage, pace ("at this rate you'll finish by..."), and what's next. If they're behind, don't just report it — propose a specific catch-up plan. Turn passive tracking into active coaching.`,
         `- Connect the dots across context. If the weather is bad and the user has free time, suggest indoor activities. If they have a gap before a meeting, suggest productive uses. If their routine is off-pattern (e.g. usually studies at 9am but hasn't today), gently check in. Be helpful, not creepy — one suggestion at a time, easy to dismiss.`,
+        `- Connect memories across conversations: when you reference a stored memory, note how it relates to other memories when relevant ("this ties into your goal of..."). Don't just recite facts — weave them together naturally.`,
+        `- Volunteer relevant memories proactively: if a stored memory is highly relevant to what the user is discussing but hasn't come up yet, mention it naturally ("by the way, you told me..."). Don't wait to be asked — but keep it to one volunteered memory at a time, easy to dismiss.`,
         `- For local recommendations (restaurants, movies, events), use web_search with the user's location (Brewster, MA / Cape Cod) for current, relevant results.`,
         `- Write tools need a clear ask: only call create_task or save_memory when the user plainly asked for a task/reminder or to remember something — never speculatively, never as a side effect of answering a question.`,
         `- If the user shares a durable preference, goal, project detail, decision, or relationship detail without asking you to remember it, use propose_memory at most twice. Never propose transient, highly sensitive, or already-stored details.`,
@@ -353,7 +391,7 @@ export function createModelClient(env = process.env) {
         return {
           model: modelName,
           store: false,
-          max_output_tokens: 1200,
+          max_output_tokens: 600,
           ...(tools ? { tools: TOOL_DEFINITIONS } : {}),
           ...(modernCache ? { prompt_cache_options: { mode: 'implicit', ttl: '30m' } } : {}),
           input: modernCache ? modelInput : withoutCacheBreakpoints(modelInput),
@@ -452,23 +490,30 @@ export function createModelClient(env = process.env) {
       ];
       const toolCalls = [];
       let lastOutput = [];
-      let selectedModel = ['ready', 'fallback'].includes(health.state) && health.activeModel ? health.activeModel : preferredModel;
+      const useComplexModel = String(message || '').length > 800;
+      const routeTargetModel = useComplexModel ? complexModel : model;
+      let selectedModel = useComplexModel ? complexModel : preferredModel;
       const callWithFallback = async (request, input) => {
         // Only use the explicitly configured compatibility chain. The models
         // endpoint can contain dozens of specialized models that are not safe
         // drop-in replacements for a chat response.
-        const candidates = uniqueModels([selectedModel, ...fallbackModels]);
+        const candidates = uniqueModels([
+          selectedModel,
+          ...(useComplexModel ? [model] : []),
+          ...fallbackModels
+        ]);
         const unavailable = [];
         let transientAttempts = 0;
         for (const candidate of candidates) {
           selectedModel = candidate;
           try {
             const output = await request(input, selectedModel);
-            preferredModel = selectedModel;
-            health.state = selectedModel === model ? 'ready' : 'fallback';
+            if (!useComplexModel || selectedModel !== complexModel) preferredModel = selectedModel;
+            const routeSucceeded = selectedModel === routeTargetModel;
+            health.state = routeSucceeded ? 'ready' : 'fallback';
             health.activeModel = selectedModel;
             health.checkedAt = new Date().toISOString();
-            health.lastError = selectedModel === model ? null : `${unavailable.join(', ') || model} unavailable; using ${selectedModel}.`;
+            health.lastError = routeSucceeded ? null : `${unavailable.join(', ') || routeTargetModel} unavailable; using ${selectedModel}.`;
             return output;
           } catch (error) {
             error.classification = error?.classification || classifyModelError(error);

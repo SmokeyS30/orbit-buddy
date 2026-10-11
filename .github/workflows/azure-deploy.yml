@@ -1,12 +1,15 @@
 # Auto-deploy Orbit Buddy to Azure Container Apps on push to main
 # Requires these GitHub secrets:
-#   AZURE_CREDENTIALS - output of: az ad sp create-for-rbac --name orbit-deploy --role contributor --scopes /subscriptions/YOUR_SUBSCRIPTION_ID --sdk-auth
-#   GHCR_TOKEN - GitHub personal access token with write:packages scope
+#   AZURE_CLIENT_ID - Entra app (service principal) client ID for OIDC federated auth
+#   AZURE_TENANT_ID - Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID - Azure subscription ID
+# Container images are pushed to GHCR using the built-in GITHUB_TOKEN
+# (requires packages: write permission on the build-and-deploy job).
 #
-# Deployment safety: after pushing the new image, this workflow waits for the
-# new revision to become healthy, tests the public /healthz endpoint, and
-# automatically restores 100% traffic to the previous healthy revision if the
-# new revision fails any check.
+# Deployment safety (single-revision mode): before pushing the new image, this
+# workflow captures the currently-deployed image. After deployment it waits for
+# the new revision to become healthy and tests the public /healthz endpoint.
+# If verification fails, it rolls back by redeploying the previous image.
 
 name: Deploy to Azure
 
@@ -24,6 +27,24 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # PostgreSQL 16 service: the integration test must run (not skip) as
+    # part of the deployment gate. Deployment is blocked until it passes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: orbit_test
+          POSTGRES_PASSWORD: orbit_test_pw
+          POSTGRES_DB: orbit_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orbit_test -d orbit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://orbit_test:orbit_test_pw@localhost:5432/orbit_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -37,9 +58,13 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      packages: write
     outputs:
       new_revision: ${{ steps.deploy.outputs.new_revision }}
-      prev_revision: ${{ steps.deploy.outputs.prev_revision }}
+      prev_image: ${{ steps.deploy.outputs.prev_image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +73,13 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ github.token }}
+
+      - name: Bump service worker cache version
+        run: |
+          VER="orbit-buddy-$(echo $GITHUB_SHA | cut -c1-7)"
+          sed -i "s/const CACHE = 'orbit-buddy-v[^']*';/const CACHE = '$VER';/" public/sw.js
+          grep -n "const CACHE" public/sw.js
 
       - name: Build and push image
         uses: docker/build-push-action@v5
@@ -63,20 +94,24 @@ jobs:
       - name: Log in to Azure
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy new revision (no traffic yet)
+      - name: Deploy new image
         id: deploy
         run: |
-          # Record the currently-active healthy revision for rollback
-          PREV=$(az containerapp revision list \
+          # Capture the currently-deployed image for rollback.
+          # In single-revision mode there is only one active revision;
+          # rollback means redeploying this image, not shifting traffic weights.
+          PREV_IMAGE=$(az containerapp show \
             -g orbit-buddy-rg -n orbit-buddy \
-            --query "[?properties.active && properties.healthState=='Healthy'].name | [0]" -o tsv)
-          echo "prev_revision=$PREV" >> $GITHUB_OUTPUT
-          echo "Previous healthy revision: $PREV"
+            --query "properties.template.containers[0].image" -o tsv)
+          echo "prev_image=$PREV_IMAGE" >> $GITHUB_OUTPUT
+          echo "Previous image: $PREV_IMAGE"
 
-          # Deploy the new image. Container Apps creates a new revision;
-          # traffic stays on the old revision until we explicitly shift it.
+          # Deploy the new image. Container Apps creates a new revision
+          # and replaces the old one (single-revision mode).
           az containerapp update \
             -g orbit-buddy-rg \
             -n orbit-buddy \
@@ -91,14 +126,19 @@ jobs:
           echo "new_revision=$NEW" >> $GITHUB_OUTPUT
           echo "New revision: $NEW"
 
-  verify-and-cutover:
+  verify:
     needs: build-and-deploy
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Log in to Azure
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Wait for new revision healthy
         id: health
@@ -126,17 +166,31 @@ jobs:
         id: public
         if: steps.health.outputs.healthy == 'true'
         run: |
-          # The new revision isn't receiving traffic yet; test via its direct URL.
-          # Fall back to the public endpoint after traffic shift.
           for i in $(seq 1 5); do
             CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://orbitbuddy.app/healthz || echo "000")
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
               BODY=$(curl -s -m 15 https://orbitbuddy.app/healthz)
-              echo "$BODY" | grep -q '"ok":true' && {
+              # Parse JSON fields exactly (no grep ambiguity)
+              CHECK=$(echo "$BODY" | python3 -c "
+          import json,sys
+          try:
+              d=json.load(sys.stdin)
+              ok=d.get('ok')==True
+              drv=d.get('database',{}).get('driver')=='postgres'
+              st=d.get('database',{}).get('state')=='ready'
+              print('PASS' if (ok and drv and st) else 'FAIL')
+          except Exception as e:
+              print('FAIL')
+              " 2>&1)
+              if [ "$CHECK" = "PASS" ]; then
                 echo "public_ok=true" >> $GITHUB_OUTPUT
+                echo "Verified: ok=true, database=postgres/ready"
                 exit 0
-              }
+              else
+                echo "FAIL: health check did not pass (ok/driver/state)"
+                continue
+              fi
             fi
             sleep 10
           done
@@ -145,26 +199,20 @@ jobs:
       - name: Rollback on failure
         if: steps.health.outputs.healthy != 'true' || steps.public.outputs.public_ok != 'true'
         run: |
-          PREV="${{ needs.build-and-deploy.outputs.prev_revision }}"
+          PREV_IMAGE="${{ needs.build-and-deploy.outputs.prev_image }}"
           NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "::error::New revision $NEW failed verification. Restoring traffic to $PREV."
-          # Deactivate the failed revision so it stops restart-looping
-          az rest --method post \
-            --url "https://management.azure.com/subscriptions/$(az account show --query id -o tsv)/resourceGroups/orbit-buddy-rg/providers/Microsoft.App/containerApps/orbit-buddy/revisions/$NEW/deactivate?api-version=2024-03-01" \
-            --body '{}' --headers "Content-Type=application/json" --output none || true
-          # Ensure previous revision has 100% traffic
-          az containerapp ingress traffic set \
+          echo "::error::New revision $NEW failed verification. Redeploying previous image $PREV_IMAGE."
+          # In single-revision mode, rollback = redeploy the previous image.
+          # This creates a new revision from the known-good image.
+          az containerapp update \
             -g orbit-buddy-rg -n orbit-buddy \
-            --revision-weight "$PREV=100" --output none
-          echo "::error::Rolled back to $PREV"
+            --image "$PREV_IMAGE" \
+            --output none
+          echo "::error::Rollback initiated: redeployed $PREV_IMAGE"
           exit 1
 
-      - name: Shift traffic to new revision
+      - name: Deployment verified
         if: steps.health.outputs.healthy == 'true' && steps.public.outputs.public_ok == 'true'
         run: |
           NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "New revision verified. Shifting 100% traffic to $NEW."
-          az containerapp ingress traffic set \
-            -g orbit-buddy-rg -n orbit-buddy \
-            --revision-weight "$NEW=100" --output none
-          echo "Traffic shifted to $NEW"
+          echo "Deployment verified. Revision $NEW is healthy and serving traffic."

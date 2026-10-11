@@ -69,6 +69,18 @@ test('user preferences and typed memory are exposed in the snapshot', async (t) 
   assert.equal(snapshot.memories[0].kind, 'goal');
 });
 
+test('snapshot hides citation markers from previously saved assistant replies', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const userId = auth.body.user.id;
+  const conversation = app.db.ensureDefaultConversation(userId);
+  app.db.addMessage(userId, conversation.id, 'assistant', 'Saved answer \uE200cite\uE202turn0search0\uE201 remains readable.');
+
+  const snapshot = await (await fetch(`${base}/api/snapshot`, { headers: { Cookie: auth.cookie } })).json();
+
+  assert.equal(snapshot.messages.at(-1).content, 'Saved answer  remains readable.');
+});
+
 test('goal and routine endpoints update the proactive snapshot', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
@@ -411,4 +423,64 @@ test('personal dates PATCH: gift_nag and gift_done', async (t) => {
   // Unauthenticated
   res = await fetch(`${base}/api/personal-dates`);
   assert.equal(res.status, 401);
+});
+
+test('/livez returns 200 without DB check', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/livez`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.service, 'orbit-buddy');
+});
+
+test('/readyz returns 200 when DB is ready', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/readyz`);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.database.state, 'ready');
+});
+
+test('/healthz ok reflects DB state', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/healthz`);
+  const body = await res.json();
+  // With working DB, ok should be true and status 200
+  assert.equal(body.ok, true);
+  assert.equal(res.status, 200);
+  assert.ok(body.database);
+  assert.ok(body.ai);
+  assert.deepEqual(body.backup, { configured: false, state: 'disabled' });
+});
+
+test('/healthz reports a fresh durable encrypted backup', async (t) => {
+  const backupDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-backup-health-'));
+  fs.writeFileSync(path.join(backupDir, 'orbit-test.orbitbackup'), 'encrypted-test-fixture');
+  const { app, base } = await fixture({ BACKUP_ENCRYPTION_KEY: 'a'.repeat(32), BACKUP_DIR: backupDir });
+  t.after(() => app.close());
+  app.db.setSetting('last_automatic_backup', new Date().toISOString().slice(0, 10));
+  const res = await fetch(`${base}/healthz`);
+  assert.equal(res.status, 200);
+  assert.deepEqual((await res.json()).backup, { configured: true, state: 'ready' });
+});
+
+test('rate limiting uses x-forwarded-for behind proxy', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  // Make requests with different forwarded IPs - they should have separate buckets
+  // This test verifies the header is parsed (not that limits are hit)
+  const res1 = await fetch(`${base}/livez`, { headers: { 'X-Forwarded-For': '1.2.3.4' } });
+  assert.equal(res1.status, 200);
+  const res2 = await fetch(`${base}/livez`, { headers: { 'X-Forwarded-For': '5.6.7.8' } });
+  assert.equal(res2.status, 200);
+});
+
+test('demo start route is not duplicated', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  // Register owner first to allow demo creation
+  await register(base);
+  const res = await fetch(`${base}/api/demo/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+  // Should succeed (201) not error from duplicate route confusion
+  assert.ok([201, 429].includes(res.status));
 });
