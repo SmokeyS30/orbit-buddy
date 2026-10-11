@@ -54,8 +54,6 @@
 }
 
 /* ---- Smooth scrolling on scroll containers ---- */
-.messages,
-#messages,
 .thread-bar,
 .tabs,
 .codes,
@@ -102,12 +100,13 @@ button:active,
 #messages {
   -webkit-overflow-scrolling: touch;
   overscroll-behavior: contain;
+  overflow-anchor: none;
+  scroll-behavior: auto;
 }
 
 /* ---- Long-list scroll performance ---- */
 .card-list > *,
-.timeline-item,
-.message {
+.timeline-item {
   content-visibility: auto;
   contain-intrinsic-size: auto 88px;
 }
