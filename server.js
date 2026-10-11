@@ -1442,10 +1442,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const name=body.name&&String(body.name).trim()?cleanText(body.name,80,'name'):null;
         if(!email)throw Object.assign(new Error('Valid email required.'),{status:400});
         const id='wl_'+randomToken(12);
-        const now=new Date().toISOString();
         try{
-          db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)')
-            .run(id,email,name,'pending',now,now);
+          db.addWaitlistEntry({id,email,name});
         }catch(e){
           if(String(e.message||'').includes('UNIQUE'))throw Object.assign(new Error('This email is already on the waitlist.'),{status:409});
           throw e;
@@ -1467,7 +1465,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
         requireOwner(req);
-        const rows=db.prepare("SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500").all();
+        const rows=db.listWaitlist();
         return json(res,200,{ok:true,waitlist:rows});
       }
       if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
@@ -1476,7 +1474,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);
         const status=String(body.status||'').trim();
         if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
-        db.prepare('UPDATE waitlist SET status=?,updated_at=? WHERE id=?').run(status,new Date().toISOString(),id);
+        db.updateWaitlistStatus(id,status);
         return json(res,200,{ok:true});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
