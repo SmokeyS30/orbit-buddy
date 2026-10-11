@@ -1454,8 +1454,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           await sendEmail(process.env,{
             to:email,
             subject:'You\'re on the Orbit Buddy waitlist',
-            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion. We'll email you as soon as we open up new spots.\n\n— The Orbit Buddy team`,
-            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion. We'll email you as soon as we open up new spots.</p><p>— The Orbit Buddy team</p>`
+            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion.\n\nWe're letting new users in gradually to keep things fast and stable. Most people hear back within 1–2 weeks. We'll email you the moment your spot is ready.\n\n— The Orbit Buddy team`,
+            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion.</p><p>We're letting new users in gradually to keep things fast and stable. <strong>Most people hear back within 1–2 weeks.</strong> We'll email you the moment your spot is ready.</p><p>— The Orbit Buddy team</p>`
           });
         }catch{}
         // Notify owner
