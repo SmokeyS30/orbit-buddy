@@ -97,6 +97,12 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     await client.query('SELECT 1');
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
+      `CREATE TABLE IF NOT EXISTS waitlist (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
+        status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )`,
+      'CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at)',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
