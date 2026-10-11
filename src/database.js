@@ -256,6 +256,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
       used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS waitlist (
+      id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
     CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);

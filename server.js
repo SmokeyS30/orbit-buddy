@@ -1434,6 +1434,51 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         return json(res,201,{ok:true,id:saved.id});
       }
+      // Waitlist — public signup for launch notifications
+      if(req.method==='POST'&&url.pathname==='/api/waitlist'){
+        if(hourlyLimited(req,5,'waitlist'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);
+        const email=safeEmail(body.email);
+        const name=body.name&&String(body.name).trim()?cleanText(body.name,80,'name'):null;
+        if(!email)throw Object.assign(new Error('Valid email required.'),{status:400});
+        const id='wl_'+randomToken(12);
+        const now=new Date().toISOString();
+        try{
+          db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+            .run(id,email,name,'pending',now,now);
+        }catch(e){
+          if(String(e.message||'').includes('UNIQUE'))throw Object.assign(new Error('This email is already on the waitlist.'),{status:409});
+          throw e;
+        }
+        // Confirmation email
+        try{
+          const {sendEmail}=await import('./src/email.js');
+          await sendEmail(process.env,{
+            to:email,
+            subject:'You\'re on the Orbit Buddy waitlist',
+            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion. We'll email you as soon as we open up new spots.\n\n— The Orbit Buddy team`,
+            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion. We'll email you as soon as we open up new spots.</p><p>— The Orbit Buddy team</p>`
+          });
+        }catch{}
+        // Notify owner
+        const owner=db.listUsers().find((u)=>u.role==='owner');
+        if(owner)await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});
+        return json(res,201,{ok:true});
+      }
+      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
+        requireOwner(req);
+        const rows=db.prepare("SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500").all();
+        return json(res,200,{ok:true,waitlist:rows});
+      }
+      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
+        requireOwner(req);
+        const id=url.pathname.split('/').pop();
+        const body=await readJson(req);
+        const status=String(body.status||'').trim();
+        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+        db.prepare('UPDATE waitlist SET status=?,updated_at=? WHERE id=?').run(status,new Date().toISOString(),id);
+        return json(res,200,{ok:true});
+      }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
         if(!email)throw Object.assign(new Error('Email required.'),{status:400});

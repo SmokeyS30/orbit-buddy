@@ -45,6 +45,31 @@ footer a{color:#4f8cff;margin:0 8px}
 <p>When you connect Gmail, Orbit Buddy requests permission to <strong>send email on your behalf</strong> and <strong>read your inbox</strong>. This lets you say things like "email John about tomorrow's meeting" or "find that receipt from last week."</p>
 <p style="margin-top:12px">Important: Orbit Buddy <strong>always shows you the exact email</strong> — recipient, subject, and body — and waits for your explicit confirmation before sending anything. It never scans your inbox in the background, never uses your email for advertising, and never shares your data with third parties. See our <a href="/privacy.html">privacy policy</a> for the full details, including our compliance with Google's API Services User Data Policy.</p>
 </div>
+<div class="section" id="waitlist" style="text-align:center;background:#fff;border-top:1px solid #e5e5e5;border-bottom:1px solid #e5e5e5">
+<h2>Get early access</h2>
+<p style="max-width:520px;margin:0 auto 24px;color:#555">Orbit Buddy is opening up to new users soon. Join the waitlist and we'll email you as soon as your spot is ready.</p>
+<form id="waitlist-form" style="max-width:420px;margin:0 auto;display:flex;flex-direction:column;gap:12px">
+<input type="text" id="wl-name" placeholder="Your name (optional)" style="padding:12px 16px;border:1px solid #ddd;border-radius:10px;font-size:1em">
+<input type="email" id="wl-email" placeholder="Email address" required style="padding:12px 16px;border:1px solid #ddd;border-radius:10px;font-size:1em">
+<button type="submit" class="cta" style="border:none;cursor:pointer">Join the waitlist</button>
+<p id="wl-status" style="font-size:.95em;min-height:1.4em"></p>
+</form>
+</div>
+<script>
+document.getElementById('waitlist-form').addEventListener('submit',async(e)=>{
+  e.preventDefault();
+  const status=document.getElementById('wl-status');
+  status.style.color='#555';status.textContent='Joining…';
+  try{
+    const r=await fetch('/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:document.getElementById('wl-name').value,email:document.getElementById('wl-email').value})});
+    const b=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(b.error||'Something went wrong.');
+    status.style.color='#2a7a2a';status.textContent="You're on the list! Check your email for confirmation.";
+    document.getElementById('wl-name').value='';document.getElementById('wl-email').value='';
+  }catch(err){status.style.color='#c0392b';status.textContent=err.message;}
+});
+</script>
 <footer>
 <a href="/privacy.html">Privacy Policy</a> · <a href="/terms.html">Terms of Service</a><br>
 <span style="margin-top:8px;display:inline-block">© 2026 Orbit Buddy</span>
