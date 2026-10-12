@@ -23,6 +23,8 @@ on:
     paths-ignore:
       - 'infra/**'
       - '**.md'
+  workflow_dispatch:
+
 
 jobs:
   test:
