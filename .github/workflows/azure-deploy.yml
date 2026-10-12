@@ -128,7 +128,7 @@ jobs:
           echo "new_revision=$NEW" >> $GITHUB_OUTPUT
           echo "New revision: $NEW"
 
-verify:
+  verify:
 needs: build-and-deploy
 runs-on: ubuntu-latest
 permissions:
