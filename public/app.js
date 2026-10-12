@@ -74,7 +74,7 @@ async function renderTimeline(){
 function renderActivity(items){const root=$('#activity-list');root.replaceChildren();if(!items.length)return empty(root,'Activity will appear here.');for(const event of items){const el=document.createElement('div');el.className='timeline-item';const p=document.createElement('p');p.textContent=event.message;const time=document.createElement('time');time.dateTime=event.created_at;time.textContent=formatDate(event.created_at);el.append(p,time);if(event.detail){const detail=document.createElement('p');detail.className='muted small';detail.textContent=event.detail;el.append(detail);}root.append(el);}}
 async function deleteFile(id,name){if(!confirm(`Delete "${name}"?`))return;try{await api(`/api/artifacts/${id}`,{method:'DELETE'});state.snapshot.artifacts=(state.snapshot.artifacts||[]).filter(f=>f.id!==id);renderFiles(state.snapshot.artifacts);toast('File deleted.');}catch(e){toast('Could not delete file: '+e.message);}}
 function renderFiles(items){const root=$('#files-list');root.replaceChildren();if(!items.length)return empty(root,'Completed task files will appear here.');for(const file of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=file.name;const p=document.createElement('p');p.textContent=`${Math.max(1,Math.round(file.size_bytes/1024))} KB · ${formatDate(file.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='card-actions';const link=document.createElement('a');link.className='primary link-button';link.href=`/api/artifacts/${file.id}`;link.textContent='Download';const del=document.createElement('button');del.className='danger link-button';del.textContent='Delete';del.onclick=()=>deleteFile(file.id,file.name);actions.append(link,del);head.append(wrap,actions);card.append(head);root.append(card);}}
-const whatsappUi={status:null,code:null,expiresAt:null,deepLink:null,loading:false};
+const whatsappUi={status:null,code:null,expiresAt:null,deepLink:null,codeRefreshed:null,loading:false};
 async function loadWhatsAppStatus(force){
   if(whatsappUi.loading)return;
   if(whatsappUi.status&&!force)return;
@@ -93,15 +93,19 @@ function renderWhatsAppCard(root){
   if(st.error){p.textContent='Could not load WhatsApp status.';card.append(p);root.append(card);return;}
   if(!st.configured){p.textContent='WhatsApp is not configured on this server yet.';card.append(p);root.append(card);return;}
   if(st.linked){
-    whatsappUi.code=null;whatsappUi.expiresAt=null;whatsappUi.deepLink=null;
+    whatsappUi.code=null;whatsappUi.expiresAt=null;whatsappUi.deepLink=null;whatsappUi.codeRefreshed=null;
     p.textContent=`Connected (${st.phone}). Messages you send to Orbit on WhatsApp appear in your chats here too.`;
     card.append(p);
     const actions=document.createElement('div');actions.className='mini-actions';
-    actions.append(button('Disconnect','danger',async()=>{try{await api('/api/whatsapp/link',{method:'DELETE'});whatsappUi.status=null;whatsappUi.code=null;whatsappUi.deepLink=null;await refresh();toast('WhatsApp disconnected.');}catch(e){toast(e.message);}}));
+    actions.append(button('Disconnect','danger',async()=>{try{await api('/api/whatsapp/link',{method:'DELETE'});whatsappUi.status=null;whatsappUi.code=null;whatsappUi.deepLink=null;whatsappUi.codeRefreshed=null;await refresh();toast('WhatsApp disconnected.');}catch(e){toast(e.message);}}));
     card.append(actions);
   }else if(whatsappUi.code){
-    p.textContent=`Tap below to open WhatsApp with your linking code pre-filled — just hit send. Expires in 10 minutes.`;
+    p.textContent=whatsappUi.codeRefreshed?'That code expired — here\u2019s a fresh one:':'Linking WhatsApp — almost there:';
     card.append(p);
+    const steps=document.createElement('ol');steps.className='muted';steps.style.cssText='margin:.3em 0 .3em 1.2em;padding:0;';
+    const s1=document.createElement('li');s1.textContent='Tap the button below — WhatsApp opens with your code ready to go.';
+    const s2=document.createElement('li');s2.textContent='Hit send. That\u2019s it — you\u2019re linked.';
+    steps.append(s1,s2);card.append(steps);
     if(whatsappUi.deepLink){
       const link=document.createElement('a');
       link.href=whatsappUi.deepLink;link.target='_blank';link.rel='noopener';
@@ -110,15 +114,19 @@ function renderWhatsAppCard(root){
       card.append(link);
     }
     const fallback=document.createElement('p');fallback.className='muted small';
-    fallback.textContent=`Or type this code manually to ${st.whatsappNumber} on WhatsApp:`;
+    fallback.textContent=`Prefer to do it by hand? Open a chat with ${st.whatsappNumber} on WhatsApp and send this code:`;
     card.append(fallback);
-    const codeEl=document.createElement('p');codeEl.style.cssText='font-size:1.4em;font-weight:800;letter-spacing:.2em;margin:.3em 0;';codeEl.textContent=whatsappUi.code;card.append(codeEl);
-    const hint=document.createElement('p');hint.className='muted small';hint.textContent='One-time code — it expires soon and can only be used once.';card.append(hint);
+    const codeEl=document.createElement('p');codeEl.style.cssText='font-size:1.4em;font-weight:800;letter-spacing:.2em;margin:.3em 0;';codeEl.textContent=whatsappUi.code.slice(0,3)+' '+whatsappUi.code.slice(3);card.append(codeEl);
+    const hint=document.createElement('p');hint.className='muted small';hint.textContent='One-time code — expires in 10 minutes and can only be used once.';card.append(hint);
+    card.append(button('Get a new code','ghost',async()=>{
+      try{const r=await api('/api/whatsapp/link/start',{method:'POST'});whatsappUi.code=r.code;whatsappUi.expiresAt=r.expiresAt;whatsappUi.deepLink=r.deepLink||null;whatsappUi.codeRefreshed=true;renderConnections();}
+      catch(e){toast(e.message);}
+    }));
   }else{
-    p.textContent='Chat with Orbit from WhatsApp, as if texting a contact. Your full Orbit — memories, tools, history — works there.';
+    p.textContent='Chat with Orbit from WhatsApp, as if texting a contact. Your full Orbit — memories, tools, history — works there. Tap Connect and I\u2019ll walk you through linking your number.';
     card.append(p);
     card.append(button('Connect WhatsApp','primary',async()=>{
-      try{const r=await api('/api/whatsapp/link/start',{method:'POST'});whatsappUi.code=r.code;whatsappUi.expiresAt=r.expiresAt;whatsappUi.deepLink=r.deepLink||null;renderConnections();}
+      try{const r=await api('/api/whatsapp/link/start',{method:'POST'});whatsappUi.code=r.code;whatsappUi.expiresAt=r.expiresAt;whatsappUi.deepLink=r.deepLink||null;whatsappUi.codeRefreshed=false;renderConnections();}
       catch(e){toast(e.message);}
     }));
   }

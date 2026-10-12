@@ -1629,7 +1629,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               try{
                 db.linkWhatsApp(linkUserId,from);
                 db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
-                try{await twilioSend(from,'Connected! You can now chat with Orbit right here on WhatsApp.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
+                try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
               }catch(e){
                 try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
               }
