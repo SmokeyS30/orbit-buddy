@@ -128,55 +128,55 @@ jobs:
           echo "new_revision=$NEW" >> $GITHUB_OUTPUT
           echo "New revision: $NEW"
 
-    verify:
-    needs: build-and-deploy
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+verify:
+needs: build-and-deploy
+runs-on: ubuntu-latest
+permissions:
+id-token: write
+contents: read
+steps:
+- name: Log in to Azure
+  uses: azure/login@v2
+  with:
+    client-id: ${{ secrets.AZURE_CLIENT_ID }}
+    tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+    subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Wait for new revision healthy
-        id: health
-        run: |
-          NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "Waiting for $NEW to become healthy..."
-          for i in $(seq 1 30); do
-            STATE=$(az containerapp revision show -g orbit-buddy-rg -n orbit-buddy --revision "$NEW" --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
-            echo "Attempt $i: healthState=$STATE"
-            if [ "$STATE" = "Healthy" ]; then
-              echo "healthy=true" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            if [ "$STATE" = "Unhealthy" ]; then
-              echo "healthy=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            sleep 20
-          done
-          echo "healthy=false" >> $GITHUB_OUTPUT
+- name: Wait for new revision healthy
+  id: health
+  run: |
+    NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
+    echo "Waiting for $NEW to become healthy..."
+    for i in $(seq 1 30); do
+      STATE=$(az containerapp revision show -g orbit-buddy-rg -n orbit-buddy --revision "$NEW" --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
+      echo "Attempt $i: healthState=$STATE"
+      if [ "$STATE" = "Healthy" ]; then
+        echo "healthy=true" >> $GITHUB_OUTPUT
+        exit 0
+      fi
+      if [ "$STATE" = "Unhealthy" ]; then
+        echo "healthy=false" >> $GITHUB_OUTPUT
+        exit 0
+      fi
+      sleep 20
+    done
+    echo "healthy=false" >> $GITHUB_OUTPUT
 
-      - name: Test health endpoint (direct, bypassing Cloudflare)
-        id: public
-        if: steps.health.outputs.healthy == 'true'
-        run: |
-          APP_URL=$(az containerapp show -g orbit-buddy-rg -n orbit-buddy --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "Testing https://$APP_URL/healthz (bypassing Cloudflare)"
-          for i in $(seq 1 8); do
-            CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://$APP_URL/healthz || echo "000")
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "public_ok=true" >> $GITHUB_OUTPUT
-              echo "Health check passed"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "public_ok=false" >> $GITHUB_OUTPUT
-          exit 1
+- name: Test health endpoint (direct, bypassing Cloudflare)
+  id: public
+  if: steps.health.outputs.healthy == 'true'
+  run: |
+    APP_URL=$(az containerapp show -g orbit-buddy-rg -n orbit-buddy --query "properties.configuration.ingress.fqdn" -o tsv)
+    echo "Testing https://$APP_URL/healthz (bypassing Cloudflare)"
+    for i in $(seq 1 8); do
+      CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://$APP_URL/healthz || echo "000")
+      echo "Attempt $i: HTTP $CODE"
+      if [ "$CODE" = "200" ]; then
+        echo "public_ok=true" >> $GITHUB_OUTPUT
+        echo "Health check passed"
+        exit 0
+      fi
+      sleep 10
+    done
+    echo "public_ok=false" >> $GITHUB_OUTPUT
+    exit 1
