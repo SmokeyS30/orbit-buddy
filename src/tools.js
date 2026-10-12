@@ -382,12 +382,14 @@ export function toolCreateTask(args = {}, ctx = null) {
     if (Number.isNaN(date.valueOf())) throw new Error('scheduleAt must be a valid date.');
     scheduleAt = date.toISOString();
   }
-  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence });
+  const deliveryChannel = args.deliveryChannel === 'whatsapp' ? 'whatsapp' : 'push';
+  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence, deliveryChannel });
   return {
     id: task.id,
     title: task.title,
     status: task.status,
     risk: task.risk,
+    deliveryChannel: task.delivery_channel,
     note: task.status === 'waiting_approval'
       ? 'Created and saved, waiting for the owner to approve it in the Tasks tab.'
       : 'Created and saved successfully. The task is in the Tasks tab and will run as scheduled.'
@@ -820,7 +822,8 @@ export const TOOL_DEFINITIONS = [
         prompt: { type: 'string', description: 'What Orbit should do for this task.' },
         risk: { type: 'string', description: '"internal" for think-only (default) or "external" for tasks that act on the world.' },
         recurrence: { type: 'string', description: '"none" (default), "daily", or "weekly".' },
-        scheduleAt: { type: 'string', description: 'ISO date/time for when the task should run. Omit to queue it now.' }
+        scheduleAt: { type: 'string', description: 'ISO date/time for when the task should run. Omit to queue it now.' },
+        deliveryChannel: { type: 'string', description: '"push" (default) or "whatsapp". Set to "whatsapp" when the user asks for the reminder via WhatsApp ("text me", "on WhatsApp", "via WhatsApp").' }
       },
       required: ['title', 'prompt'],
       additionalProperties: false

@@ -127,6 +127,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_expires_at TEXT',
       'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_error TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS delivery_channel TEXT NOT NULL DEFAULT \'push\'',
       'ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_outreach_at TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_date TEXT',
@@ -805,12 +806,13 @@ const indexMigrations = [
     countConversationMessages: async (userId, conversationId) => Number((await get('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?', conversationId, userId)).count),
 
     // --- Tasks ---
-    async addTask(userId, { title, prompt, risk='internal', scheduleAt=null, recurrence='none' }) {
+    async addTask(userId, { title, prompt, risk='internal', scheduleAt=null, recurrence='none', deliveryChannel='push' }) {
       const now = timestamp();
       const status = risk === 'external' ? 'waiting_approval' : scheduleAt ? 'scheduled' : 'queued';
-      const row = { id: randomUUID(), user_id: userId, title, prompt, status, risk, schedule_at: scheduleAt, recurrence, result: null, created_at: now, updated_at: now };
-      await run(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`, row.id, row.user_id, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.created_at, row.updated_at);
+      const channel = deliveryChannel === 'whatsapp' ? 'whatsapp' : 'push';
+      const row = { id: randomUUID(), user_id: userId, title, prompt, status, risk, schedule_at: scheduleAt, recurrence, delivery_channel: channel, result: null, created_at: now, updated_at: now };
+      await run(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)`, row.id, row.user_id, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.delivery_channel, row.created_at, row.updated_at);
       return row;
     },
     listTasks: async (userId) => all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),

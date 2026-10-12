@@ -132,6 +132,25 @@ export function formatLocationMessage({ lat, lng }, label = '') {
  */
 export const LOCATION_STORED_MESSAGE = '[Shared location]';
 
+/** WhatsApp's customer-service messaging window: free-form outbound messages
+ * are only allowed within 24h of the user's last inbound message. Outside the
+ * window only approved template messages may be sent — and this app sends no
+ * templates, so outbound WhatsApp delivery must be skipped/fallback elsewhere.
+ */
+export const WHATSAPP_MESSAGE_WINDOW_MS = 24 * 3600_000;
+
+/**
+ * True when the 24h messaging window is open for the given last-inbound
+ * timestamp (ISO string). Pure and testable; `nowMs` is injectable.
+ */
+export function isWindowOpen(lastInboundAt, nowMs = Date.now()) {
+  if (!lastInboundAt) return false;
+  const at = new Date(lastInboundAt).valueOf();
+  if (!Number.isFinite(at)) return false;
+  const age = nowMs - at;
+  return age >= 0 && age < WHATSAPP_MESSAGE_WINDOW_MS;
+}
+
 /** Max bytes downloaded from a Twilio media URL (~10 MB; WhatsApp voice notes are far smaller). */
 export const MAX_TWILIO_MEDIA_BYTES = 10 * 1024 * 1024;
 

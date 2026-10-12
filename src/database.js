@@ -311,6 +311,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'tasks', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'tasks', 'lease_expires_at', 'TEXT');
   ensureColumn(db, 'tasks', 'last_error', 'TEXT');
+  ensureColumn(db, 'tasks', 'delivery_channel', "TEXT NOT NULL DEFAULT 'push'");
   ensureColumn(db, 'events', 'user_id', 'TEXT');
   ensureColumn(db, 'proactive_state', 'last_outreach_at', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_date', 'TEXT');
@@ -512,8 +513,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
     countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
     countUserMessages: db.prepare("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'"),
-    addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
+    addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
     addCalendarFeed: db.prepare(`INSERT INTO calendar_feeds(id,user_id,label,url,created_at,updated_at)
       VALUES(?,?,?,?,?,?)`),
@@ -833,10 +834,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
     setConversationSummary(userId,conversationId,summary,messageCount){s.upsertConversationSummary.run(conversationId,userId,summary,messageCount,timestamp());return s.getConversationSummary.get(conversationId,userId);},
     countConversationMessages:(userId,conversationId)=>s.countConversationMessages.get(conversationId,userId).count,
-    addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none'}) {
+    addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none',deliveryChannel='push'}) {
       const now=timestamp(); const status=risk==='external'?'waiting_approval':scheduleAt?'scheduled':'queued';
-      const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,result:null,created_at:now,updated_at:now};
-      s.addTask.run(row.id,row.user_id,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.created_at,row.updated_at); return row;
+      const channel=deliveryChannel==='whatsapp'?'whatsapp':'push'; // validated: only push/whatsapp
+      const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,delivery_channel:channel,result:null,created_at:now,updated_at:now};
+      s.addTask.run(row.id,row.user_id,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.delivery_channel,row.created_at,row.updated_at); return row;
     },
     listTasks: (userId) => s.listTasks.all(userId),
     addCalendarFeed(userId, { label, url }) {

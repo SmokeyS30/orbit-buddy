@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   risk TEXT NOT NULL CHECK(risk IN ('internal','external')),
   schedule_at TEXT,
   recurrence TEXT NOT NULL CHECK(recurrence IN ('none','daily','weekly')),
+  delivery_channel TEXT NOT NULL DEFAULT 'push',
   result TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   lease_expires_at TEXT,
