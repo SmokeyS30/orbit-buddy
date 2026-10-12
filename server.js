@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -1624,7 +1624,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const linkUserId=record.slice(0,sep);
             const expiresAt=record.slice(sep+1);
             db.setSetting(`whatsapp_link_code_${body}`,''); // single-use
-            if(linkUserId&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
+            const linkUser=linkUserId?db.getUserById(linkUserId):null; // WhatsApp is owner-only: code must belong to the owner
+            if(linkUserId&&linkUser&&linkUser.role==='owner'&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
               try{
                 db.linkWhatsApp(linkUserId,from);
                 db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
@@ -1787,17 +1788,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
           if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
+          requireOwner(user); // WhatsApp is owner-only
           const code=String(randomInt(100000,1000000));
           const expiresAt=new Date(Date.now()+10*60_000).toISOString();
           db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
           db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
-          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER});
+          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER,deepLink:buildLinkDeepLink(env.TWILIO_WHATSAPP_NUMBER,code)});
         }
         if(req.method==='GET'&&url.pathname==='/api/whatsapp/link/status'){
+          requireOwner(user); // WhatsApp is owner-only
           const link=db.getWhatsAppLink(userId);
           return json(res,200,{linked:!!link,phone:link?maskPhone(link.phone_e164):null,configured:whatsappConfigured(env),whatsappNumber:whatsappConfigured(env)?env.TWILIO_WHATSAPP_NUMBER:null});
         }
         if(req.method==='DELETE'&&url.pathname==='/api/whatsapp/link'){
+          requireOwner(user); // WhatsApp is owner-only
           db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
           return json(res,200,{ok:true});
         }

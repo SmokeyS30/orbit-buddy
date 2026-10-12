@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHmac } from 'node:crypto';
 import { openDatabase } from '../src/database.js';
+import { hashToken } from '../src/security.js';
 import { createOrbitServer } from '../server.js';
 import {
   verifyTwilioSignature,
@@ -13,6 +14,7 @@ import {
   isE164,
   maskPhone,
   whatsappConfigured,
+  buildLinkDeepLink,
 } from '../src/whatsapp.js';
 
 // --- Unit: signature verification ---
@@ -68,6 +70,12 @@ test('whatsappConfigured requires all three env vars', () => {
   assert.equal(whatsappConfigured({}), false);
   assert.equal(whatsappConfigured({ TWILIO_ACCOUNT_SID: 'ACx', TWILIO_AUTH_TOKEN: 't' }), false);
   assert.equal(whatsappConfigured({ TWILIO_ACCOUNT_SID: 'ACx', TWILIO_AUTH_TOKEN: 't', TWILIO_WHATSAPP_NUMBER: '+1415' }), true);
+});
+
+test('buildLinkDeepLink produces a wa.me link with the code pre-filled', () => {
+  assert.equal(buildLinkDeepLink('+15089074074', '482913'), 'https://wa.me/15089074074?text=482913');
+  assert.equal(buildLinkDeepLink('whatsapp:+15089074074', '482913'), 'https://wa.me/15089074074?text=482913');
+  assert.match(buildLinkDeepLink('+14155238886', '123456'), /^https:\/\/wa\.me\/14155238886\?text=123456$/);
 });
 
 // --- Unit: database linking helpers ---
@@ -164,9 +172,12 @@ test('linking flow: code issued, texted, number linked', async (t) => {
   // Start linking
   const start = await fetch(`${base}/api/whatsapp/link/start`, { method: 'POST', headers: authHeaders(auth) });
   assert.equal(start.status, 200);
-  const { code, whatsappNumber } = await start.json();
+  const { code, whatsappNumber, deepLink } = await start.json();
   assert.match(code, /^\d{6}$/);
   assert.equal(whatsappNumber, TWILIO_ENV.TWILIO_WHATSAPP_NUMBER);
+  const digits = TWILIO_ENV.TWILIO_WHATSAPP_NUMBER.replace(/\D/g, '');
+  assert.match(deepLink, /^https:\/\/wa\.me\/\d+\?text=\d{6}$/);
+  assert.equal(deepLink, `https://wa.me/${digits}?text=${code}`);
   // Status before linking
   const before = await (await fetch(`${base}/api/whatsapp/link/status`, { headers: authHeaders(auth) })).json();
   assert.equal(before.linked, false);
@@ -249,4 +260,54 @@ test('link/start requires Twilio configuration', async (t) => {
   const auth = await register(base);
   const res = await fetch(`${base}/api/whatsapp/link/start`, { method: 'POST', headers: authHeaders(auth) });
   assert.equal(res.status, 503);
+});
+
+// Create a member user directly in the DB (registration closes after the first
+// user) and insert a session row directly to simulate a logged-in member.
+async function loginAsMember(app, base, suffix) {
+  const email = `member-${suffix}@example.com`;
+  app.db.createUser({ email, displayName: 'Member', passwordHash: 'x', passwordSalt: 'y', role: 'member' });
+  const user = app.db.getUserByEmail(email);
+  const token = `tok-${suffix}-${Date.now()}`;
+  const csrf = `csrf-${suffix}`;
+  app.db.createSession({ tokenHash: hashToken(token), userId: user.id, csrfToken: csrf, expiresAt: new Date(Date.now() + 3600_000).toISOString(), userAgent: 'test' });
+  return { cookie: `orbit_session=${token}`, csrf };
+}
+
+test('WhatsApp linking is owner-only: member gets 403 on link endpoints', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await register(base, { email: 'owner2@example.com', displayName: 'Owner' }); // first user -> owner
+  const memberAuth = await loginAsMember(app, base, 't1');
+  const memberHeaders = authHeaders(memberAuth);
+  const start = await fetch(`${base}/api/whatsapp/link/start`, { method: 'POST', headers: memberHeaders });
+  assert.equal(start.status, 403);
+  const status = await fetch(`${base}/api/whatsapp/link/status`, { headers: memberHeaders });
+  assert.equal(status.status, 403);
+  const del = await fetch(`${base}/api/whatsapp/link`, { method: 'DELETE', headers: memberHeaders });
+  assert.equal(del.status, 403);
+});
+
+test('webhook ignores a linking code bound to a non-owner account', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await register(base, { email: 'owner3@example.com', displayName: 'Owner' });
+  await loginAsMember(app, base, 't2');
+  const memberId = app.db.listUsers().find((u) => u.role === 'member').id;
+  // Plant a code bound to the member's userId (as if issued before the owner gate)
+  const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+  app.db.setSetting('whatsapp_link_code_999888', `${memberId}:${expiresAt}`);
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  const isTwilio = (u) => { try { return new URL(String(u)).hostname === 'api.twilio.com'; } catch { return false; } };
+  globalThis.fetch = async (url, opts) => {
+    if (isTwilio(url)) { sent.push(String(url)); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, { From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`, Body: '999888', MessageSid: 'SM9' });
+    assert.equal(hook.status, 200);
+    assert.equal(app.db.getWhatsAppLink(memberId), null); // not linked
+    assert.ok(!sent.length, 'no confirmation text should be sent for a non-owner code');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
 });
