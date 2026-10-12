@@ -532,8 +532,22 @@ test('create_task validates input and creates via ctx', async () => {
     prompt: 'Summarize the news',
     risk: 'internal',
     scheduleAt: null,
-    recurrence: 'daily'
+    recurrence: 'daily',
+    deliveryChannel: 'push'
   });
+});
+
+test('create_task accepts a whatsapp delivery channel and defaults to push', async () => {
+  const def = TOOL_DEFINITIONS.find((t) => t.name === 'create_task');
+  assert.ok(def.parameters.properties.deliveryChannel, 'create_task defines deliveryChannel');
+  assert.equal(def.parameters.properties.deliveryChannel.type, 'string');
+  const ctx = writeCtx();
+  const wa = await executeTool('create_task', { title: 'Trash day', prompt: 'Take out the trash', scheduleAt: '2026-10-13T12:00:00Z', deliveryChannel: 'whatsapp' }, {}, ctx);
+  assert.equal(wa.result.status, 'scheduled');
+  assert.deepEqual(ctx.calls[0][2].deliveryChannel, 'whatsapp');
+  const ctx2 = writeCtx();
+  await executeTool('create_task', { title: 'Other', prompt: 'x', deliveryChannel: 'pigeon' }, {}, ctx2);
+  assert.deepEqual(ctx2.calls[0][2].deliveryChannel, 'push');
 });
 
 test('create_task routes external risk through approval', async () => {

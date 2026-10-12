@@ -23,6 +23,8 @@ import {
   downloadTwilioMedia,
   transcribeVoiceNote,
   WHISPER_ENDPOINT,
+  isWindowOpen,
+  WHATSAPP_MESSAGE_WINDOW_MS,
 } from '../src/whatsapp.js';
 
 // --- Unit: signature verification ---
@@ -595,4 +597,150 @@ test('webhook: image media still gets the photo-coming-soon reply', async (t) =>
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+// --- Feature 4 + 5: proactive delivery via WhatsApp ---
+
+test('isWindowOpen honors the 24h messaging window', () => {
+  const now = new Date('2026-10-12T20:00:00.000Z').valueOf();
+  const ago = (ms) => new Date(now - ms).toISOString();
+  assert.equal(WHATSAPP_MESSAGE_WINDOW_MS, 24 * 3600_000);
+  assert.equal(isWindowOpen(ago(23 * 3600_000), now), true);
+  assert.equal(isWindowOpen(ago(1 * 60_000), now), true);
+  assert.equal(isWindowOpen(ago(25 * 3600_000), now), false);
+  assert.equal(isWindowOpen(ago(48 * 3600_000), now), false);
+  assert.equal(isWindowOpen(new Date(now + 3600_000).toISOString(), now), false, 'future timestamps are not open');
+  assert.equal(isWindowOpen(null, now), false);
+  assert.equal(isWindowOpen(undefined, now), false);
+  assert.equal(isWindowOpen('not-a-date', now), false);
+  assert.equal(isWindowOpen('', now), false);
+});
+
+function stubTwilio(sent) {
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    try { if (new URL(String(url)).hostname === 'api.twilio.com') { sent.push({ url: String(url), body: String(opts?.body || '') }); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; } } catch {}
+    return origFetch(url, opts);
+  };
+  return () => { globalThis.fetch = origFetch; };
+}
+
+function stubPush(app, pushes) {
+  app.push.notify = async (...args) => { pushes.push(args); return { sent: 1, failed: 0 }; };
+}
+
+const decodeForm = (body) => decodeURIComponent(String(body || '')).replace(/\+/g, ' ');
+
+test('deliverProactive: window open sends via WhatsApp INSTEAD of push', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  app.db.setWhatsAppLastInbound(userId, new Date(Date.now() - 3600_000).toISOString()); // 1h ago: window open
+  const sent = []; const restore = stubTwilio(sent);
+  const pushes = []; stubPush(app, pushes);
+  try {
+    await app.deliverProactive(app.db.getUserById(userId), 'Quick check-in: how is the studying going?', 'smart_checkin_sent', 'Sent smart check-in.');
+    // Note: check the raw (still-encoded) body for the To number — decodeForm turns %2B into a space.
+    assert.ok(sent.some((s) => s.body.includes('whatsapp%3A%2B15085551234') && decodeForm(s.body).includes('how is the studying going')), 'check-in went out via Twilio/WhatsApp');
+    assert.equal(pushes.length, 0, 'push is NOT sent when WhatsApp delivers');
+    const convo = app.db.ensureDefaultConversation(userId);
+    assert.ok(app.db.listConversationMessages(userId, convo.id, 8).some((m) => m.content.includes('how is the studying going')), 'still written to the conversation');
+    assert.ok(app.db.listEvents(userId).some((e) => e.type === 'whatsapp_proactive_sent'), 'event recorded');
+  } finally { restore(); }
+});
+
+test('deliverProactive: window closed skips WhatsApp, push still fires', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  app.db.setWhatsAppLastInbound(userId, new Date(Date.now() - 25 * 3600_000).toISOString()); // 25h ago: window closed
+  const sent = []; const restore = stubTwilio(sent);
+  const pushes = []; stubPush(app, pushes);
+  try {
+    await app.deliverProactive(app.db.getUserById(userId), 'Quiet nudge', 'quiet_nudge_sent', 'Sent a quiet check-in nudge.');
+    assert.equal(sent.length, 0, 'no WhatsApp send outside the window');
+    assert.equal(pushes.length, 1, 'push still fires so nothing is lost');
+    assert.equal(pushes[0][1], 'Orbit');
+    assert.equal(pushes[0][2], 'Quiet nudge');
+  } finally { restore(); }
+});
+
+test('deliverProactive: no WhatsApp link and non-owner fall back to push', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  const pushes = []; stubPush(app, pushes);
+  const sent = []; const restore = stubTwilio(sent);
+  try {
+    // Unlinked owner: push
+    app.db.unlinkWhatsApp(userId);
+    await app.deliverProactive(app.db.getUserById(userId), 'Hello owner', 'routine_sent', 'Ran routine.');
+    assert.equal(sent.length, 0);
+    assert.equal(pushes.length, 1);
+    // Linked non-owner: push (owner-only gating preserved)
+    const member = app.db.createUser({ email: 'member@example.com', displayName: 'Member', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    app.db.linkWhatsApp(member.id, '+15085557777');
+    app.db.setWhatsAppLastInbound(member.id, new Date().toISOString());
+    await app.deliverProactive(member, 'Hello member', 'routine_sent', 'Ran routine.');
+    assert.equal(sent.length, 0, 'no WhatsApp send for a non-owner');
+    assert.equal(pushes.length, 2, 'member falls back to push');
+  } finally { restore(); }
+});
+
+function dueTask(app, userId, overrides = {}) {
+  return app.db.addTask(userId, {
+    title: 'Take out the trash',
+    prompt: 'Remind me to take out the trash.',
+    scheduleAt: new Date(Date.now() - 60_000).toISOString(), // due now
+    deliveryChannel: 'whatsapp',
+    ...overrides,
+  });
+}
+
+test('runDueTasks: whatsapp-channel task delivered via WhatsApp when window open', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  app.db.setWhatsAppLastInbound(userId, new Date(Date.now() - 2 * 3600_000).toISOString());
+  const task = dueTask(app, userId);
+  assert.equal(task.delivery_channel, 'whatsapp');
+  const sent = []; const restore = stubTwilio(sent);
+  const pushes = []; stubPush(app, pushes);
+  try {
+    await app.runDueTasks();
+    assert.ok(sent.some((s) => s.body.includes('whatsapp%3A%2B15085551234')), 'reminder went out via WhatsApp');
+    assert.equal(pushes.length, 0, 'no duplicate push');
+    assert.equal(app.db.getTask(userId, task.id).status, 'completed');
+    const convo = app.db.ensureDefaultConversation(userId);
+    const messages = app.db.listConversationMessages(userId, convo.id, 8);
+    assert.ok(messages.some((m) => m.role === 'assistant' && app.db.getTask(userId, task.id).result && m.content.includes(app.db.getTask(userId, task.id).result.slice(0, 20))), 'result written to the conversation');
+    assert.ok(app.db.listEvents(userId).some((e) => e.type === 'task_delivered_whatsapp'), 'delivery event recorded');
+  } finally { restore(); }
+});
+
+test('runDueTasks: whatsapp-channel task falls back to push when window closed', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  app.db.setWhatsAppLastInbound(userId, new Date(Date.now() - 30 * 3600_000).toISOString()); // 30h: closed
+  const task = dueTask(app, userId);
+  const sent = []; const restore = stubTwilio(sent);
+  const pushes = []; stubPush(app, pushes);
+  try {
+    await app.runDueTasks();
+    assert.equal(sent.length, 0, 'no WhatsApp send outside the window');
+    assert.equal(pushes.length, 1, 'push fallback fires — reminder never dropped');
+    assert.equal(app.db.getTask(userId, task.id).status, 'completed');
+  } finally { restore(); }
+});
+
+test('runDueTasks: default-channel task still uses push', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  app.db.setWhatsAppLastInbound(userId, new Date().toISOString()); // window open, but channel is push
+  const task = dueTask(app, userId, { deliveryChannel: 'push' });
+  assert.equal(task.delivery_channel, 'push');
+  const sent = []; const restore = stubTwilio(sent);
+  const pushes = []; stubPush(app, pushes);
+  try {
+    await app.runDueTasks();
+    assert.equal(sent.length, 0, 'no WhatsApp for push-channel tasks');
+    assert.equal(pushes.length, 1, 'push used');
+    assert.equal(app.db.getTask(userId, task.id).status, 'completed');
+  } finally { restore(); }
 });

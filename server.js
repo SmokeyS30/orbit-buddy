@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -336,6 +336,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
+          // Delivery channel: WhatsApp replaces push when the 24h window is open;
+          // outside the window (or on send failure) fall back to push — a reminder
+          // is never silently dropped.
+          if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
         }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
       }
@@ -344,13 +348,60 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
 
   // A proactive message lands in the default conversation AND as a push notification,
   // so the buddy reaches out even on devices without push enabled.
+  // WhatsApp proactive send: WhatsApp REPLACES push when the 24h messaging
+  // window is open (user texted Orbit within the last 24h). Outside the window
+  // only approved template messages are allowed — this app sends none — so the
+  // push notification still fires and nothing is lost. WhatsApp linking is
+  // owner-only (enforced in the linking webhook), so a link can only ever
+  // exist for the owner.
+  async function tryWhatsAppProactive(userId, text) {
+    if (!tryWhatsAppDeliveryGate(userId)) return false;
+    const link = db.getWhatsAppLink(userId);
+    try {
+      await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: text });
+      db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');
+      return true;
+    } catch (error) {
+      console.error('whatsapp proactive send failed', error && error.message);
+      db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));
+      return false; // fall back to push below
+    }
+  }
   async function deliverProactive(user,text,eventType,eventMessage){
     const conversation=db.ensureDefaultConversation(user.id);
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
+    if(await tryWhatsAppProactive(user.id,text))return;
     await push.notify(user.id,buddyNameFor(user.id),text,{view:'today'});
+  }
+  // WhatsApp delivery for a completed scheduled task: only when the 24h window
+  // is open. Outside the window (or if sending fails) we fall back to push so
+  // a reminder is never silently dropped. The result is also written to the
+  // conversation so the web app keeps a record.
+  async function tryWhatsAppTaskResult(task, result) {
+    if (!tryWhatsAppDeliveryGate(task.user_id)) return false;
+    try {
+      const link = db.getWhatsAppLink(task.user_id);
+      await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: result });
+      const conversation = db.ensureDefaultConversation(task.user_id);
+      db.addMessage(task.user_id, conversation.id, 'assistant', result);
+      db.touchConversation(task.user_id, conversation.id);
+      db.addEvent(task.user_id, 'task_delivered_whatsapp', `Delivered task result via WhatsApp: “${task.title}”.`);
+      return true;
+    } catch (error) {
+      console.error('whatsapp task delivery failed', error && error.message);
+      db.addEvent(task.user_id, 'whatsapp_send_failed', 'Could not send WhatsApp task result.', String(error && error.message || error).slice(0, 200));
+      return false; // fall back to push
+    }
+  }
+  function tryWhatsAppDeliveryGate(userId) {
+    if (!whatsappConfigured(env)) return false;
+    const owner = db.getUserById(userId);
+    if (!owner || owner.role !== 'owner') return false; // WhatsApp linking is owner-only
+    const link = db.getWhatsAppLink(userId);
+    return Boolean(link?.phone_e164) && isWindowOpen(link.last_inbound_at);
   }
   async function maybeRefreshConversationSummary(user,conversation){
     const userId=user.user_id||user.id;
@@ -1993,7 +2044,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,runDueTasks,runProactiveChecks,checkDoorLeftOpen,
+  return {server,db,push,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
     startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
