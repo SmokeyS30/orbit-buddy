@@ -100,3 +100,14 @@ export function maskPhone(e164) {
   if (digits.length < 4) return '••••';
   return `+${digits.slice(0, digits.length - 10)} ••• ••• ${digits.slice(-4)}`.replace(/^\+ /, '+');
 }
+
+/**
+ * Build a wa.me deep link that opens WhatsApp to Orbit's number with the
+ * linking code pre-filled. Tapping it on a phone opens the chat ready to send.
+ * `fromNumber` is the configured TWILIO_WHATSAPP_NUMBER (may include the
+ * "whatsapp:" prefix and formatting); digits are extracted for wa.me.
+ */
+export function buildLinkDeepLink(fromNumber, code) {
+  const digits = String(fromNumber || '').replace(/\D/g, '');
+  return `https://wa.me/${digits}?text=${encodeURIComponent(String(code || ''))}`;
+}

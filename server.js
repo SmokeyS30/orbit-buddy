@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -1791,7 +1791,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const expiresAt=new Date(Date.now()+10*60_000).toISOString();
           db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
           db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
-          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER});
+          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER,deepLink:buildLinkDeepLink(env.TWILIO_WHATSAPP_NUMBER,code)});
         }
         if(req.method==='GET'&&url.pathname==='/api/whatsapp/link/status'){
           const link=db.getWhatsAppLink(userId);

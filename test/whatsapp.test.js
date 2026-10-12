@@ -13,6 +13,7 @@ import {
   isE164,
   maskPhone,
   whatsappConfigured,
+  buildLinkDeepLink,
 } from '../src/whatsapp.js';
 
 // --- Unit: signature verification ---
@@ -68,6 +69,12 @@ test('whatsappConfigured requires all three env vars', () => {
   assert.equal(whatsappConfigured({}), false);
   assert.equal(whatsappConfigured({ TWILIO_ACCOUNT_SID: 'ACx', TWILIO_AUTH_TOKEN: 't' }), false);
   assert.equal(whatsappConfigured({ TWILIO_ACCOUNT_SID: 'ACx', TWILIO_AUTH_TOKEN: 't', TWILIO_WHATSAPP_NUMBER: '+1415' }), true);
+});
+
+test('buildLinkDeepLink produces a wa.me link with the code pre-filled', () => {
+  assert.equal(buildLinkDeepLink('+15089074074', '482913'), 'https://wa.me/15089074074?text=482913');
+  assert.equal(buildLinkDeepLink('whatsapp:+15089074074', '482913'), 'https://wa.me/15089074074?text=482913');
+  assert.match(buildLinkDeepLink('+14155238886', '123456'), /^https:\/\/wa\.me\/14155238886\?text=123456$/);
 });
 
 // --- Unit: database linking helpers ---
@@ -164,9 +171,12 @@ test('linking flow: code issued, texted, number linked', async (t) => {
   // Start linking
   const start = await fetch(`${base}/api/whatsapp/link/start`, { method: 'POST', headers: authHeaders(auth) });
   assert.equal(start.status, 200);
-  const { code, whatsappNumber } = await start.json();
+  const { code, whatsappNumber, deepLink } = await start.json();
   assert.match(code, /^\d{6}$/);
   assert.equal(whatsappNumber, TWILIO_ENV.TWILIO_WHATSAPP_NUMBER);
+  const digits = TWILIO_ENV.TWILIO_WHATSAPP_NUMBER.replace(/\D/g, '');
+  assert.match(deepLink, /^https:\/\/wa\.me\/\d+\?text=\d{6}$/);
+  assert.equal(deepLink, `https://wa.me/${digits}?text=${code}`);
   // Status before linking
   const before = await (await fetch(`${base}/api/whatsapp/link/status`, { headers: authHeaders(auth) })).json();
   assert.equal(before.linked, false);
