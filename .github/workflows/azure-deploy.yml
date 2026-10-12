@@ -162,15 +162,17 @@ jobs:
           done
           echo "healthy=false" >> $GITHUB_OUTPUT
 
-      - name: Test public health endpoint
+            - name: Test health endpoint (direct, bypassing Cloudflare)
         id: public
         if: steps.health.outputs.healthy == 'true'
         run: |
-          for i in $(seq 1 5); do
-            CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://orbitbuddy.app/healthz || echo "000")
+          APP_URL=$(az containerapp show -g orbit-buddy-rg -n orbit-buddy --query "properties.configuration.ingress.fqdn" -o tsv)
+          echo "Testing https://$APP_URL/healthz (bypassing Cloudflare)"
+          for i in $(seq 1 8); do
+            CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://$APP_URL/healthz || echo "000")
             echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              BODY=$(curl -s -m 15 https://orbitbuddy.app/healthz)
+              BODY=$(curl -s -m 15 https://$APP_URL/healthz)
               # Parse JSON fields exactly (no grep ambiguity)
               CHECK=$(echo "$BODY" | python3 -c "
           import json,sys
