@@ -140,6 +140,13 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_length TEXT NOT NULL DEFAULT \'quick\'',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS buddy_name TEXT',
       'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
+      `CREATE TABLE IF NOT EXISTS whatsapp_links (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        phone_e164 TEXT NOT NULL UNIQUE,
+        verified_at TEXT NOT NULL,
+        last_inbound_at TEXT,
+        created_at TEXT NOT NULL
+      )`,
     ];
 const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
@@ -873,6 +880,19 @@ const indexMigrations = [
     listConnectors: async (userId) => all('SELECT id,provider,scopes,expires_at,profile_json,created_at,updated_at FROM connectors WHERE user_id=?', userId),
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
     deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
+
+    // --- WhatsApp linking ---
+    async linkWhatsApp(userId, phoneE164) {
+      const now = timestamp();
+      await run(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+        VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,verified_at=excluded.verified_at,created_at=excluded.created_at`,
+        userId, phoneE164, now, now, now);
+      return get('SELECT * FROM whatsapp_links WHERE user_id=?', userId);
+    },
+    getWhatsAppLink: async (userId) => (await get('SELECT * FROM whatsapp_links WHERE user_id=?', userId)) || null,
+    getUserByWhatsApp: async (phoneE164) => (await get('SELECT * FROM whatsapp_links WHERE phone_e164=?', phoneE164)) || null,
+    setWhatsAppLastInbound: async (userId, at = timestamp()) => (await run('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?', at, userId)).changes > 0,
+    unlinkWhatsApp: async (userId) => (await run('DELETE FROM whatsapp_links WHERE user_id=?', userId)).changes > 0,
 
     // --- OAuth states ---
     addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },

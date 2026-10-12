@@ -423,6 +423,14 @@ CREATE TABLE IF NOT EXISTS waitlist (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS whatsapp_links (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  phone_e164 TEXT NOT NULL UNIQUE,
+  verified_at TEXT NOT NULL,
+  last_inbound_at TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_personal_dates_user ON personal_dates(user_id);
