@@ -101,6 +101,99 @@ export function maskPhone(e164) {
   return `+${digits.slice(0, digits.length - 10)} ••• ••• ${digits.slice(-4)}`.replace(/^\+ /, '+');
 }
 
+/** True when the Twilio media content type is an audio voice note (WhatsApp sends audio/ogg). */
+export function isAudioContentType(mimeType) {
+  return String(mimeType || '').toLowerCase().startsWith('audio/');
+}
+
+/**
+ * Parse a WhatsApp location share from webhook form params.
+ * Twilio sends `Latitude`/`Longitude` (and optionally `Address`/`Label`).
+ * Returns { lat, lng } rounded to 4 decimals, or null when absent/invalid.
+ * Coordinates are range-checked; invalid values are treated as "no location".
+ */
+export function parseWhatsAppLocation(params) {
+  const lat = Number(params?.Latitude);
+  const lng = Number(params?.Longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return null;
+  return { lat: lat.toFixed(4), lng: lng.toFixed(4) };
+}
+
+/** Format a parsed location as the chat-pipeline message text. */
+export function formatLocationMessage({ lat, lng }, label = '') {
+  const clean = String(label || '').trim().slice(0, 120);
+  return `[Shared location: ${lat}, ${lng}]${clean ? ` ${clean}` : ''}`;
+}
+
+/**
+ * Stored in the conversation history in place of a location message.
+ * Coordinates are NEVER persisted — only the model turn sees them.
+ */
+export const LOCATION_STORED_MESSAGE = '[Shared location]';
+
+/** Max bytes downloaded from a Twilio media URL (~10 MB; WhatsApp voice notes are far smaller). */
+export const MAX_TWILIO_MEDIA_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Download a Twilio-hosted media file (media URLs 401 without auth).
+ * GET with Basic auth (AccountSid:AuthToken), with a size cap enforced via
+ * Content-Length when present and a streaming cap as a backstop.
+ * Returns { bytes: Buffer, contentType }. Throws on HTTP errors or oversize.
+ */
+export async function downloadTwilioMedia({ accountSid, authToken, url, maxBytes = MAX_TWILIO_MEDIA_BYTES }) {
+  if (!url) throw new Error('No media URL provided.');
+  const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
+  const response = await fetch(String(url), {
+    headers: { Authorization: `Basic ${credentials}` },
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Twilio media download failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw Object.assign(new Error('Media file is too large.'), { code: 'MEDIA_TOO_LARGE' });
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > maxBytes) throw Object.assign(new Error('Media file is too large.'), { code: 'MEDIA_TOO_LARGE' });
+    chunks.push(chunk);
+  }
+  const contentType = String(response.headers?.get?.('content-type') || '').split(';')[0].trim();
+  return { bytes: Buffer.concat(chunks), contentType };
+}
+
+/** OpenAI Whisper transcription endpoint. */
+export const WHISPER_ENDPOINT = 'https://api.openai.com/v1/audio/transcriptions';
+
+/**
+ * Transcribe a voice-note's audio bytes with Whisper (whisper-1 takes Ogg/Opus
+ * natively — no conversion). Returns the transcript text. Throws on failure.
+ * Audio is processed in memory and never persisted.
+ */
+export async function transcribeVoiceNote({ apiKey, audioBytes, filename = 'voice-note.ogg', mimeType = 'audio/ogg' }) {
+  if (!apiKey?.trim()) throw new Error('Transcription is not configured.');
+  const bytes = Buffer.isBuffer(audioBytes) ? audioBytes : Buffer.from(audioBytes || []);
+  if (!bytes.length) throw new Error('Empty audio payload.');
+  const form = new FormData();
+  form.append('model', 'whisper-1');
+  form.append('file', new Blob([bytes], { type: mimeType }), filename);
+  const response = await fetch(WHISPER_ENDPOINT, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey.trim()}` },
+    body: form,
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Transcription failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  return String(data.text || '').trim();
+}
+
 /**
  * Build a wa.me deep link that opens WhatsApp to Orbit's number with the
  * linking code pre-filled. Tapping it on a phone opens the chat ready to send.
