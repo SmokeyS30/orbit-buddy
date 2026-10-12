@@ -2,7 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -1647,10 +1647,58 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
         const waUser=db.getUserById(waUserId);
+        // Location share: Latitude/Longitude form fields, no media. Coordinates are
+        // passed to the model turn only — the stored history row is redacted and
+        // nothing is logged, so the location stays ephemeral.
+        const sharedLocation=parseWhatsAppLocation(params);
+        if(sharedLocation){
+          const locationMessage=formatLocationMessage(sharedLocation,body);
+          const userMsg=db.addMessage(waUserId,conversation.id,'user',LOCATION_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
+          enqueueChatReply(conversation.id,async()=>{
+            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg});
+            if(answer&&from){
+              try{await twilioSend(from,answer);}
+              catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+            }
+          });
+          return json(res,200,{ok:true,location:true});
+        }
         if(numMedia>0){
-          // Phase 1 is text-only; media support lands in Phase 2.
+          const mediaContentType=String(params.MediaContentType0||'');
+          const mediaUrl=String(params.MediaUrl0||'');
+          // Voice notes (audio/ogg): download, transcribe with Whisper, feed the
+          // transcript into the normal pipeline. Audio is never stored.
+          if(isAudioContentType(mediaContentType)&&mediaUrl){
+            let transcript=null;
+            try{
+              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+              transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
+            }catch(e){
+              console.error('whatsapp voice note failed',e.code||e.message);
+              const tooLong=e.code==='MEDIA_TOO_LARGE';
+              try{await twilioSend(from,tooLong
+                ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
+                :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
+              return json(res,200,{ok:true,voiceNote:false});
+            }
+            if(!transcript){
+              try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
+              return json(res,200,{ok:true,voiceNote:false});
+            }
+            const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
+            const userMsg=db.addMessage(waUserId,conversation.id,'user',voiceMessage);db.touchConversation(waUserId,conversation.id);
+            enqueueChatReply(conversation.id,async()=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg});
+              if(answer&&from){
+                try{await twilioSend(from,answer);}
+                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+              }
+            });
+            return json(res,200,{ok:true,voiceNote:true});
+          }
+          // Phase 2 covers location + voice notes; images land later.
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
-          try{await twilioSend(from,'I can only read text messages for now — photo and voice-note support is coming soon.');}catch(e){console.error('whatsapp media reply failed',e.message);}
+          try{await twilioSend(from,'I can read text and listen to voice notes now — photo support is coming soon.');}catch(e){console.error('whatsapp media reply failed',e.message);}
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback

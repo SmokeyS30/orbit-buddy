@@ -15,6 +15,14 @@ import {
   maskPhone,
   whatsappConfigured,
   buildLinkDeepLink,
+  isAudioContentType,
+  parseWhatsAppLocation,
+  formatLocationMessage,
+  LOCATION_STORED_MESSAGE,
+  MAX_TWILIO_MEDIA_BYTES,
+  downloadTwilioMedia,
+  transcribeVoiceNote,
+  WHISPER_ENDPOINT,
 } from '../src/whatsapp.js';
 
 // --- Unit: signature verification ---
@@ -115,9 +123,10 @@ const TWILIO_ENV = {
 
 async function serverFixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-wa-server-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...TWILIO_ENV, ...extraEnv } });
+  const env = { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...TWILIO_ENV, ...extraEnv };
+  const app = createOrbitServer({ dataDir: directory, env });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
-  return { app, base: `http://127.0.0.1:${app.server.address().port}` };
+  return { app, base: `http://127.0.0.1:${app.server.address().port}`, env };
 }
 
 async function register(base, { email = 'owner@example.com', displayName = 'Owner' } = {}) {
@@ -307,6 +316,282 @@ test('webhook ignores a linking code bound to a non-owner account', async (t) =>
     assert.equal(hook.status, 200);
     assert.equal(app.db.getWhatsAppLink(memberId), null); // not linked
     assert.ok(!sent.length, 'no confirmation text should be sent for a non-owner code');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+// --- Phase 2: location shares + voice notes ---
+
+test('parseWhatsAppLocation parses and range-checks coordinates', () => {
+  assert.deepEqual(parseWhatsAppLocation({ Latitude: '41.7210', Longitude: '-70.0830' }), { lat: '41.7210', lng: '-70.0830' });
+  assert.deepEqual(parseWhatsAppLocation({ Latitude: '41.72104', Longitude: '-70.08304' }), { lat: '41.7210', lng: '-70.0830' });
+  assert.equal(parseWhatsAppLocation({}), null);
+  assert.equal(parseWhatsAppLocation({ Latitude: 'abc', Longitude: '-70.08' }), null);
+  assert.equal(parseWhatsAppLocation({ Latitude: '41.72' }), null);
+  assert.equal(parseWhatsAppLocation({ Latitude: '91', Longitude: '0' }), null); // lat out of range
+  assert.equal(parseWhatsAppLocation({ Latitude: '0', Longitude: '181' }), null); // lng out of range
+  assert.equal(parseWhatsAppLocation(null), null);
+});
+
+test('formatLocationMessage builds the pipeline message text', () => {
+  assert.equal(formatLocationMessage({ lat: '41.7210', lng: '-70.0830' }), '[Shared location: 41.7210, -70.0830]');
+  assert.equal(formatLocationMessage({ lat: '41.7210', lng: '-70.0830' }, 'Home'), '[Shared location: 41.7210, -70.0830] Home');
+  assert.equal(formatLocationMessage({ lat: '41.7210', lng: '-70.0830' }, '  '), '[Shared location: 41.7210, -70.0830]');
+  // The stored redaction must never contain coordinates (no digits at all)
+  assert.equal(LOCATION_STORED_MESSAGE, '[Shared location]');
+  assert.ok(!/\d/.test(LOCATION_STORED_MESSAGE));
+});
+
+test('isAudioContentType detects voice-note media', () => {
+  assert.equal(isAudioContentType('audio/ogg'), true);
+  assert.equal(isAudioContentType('audio/ogg;codecs=opus'), true);
+  assert.equal(isAudioContentType('image/jpeg'), false);
+  assert.equal(isAudioContentType(''), false);
+  assert.equal(isAudioContentType(null), false);
+});
+
+// --- downloadTwilioMedia unit tests ---
+
+function mediaResponse(bytes, { status = 200, contentLength, contentType = 'audio/ogg' } = {}) {
+  const buf = Buffer.from(bytes);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (name) => {
+        const n = String(name).toLowerCase();
+        if (n === 'content-length') return contentLength === undefined ? String(buf.length) : contentLength;
+        if (n === 'content-type') return contentType;
+        return null;
+      },
+    },
+    body: (async function* () { yield buf; })(),
+    text: async () => '',
+  };
+}
+
+async function withFetchStub(stub, fn) {
+  const orig = globalThis.fetch;
+  globalThis.fetch = stub;
+  try { return await fn(); } finally { globalThis.fetch = orig; }
+}
+
+test('downloadTwilioMedia sends Basic auth and returns bytes', async () => {
+  const calls = [];
+  const { bytes, contentType } = await withFetchStub(async (url, opts) => {
+    calls.push({ url: String(url), auth: opts.headers.Authorization });
+    return mediaResponse([1, 2, 3, 4]);
+  }, () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' }));
+  assert.equal(bytes.length, 4);
+  assert.equal(contentType, 'audio/ogg');
+  assert.equal(calls[0].url, 'https://api.twilio.com/x');
+  assert.equal(calls[0].auth, `Basic ${Buffer.from('ACx:tok', 'utf8').toString('base64')}`);
+});
+
+test('downloadTwilioMedia rejects oversized media via Content-Length and streaming', async () => {
+  // Declared size over the cap: rejected without reading the body
+  await assert.rejects(
+    withFetchStub(async () => mediaResponse([1], { contentLength: String(MAX_TWILIO_MEDIA_BYTES + 1) }),
+      () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+    (e) => e.code === 'MEDIA_TOO_LARGE'
+  );
+  // No declared size but the stream exceeds the cap: rejected mid-read
+  await assert.rejects(
+    withFetchStub(async () => ({
+      ...mediaResponse([1], { contentLength: null }),
+      body: (async function* () { yield Buffer.alloc(MAX_TWILIO_MEDIA_BYTES + 1); })(),
+    }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x', maxBytes: 100 })),
+    (e) => e.code === 'MEDIA_TOO_LARGE'
+  );
+});
+
+test('downloadTwilioMedia throws on HTTP errors and missing URL', async () => {
+  await assert.rejects(
+    withFetchStub(async () => mediaResponse([], { status: 401 }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+    /401/
+  );
+  await assert.rejects(downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: '' }), /No media URL/);
+});
+
+// --- transcribeVoiceNote unit tests ---
+
+test('transcribeVoiceNote posts to Whisper and returns trimmed text', async () => {
+  const calls = [];
+  const text = await withFetchStub(async (url, opts) => {
+    calls.push({ url: String(url), opts });
+    return { ok: true, status: 200, json: async () => ({ text: '  buy oat milk  ' }), text: async () => '' };
+  }, () => transcribeVoiceNote({ apiKey: 'sk-test', audioBytes: Buffer.from([10, 20, 30]), mimeType: 'audio/ogg' }));
+  assert.equal(text, 'buy oat milk');
+  assert.equal(calls[0].url, WHISPER_ENDPOINT);
+  assert.equal(calls[0].opts.method, 'POST');
+  assert.equal(calls[0].opts.headers.Authorization, 'Bearer sk-test');
+  const form = calls[0].opts.body;
+  assert.ok(form instanceof FormData);
+  assert.equal(form.get('model'), 'whisper-1');
+  const file = form.get('file');
+  assert.equal(file.name, 'voice-note.ogg');
+  assert.equal(file.type, 'audio/ogg');
+});
+
+test('transcribeVoiceNote rejects missing key, empty audio, and API errors', async () => {
+  await assert.rejects(transcribeVoiceNote({ apiKey: '', audioBytes: Buffer.from([1]) }), /not configured/);
+  await assert.rejects(transcribeVoiceNote({ apiKey: 'sk', audioBytes: Buffer.alloc(0) }), /Empty audio/);
+  await assert.rejects(
+    withFetchStub(async () => ({ ok: false, status: 500, json: async () => ({}), text: async () => 'boom' }),
+      () => transcribeVoiceNote({ apiKey: 'sk', audioBytes: Buffer.from([1]) })),
+    /500/
+  );
+});
+
+// --- Server: Phase 2 webhook branches ---
+
+async function linkOwnerDirectly(app, base, email = 'owner@example.com') {
+  const auth = await register(base, { email });
+  const user = app.db.getUserByEmail(email);
+  app.db.linkWhatsApp(user.id, '+15085551234');
+  return { auth, userId: user.id };
+}
+
+function userMessages(app, userId) {
+  const convo = app.db.ensureDefaultConversation(userId);
+  return app.db.listConversationMessages(userId, convo.id, 24);
+}
+
+async function waitForTwilioReply(sent, isTwilio, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && !sent.some((s) => isTwilio(s.url) && s.body.includes('15085551234'))) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return sent.find((s) => isTwilio(s.url));
+}
+
+test('webhook: location share runs the pipeline with coordinates redacted in storage', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  const isTwilio = (u) => { try { return new URL(String(u)).hostname === 'api.twilio.com'; } catch { return false; } };
+  globalThis.fetch = async (url, opts) => {
+    if (isTwilio(url)) { sent.push({ url: String(url), body: String(opts?.body || '') }); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      Latitude: '41.7210', Longitude: '-70.0830', Body: '', MessageSid: 'SMloc',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, location: true });
+    // Stored history row is redacted: no raw coordinates anywhere
+    const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
+    assert.ok(msgs.length >= 1);
+    const stored = String(msgs[msgs.length - 1].content);
+    assert.equal(stored, LOCATION_STORED_MESSAGE);
+    assert.ok(!stored.includes('41.7210') && !stored.includes('-70.0830'), 'coordinates must not be stored');
+    // The pipeline ran and replied
+    const reply = await waitForTwilioReply(sent, isTwilio);
+    assert.ok(reply, 'expected a Twilio reply for the location share');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: invalid location fields fall through to the text path', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app, base, 'owner-loc2@example.com');
+  const hook = await webhookPost(base, {
+    From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+    Latitude: 'not-a-number', Longitude: '0', Body: '', MessageSid: 'SMloc2',
+  });
+  assert.equal(hook.status, 200);
+  assert.deepEqual(await hook.json(), { ok: true }); // empty body, no media: nothing to do
+});
+
+test('webhook: voice note is downloaded, transcribed, and fed to the pipeline', async (t) => {
+  const { app, base, env } = await serverFixture(); t.after(() => app.close());
+  env.OPENAI_API_KEY = 'test-whisper-key'; // read live by the handler; model client stays in demo mode
+  const { userId } = await linkOwnerDirectly(app, base, 'owner-voice@example.com');
+  const sent = [];
+  let whisperCalls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return mediaResponse([5, 6, 7, 8]);
+    if (u?.hostname === 'api.twilio.com') { sent.push({ url: String(url), body: String(opts?.body || '') }); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    if (u?.hostname === 'api.openai.com') { whisperCalls++; return { ok: true, status: 200, json: async () => ({ text: 'buy oat milk' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'audio/ogg',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv/Media/MEv',
+      Body: '', MessageSid: 'SMvoice',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, voiceNote: true });
+    assert.equal(whisperCalls, 1);
+    // Transcript is stored with the required prefix, feeding the normal pipeline
+    const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
+    assert.ok(msgs.length >= 1);
+    assert.equal(String(msgs[msgs.length - 1].content), '[Voice note transcript]: "buy oat milk"');
+    const reply = await waitForTwilioReply(sent, (u) => { try { return new URL(String(u)).hostname === 'api.twilio.com'; } catch { return false; } });
+    assert.ok(reply, 'expected a Twilio reply for the voice note');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: oversized voice note gets the "bit long" reply and is not transcribed', async (t) => {
+  const { app, base, env } = await serverFixture(); t.after(() => app.close());
+  env.OPENAI_API_KEY = 'test-whisper-key';
+  await linkOwnerDirectly(app, base, 'owner-voice2@example.com');
+  const sent = [];
+  let whisperCalls = 0;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return mediaResponse([1], { contentLength: String(MAX_TWILIO_MEDIA_BYTES + 1) });
+    if (u?.hostname === 'api.twilio.com') { sent.push({ url: String(url), body: String(opts?.body || '') }); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    if (u?.hostname === 'api.openai.com') { whisperCalls++; return { ok: true, status: 200, json: async () => ({ text: 'x' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'audio/ogg',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv2/Media/MEv2',
+      Body: '', MessageSid: 'SMvoice2',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, voiceNote: false });
+    assert.equal(whisperCalls, 0, 'transcription must not be attempted for oversized audio');
+    assert.ok(sent.some((s) => decodeURIComponent(s.body).replace(/\+/g, ' ').includes('a bit long')), 'expected the polite too-long reply');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: image media still gets the photo-coming-soon reply', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app, base, 'owner-img@example.com');
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    try { if (new URL(String(url)).hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; } } catch {}
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'image/jpeg',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi/Media/MEi',
+      Body: '', MessageSid: 'SMimg',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true });
+    assert.ok(sent.some((b) => decodeURIComponent(b).replace(/\+/g, ' ').includes('photo support is coming soon')));
   } finally {
     globalThis.fetch = origFetch;
   }
