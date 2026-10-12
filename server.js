@@ -1204,6 +1204,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
       }catch(error){
         db.releaseProactiveSlot(user.id,today);
+        // Silent skip on rate limits — the worker retries in 5 min; don't pollute the Reliability tab
+        if(error.classification==='rate_limit')return;
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
       }
     }
@@ -1310,6 +1312,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
       }catch(error){
+        // Silent skip on rate limits — the worker retries in 5 min
+        if(error.classification==='rate_limit')return;
+        // Distinct event for Gmail auth failures so Edward gets an actionable message
+        if(error.status===401){
+          db.addEvent(user.id,'gmail_disconnected','Gmail needs reconnecting.','Please reconnect Gmail in the Connections tab.');
+          return;
+        }
         db.addEvent(user.id,'email_triage_failed','Could not triage emails.',error.message);
       }
     }
