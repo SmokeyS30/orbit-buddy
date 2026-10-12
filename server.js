@@ -1,6 +1,8 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomInt } from 'node:crypto';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -254,6 +256,65 @@ export function createOrbitServer(options={}) {
   const chatQueues=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
   function enqueueChatReply(conversationId,job){const prev=chatQueues.get(conversationId)||Promise.resolve();const next=prev.then(async()=>{try{await job();}catch(error){console.error('chat job failed',conversationId,error&&error.message);}});chatQueues.set(conversationId,next);next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});return next;}
+  // Shared reply pipeline used by web chat (/api/chat) and WhatsApp.
+  // The caller adds the user message first; this generates the assistant reply
+  // with the full model pipeline, stores it, and returns the answer text.
+  async function runChatReplyJob({userId,user,conversation,message,userMsg}){
+    if(!db.getConversation(userId,conversation.id))return null;
+    const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
+    let answer=null;
+    try{
+      const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
+      const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
+      const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
+      let needsBuddyName=false;
+      if(!customBuddyName){
+        const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
+        if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
+      }
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,
+        memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
+          gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
+        onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
+      for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
+      // Backward compatibility for replies from older/custom models that still emit legacy markers.
+      for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
+      for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
+      answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
+      db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';db.addMessage(userId,conversation.id,'assistant',answer);}
+    streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
+    await maybeRefreshConversationSummary(user,conversation);
+    if(isCorrectionMessage(message)){
+      // Learn from the correction without blocking: figure out what was wrong and save the fix
+      setImmediate(async()=>{
+        try{
+          const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
+          const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
+          const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
+
+Conversation:
+${hist}
+
+Respond with a single JSON object: {"content":"one clear sentence capturing the corrected understanding","confidence":0.85-0.95}`,memories:[],goals:[],history:[],userTimeZone:tzNow,taskMode:true});
+          const fm=fixText.match(/\{[\s\S]*\}/);
+          if(fm){
+            const parsed=JSON.parse(fm[0]);
+            const content=String(parsed.content||'').trim().slice(0,500);
+            if(content.length>=10){
+              const existing=db.listRelevantMemories(userId,content,3);
+              if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
+                db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
+                db.addEvent(userId,'correction_learned','Learned from a user correction.');
+              }
+            }
+          }
+        }catch(e){db.addEvent(userId,'correction_learn_failed','Could not learn from a correction.',e.message);}
+      });
+    }
+    return answer;
+  }
   async function runDueTasks(){
     if(workerBusy||paused())return;workerBusy=true;
     try{
@@ -1544,6 +1605,64 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const now=new Date();const monthStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)).toISOString();
         return json(res,200,{month:monthStart.slice(0,7),braveConfigured:!!env.BRAVE_SEARCH_API_KEY?.trim(),webSearches:db.countToolUseSince('web_search',monthStart)});
       }
+      // WhatsApp webhook (Twilio). Public: Twilio authenticates via X-Twilio-Signature.
+      if(req.method==='POST'&&url.pathname==='/api/whatsapp/webhook'){
+        if(!whatsappConfigured(env))return json(res,200,{ok:true,configured:false});
+        const params=await readFormBody(req);
+        const webhookUrl=originFor(req)+'/api/whatsapp/webhook';
+        if(!verifyTwilioSignature({authToken:env.TWILIO_AUTH_TOKEN,url:webhookUrl,params,signature:req.headers['x-twilio-signature']})){
+          return json(res,403,{error:'Invalid signature.'});
+        }
+        const from=normalizePhone(params.From);
+        const body=String(params.Body||'').trim();
+        const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
+        // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
+        if(/^\d{6}$/.test(body)){
+          const record=db.getSetting(`whatsapp_link_code_${body}`);
+          if(record){
+            const sep=record.indexOf(':'); // userId is a UUID (no colons); the ISO timestamp after it has colons
+            const linkUserId=record.slice(0,sep);
+            const expiresAt=record.slice(sep+1);
+            db.setSetting(`whatsapp_link_code_${body}`,''); // single-use
+            if(linkUserId&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
+              try{
+                db.linkWhatsApp(linkUserId,from);
+                db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
+                try{await twilioSend(from,'Connected! You can now chat with Orbit right here on WhatsApp.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
+              }catch(e){
+                try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
+              }
+              return json(res,200,{ok:true});
+            }
+          }
+          // Code didn't match: fall through to normal message handling below.
+        }
+        const link=from?db.getUserByWhatsApp(from):null;
+        if(!link)return json(res,200,{ok:true,ignored:true}); // unknown sender (or status callback): ignore
+        const waUserId=link.user_id;
+        if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
+        if(paused())return json(res,200,{ok:true,paused:true});
+        db.setWhatsAppLastInbound(waUserId);
+        const numMedia=parseInt(params.NumMedia||'0',10)||0;
+        const conversation=db.ensureDefaultConversation(waUserId);
+        const waUser=db.getUserById(waUserId);
+        if(numMedia>0){
+          // Phase 1 is text-only; media support lands in Phase 2.
+          db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
+          try{await twilioSend(from,'I can only read text messages for now — photo and voice-note support is coming soon.');}catch(e){console.error('whatsapp media reply failed',e.message);}
+          return json(res,200,{ok:true});
+        }
+        if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
+        const userMsg=db.addMessage(waUserId,conversation.id,'user',body.slice(0,6000));db.touchConversation(waUserId,conversation.id);
+        enqueueChatReply(conversation.id,async()=>{
+          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg});
+          if(answer&&from){
+            try{await twilioSend(from,answer);}
+            catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+          }
+        });
+        return json(res,200,{ok:true});
+      }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
@@ -1662,62 +1781,25 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
           const userMsg=db.addMessage(userId,conversation.id,'user',message);db.touchConversation(userId,conversation.id);
-          const isCorrection=isCorrectionMessage(message);
-          enqueueChatReply(conversation.id,async()=>{
-            if(!db.getConversation(userId,conversation.id))return;
-            const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
-            try{
-              const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
-              const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
-              const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
-              let needsBuddyName=false;
-              if(!customBuddyName){
-                const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
-                if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
-              }
-              const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,
-                memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-                tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
-                  gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
-                onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
-              for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
-              // Backward compatibility for replies from older/custom models that still emit legacy markers.
-              for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
-              for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
-              const answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
-              db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
-            }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);db.addMessage(userId,conversation.id,'assistant',connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?');}
-            streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
-            await maybeRefreshConversationSummary(user,conversation);
-            if(isCorrection){
-              // Learn from the correction without blocking: figure out what was wrong and save the fix
-              setImmediate(async()=>{
-                try{
-                  const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
-                  const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
-                  const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
-
-Conversation:
-${hist}
-
-Respond with a single JSON object: {"content":"one clear sentence capturing the corrected understanding","confidence":0.85-0.95}`,memories:[],goals:[],history:[],userTimeZone:tzNow,taskMode:true});
-                  const fm=fixText.match(/\{[\s\S]*\}/);
-                  if(fm){
-                    const parsed=JSON.parse(fm[0]);
-                    const content=String(parsed.content||'').trim().slice(0,500);
-                    if(content.length>=10){
-                      const existing=db.listRelevantMemories(userId,content,3);
-                      if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
-                        db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
-                        db.addEvent(userId,'correction_learned','Learned from a user correction.');
-                      }
-                    }
-                  }
-                }catch(e){db.addEvent(userId,'correction_learn_failed','Could not learn from a correction.',e.message);}
-              });
-            }
-          });
+          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message,userMsg}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+        }
+        // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
+        if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
+          if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
+          const code=String(randomInt(100000,1000000));
+          const expiresAt=new Date(Date.now()+10*60_000).toISOString();
+          db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
+          db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
+          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/whatsapp/link/status'){
+          const link=db.getWhatsAppLink(userId);
+          return json(res,200,{linked:!!link,phone:link?maskPhone(link.phone_e164):null,configured:whatsappConfigured(env),whatsappNumber:whatsappConfigured(env)?env.TWILIO_WHATSAPP_NUMBER:null});
+        }
+        if(req.method==='DELETE'&&url.pathname==='/api/whatsapp/link'){
+          db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
+          return json(res,200,{ok:true});
         }
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
         if(req.method==='POST'&&url.pathname==='/api/conversations'){const body=await readJson(req);const raw=String(body.title||'').trim();const title=raw?cleanText(raw,80,'title'):'New chat';return json(res,201,db.createConversation(userId,title));}

@@ -256,6 +256,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
       used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS whatsapp_links (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      phone_e164 TEXT NOT NULL UNIQUE,
+      verified_at TEXT NOT NULL,
+      last_inbound_at TEXT,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS waitlist (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
       status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
@@ -558,7 +565,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addPwResetToken: db.prepare('INSERT INTO password_reset_tokens VALUES (?, ?, ?, 0, ?)'),
     getPwResetToken: db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?'),
     usePwResetToken: db.prepare('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0'),
-    cleanPwResetTokens: db.prepare('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1')
+    cleanPwResetTokens: db.prepare('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1'),
+    linkWhatsApp: db.prepare(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,verified_at=excluded.verified_at,created_at=excluded.created_at`),
+    getWhatsAppLink: db.prepare('SELECT * FROM whatsapp_links WHERE user_id=?'),
+    getUserByWhatsApp: db.prepare('SELECT * FROM whatsapp_links WHERE phone_e164=?'),
+    setWhatsAppLastInbound: db.prepare('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?'),
+    unlinkWhatsApp: db.prepare('DELETE FROM whatsapp_links WHERE user_id=?')
   };
 
   return {
@@ -857,6 +870,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listConnectors: (userId) => s.listConnectors.all(userId),
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
+    linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
+    getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
+    getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
+    setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,
+    unlinkWhatsApp: (userId) => s.unlinkWhatsApp.run(userId).changes>0,
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
