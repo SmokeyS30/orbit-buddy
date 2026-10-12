@@ -27,12 +27,16 @@ test('health and setup are public while private data requires a session', async 
   // Retry the static file fetch: occasionally the server isn't fully ready
   let shellText = '';
   for (let i = 0; i < 5; i++) {
-    const shell = await fetch(base);
+    const shell = await fetch(`${base}/index.html`);
     shellText = await shell.text();
     if (shellText.includes('id="model-check-button"')) break;
     await new Promise((r) => setTimeout(r, 200));
   }
   assert.match(shellText, /id="model-check-button"/);
+  // Logged-out visitors get the welcome page at /
+  const welcome = await fetch(base);
+  const welcomeText = await welcome.text();
+  assert.match(welcomeText, /Join the Waitlist/);
   const appScript = await fetch(`${base}/app.js`);
   assert.match(appScript.headers.get('cache-control'), /no-cache/);
   const health = await fetch(`${base}/healthz`);
