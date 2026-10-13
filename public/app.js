@@ -2,6 +2,7 @@
 import { isNearBottom, scrollToBottom, settleAtBottom, shouldSettleAtBottom } from './chat-scroll.js';
 import { renderAssistantMarkdown } from './chat-markdown.js';
 import { isVoiceModeCommand, createVoiceMode } from './voice-mode.js';
+import { isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage } from './canvas.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
 let activeConversationId=null;try{activeConversationId=localStorage.getItem('orbit-convo');}catch(_){}
 let preferencesDirty=false;
@@ -28,7 +29,7 @@ function settlePendingReplies(messages,convoId){const set=pendingReplies.get(con
 function syncTypingBubble(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!typingActive)showTyping(false);else if(!want&&typingActive)hideTyping();}
 let lastMessageFingerprint='';
 let renderedConversationId=null;
-function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id)el.id='msg-'+item.id;if(item.role==='assistant'){if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id)el.id='msg-'+item.id;if(item.role==='assistant'){if(isCanvasWorthy(item.content))renderCanvasDoc(el,item.content);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$('#task-count').textContent=String(items.filter((task)=>!['completed','cancelled','failed'].includes(task.status)).length);if(!items.length)return empty(root,'No tasks yet. Give Orbit one clear outcome to prepare.');for(const task of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=task.title;const prompt=document.createElement('p');prompt.textContent=task.prompt;wrap.append(h,prompt);const status=document.createElement('span');status.className=`badge ${task.status}`;status.textContent=task.status.replaceAll('_',' ');head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';for(const value of [task.risk==='external'?'approval gated':'think only',task.recurrence,formatDate(task.schedule_at)]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}card.append(meta);if(task.result){const result=document.createElement('p');result.className='result';result.textContent=task.result;card.append(result);}if(task.status==='waiting_approval'){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve plan','primary',()=>taskAction(task.id,'approve')),button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}else if(!['completed','failed','cancelled'].includes(task.status)){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Cancel','danger',()=>taskAction(task.id,'cancel')),button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}else{const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}root.append(card);}}
 // --- B1: Today tab morning briefing ---
@@ -553,12 +554,36 @@ function openVoiceMode(){
   }
   if(!voiceMode.isOpen())voiceMode.open();
 }
+// R2 Canvas: substantial assistant responses render as document panels
+// instead of chat bubbles. Detection is automatic from the response shape.
+function renderCanvasDoc(el,content){
+  el.classList.add('canvas-doc');
+  const head=document.createElement('header');head.className='canvas-head';
+  const eyebrow=document.createElement('p');eyebrow.className='eyebrow';eyebrow.textContent='Document';
+  const title=document.createElement('h3');title.textContent=canvasTitle(content);
+  head.append(eyebrow,title);
+  const body=document.createElement('div');body.className='canvas-body';
+  if(!renderAssistantMarkdown(body,content))body.textContent=content;
+  el.append(head,body);
+}
+// R2 Canvas: "print this" / "share this" open the printable page for the
+// latest canvas document in the active conversation.
+async function openCanvasRender(){
+  const doc=findLatestCanvasMessage(state.snapshot&&state.snapshot.messages);
+  if(!doc){toast('No document in this conversation yet — ask Orbit for a plan, itinerary, or comparison first.');return;}
+  try{
+    const res=await api('/api/canvas/render',{method:'POST',body:JSON.stringify({title:doc.title,markdown:doc.content})});
+    if(res&&res.token)window.open('/api/canvas/render/'+encodeURIComponent(res.token),'_blank','noopener');
+    else toast('Could not prepare the document.');
+  }catch(error){toast(error.message);}
+}
 async function sendChatMessage(text){
   const input=$('#chat-input');
   const submit=document.querySelector('#chat-form button[type="submit"]');
   const message=String(text||'').trim();
   if(!message)return;
   if(isVoiceModeCommand(message)){openVoiceMode();return;}
+  if(isCanvasCommand(message)){openCanvasRender();return;}
   if(submit)submit.disabled=true;
   if(!navigator.onLine){queueOfflineMessage(message);if(submit)submit.disabled=false;return;}
   const el=appendOptimisticMessage(message);

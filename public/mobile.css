@@ -31,3 +31,9 @@
   #voice-orb{width:104px;height:104px;font-size:38px}
   .voice-transcript{max-height:220px}
 }
+
+/* --- R2: canvas documents on small screens --- */
+@media(max-width:760px){
+  .message.assistant.canvas-doc{padding:20px 18px;border-radius:16px}
+  .canvas-head h3{font-size:18px}
+}
