@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 29);
+  assert.equal(TOOL_DEFINITIONS.length, 30);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_buddy_name', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_ambient_context', 'set_buddy_name', 'update_goal', 'update_project_step', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -907,5 +907,24 @@ test('set_buddy_name saves a custom buddy name', async () => {
   // Empty name rejected
   await assert.rejects(() => executeTool('set_buddy_name', { name: '   ' }, {}, ctx), /1-40 characters/);
   await assert.rejects(() => executeTool('set_buddy_name', {}, {}, ctx), /1-40 characters/);
+  db.close();
+});
+
+test('set_ambient_context records the permission choice', async () => {
+  const { openDatabase } = await import('../src/database.js');
+  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-ambient-'));
+  const db = openDatabase(path.join(dir, 't.sqlite'));
+  const user = db.createUser({ email: 'ambient@example.com', displayName: 'T', passwordHash: 'h', passwordSalt: 's', role: 'owner' });
+  const ctx = { db, userId: user.id };
+  assert.equal(db.getSetting(`ambient_context_${user.id}`), null);
+  const { result } = await executeTool('set_ambient_context', { value: 'granted' }, {}, ctx);
+  assert.equal(result.value, 'granted');
+  assert.equal(db.getSetting(`ambient_context_${user.id}`), 'granted');
+  const { result: r2 } = await executeTool('set_ambient_context', { value: 'DECLINED' }, {}, ctx);
+  assert.equal(r2.value, 'declined');
+  assert.equal(db.getSetting(`ambient_context_${user.id}`), 'declined');
+  await assert.rejects(() => executeTool('set_ambient_context', { value: 'maybe' }, {}, ctx), /granted.*declined/);
+  await assert.rejects(() => executeTool('set_ambient_context', {}, {}, ctx), /granted.*declined/);
   db.close();
 });
