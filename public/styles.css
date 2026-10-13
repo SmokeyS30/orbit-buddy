@@ -50,6 +50,9 @@ button,.tab,.thread-chip,.check{-webkit-tap-highlight-color:transparent}
 /* Keyboard focus visibility */
 button:focus-visible,.tab:focus-visible,.thread-chip:focus-visible,a:focus-visible,.check input:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
 
+/* iOS Safari: ensure taps register as taps, not scroll/pinch gestures */
+button,.tab,.thread-chip,a{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+
 /* Comfortable mobile touch targets */
 .mini-actions button{min-height:40px}
 .auth-links button{padding:10px 8px}
