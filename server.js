@@ -14,6 +14,7 @@ import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDa
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
 import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
+import { buildTodayBriefing } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
@@ -199,6 +200,8 @@ export function createOrbitServer(options={}) {
   const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
+  // B1: per-user morning-briefing cache (userId -> {date, at, data}), 10-min TTL.
+  const briefingCache=new Map();
   function reliabilityFor(userId){
     const events=db.listEvents(userId,200);const since=Date.now()-7*24*60*60_000;const recent=events.filter((event)=>new Date(event.created_at).valueOf()>=since);
     const count=(type)=>recent.filter((event)=>event.type===type).length;const chats={successful:count('chat'),failed:count('chat_failed')};const tasks={successful:count('task_completed'),failed:count('task_failed')};
@@ -1830,6 +1833,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
+        // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
+        // the 15s frontend refresh doesn't refetch weather/calendar each time.
+        if(req.method==='GET'&&url.pathname==='/api/today-briefing'){
+          const prefs=db.getPreferences(userId);
+          const zone=prefs.time_zone||'America/New_York';
+          const today=todayInZone(zone);
+          const cached=briefingCache.get(userId);
+          if(cached&&cached.date===today&&Date.now()-cached.at<10*60_000)return json(res,200,cached.data);
+          const data=await buildTodayBriefing(db,userId,{reliability:reliabilityFor(userId)});
+          briefingCache.set(userId,{date:today,at:Date.now(),data});
+          return json(res,200,data);
+        }
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
           let months=parseInt(url.searchParams.get('months')||'12',10);

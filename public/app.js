@@ -30,7 +30,169 @@ let renderedConversationId=null;
 function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id)el.id='msg-'+item.id;if(item.role==='assistant'){if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$('#task-count').textContent=String(items.filter((task)=>!['completed','cancelled','failed'].includes(task.status)).length);if(!items.length)return empty(root,'No tasks yet. Give Orbit one clear outcome to prepare.');for(const task of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=task.title;const prompt=document.createElement('p');prompt.textContent=task.prompt;wrap.append(h,prompt);const status=document.createElement('span');status.className=`badge ${task.status}`;status.textContent=task.status.replaceAll('_',' ');head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';for(const value of [task.risk==='external'?'approval gated':'think only',task.recurrence,formatDate(task.schedule_at)]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}card.append(meta);if(task.result){const result=document.createElement('p');result.className='result';result.textContent=task.result;card.append(result);}if(task.status==='waiting_approval'){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve plan','primary',()=>taskAction(task.id,'approve')),button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}else if(!['completed','failed','cancelled'].includes(task.status)){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Cancel','danger',()=>taskAction(task.id,'cancel')),button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}else{const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}root.append(card);}}
-function renderTodayFocus(goals,routines){const root=$('#today-focus');root.replaceChildren();const active=goals.filter((goal)=>goal.status==='active').slice(0,2);for(const goal of active){const card=document.createElement('article');card.className='focus-card';const label=document.createElement('span');label.className='badge kind-badge';label.textContent=`priority ${goal.priority} goal`;const title=document.createElement('h3');title.textContent=goal.title;const detail=document.createElement('p');detail.textContent=goal.next_step?`Next: ${goal.next_step}`:`${goal.progress}% complete${goal.target_date?` · target ${goal.target_date}`:''}`;card.append(label,title,detail);root.append(card);}const routine=routines.find((item)=>item.enabled);if(routine){const card=document.createElement('article');card.className='focus-card';const label=document.createElement('span');label.className='badge';label.textContent='next routine';const title=document.createElement('h3');title.textContent=routine.title;const detail=document.createElement('p');detail.textContent=`${routine.cadence} at ${routine.time_local} local`;card.append(label,title,detail);root.append(card);}if(!root.children.length){const card=document.createElement('article');card.className='focus-card';const title=document.createElement('h3');title.textContent='Build your focus';const detail=document.createElement('p');detail.textContent='Add a goal or routine and Orbit will keep the right next step visible here.';card.append(title,detail);root.append(card);}}
+// --- B1: Today tab morning briefing ---
+// Magazine-style generated morning page: weather, calendar, focus goals,
+// memory anniversaries, open approvals, and a quiet systems line (B4).
+// Data comes from GET /api/today-briefing; cached client-side for 10 minutes
+// so the 15s refresh loop doesn't refetch it.
+const briefingState={data:null,at:0};
+async function loadBriefing(){
+  if(briefingState.data&&Date.now()-briefingState.at<10*60_000){renderBriefing(briefingState.data);return;}
+  try{
+    const data=await api('/api/today-briefing');
+    briefingState.data=data;briefingState.at=Date.now();
+    renderBriefing(data);
+  }catch(error){renderBriefingError();}
+}
+function renderBriefingError(){
+  const root=$('#today-briefing');if(!root)return;root.replaceChildren();
+  const p=document.createElement('p');p.className='muted';
+  p.textContent='Could not load your briefing just now — it will retry on its own.';
+  root.append(p);
+}
+function briefingCard(title){
+  const card=document.createElement('article');card.className='briefing-card';
+  const h=document.createElement('h3');h.textContent=title;card.append(h);
+  return card;
+}
+function renderBriefing(data){
+  const root=$('#today-briefing');if(!root||!data)return;root.replaceChildren();
+  const mast=document.createElement('div');mast.className='briefing-masthead';
+  const eyebrow=document.createElement('p');eyebrow.className='eyebrow';
+  eyebrow.textContent=`Morning briefing · ${data.dateLabel||''}`;
+  const h=document.createElement('h2');h.textContent=`${data.greeting||'Good morning'}.`;
+  mast.append(eyebrow,h);
+  const parts=[];
+  if((data.agenda||[]).length)parts.push(`${data.agenda.length} on the calendar`);
+  if(data.openLoopCount)parts.push(`${data.openLoopCount} open loop${data.openLoopCount===1?'':'s'}`);
+  const todayAnn=(data.anniversaries||[]).filter((a)=>a.daysUntil===0);
+  for(const a of todayAnn)parts.push(`${a.label} today`);
+  if(data.tomorrowCount)parts.push(`${data.tomorrowCount} tomorrow`);
+  const dek=document.createElement('p');dek.className='briefing-dek';
+  dek.textContent=parts.length?parts.join(' · '):'A clear day — make it count.';
+  mast.append(dek);root.append(mast);
+  const grid=document.createElement('div');grid.className='briefing-grid';
+
+  // Weather
+  if(data.weather){
+    const card=briefingCard('Weather');
+    const now=document.createElement('div');now.className='weather-now';
+    const temp=document.createElement('strong');temp.textContent=`${data.weather.current.tempF}°`;
+    const cond=document.createElement('div');
+    const c1=document.createElement('p');c1.textContent=data.weather.current.condition;
+    const c2=document.createElement('p');c2.className='muted small';
+    c2.textContent=`${data.weather.location||''} · wind ${data.weather.current.windMph} mph`.replace(/^ · /,'');
+    cond.append(c1,c2);now.append(temp,cond);card.append(now);
+    if((data.weather.forecast||[]).length){
+      const strip=document.createElement('div');strip.className='forecast-strip';
+      for(const f of data.weather.forecast){
+        const d=document.createElement('div');d.className='forecast-day';
+        const dn=document.createElement('span');dn.className='forecast-name';dn.textContent=f.day;
+        const dc=document.createElement('span');dc.className='muted small';dc.textContent=f.condition;
+        const dt=document.createElement('span');dt.className='forecast-temps';dt.textContent=`${f.highF}° / ${f.lowF}°`;
+        d.append(dn,dc,dt);strip.append(d);
+      }
+      card.append(strip);
+    }
+    grid.append(card);
+  }
+
+  // Agenda
+  {
+    const card=briefingCard('Today');
+    if(!(data.agenda||[]).length){
+      const p=document.createElement('p');p.className='muted';p.textContent='Nothing scheduled — the day is yours.';
+      card.append(p);
+    }
+    for(const e of data.agenda||[]){
+      const row=document.createElement('div');row.className='agenda-row';
+      const t=document.createElement('span');t.className='agenda-time';t.textContent=e.allDay?'All day':e.endLabel?`${e.timeLabel} – ${e.endLabel}`:e.timeLabel;
+      const title=document.createElement('span');title.className='agenda-title';title.textContent=e.title;
+      row.append(t,title);
+      if(e.location){const loc=document.createElement('small');loc.className='muted';loc.textContent=e.location;row.append(loc);}
+      card.append(row);
+    }
+    if(data.tomorrowCount){
+      const p=document.createElement('p');p.className='muted small block-top';
+      p.textContent=`Plus ${data.tomorrowCount} tomorrow.`;
+      card.append(p);
+    }
+    grid.append(card);
+  }
+
+  // Focus goals
+  if((data.focusGoals||[]).length){
+    const card=briefingCard('Focus');
+    for(const g of data.focusGoals){
+      const wrap=document.createElement('div');wrap.className='focus-goal';
+      const title=document.createElement('strong');title.textContent=g.title;wrap.append(title);
+      const bar=document.createElement('progress');bar.className='goal-progress';bar.max=100;bar.value=g.progress;
+      bar.setAttribute('aria-label',`${g.title} progress`);wrap.append(bar);
+      const detail=document.createElement('p');detail.className='muted small';
+      const bits=[`${g.progress}%`];
+      if(g.nextStep)bits.push(`next: ${g.nextStep}`);
+      else if(g.targetDate)bits.push(`target ${g.targetDate}`);
+      if(g.streak>=2)bits.push(`🔥 ${g.streak}-day streak`);
+      detail.textContent=bits.join(' · ');wrap.append(detail);
+      card.append(wrap);
+    }
+    grid.append(card);
+  }
+
+  // Open loops: approvals, approval-gated tasks, due follow-ups
+  if(data.openLoopCount){
+    const card=briefingCard('Open loops');
+    const loops=data.openLoops||{};
+    for(const a of loops.approvals||[]){
+      const row=document.createElement('button');row.type='button';row.className='loop-row';
+      const label=document.createElement('span');label.textContent=`Approval: ${a.title}`;
+      const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
+      row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
+    }
+    for(const t of loops.waitingTasks||[]){
+      const row=document.createElement('button');row.type='button';row.className='loop-row';
+      const label=document.createElement('span');label.textContent=`Task plan: ${t.title}`;
+      const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
+      row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
+    }
+    for(const f of loops.followUps||[]){
+      const row=document.createElement('div');row.className='loop-row static';
+      const label=document.createElement('span');label.textContent=`Follow-up: ${f.description}`;
+      const hint=document.createElement('small');hint.className='muted';hint.textContent=f.overdue?`was due ${f.dueDate}`:`due ${f.dueDate}`;
+      row.append(label,hint);card.append(row);
+    }
+    grid.append(card);
+  }
+
+  // Anniversaries / personal dates coming up
+  if((data.anniversaries||[]).length){
+    const card=briefingCard('Coming up');
+    for(const a of data.anniversaries){
+      const row=document.createElement('div');row.className='agenda-row';
+      const icon=document.createElement('span');icon.textContent=a.type==='birthday'?'🎂':a.type==='anniversary'?'💛':'📌';
+      const label=document.createElement('span');label.className='agenda-title';
+      label.textContent=a.years?`${a.label} — ${a.years} year${a.years===1?'':'s'}`:a.label;
+      const when=document.createElement('small');when.className='muted';when.textContent=a.when;
+      row.append(icon,label,when);card.append(row);
+    }
+    grid.append(card);
+  }
+
+  if(grid.children.length)root.append(grid);
+
+  // B4: Reliability is quiet by default — one status line, full tab as drill-down.
+  const sys=data.systems;
+  const line=document.createElement('button');line.type='button';
+  line.className='systems-line'+(sys&&!sys.ok?' warn':'');
+  const dot=document.createElement('span');dot.className='systems-dot';dot.setAttribute('aria-hidden','true');
+  const label=document.createElement('span');
+  if(!sys)label.textContent='Systems status unavailable';
+  else if(sys.ok)label.textContent=`All systems normal${sys.chatSuccessRate!==null&&sys.chatSuccessRate!==undefined?` · ${sys.chatSuccessRate}% chat success (7d)`:''}`;
+  else label.textContent=`${sys.failureCount} failure${sys.failureCount===1?'':'s'} in the last 7 days — view Reliability`;
+  line.append(dot,label);
+  line.addEventListener('click',()=>activateView('reliability'));
+  root.append(line);
+}
 function renderGoals(items){const root=$('#goals-list');if(root.contains(document.activeElement))return;root.replaceChildren();if(!items.length)return empty(root,'No goals yet. Track one outcome Orbit can help you keep in view.');for(const goal of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const title=document.createElement('h3');title.textContent=goal.title;const description=document.createElement('p');description.textContent=goal.description||goal.next_step||'No details added.';wrap.append(title,description);const status=document.createElement('span');status.className=`badge ${goal.status}`;status.textContent=goal.status;head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';const goalStreak=state.snapshot?.streaks?.goals?.[goal.id]||0;for(const value of [`priority ${goal.priority}`,goal.target_date?`target ${goal.target_date}`:'no target date',`${goal.progress}% complete`]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}if(goalStreak>=2){const stag=document.createElement('span');stag.className='badge streak';stag.textContent=`🔥 ${goalStreak}-day streak`;meta.append(stag);}card.append(meta);const progress=document.createElement('progress');progress.className='goal-progress';progress.max=100;progress.value=goal.progress;progress.setAttribute('aria-label',`${goal.title} progress`);card.append(progress);if(goal.next_step){const next=document.createElement('p');next.textContent=`Next: ${goal.next_step}`;card.append(next);}if(goal.status!=='completed'){const editor=document.createElement('div');editor.className='goal-editor';const amount=document.createElement('input');amount.type='number';amount.min='0';amount.max='100';amount.value=String(goal.progress);amount.setAttribute('aria-label','Progress percent');const next=document.createElement('input');next.value=goal.next_step||'';next.maxLength=500;next.placeholder='Next step';const save=button('Update','ghost',()=>updateGoal(goal.id,{progress:Number(amount.value),nextStep:next.value}));editor.append(amount,next,save);card.append(editor);}const actions=document.createElement('div');actions.className='mini-actions';if(goal.status!=='completed')actions.append(button(goal.status==='paused'?'Resume':'Pause','ghost',()=>updateGoal(goal.id,{status:goal.status==='paused'?'active':'paused'})),button('Complete','primary',()=>updateGoal(goal.id,{progress:100,status:'completed'})));actions.append(button('Delete','danger',()=>deleteGoal(goal.id,goal.title)));card.append(actions);root.append(card);}}
 function renderRoutines(items){const root=$('#routines-list');root.replaceChildren();if(!items.length)return empty(root,'No routines yet. A morning briefing is a good place to start.');const weekdays=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];for(const routine of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const title=document.createElement('h3');title.textContent=routine.title;const prompt=document.createElement('p');prompt.textContent=routine.prompt;wrap.append(title,prompt);const status=document.createElement('span');status.className=`badge ${routine.enabled?'active':'paused'}`;status.textContent=routine.enabled?'active':'paused';head.append(wrap,status);card.append(head);const cadence=routine.cadence==='weekly'?`weekly · ${weekdays[routine.day_of_week]}`:routine.cadence;const meta=document.createElement('div');meta.className='meta';const routineStreak=state.snapshot?.streaks?.routines?.[routine.id]||0;for(const value of [routine.kind,cadence,`${routine.time_local} local`,routine.last_run_at?`last ran ${formatDate(routine.last_run_at)}`:'not run yet']){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}if(routineStreak>=2){const stag=document.createElement('span');stag.className='badge streak';stag.textContent=`🔥 ${routineStreak}-day streak`;meta.append(stag);}card.append(meta);if(routine.last_error){const error=document.createElement('p');error.className='routine-error';error.textContent=`Last run: ${routine.last_error}`;card.append(error);}const actions=document.createElement('div');actions.className='mini-actions';actions.append(button(routine.enabled?'Pause':'Enable','ghost',()=>toggleRoutine(routine.id,!routine.enabled)),button('Delete','danger',()=>deleteRoutine(routine.id,routine.title)));card.append(actions);root.append(card);}}
 function renderMemories(items,suggestions){const root=$('#memory-list');root.replaceChildren();for(const s of suggestions||[]){const card=document.createElement('article');card.className='item-card suggested';const head=document.createElement('header');const wrap=document.createElement('div');const badge=document.createElement('p');badge.className='hint';badge.textContent=`Suggested ${s.kind||'fact'} — needs your approval`;const text=document.createElement('p');text.textContent=s.content;wrap.append(badge,text);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve','primary',()=>approveSuggestion(s.id)),button('Dismiss','ghost',()=>dismissSuggestion(s.id)));head.append(wrap,actions);card.append(head);root.append(card);}if(!items.length&&!(suggestions||[]).length)return empty(root,'Nothing saved. Orbit only remembers what you approve.');for(const memory of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const kind=document.createElement('span');kind.className='badge kind-badge';kind.textContent=memory.kind||'fact';const text=document.createElement('p');text.textContent=memory.content;wrap.append(kind,text);head.append(wrap,button('Delete','danger',()=>deleteMemory(memory.id)));card.append(head);root.append(card);}}
@@ -136,7 +298,7 @@ function renderWhatsAppCard(root){
 function renderConnections(){const root=$('#connections-list');if(!root||!state.snapshot)return;const ae=document.activeElement;if(ae&&ae.tagName==='INPUT'&&root.contains(ae))return;root.replaceChildren();const connected=new Map((state.snapshot.connectors||[]).map((item)=>[item.provider,item]));for(const provider of state.status.connectors||[]){const card=document.createElement('article');card.className='panel connector-card';const h=document.createElement('h2');h.textContent=provider.label;const p=document.createElement('p');p.className='muted';const live=connected.has(provider.id);p.textContent=live?'Connected with encrypted credentials.':provider.configured?'Ready to connect.':'Server administrator must configure OAuth credentials.';card.append(h,p);if(live){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Preview access','ghost',()=>previewConnector(provider.id)),button('Disconnect','danger',()=>disconnectConnector(provider.id)));card.append(actions);}else{const connect=button('Connect','primary',()=>beginConnector(provider.id));connect.disabled=!provider.configured;card.append(connect);}root.append(card);}if(state.user&&state.user.role==='owner')renderWhatsAppCard(root);renderCalendarFeeds();}
 function renderCalendarFeeds(){const root=$('#connections-list');if(!root||!state.snapshot)return;const feeds=state.snapshot.calendarFeeds||[];const panel=document.createElement('section');panel.className='panel section-gap';const h=document.createElement('h2');h.textContent='Calendar feeds';panel.append(h);const p=document.createElement('p');p.className='muted';p.textContent='Connect iCal feeds (Google, Apple, Outlook) so Orbit can read your schedule. Feed URLs are secret \u2014 only a masked preview is ever shown.';panel.append(p);const list=document.createElement('div');list.className='card-list block-top';if(!feeds.length){const e=document.createElement('p');e.className='muted';e.textContent='No calendars connected yet.';list.append(e);}for(const feed of feeds){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const title=document.createElement('h3');title.textContent=feed.label;const url=document.createElement('p');url.className='muted';url.textContent=feed.url;wrap.append(title,url);head.append(wrap,button('Remove','danger',()=>removeCalendarFeed(feed.id,feed.label)));card.append(head);list.append(card);}panel.append(list);const form=document.createElement('div');form.className='form-grid block-top';const labelWrap=document.createElement('label');labelWrap.textContent='Label';const labelInput=document.createElement('input');labelInput.placeholder='e.g. School';labelInput.maxLength=60;labelWrap.append(labelInput);const urlWrap=document.createElement('label');urlWrap.textContent='iCal feed URL';const urlInput=document.createElement('input');urlInput.placeholder='https://\u2026';urlInput.inputMode='url';urlInput.autocomplete='off';urlWrap.append(urlInput);const addBtn=button('Add calendar','primary',async()=>{const label=labelInput.value.trim(),feedUrl=urlInput.value.trim();if(!label||!feedUrl){toast('A label and feed URL are both required.');return;}addBtn.disabled=true;try{const added=await api('/api/calendar-feeds',{method:'POST',body:JSON.stringify({label,url:feedUrl})});toast(`Connected \u201c${added.feed.label}\u201d \u2014 ${added.eventsFound} events found.`);await refresh();}catch(error){toast(error.message);}finally{addBtn.disabled=false;}});form.append(labelWrap,urlWrap,addBtn);panel.append(form);const hint=document.createElement('p');hint.className='hint';hint.textContent='Google Calendar: Settings \u2192 pick the calendar \u2192 Secret address in iCal format. Apple Calendar: publish/share the calendar and copy its subscription link.';panel.append(hint);root.append(panel);}
 async function removeCalendarFeed(id,label){if(!window.confirm(`Remove the \u201c${label}\u201d calendar feed?`))return;try{await api(`/api/calendar-feeds/${id}`,{method:'DELETE'});await refresh();toast('Calendar feed removed.');}catch(error){toast(error.message);}}
-function render(){if(!state.snapshot)return;renderThreads();settlePendingReplies(state.snapshot.messages||[],state.snapshot.activeConversation&&state.snapshot.activeConversation.id);renderMessages(state.snapshot.messages);syncTypingBubble();syncStreamPoller();renderTodayFocus(state.snapshot.goals||[],state.snapshot.routines||[]);renderGoals(state.snapshot.goals||[]);renderRoutines(state.snapshot.routines||[]);renderProjects(state.snapshot.projects||[]);renderApprovals(state.snapshot.approvals||[],state.snapshot.tasks||[]);renderReliability(state.snapshot.reliability);renderTasks(state.snapshot.tasks);renderFiles(state.snapshot.artifacts||[]);renderMemories(state.snapshot.memories,state.snapshot.memorySuggestions);renderFollowUps(state.snapshot.followUps||[]);renderPersonalDates(state.snapshot.personalDates||[]);renderPreferences(state.snapshot.preferences);renderModelStatus(state.status.modelStatus);renderActivity(state.snapshot.events);renderConnections();renderTimeline();const paused=state.status.paused;$('#pause-banner').classList.toggle('hidden',!paused);$('#pause-button').classList.toggle('hidden',paused);$('#resume-button').classList.toggle('hidden',!paused);$('#chat-input').disabled=paused;const isOwner=state.user&&state.user.role==='owner';$('#registration-panel').classList.toggle('hidden',!isOwner);if(isOwner){const open=!!state.setup?.registrationOpen;$('#registration-status').textContent=open?'Registration is open. New signups can create accounts.':'Registration is closed. New signups are turned away.';$('#registration-toggle').textContent=open?'Close':'Open';$('#registration-toggle').classList.toggle('danger',open);}$('#access-panel').classList.toggle('hidden',!isOwner);$('#users-panel').classList.toggle('hidden',!isOwner);if(isOwner){renderAccessRequests();renderUserList();}}
+function render(){if(!state.snapshot)return;renderThreads();settlePendingReplies(state.snapshot.messages||[],state.snapshot.activeConversation&&state.snapshot.activeConversation.id);renderMessages(state.snapshot.messages);renderFollowUpNudge();syncTypingBubble();syncStreamPoller();renderGoals(state.snapshot.goals||[]);renderRoutines(state.snapshot.routines||[]);renderProjects(state.snapshot.projects||[]);renderApprovals(state.snapshot.approvals||[],state.snapshot.tasks||[]);renderReliability(state.snapshot.reliability);renderTasks(state.snapshot.tasks);renderFiles(state.snapshot.artifacts||[]);renderMemories(state.snapshot.memories,state.snapshot.memorySuggestions);renderFollowUps(state.snapshot.followUps||[]);renderPersonalDates(state.snapshot.personalDates||[]);renderPreferences(state.snapshot.preferences);renderModelStatus(state.status.modelStatus);renderActivity(state.snapshot.events);renderConnections();renderTimeline();const paused=state.status.paused;$('#pause-banner').classList.toggle('hidden',!paused);$('#pause-button').classList.toggle('hidden',paused);$('#resume-button').classList.toggle('hidden',!paused);$('#chat-input').disabled=paused;const isOwner=state.user&&state.user.role==='owner';$('#registration-panel').classList.toggle('hidden',!isOwner);if(isOwner){const open=!!state.setup?.registrationOpen;$('#registration-status').textContent=open?'Registration is open. New signups can create accounts.':'Registration is closed. New signups are turned away.';$('#registration-toggle').textContent=open?'Close':'Open';$('#registration-toggle').classList.toggle('danger',open);}$('#access-panel').classList.toggle('hidden',!isOwner);$('#users-panel').classList.toggle('hidden',!isOwner);if(isOwner){renderAccessRequests();renderUserList();}}
 function renderThreads(){const bar=document.querySelector('#thread-bar');if(!bar||!state.snapshot)return;bar.replaceChildren();for(const c of state.snapshot.conversations||[]){const b=document.createElement('button');b.type='button';b.className='thread-chip'+(c.id===activeConversationId?' active':'');const label=document.createElement('span');label.className='thread-label';label.textContent=c.title;b.append(label);const x=document.createElement('span');x.className='thread-x';x.textContent='\u00d7';x.title='Delete this conversation';x.addEventListener('click',(ev)=>{ev.stopPropagation();deleteThread(c.id,c.title);});b.append(x);b.addEventListener('click',()=>{if(c.id!==activeConversationId){activeConversationId=c.id;try{localStorage.setItem('orbit-convo',c.id);}catch(_){}refresh().catch(()=>{});}});bar.append(b);}const n=document.createElement('button');n.type='button';n.className='thread-chip thread-new';n.textContent='+ New chat';n.addEventListener('click',newThread);bar.append(n);}
 async function newThread(){try{const c=await api('/api/conversations',{method:'POST',body:JSON.stringify({})});activeConversationId=c.id;try{localStorage.setItem('orbit-convo',c.id);}catch(_){}await refresh();}catch(error){toast(error.message);}}
 async function deleteThread(id,title){if(!window.confirm(`Delete "${title}" and all its messages?`))return;try{await api(`/api/conversations/${id}`,{method:'DELETE'});if(id===activeConversationId){activeConversationId=null;try{localStorage.removeItem('orbit-convo');}catch(_){}}await refresh();toast('Conversation deleted.');}catch(error){toast(error.message);}}
@@ -148,7 +310,7 @@ let lastTypeAt=0;
 function isComposing(){const input=$('#chat-input');if(input&&(document.activeElement===input||input.value.trim()))return true;return Date.now()-lastTypeAt<3000;}
 document.addEventListener('input',(e)=>{if(e.target&&e.target.id==='chat-input')lastTypeAt=Date.now();},true);
 let refreshInFlight=false;
-async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{state.status=await api('/api/status');try{state.setup=await(await fetch('/api/auth/setup-status')).json();}catch(_){}const qs=activeConversationId?`?conversation=${encodeURIComponent(activeConversationId)}`:'';state.snapshot=await api('/api/snapshot'+qs);state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();}finally{refreshInFlight=false;}}
+async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{state.status=await api('/api/status');try{state.setup=await(await fetch('/api/auth/setup-status')).json();}catch(_){}const qs=activeConversationId?`?conversation=${encodeURIComponent(activeConversationId)}`:'';state.snapshot=await api('/api/snapshot'+qs);state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();if(state.user&&$('#today').classList.contains('active'))loadBriefing();}finally{refreshInFlight=false;}}
 async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');await refresh();maybeAskName();$('#auth-dialog').close();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await fetch('/api/auth/setup-status').then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(!$('#auth-dialog').open)$('#auth-dialog').showModal();}else{$('#status-text').textContent='Connection issue';$('#model-pill').textContent='Retrying connection';toast(error.message);}}}
 function setAuthMode(mode){$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';const forgot=mode==='forgot';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':forgot?'Reset password':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':forgot?'Enter your email and we\'ll send you a password reset link.':'Private by design — your conversations stay on your server and never train AI models.';$('#name-label').classList.toggle('hidden',!register);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover||forgot);$('#forgot-row').classList.toggle('hidden',mode!=='login');$('#auth-password').required=!recover&&!forgot;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':forgot?'Send reset link':'Sign in';const doorClosed=register&&state.setup&&!state.setup.needsOwner&&!state.setup.registrationOpen;$('#auth-closed').classList.toggle('hidden',!doorClosed);for(const id of['#name-label','#email-label','#password-label','#auth-submit']){const field=$(id);if(field)field.classList.toggle('hidden',!!doorClosed);}if(doorClosed){$('#auth-title').textContent='Registration is closed';$('#auth-copy').textContent='Ask the owner to open registration, then try again.';}$('#auth-error').textContent='';$('#request-form').classList.add('hidden');$('#request-status').textContent='';}
 function renderAccessRequests(){const list=$('#access-list');if(!list)return;list.replaceChildren();const pending=(state.accessRequests||[]).filter((r)=>!r.handled_at);if(!pending.length)return empty(list,'No pending requests.');for(const r of pending){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=r.name;const p=document.createElement('p');p.textContent=`${r.email} · asked ${formatDate(r.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve','primary',()=>approveRequest(r.id)),button('Deny','danger',()=>denyRequest(r.id)),button('Dismiss','ghost',()=>dismissRequest(r.id)));head.append(wrap);card.append(head,actions);list.append(card);}}
@@ -157,6 +319,33 @@ function renderUserList(){const list=$('#user-list');if(!list)return;list.replac
 async function dismissRequest(id){try{await api(`/api/admin/access-requests/${id}`,{method:'POST'});await refresh();toast('Request dismissed.');}catch(error){toast(error.message);}}
 async function approveRequest(id){if(!confirm('Approve this user for Orbit access?'))return;try{await api(`/api/admin/access-requests/${id}/approve`,{method:'POST'});await refresh();toast('Access approved.');}catch(error){toast(error.message);}}
 async function denyRequest(id){if(!confirm('Deny access? This will block their account.'))return;try{await api(`/api/admin/access-requests/${id}/deny`,{method:'POST'});await refresh();toast('Access denied.');}catch(error){toast(error.message);}}
+// --- B3: follow-ups surfaced inline in chat ---
+// Follow-ups exist as a data type but live on a tab nobody opens. The next
+// due follow-up appears as one gentle suggestion at the bottom of the
+// conversation: one tap to engage, easy to ignore (dismiss lasts the session).
+function renderFollowUpNudge(){
+  const root=$('#followup-nudge');if(!root)return;root.replaceChildren();
+  const items=(state.snapshot&&state.snapshot.followUps)||[];
+  if(!items.length)return;
+  const todayStr=new Date().toLocaleDateString('en-CA');
+  const inDays=(d)=>{const ms=new Date(d+'T12:00:00')-new Date(todayStr+'T12:00:00');return Math.round(ms/864e5);};
+  const due=items.filter((f)=>f.due_date<=todayStr).sort((a,b)=>a.due_date<b.due_date?-1:1)[0]
+    ||items.filter((f)=>inDays(f.due_date)<=3).sort((a,b)=>a.due_date<b.due_date?-1:1)[0];
+  if(!due)return;
+  try{if(sessionStorage.getItem('orbit-nudge-dismissed-'+due.id)==='1')return;}catch(_){}
+  const when=due.due_date<todayStr?`was due ${due.due_date}`:due.due_date===todayStr?'is due today':`is due ${due.due_date}`;
+  const card=document.createElement('div');card.className='followup-nudge';
+  const text=document.createElement('p');
+  const quote=document.createElement('strong');quote.textContent=`\u201c${due.description}\u201d`;
+  text.append(document.createTextNode('📌 '),quote,document.createTextNode(` ${when} — want to pick up where you left off?`));
+  const actions=document.createElement('div');actions.className='mini-actions';
+  actions.append(
+    button('Pick it up','primary',()=>sendChatMessage(`Let's pick this back up: ${due.description}`)),
+    button('Not now','ghost',()=>{try{sessionStorage.setItem('orbit-nudge-dismissed-'+due.id,'1');}catch(_){}renderFollowUpNudge();})
+  );
+  card.append(text,actions);root.append(card);
+}
+
 async function taskAction(id,action){try{await api(`/api/tasks/${id}/${action}`,{method:'POST'});await refresh();toast(action==='approve'?'Task approved.':'Task cancelled.');}catch(error){toast(error.message);}}
 async function taskDelete(id){if(!confirm('Delete this task permanently?'))return;try{await api(`/api/tasks/${id}`,{method:'DELETE'});await refresh();toast('Task deleted.');}catch(error){toast(error.message);}}
 async function updateGoal(id,patch){try{await api(`/api/goals/${id}`,{method:'PATCH',body:JSON.stringify(patch)});await refresh();toast('Goal updated.');}catch(error){toast(error.message);}}
@@ -177,7 +366,7 @@ async function beginConnector(provider){try{const result=await api(`/api/connect
 async function disconnectConnector(provider){try{await api(`/api/connectors/${provider}`,{method:'DELETE'});await refresh();toast('Connector disconnected.');}catch(error){toast(error.message);}}
 async function previewConnector(provider){try{const result=await api(`/api/connectors/${provider}/preview`);const items=(result.items||[]).slice(0,5);const summary=items.map((item)=>{const label=item.name||item.start||'Item';return item.from?`${label} — ${item.from.replace(/<.*>/,'').trim().slice(0,40)}`:label;}).join(' · ');toast(summary||'Connected, with no recent items.');}catch(error){toast(error.message);}}
 
-function activateView(name,{updateHash=true}={}){if(name==='more')return true;const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));return true;}
+function activateView(name,{updateHash=true}={}){if(name==='more')return true;const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));if(name==='today'&&state.user)loadBriefing();return true;}
 $$('.tab').forEach((tab)=>{if(tab.dataset.view==='more')return;tab.addEventListener('click',()=>activateView(tab.dataset.view));});
 
 // --- In-chat search UI (Q3) ---
@@ -312,7 +501,26 @@ async function flushChatQueue(){
 }
 window.addEventListener('online',()=>{flushChatQueue().catch(()=>{});});
 
-$('#chat-form').addEventListener('submit',async(event)=>{event.preventDefault();const submit=event.submitter;const input=$('#chat-input');const text=input.value;if(!text.trim())return;submit.disabled=true;input.value='';if(!navigator.onLine){queueOfflineMessage(text);submit.disabled=false;return;}const el=appendOptimisticMessage(text);try{const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text,conversationId:activeConversationId})});pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());await refresh();}catch(error){if(isNetworkError(error))queueOfflineMessage(text,el);else{input.value=text;if(el)el.remove();toast(error.message);await refresh();}}finally{submit.disabled=false;}});
+// Shared send path: the composer submit handler and the B3 follow-up nudge
+// ("Pick it up") both go through here.
+async function sendChatMessage(text){
+  const input=$('#chat-input');
+  const submit=document.querySelector('#chat-form button[type="submit"]');
+  const message=String(text||'').trim();
+  if(!message)return;
+  if(submit)submit.disabled=true;
+  if(!navigator.onLine){queueOfflineMessage(message);if(submit)submit.disabled=false;return;}
+  const el=appendOptimisticMessage(message);
+  try{
+    const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,conversationId:activeConversationId})});
+    pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());
+    await refresh();
+  }catch(error){
+    if(isNetworkError(error))queueOfflineMessage(message,el);
+    else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
+  }finally{if(submit)submit.disabled=false;}
+}
+$('#chat-form').addEventListener('submit',(event)=>{event.preventDefault();const input=$('#chat-input');const text=input.value;input.value='';sendChatMessage(text);});
 function appendOptimisticMessage(text){const root=$('#messages');if(!root)return null;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';const body=document.createElement('span');body.textContent=text;el.append(body);root.append(el);scrollToBottom(root);return el;}
 
 // Voice input via Web Speech API

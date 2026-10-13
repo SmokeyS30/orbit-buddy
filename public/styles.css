@@ -101,3 +101,39 @@ button:focus-visible,.tab:focus-visible,.thread-chip:focus-visible,a:focus-visib
 .more-menu .tab{flex:none;text-align:left;padding:11px 14px;border-radius:10px}
 .more-menu .tab.active{background:rgba(255,255,255,.08)}
 @media(max-width:760px){.more-wrap{display:block}#chat-search-input{width:150px}}
+.small{font-size:12px}
+/* --- B1: morning briefing (magazine-style) --- */
+.briefing{margin-top:22px}
+.briefing-loading{padding:18px 4px}
+.briefing-masthead{padding:6px 4px 0}
+.briefing-masthead h2{font-size:clamp(30px,4.6vw,44px);letter-spacing:-.04em;line-height:1.05;margin:6px 0 8px}
+.briefing-dek{color:var(--muted);margin:0 0 4px;line-height:1.5}
+.briefing-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.briefing-card{background:var(--panel);border:1px solid var(--line);border-radius:17px;padding:18px 20px}
+.briefing-card h3{margin:0 0 12px;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.briefing-card p{margin:0 0 8px;line-height:1.5}
+.weather-now{display:flex;align-items:center;gap:14px}
+.weather-now strong{font-size:44px;letter-spacing:-.03em;line-height:1}
+.forecast-strip{display:flex;gap:10px;margin-top:14px}
+.forecast-day{flex:1;background:#12141a;border:1px solid var(--line);border-radius:12px;padding:10px;text-align:center;display:flex;flex-direction:column;gap:3px}
+.forecast-name{font-weight:750;font-size:13px}
+.forecast-temps{font-size:13px}
+.agenda-row{display:flex;align-items:baseline;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+.agenda-row:first-of-type{border-top:0}
+.agenda-time{flex:0 0 auto;min-width:96px;color:var(--cyan);font-size:13px;font-weight:700}
+.agenda-title{font-weight:600}
+.focus-goal{padding:10px 0;border-top:1px solid var(--line)}
+.focus-goal:first-of-type{border-top:0;padding-top:0}
+.focus-goal strong{display:block;margin-bottom:2px}
+.loop-row{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;text-align:left;background:#12141a;border:1px solid var(--line);border-radius:12px;padding:11px 13px;margin-top:8px;color:var(--text);font:inherit;cursor:pointer}
+.loop-row.static{cursor:default}
+/* --- B4: reliability is quiet by default — one status line, tab is the drill-down --- */
+.systems-line{display:flex;align-items:center;gap:10px;width:100%;margin-top:14px;padding:12px 16px;background:transparent;border:1px solid var(--line);border-radius:99px;color:var(--muted);font:inherit;font-size:13px;cursor:pointer}
+.systems-dot{width:9px;height:9px;border-radius:50%;background:var(--lime);box-shadow:0 0 10px var(--lime);flex:0 0 auto}
+.systems-line.warn .systems-dot{background:var(--coral);box-shadow:0 0 10px var(--coral)}
+.systems-line.warn{color:var(--coral)}
+/* --- B3: follow-up surfaced inline in chat --- */
+.followup-nudge{margin:4px 4px 12px;padding:14px 16px;border:1px dashed rgba(169,152,255,.5);border-radius:14px;background:rgba(169,152,255,.07)}
+.followup-nudge p{margin:0 0 4px;line-height:1.5;font-size:14px}
+.followup-nudge .mini-actions{margin-top:8px}
+@media(max-width:760px){.briefing-grid{grid-template-columns:1fr}.agenda-time{min-width:78px}}
