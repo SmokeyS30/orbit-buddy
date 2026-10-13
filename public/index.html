@@ -107,11 +107,9 @@
             <div class="model-pill" id="model-pill">Connecting</div>
           </div>
         </div>
-        <section
-          id="today-focus"
-          class="today-focus"
-          aria-label="Current focus"
-        ></section>
+        <section id="today-briefing" class="briefing" aria-label="Morning briefing">
+          <p class="muted briefing-loading">Putting your morning together…</p>
+        </section>
         <section class="panel conversation-panel">
           <div class="panel-heading">
             <div>
@@ -141,6 +139,7 @@
             aria-label="Conversations"
           ></div>
           <div id="messages" class="messages" aria-live="polite"></div>
+          <div id="followup-nudge" aria-live="polite"></div>
           <form id="chat-form" class="composer">
             <label class="sr-only" for="chat-input">Message Orbit</label
             ><textarea
