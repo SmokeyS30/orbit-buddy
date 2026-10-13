@@ -440,6 +440,7 @@ async function jumpToSearchResult(item){
   const tabsNav=document.querySelector('.tabs');
   function closeMenu(){menu.classList.add('hidden');moreTab.setAttribute('aria-expanded','false');}
   function openMenu(){
+    if(menu.parentElement!==document.body)document.body.appendChild(menu); // escape the sticky tab bar's stacking context
     const r=moreTab.getBoundingClientRect(); // position:fixed escapes the tabs' overflow:auto
     menu.style.top=(r.bottom+6)+'px';
     menu.style.right=Math.max(8,window.innerWidth-r.right)+'px';
