@@ -82,3 +82,22 @@ button:focus-visible,.tab:focus-visible,.thread-chip:focus-visible,a:focus-visib
 .copy-btn{position:absolute;top:8px;right:8px;border:1px solid var(--line);background:rgba(24,26,34,.92);color:var(--muted);border-radius:8px;padding:5px 10px;font-size:11.5px;font-family:inherit;cursor:pointer}
 .copy-btn:hover{color:var(--text);border-color:var(--violet)}
 .copy-btn:active{transform:scale(.96)}
+
+/* Web app quick wins: in-chat search (Q3), offline queue (Q5), tab triage (Q6) */
+.chat-search{position:relative;align-self:flex-start;flex:none}
+#chat-search-input{width:200px;padding:9px 12px;font-size:13px;border-radius:11px}
+.chat-search-results{position:absolute;right:0;top:calc(100% + 8px);width:min(360px,82vw);max-height:340px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);z-index:30;padding:8px;display:flex;flex-direction:column;gap:4px}
+.search-result{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);font:inherit;padding:10px 12px;border-radius:10px;cursor:pointer}
+.search-result:hover{background:rgba(255,255,255,.06)}
+.search-result-title{display:block;font-size:13px}
+.search-result-meta{display:block;font-size:11px;color:var(--muted);margin:2px 0 4px}
+.search-result-excerpt{display:block;font-size:12.5px;color:var(--muted);line-height:1.45}
+.search-empty{color:var(--muted);font-size:13px;text-align:center;padding:14px;margin:0}
+.search-hit{outline:2px solid var(--lime);outline-offset:3px}
+.queued-note{display:block;margin-top:6px;font-size:11.5px;font-weight:600;opacity:.7}
+.more-wrap{position:relative;display:none;flex:none}
+.more-tab{width:100%}
+.more-menu{position:fixed;min-width:180px;background:var(--panel2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);z-index:30;padding:6px;display:flex;flex-direction:column;gap:2px}
+.more-menu .tab{flex:none;text-align:left;padding:11px 14px;border-radius:10px}
+.more-menu .tab.active{background:rgba(255,255,255,.08)}
+@media(max-width:760px){.more-wrap{display:block}#chat-search-input{width:150px}}

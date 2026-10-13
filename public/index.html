@@ -68,7 +68,23 @@
         ><button class="tab" data-view="connections">Connections</button
         ><button class="tab" data-view="reliability">Reliability</button
         ><button class="tab" data-view="activity">Activity</button
-        ><button class="tab" data-view="safety">Safety</button>
+        ><button class="tab" data-view="safety">Safety</button
+        ><span class="more-wrap hidden" id="more-wrap"
+          ><button
+            class="tab more-tab"
+            data-view="more"
+            type="button"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            More ▾</button
+          ><span
+            class="more-menu hidden"
+            id="more-menu"
+            role="menu"
+            aria-label="More sections"
+          ></span
+        ></span>
       </nav>
 
       <section id="today" class="view active">
@@ -101,6 +117,22 @@
             <div>
               <p class="eyebrow">CONVERSATION</p>
               <h2>Talk with Orbit</h2>
+            </div>
+            <div class="chat-search">
+              <input
+                id="chat-search-input"
+                type="search"
+                placeholder="Find in conversations…"
+                aria-label="Find in conversations"
+                autocomplete="off"
+                maxlength="120"
+              />
+              <div
+                id="chat-search-results"
+                class="chat-search-results hidden"
+                role="listbox"
+                aria-label="Search results"
+              ></div>
             </div>
           </div>
           <div

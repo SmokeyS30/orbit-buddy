@@ -39,3 +39,16 @@ export function formatSearchResults(results) {
     return `${ts} — ${excerpt}`;
   });
 }
+
+// Structured companion to formatSearchResults: the fields the web app needs
+// to jump to a result's message in its conversation. Purely additive — the
+// string format above is unchanged.
+export function formatSearchItems(results) {
+  return (results || []).map(({ message, excerpt }) => ({
+    id: message?.id || null,
+    conversationId: message?.conversation_id || null,
+    role: message?.role || null,
+    createdAt: message?.created_at || null,
+    excerpt,
+  }));
+}
