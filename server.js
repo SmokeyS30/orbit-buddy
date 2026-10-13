@@ -1,7 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomInt } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
@@ -41,7 +41,7 @@ function publicFeed(feed) { return { id:feed.id,label:feed.label,url:maskFeedUrl
 async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} }
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
 function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
-function markdownToHtml(md,autoPrint,printUrl){
+function markdownToHtml(md,autoPrint,printUrl,toolbarOverride=null,docTitle=''){
   const esc=(s)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const inline=(s)=>esc(s).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/`([^`]+)`/g,'<code>$1</code>');
   const lines=String(md||'').split('\n');
@@ -54,12 +54,19 @@ function markdownToHtml(md,autoPrint,printUrl){
     else{if(inList){html+='</ul>';inList=false;}if(line.trim())html+=`<p>${inline(line.trim())}</p>`;}
   }
   if(inList)html+='</ul>';
-  const shareJs=`async function sharePrint(){try{const res=await fetch(location.pathname+'?format=pdf');if(!res.ok)throw new Error('pdf');const blob=await res.blob();const file=new File([blob],'orbit-result.pdf',{type:'application/pdf'});if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:document.title});}else{alert('Sharing is not supported here.');}}catch(e){alert('Could not prepare the file.');}}`;
-  const toolbar=autoPrint
+  const toolbar=toolbarOverride||(autoPrint
     ? `<div class="toolbar"><button onclick="window.print()" style="font-size:1.2em;padding:.7em 1.5em;">Tap to Print</button></div>`
-    : `<div class="toolbar"><a href="/#files">Done</a><button onclick="sharePrint()">Print</button></div><script>${shareJs}</script>`;
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
+    : `<div class="toolbar"><a href="/#files">Done</a><button onclick="sharePrint()">Print</button></div><script>${PRINT_SHARE_JS}</script>`);
+  const title=String(docTitle||'').replace(/[<>&"]/g,'').slice(0,80)||'Orbit result';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em;gap:.5em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
 }
+// Shared by the artifact print flow and R2 Canvas: fetch the page as ?format=pdf
+// and share it via the Web Share API.
+const PRINT_SHARE_JS=`async function sharePrint(){try{const res=await fetch(location.pathname+'?format=pdf');if(!res.ok)throw new Error('pdf');const blob=await res.blob();const file=new File([blob],'orbit-result.pdf',{type:'application/pdf'});if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:document.title});}else{alert('Sharing is not supported here.');}}catch(e){alert('Could not prepare the file.');}}`;
+// R2 Canvas: short-lived printable renders. Tokens are unguessable, bound to
+// the user, and expire after 10 minutes; the markdown lives in memory only.
+const canvasRenders=new Map();
+function pruneCanvasRenders(){const now=Date.now();for(const [key,entry] of canvasRenders){if(entry.expires<now)canvasRenders.delete(key);}if(canvasRenders.size>200){const drop=[...canvasRenders.keys()].slice(0,canvasRenders.size-200);for(const key of drop)canvasRenders.delete(key);}}
 function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
 function pdfEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)').replace(/[\u2018\u2019]/g,"'").replace(/[\u201c\u201d]/g,'"').replace(/\u2014/g,'--').replace(/\u2013/g,'-').replace(/\u2022/g,'*').replace(/[^\x20-\x7e]/g,'?');}
 function wrapPdfText(text,size){
@@ -1913,6 +1920,35 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const text=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes,filename:'voice-turn.'+(mimeType.includes('mp4')?'m4a':'webm'),mimeType});
           db.addEvent(userId,'voice_transcribed','Transcribed a voice-mode turn with Whisper.');
           return json(res,200,{text});
+        }
+        // R2 Canvas: mint a short-lived printable render of a canvas document.
+        if(req.method==='POST'&&url.pathname==='/api/canvas/render'){
+          if(userRateLimited(userId,'canvas',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const body=await readJson(req,512*1024);
+          const markdown=String(body.markdown||'');
+          const title=String(body.title||'Document').slice(0,120);
+          if(!markdown.trim())throw Object.assign(new Error('Nothing to render.'),{status:400});
+          if(markdown.length>200*1024)throw Object.assign(new Error('Document is too large.'),{status:413});
+          pruneCanvasRenders();
+          const token=randomUUID();
+          canvasRenders.set(token,{userId,title,markdown,expires:Date.now()+10*60_000});
+          return json(res,200,{token});
+        }
+        // R2 Canvas: serve the printable page (or ?format=pdf) for a render token.
+        const canvasRenderMatch=url.pathname.match(/^\/api\/canvas\/render\/([0-9a-f-]{36})$/);
+        if(req.method==='GET'&&canvasRenderMatch){
+          const entry=canvasRenders.get(canvasRenderMatch[1]);
+          if(!entry||entry.expires<Date.now()||entry.userId!==userId)throw Object.assign(new Error('This document link has expired.'),{status:404});
+          if(url.searchParams.get('format')==='pdf'){
+            const pdf=await markdownToPdfBuffer(entry.markdown);
+            res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':'inline; filename="orbit-document.pdf"','Cache-Control':'no-store'});
+            return res.end(pdf);
+          }
+          const toolbar=`<div class="toolbar"><button onclick="window.close()">Done</button><button onclick="sharePrint()">Share / PDF</button><button onclick="window.print()">Print</button></div><script>${PRINT_SHARE_JS}</script>`;
+          const html=markdownToHtml(entry.markdown,false,null,toolbar,entry.title);
+          res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+          res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});
+          return res.end(html);
         }
         // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
