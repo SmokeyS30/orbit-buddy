@@ -360,7 +360,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false }) {
+    async respond({ buddyName, userName, message, memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -387,6 +387,9 @@ export function createModelClient(env = process.env) {
         ...(needsBuddyName
           ? [`You don't have a personal name yet — "${buddyName}" is just the default. Early in this conversation, naturally ask the user what they'd like to call you (one gentle ask, woven into the flow, never a formal setup question). If they give you a name, call the set_buddy_name tool right away and start using it. If they dodge, ignore it, or say they don't care, drop it completely and don't bring it up again.`]
           : [`Your name is ${buddyName}. When the user says your name, they're talking directly to you.`]),
+        ...(needsAmbientAsk
+          ? [`One gentle ask, woven naturally into this conversation (never a formal setup question): may you note the setting of your chats — the time of day and any place labels the user mentions themselves, like "at the cabin" — so you can notice their rhythms (e.g. Sunday-morning hike planning)? Be explicit and honest: it's only with their permission; everything is stored as ordinary memories they can see and delete in the Memory tab; nothing leaves this server; you never track precise location, only labels they give you. If they say yes, call the set_ambient_context tool with "granted" right away. If they decline, call it with "declined". If they dodge or ignore the question, drop it completely and don't bring it up again.`]
+          : []),
         `Today is ${today} (YYYY-MM-DD) in the user's timezone, ${timeZone}. Use it to resolve relative dates like "Thursday", "tomorrow", or "next week".`,
         taskMode ? 'Complete the requested background thinking task and return a useful result.' : 'Answer the user directly.',
         `Relevant user-approved memory:\n${memoryText}`,

@@ -13,6 +13,7 @@ import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
+import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone } from './src/ambient.js';
 import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
 import { buildTodayBriefing } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
@@ -266,6 +267,22 @@ export function createOrbitServer(options={}) {
   const chatQueues=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
   function enqueueChatReply(conversationId,job){const prev=chatQueues.get(conversationId)||Promise.resolve();const next=prev.then(async()=>{try{await job();}catch(error){console.error('chat job failed',conversationId,error&&error.message);}});chatQueues.set(conversationId,next);next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});return next;}
+  // R3 ambient context ("Orbit remembers the room"). With the user's explicit
+  // permission, note the setting of a conversation: weekday, time of day, and
+  // a self-declared place label. One memory per day max; repeats of the same
+  // setting within 14 days are not re-stored (rhythms come from repetition).
+  // Everything is an ordinary memory the user can see and delete.
+  function captureAmbientContext(db,userId,message,timeZone){
+    const snap=ambientSnapshot({message,nowMs:Date.now(),timeZone});
+    const content=ambientMemoryContent(snap);
+    const recent=db.listMemoriesBySource(userId,'ambient',50);
+    const memDay=(m)=>dayInZone(new Date(m.created_at).valueOf(),timeZone);
+    if(recent.some((m)=>memDay(m)===snap.day))return; // one per day
+    const cutoffDay=dayInZone(Date.now()-14*24*3600_000,timeZone);
+    if(recent.some((m)=>m.content===content&&memDay(m)>=cutoffDay))return; // no 14-day repeats
+    db.addMemory(userId,content,{kind:'fact',source:'ambient',confidence:0.9});
+    db.addEvent(userId,'ambient_noted',`Noted ambient context: ${snap.weekday} ${snap.bucket}${snap.place?` (${snap.place})`:''}.`);
+  }
   // Shared reply pipeline used by web chat (/api/chat) and WhatsApp.
   // The caller adds the user message first; this generates the assistant reply
   // with the full model pipeline, stores it, and returns the answer text.
@@ -282,7 +299,18 @@ export function createOrbitServer(options={}) {
         const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
         if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,
+      // R3 ambient context: one gentle permission ask in chat, never a toggle.
+      // Declined = never ask again; dodged = re-ask after 90 days at most.
+      // Only asked once the user has actually chatted a little (>=4 turns).
+      let needsAmbientAsk=false;
+      if(!db.getSetting(`ambient_context_${userId}`)){
+        const ambientAskedAt=Number(db.getSetting(`ambient_asked_${userId}`)||0);
+        const userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
+        if(userTurns>=4&&(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000)){
+          needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));
+        }
+      }
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,needsAmbientAsk,
         memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
@@ -293,6 +321,10 @@ export function createOrbitServer(options={}) {
       for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
       answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
       db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      if(db.getSetting(`ambient_context_${userId}`)==='granted'){
+        // R3: note the setting of this conversation. Non-blocking; in-memory only.
+        setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
+      }
     }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';db.addMessage(userId,conversation.id,'assistant',answer);}
     streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
     await maybeRefreshConversationSummary(user,conversation);
@@ -526,6 +558,28 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       }catch(error){
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
+
+      // --- R3 ambient rhythms: the same setting on 3+ distinct days becomes a
+      // rhythm memory, so Orbit can use it unprompted (e.g. Sunday-morning
+      // hike planning). Only runs with the user's explicit permission.
+      try{
+        if(db.getSetting(`ambient_context_${user.id}`)==='granted'){
+          const observations=db.listMemoriesBySource(user.id,'ambient',50)
+            .map((m)=>{const p=parseAmbientMemory(m.content);return p?{...p,day:dayInZone(new Date(m.created_at).valueOf(),timeZone)}:null;})
+            .filter(Boolean);
+          const rhythms=detectRhythms(observations);
+          const known=new Set(db.listMemoriesBySource(user.id,'ambient-rhythm',50).map((m)=>String(m.content||'').split(' ')[0]));
+          let rhythmsAdded=0;
+          for(const r of rhythms.slice(0,2)){
+            const marker=rhythmKey(r);
+            if(known.has(marker))continue;
+            const who=user.display_name||'The user';
+            db.addMemory(user.id,`${marker} ${who} ${rhythmSentence(r)}. Noticed from chat times — useful for unprompted, well-timed suggestions.`,{kind:'fact',source:'ambient-rhythm',confidence:0.7});
+            rhythmsAdded++;
+          }
+          if(rhythmsAdded>0)db.addEvent(user.id,'ambient_rhythm',`Noticed ${rhythmsAdded} chat rhythm${rhythmsAdded>1?'s':''}.`);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
 
       // --- Monthly deep dive: mine full history for long arcs ---
       try{

@@ -492,6 +492,18 @@ export function toolSetBuddyName(args = {}, ctx = null) {
   return { name, note: `Your buddy's name is now "${name}".` };
 }
 
+// R3 ambient context: record the user's explicit permission choice. Asked in
+// chat (never a toggle); stored as a setting, never as a memory.
+export function toolSetAmbientContext(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'set_ambient_context');
+  const value = String(args.value || '').toLowerCase().trim();
+  if (value !== 'granted' && value !== 'declined') throw new Error('value must be "granted" or "declined".');
+  db.setSetting(`ambient_context_${userId}`, value);
+  db.addEvent(userId, value === 'granted' ? 'ambient_context_granted' : 'ambient_context_declined',
+    value === 'granted' ? 'Ambient context permission granted in chat.' : 'Ambient context permission declined in chat.');
+  return { value, note: value === 'granted' ? 'Ambient context is on.' : 'Ambient context is off — it will not be asked about again.' };
+}
+
 export function toolScheduleFollowUp(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'schedule_followup');
   const description = cleanArg(args.description, 120, 'description');
@@ -697,6 +709,19 @@ export const TOOL_DEFINITIONS = [
         name: { type: 'string', description: 'The name the user chose for their buddy (1-40 characters).' }
       },
       required: ['name'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'set_ambient_context',
+    description: 'Record the user\'s answer to the one-time ambient-context permission question (whether Orbit may note the setting of chats: time of day and self-declared place labels). Call with "granted" when they say yes, "declined" when they say no. Only call in direct response to that permission question.',
+    parameters: {
+      type: 'object',
+      properties: {
+        value: { type: 'string', description: 'The user\'s choice: "granted" or "declined".' }
+      },
+      required: ['value'],
       additionalProperties: false
     }
   },
@@ -1103,6 +1128,7 @@ const TOOL_SUMMARIES = {
   mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
   complete_task: (args) => `Task done: ${String(args.title || '').slice(0, 60)}`,
   set_buddy_name: (args) => `Named buddy: ${String(args.name || '').slice(0, 40)}`,
+  set_ambient_context: (args) => `Ambient context: ${String(args.value || '').slice(0, 20)}`,
   enable_gift_reminder: (args) => `Gift reminders on: ${String(args.label || '').slice(0, 60)}`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
@@ -1178,6 +1204,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'set_buddy_name': {
       const result = toolSetBuddyName(clean, ctx);
       return { result, summary: `Named buddy: ${String(result.name || '').slice(0, 40)}` };
+    }
+    case 'set_ambient_context': {
+      const result = toolSetAmbientContext(clean, ctx);
+      return { result, summary: `Ambient context: ${String(result.value || '')}` };
     }
     case 'enable_gift_reminder': {
       const result = toolEnableGiftReminder(clean, ctx);
