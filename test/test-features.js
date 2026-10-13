@@ -1,6 +1,6 @@
 import assert from 'node:assert';
 import { cosineSimilarity, semanticRank, hybridRank } from '../src/semantic-search.js';
-import { searchMessages, formatSearchResults } from '../src/conversation-search.js';
+import { searchMessages, formatSearchResults, formatSearchItems } from '../src/conversation-search.js';
 import { buildTimeline, formatTimeline } from '../src/memory-timeline.js';
 
 // --- cosineSimilarity ---
@@ -83,6 +83,23 @@ import { buildTimeline, formatTimeline } from '../src/memory-timeline.js';
   assert.strictEqual(formatted.length, 1);
   assert.ok(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /.test(formatted[0]), 'timestamp format');
   assert.ok(formatted[0].includes('pepperoni pizza...'), 'excerpt included');
+}
+
+// --- formatSearchItems ---
+{
+  const results = [
+    { message: { id: 'm1', conversation_id: 'c1', role: 'user', created_at: '2026-10-08T14:05:00Z' }, excerpt: 'pepperoni pizza...' },
+    { message: {}, excerpt: 'no ids here' },
+  ];
+  const items = formatSearchItems(results);
+  assert.strictEqual(items.length, 2);
+  assert.strictEqual(items[0].id, 'm1');
+  assert.strictEqual(items[0].conversationId, 'c1');
+  assert.strictEqual(items[0].role, 'user');
+  assert.strictEqual(items[0].createdAt, '2026-10-08T14:05:00Z');
+  assert.ok(items[0].excerpt.includes('pepperoni pizza'), 'excerpt carried through');
+  assert.strictEqual(items[1].id, null, 'missing fields => null');
+  assert.strictEqual(items[1].conversationId, null);
 }
 
 // --- buildTimeline ---

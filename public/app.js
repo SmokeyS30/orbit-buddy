@@ -27,7 +27,7 @@ function settlePendingReplies(messages,convoId){const set=pendingReplies.get(con
 function syncTypingBubble(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!typingActive)showTyping(false);else if(!want&&typingActive)hideTyping();}
 let lastMessageFingerprint='';
 let renderedConversationId=null;
-function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.role==='assistant'){if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id)el.id='msg-'+item.id;if(item.role==='assistant'){if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$('#task-count').textContent=String(items.filter((task)=>!['completed','cancelled','failed'].includes(task.status)).length);if(!items.length)return empty(root,'No tasks yet. Give Orbit one clear outcome to prepare.');for(const task of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=task.title;const prompt=document.createElement('p');prompt.textContent=task.prompt;wrap.append(h,prompt);const status=document.createElement('span');status.className=`badge ${task.status}`;status.textContent=task.status.replaceAll('_',' ');head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';for(const value of [task.risk==='external'?'approval gated':'think only',task.recurrence,formatDate(task.schedule_at)]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}card.append(meta);if(task.result){const result=document.createElement('p');result.className='result';result.textContent=task.result;card.append(result);}if(task.status==='waiting_approval'){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve plan','primary',()=>taskAction(task.id,'approve')),button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}else if(!['completed','failed','cancelled'].includes(task.status)){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Cancel','danger',()=>taskAction(task.id,'cancel')),button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}else{const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}root.append(card);}}
 function renderTodayFocus(goals,routines){const root=$('#today-focus');root.replaceChildren();const active=goals.filter((goal)=>goal.status==='active').slice(0,2);for(const goal of active){const card=document.createElement('article');card.className='focus-card';const label=document.createElement('span');label.className='badge kind-badge';label.textContent=`priority ${goal.priority} goal`;const title=document.createElement('h3');title.textContent=goal.title;const detail=document.createElement('p');detail.textContent=goal.next_step?`Next: ${goal.next_step}`:`${goal.progress}% complete${goal.target_date?` · target ${goal.target_date}`:''}`;card.append(label,title,detail);root.append(card);}const routine=routines.find((item)=>item.enabled);if(routine){const card=document.createElement('article');card.className='focus-card';const label=document.createElement('span');label.className='badge';label.textContent='next routine';const title=document.createElement('h3');title.textContent=routine.title;const detail=document.createElement('p');detail.textContent=`${routine.cadence} at ${routine.time_local} local`;card.append(label,title,detail);root.append(card);}if(!root.children.length){const card=document.createElement('article');card.className='focus-card';const title=document.createElement('h3');title.textContent='Build your focus';const detail=document.createElement('p');detail.textContent='Add a goal or routine and Orbit will keep the right next step visible here.';card.append(title,detail);root.append(card);}}
@@ -177,8 +177,102 @@ async function beginConnector(provider){try{const result=await api(`/api/connect
 async function disconnectConnector(provider){try{await api(`/api/connectors/${provider}`,{method:'DELETE'});await refresh();toast('Connector disconnected.');}catch(error){toast(error.message);}}
 async function previewConnector(provider){try{const result=await api(`/api/connectors/${provider}/preview`);const items=(result.items||[]).slice(0,5);const summary=items.map((item)=>{const label=item.name||item.start||'Item';return item.from?`${label} — ${item.from.replace(/<.*>/,'').trim().slice(0,40)}`:label;}).join(' · ');toast(summary||'Connected, with no recent items.');}catch(error){toast(error.message);}}
 
-function activateView(name,{updateHash=true}={}){const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));return true;}
-$$('.tab').forEach((tab)=>tab.addEventListener('click',()=>activateView(tab.dataset.view)));
+function activateView(name,{updateHash=true}={}){if(name==='more')return true;const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));return true;}
+$$('.tab').forEach((tab)=>{if(tab.dataset.view==='more')return;tab.addEventListener('click',()=>activateView(tab.dataset.view));});
+
+// --- In-chat search UI (Q3) ---
+// Wired to the existing GET /api/search/messages endpoint. One input, a
+// results list, and tapping a result jumps to that message in its
+// conversation. No server changes.
+async function jumpToSearchResult(item){
+  const resultsEl=$('#chat-search-results');
+  if(resultsEl)resultsEl.classList.add('hidden');
+  try{
+    if(item.conversationId&&item.conversationId!==activeConversationId){
+      activeConversationId=item.conversationId;
+      try{localStorage.setItem('orbit-convo',item.conversationId);}catch(_){}
+      await refresh();
+    }
+    const el=document.getElementById('msg-'+item.id);
+    if(!el){toast('That message is outside the visible window of its conversation.');return;}
+    el.scrollIntoView({block:'center',behavior:'smooth'});
+    el.classList.add('search-hit');
+    setTimeout(()=>el.classList.remove('search-hit'),2600);
+  }catch(error){toast(error.message);}
+}
+(function initChatSearch(){
+  const input=$('#chat-search-input'),resultsEl=$('#chat-search-results');
+  if(!input||!resultsEl)return;
+  let timer=null;
+  const hide=()=>{resultsEl.classList.add('hidden');resultsEl.replaceChildren();};
+  const conversationTitle=(id)=>{const c=(state.snapshot?.conversations||[]).find((x)=>x.id===id);return c?.title||'Conversation';};
+  const formatWhen=(iso)=>{try{return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(iso));}catch(_){return'';}};
+  async function run(query){
+    let items=[];
+    try{const data=await api('/api/search/messages?q='+encodeURIComponent(query));items=data.items||[];}
+    catch(error){
+      resultsEl.replaceChildren();
+      const p=document.createElement('p');p.className='search-empty';p.textContent='Search is unavailable right now.';
+      resultsEl.append(p);resultsEl.classList.remove('hidden');return;
+    }
+    resultsEl.replaceChildren();
+    if(!items.length){
+      const p=document.createElement('p');p.className='search-empty';p.textContent='No messages found.';
+      resultsEl.append(p);
+    }
+    for(const item of items.slice(0,20)){
+      const b=document.createElement('button');b.type='button';b.className='search-result';b.setAttribute('role','option');
+      const title=document.createElement('strong');title.className='search-result-title';title.textContent=conversationTitle(item.conversationId);
+      const meta=document.createElement('span');meta.className='search-result-meta';meta.textContent=`${item.role==='assistant'?'Orbit':'You'} · ${formatWhen(item.createdAt)}`;
+      const excerpt=document.createElement('span');excerpt.className='search-result-excerpt';excerpt.textContent=item.excerpt;
+      b.append(title,meta,excerpt);
+      b.addEventListener('click',()=>jumpToSearchResult(item));
+      resultsEl.append(b);
+    }
+    resultsEl.classList.remove('hidden');
+  }
+  input.addEventListener('input',()=>{clearTimeout(timer);const q=input.value.trim();if(q.length<2){hide();return;}timer=setTimeout(()=>run(q),350);});
+  input.addEventListener('keydown',(event)=>{if(event.key==='Escape'){input.value='';hide();input.blur();}});
+  input.addEventListener('focus',()=>{if(input.value.trim().length>=2&&resultsEl.children.length)resultsEl.classList.remove('hidden');});
+  document.addEventListener('click',(event)=>{if(!event.target.closest('.chat-search'))hide();});
+})();
+
+// --- Tab bar triage (Q6) ---
+// On narrow screens, low-traffic tabs (Reliability, Activity, Safety) move
+// under a single "More" overflow; chat-adjacent tabs stay prominent.
+// Pure DOM relocation + CSS — no feature changes.
+(function initTabTriage(){
+  const wrap=$('#more-wrap'),menu=$('#more-menu'),moreTab=document.querySelector('.more-tab');
+  if(!wrap||!menu||!moreTab)return;
+  const ORDER=['reliability','activity','safety'];
+  const mq=window.matchMedia('(max-width: 760px)');
+  const tabsNav=document.querySelector('.tabs');
+  function closeMenu(){menu.classList.add('hidden');moreTab.setAttribute('aria-expanded','false');}
+  function openMenu(){
+    const r=moreTab.getBoundingClientRect(); // position:fixed escapes the tabs' overflow:auto
+    menu.style.top=(r.bottom+6)+'px';
+    menu.style.right=Math.max(8,window.innerWidth-r.right)+'px';
+    menu.classList.remove('hidden');
+    moreTab.setAttribute('aria-expanded','true');
+  }
+  function placeTabs(){
+    const narrow=mq.matches;
+    for(const view of ORDER){
+      const tab=document.querySelector(`.tab[data-view="${CSS.escape(view)}"]`);
+      if(!tab)continue;
+      if(narrow){if(tab.parentElement!==menu)menu.append(tab);}
+      else if(tab.parentElement!==tabsNav)tabsNav.insertBefore(tab,wrap);
+    }
+    wrap.classList.toggle('hidden',!narrow);
+    if(!narrow)closeMenu();
+  }
+  moreTab.addEventListener('click',(event)=>{event.stopPropagation();if(menu.classList.contains('hidden'))openMenu();else closeMenu();});
+  menu.addEventListener('click',(event)=>{if(event.target.closest('.tab'))closeMenu();});
+  document.addEventListener('click',(event)=>{if(!event.target.closest('#more-wrap')&&!event.target.closest('#more-menu'))closeMenu();});
+  window.addEventListener('resize',closeMenu);
+  if(mq.addEventListener)mq.addEventListener('change',placeTabs);else if(mq.addListener)mq.addListener(placeTabs);
+  placeTabs();
+})();
 window.addEventListener('hashchange',()=>activateView(location.hash.slice(1),{updateHash:false}));
 $('#model-check-button')?.addEventListener('click',checkModelConnection);
 $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await fetch('/api/auth/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await fetch('/api/auth/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value}:{email:$('#auth-email').value,password:$('#auth-password').value};const response=await fetch(endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;if(body.recoveryCodes)showCodes(body.recoveryCodes);await connect();}catch(error){$('#auth-error').textContent=error.message;}});
@@ -187,8 +281,39 @@ $('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=tr
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload();});
-$('#chat-form').addEventListener('submit',async(event)=>{event.preventDefault();const submit=event.submitter;const input=$('#chat-input');const text=input.value;if(!text.trim())return;submit.disabled=true;input.value='';appendOptimisticMessage(text);try{const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text,conversationId:activeConversationId})});pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());await refresh();}catch(error){input.value=text;toast(error.message);await refresh();}finally{submit.disabled=false;}});
-function appendOptimisticMessage(text){const root=$('#messages');if(!root)return;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';el.textContent=text;root.append(el);scrollToBottom(root);}
+// --- Offline message queue (Q5) ---
+// Typed messages queue locally when the network drops and send automatically
+// when connectivity returns — no error, no lost message, no extra UI.
+const CHAT_QUEUE_KEY='orbit-chat-queue';
+function loadChatQueue(){try{const q=JSON.parse(localStorage.getItem(CHAT_QUEUE_KEY));return Array.isArray(q)?q:[];}catch(_){return[];}}
+function saveChatQueue(queue){try{localStorage.setItem(CHAT_QUEUE_KEY,JSON.stringify(queue));}catch(_){}}
+function isNetworkError(error){return !navigator.onLine||/failed to fetch|load failed|network error|networkerror/i.test(String(error&&error.message||''));}
+function markQueued(el){if(!el||el.classList.contains('queued'))return;el.classList.add('queued');const note=document.createElement('span');note.className='queued-note';note.textContent='queued — will send when online';el.append(note);}
+function queueOfflineMessage(text,element){const queue=loadChatQueue();const entry={id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,queuedAt:new Date().toISOString()};queue.push(entry);saveChatQueue(queue);markQueued(element||appendOptimisticMessage(text));}
+let flushingQueue=false;
+async function flushChatQueue(){
+  if(flushingQueue)return;flushingQueue=true;
+  try{
+    let queue=loadChatQueue();
+    while(queue.length){
+      if(!navigator.onLine)break; // still offline — stop, keep the rest queued
+      const entry=queue[0];
+      try{
+        const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:entry.text,conversationId:entry.conversationId||activeConversationId})});
+        pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now());
+      }catch(error){
+        if(isNetworkError(error))break; // connection dropped mid-flush — retry later
+        toast(`A queued message failed: ${error.message}`); // non-network error — drop this one
+      }
+      queue=queue.slice(1);saveChatQueue(queue);
+    }
+    await refresh().catch(()=>{});
+  }finally{flushingQueue=false;}
+}
+window.addEventListener('online',()=>{flushChatQueue().catch(()=>{});});
+
+$('#chat-form').addEventListener('submit',async(event)=>{event.preventDefault();const submit=event.submitter;const input=$('#chat-input');const text=input.value;if(!text.trim())return;submit.disabled=true;input.value='';if(!navigator.onLine){queueOfflineMessage(text);submit.disabled=false;return;}const el=appendOptimisticMessage(text);try{const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:text,conversationId:activeConversationId})});pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());await refresh();}catch(error){if(isNetworkError(error))queueOfflineMessage(text,el);else{input.value=text;if(el)el.remove();toast(error.message);await refresh();}}finally{submit.disabled=false;}});
+function appendOptimisticMessage(text){const root=$('#messages');if(!root)return null;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';const body=document.createElement('span');body.textContent=text;el.append(body);root.append(el);scrollToBottom(root);return el;}
 
 // Voice input via Web Speech API
 (function(){

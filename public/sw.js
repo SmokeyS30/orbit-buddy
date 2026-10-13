@@ -1,4 +1,4 @@
-const CACHE = 'orbit-buddy-v49';
+const CACHE = 'orbit-buddy-v50';
 const ASSETS = ['/', '/styles.css', '/mobile.css', '/app.js', '/chat-scroll.js', '/chat-markdown.js', '/vendor/marked.min.js', '/vendor/purify.min.js', '/smooth.css', '/smooth.js', '/manifest.webmanifest', '/icon.svg', '/apple-touch-icon.png', '/icon-192.png', '/icon-512.png'];
 self.addEventListener('install', (event) => event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)).then(() => self.skipWaiting())));
 self.addEventListener('activate', (event) => event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))).then(() => self.clients.claim()).then(() => self.clients.matchAll({ type: 'window' })).then((windows) => Promise.all(windows.map((client) => { try { client.postMessage({ type: 'SW_UPDATED' }); } catch (_) {} try { const p = client.navigate(client.url); if (p && p.catch) p.catch(() => {}); } catch (_) {} })))));
