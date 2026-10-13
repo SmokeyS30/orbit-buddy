@@ -841,6 +841,18 @@
       </section>
     </dialog>
     <div id="offline-banner" class="offline-banner hidden" role="status">You're offline — Orbit will reconnect when you're back.</div><div id="toast" class="toast" role="status"></div>
+    <!-- Voice conversation mode ("call Orbit"): full-screen spoken chat. Entered by
+         long-pressing the mic button or typing "call Orbit" — no extra buttons. -->
+    <div id="voice-overlay" class="hidden" role="dialog" aria-modal="true" aria-label="Voice conversation">
+      <div class="voice-shell">
+        <p class="eyebrow">Voice conversation</p>
+        <h2 id="voice-name">Orbit</h2>
+        <div id="voice-orb" role="button" tabindex="0" aria-label="Talk or interrupt"><span aria-hidden="true">🎤</span></div>
+        <p id="voice-status" class="voice-status" role="status">Listening…</p>
+        <div id="voice-transcript" class="voice-transcript" aria-live="polite"></div>
+        <button id="voice-done" class="voice-done" type="button">Done</button>
+      </div>
+    </div>
     <footer style="display:flex;justify-content:center;align-items:center;gap:1rem;padding:1rem 1rem calc(1.5rem + env(safe-area-inset-bottom,0px));font-size:0.85rem;opacity:0.7;">
       <a href="/privacy" style="color:inherit;padding:0.5rem;">Privacy</a><a href="/terms" style="color:inherit;padding:0.5rem;">Terms</a>
     </footer>

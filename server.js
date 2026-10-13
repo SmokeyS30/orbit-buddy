@@ -1899,6 +1899,21 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message,userMsg}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
+        // R1 voice mode: Whisper transcription fallback for browsers without
+        // Web Speech API. Audio is processed in memory and never persisted.
+        if(req.method==='POST'&&url.pathname==='/api/voice/transcribe'){
+          if(userRateLimited(userId,'voice-transcribe',20,60*60_000))throw Object.assign(new Error('Too many transcription requests. Try again shortly.'),{status:429});
+          const body=await readJson(req,6*1024*1024);
+          const audioBytes=Buffer.from(String(body.audio||''),'base64');
+          const mimeType=String(body.mimeType||'audio/webm').slice(0,100);
+          if(!audioBytes.length)throw Object.assign(new Error('No audio provided.'),{status:400});
+          if(audioBytes.length>4*1024*1024)throw Object.assign(new Error('Audio is too large (4MB max).'),{status:413});
+          if(!/^audio\//.test(mimeType))throw Object.assign(new Error('Unsupported audio type.'),{status:400});
+          if(!env.OPENAI_API_KEY)throw Object.assign(new Error('Voice transcription is not configured on this server.'),{status:503});
+          const text=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes,filename:'voice-turn.'+(mimeType.includes('mp4')?'m4a':'webm'),mimeType});
+          db.addEvent(userId,'voice_transcribed','Transcribed a voice-mode turn with Whisper.');
+          return json(res,200,{text});
+        }
         // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
           if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
