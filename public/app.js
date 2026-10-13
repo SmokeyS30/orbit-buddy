@@ -1,6 +1,7 @@
 // Orbit Buddy frontend v2.1 - optimistic chat send
 import { isNearBottom, scrollToBottom, settleAtBottom, shouldSettleAtBottom } from './chat-scroll.js';
 import { renderAssistantMarkdown } from './chat-markdown.js';
+import { isVoiceModeCommand, createVoiceMode } from './voice-mode.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
 let activeConversationId=null;try{activeConversationId=localStorage.getItem('orbit-convo');}catch(_){}
 let preferencesDirty=false;
@@ -503,18 +504,66 @@ window.addEventListener('online',()=>{flushChatQueue().catch(()=>{});});
 
 // Shared send path: the composer submit handler and the B3 follow-up nudge
 // ("Pick it up") both go through here.
+async function postChatMessage(text){
+  const message=String(text||'').trim();
+  if(!message)throw new Error('Nothing to send.');
+  if(!navigator.onLine)throw Object.assign(new Error('offline'),{offline:true});
+  const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,conversationId:activeConversationId})});
+  const conversationId=sent.conversationId||activeConversationId;
+  pendingFor(conversationId).set(sent.id,Date.now());
+  await refresh();
+  return {id:sent.id,conversationId};
+}
+async function waitForAssistantReply(conversationId,userMessageId,timeoutMs=180000){
+  const start=Date.now();
+  for(;;){
+    let data=null;
+    try{data=await api('/api/chat/stream-state?conversationId='+encodeURIComponent(conversationId));}catch(_){}
+    if(data&&(data.state==='done'||data.state==='idle'))break;
+    if(Date.now()-start>timeoutMs)break;
+    await new Promise((resolve)=>setTimeout(resolve,1200));
+  }
+  await refresh();
+  const msgs=(state.snapshot&&state.snapshot.messages)||[];
+  const idx=msgs.findIndex((m)=>m.id===userMessageId);
+  let reply='';
+  for(let i=(idx===-1?0:idx+1);i<msgs.length;i++){
+    if(msgs[i].role==='assistant'&&msgs[i].content)reply=msgs[i].content;
+  }
+  return reply;
+}
+// R1 voice mode: one spoken turn through the normal chat pipeline.
+async function sendVoiceTurn(text){
+  const sent=await postChatMessage(text);
+  return waitForAssistantReply(sent.conversationId,sent.id);
+}
+async function transcribeAudio(blob){
+  const bytes=new Uint8Array(await blob.arrayBuffer());
+  let binary='';
+  const CHUNK=0x8000;
+  for(let i=0;i<bytes.length;i+=CHUNK)binary+=String.fromCharCode.apply(null,bytes.subarray(i,i+CHUNK));
+  const data=await api('/api/voice/transcribe',{method:'POST',body:JSON.stringify({audio:btoa(binary),mimeType:blob.type||'audio/webm'})});
+  return String(data.text||'');
+}
+let voiceMode=null;
+function openVoiceMode(){
+  if(!voiceMode){
+    voiceMode=createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio});
+    voiceMode.wire();
+  }
+  if(!voiceMode.isOpen())voiceMode.open();
+}
 async function sendChatMessage(text){
   const input=$('#chat-input');
   const submit=document.querySelector('#chat-form button[type="submit"]');
   const message=String(text||'').trim();
   if(!message)return;
+  if(isVoiceModeCommand(message)){openVoiceMode();return;}
   if(submit)submit.disabled=true;
   if(!navigator.onLine){queueOfflineMessage(message);if(submit)submit.disabled=false;return;}
   const el=appendOptimisticMessage(message);
   try{
-    const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,conversationId:activeConversationId})});
-    pendingFor(sent.conversationId||activeConversationId).set(sent.id,Date.now());
-    await refresh();
+    await postChatMessage(message);
   }catch(error){
     if(isNetworkError(error))queueOfflineMessage(message,el);
     else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
@@ -523,16 +572,37 @@ async function sendChatMessage(text){
 $('#chat-form').addEventListener('submit',(event)=>{event.preventDefault();const input=$('#chat-input');const text=input.value;input.value='';sendChatMessage(text);});
 function appendOptimisticMessage(text){const root=$('#messages');if(!root)return null;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';const body=document.createElement('span');body.textContent=text;el.append(body);root.append(el);scrollToBottom(root);return el;}
 
-// Voice input via Web Speech API
+// Voice input via Web Speech API, plus R1 voice conversation mode ("call Orbit").
+// Tap the mic: dictate into the composer (needs Web Speech API).
+// Long-press the mic — or type "call Orbit" — for a full spoken conversation.
+// Where Web Speech API is missing entirely, the mic opens voice mode directly
+// (it falls back to server-side Whisper transcription).
 (function(){
   const voiceBtn=$('#voice-button');
   const input=$('#chat-input');
   if(!voiceBtn||!input)return;
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  if(!SR){voiceBtn.style.display='none';return;} // Hide if not supported
+  let longPressTimer=null,longPressFired=false;
+  voiceBtn.addEventListener('pointerdown',()=>{
+    longPressFired=false;
+    clearTimeout(longPressTimer);
+    longPressTimer=setTimeout(()=>{longPressFired=true;openVoiceMode();},650);
+  });
+  const cancelLongPress=()=>{clearTimeout(longPressTimer);longPressTimer=null;};
+  voiceBtn.addEventListener('pointerup',cancelLongPress);
+  voiceBtn.addEventListener('pointerleave',cancelLongPress);
+  voiceBtn.addEventListener('pointercancel',cancelLongPress);
+  voiceBtn.addEventListener('contextmenu',(event)=>event.preventDefault());
+  if(!SR){
+    voiceBtn.title='Voice conversation';
+    voiceBtn.setAttribute('aria-label','Voice conversation');
+    voiceBtn.addEventListener('click',()=>{if(longPressFired){longPressFired=false;return;}openVoiceMode();});
+    return;
+  }
   let recognizing=false;
   let recognition=null;
   voiceBtn.addEventListener('click',()=>{
+    if(longPressFired){longPressFired=false;return;} // long-press already opened voice mode
     if(recognizing&&recognition){recognition.stop();return;}
     recognition=new SR();
     recognition.lang='en-US';
