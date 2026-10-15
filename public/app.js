@@ -4,8 +4,24 @@ import { renderAssistantMarkdown } from './chat-markdown.js';
 import { isVoiceModeCommand, createVoiceMode } from './voice-mode.js';
 import { isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage } from './canvas.js';
 import { briefingLayoutFor } from './briefing-layout.js';
+import { parseConversationDeepLink } from './deep-link.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
 let activeConversationId=null;try{activeConversationId=localStorage.getItem('orbit-convo');}catch(_){}
+// W4: notification tap deep-link — ?conversation=<id> opens that thread.
+// The snapshot API already treats ?conversation= as the active conversation and
+// falls back to the default one for unknown ids (graceful Today fallback), so
+// seeding activeConversationId before the first refresh is enough. The param is
+// stripped afterwards so later refreshes and thread switches aren't forced back.
+try{
+  const deepLinkId=parseConversationDeepLink(location.search);
+  if(deepLinkId){
+    activeConversationId=deepLinkId;
+    const params=new URLSearchParams(location.search);
+    params.delete('conversation');
+    const rest=params.toString();
+    history.replaceState(null,'',location.pathname+(rest?'?'+rest:'')+location.hash);
+  }
+}catch(_){}
 let preferencesDirty=false;
 const $=(selector)=>document.querySelector(selector);const $$=(selector)=>[...document.querySelectorAll(selector)];
 // Native app (Capacitor iOS) detection. The native webview runs on

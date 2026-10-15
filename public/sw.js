@@ -30,6 +30,7 @@ const STATIC_ASSETS = [
   { url: '/canvas.js', versioned: false },
   { url: '/chat-scroll.js', versioned: false },
   { url: '/chat-markdown.js', versioned: false },
+  { url: '/deep-link.js', versioned: false },
   { url: '/smooth.js', versioned: false },
   { url: '/pwa-install.js', versioned: false },
   { url: '/vendor/marked.min.js', versioned: false },
@@ -162,8 +163,14 @@ self.addEventListener('notificationclick', (event) => {
     return;
   }
   const view = data.view || 'today';
+  // W4: notification tap deep-linking — when the push relates to a conversation,
+  // carry its id in the URL so the app opens that thread on boot (the client
+  // seeds its active conversation from ?conversation=; see public/app.js).
+  // Notifications without a conversation keep the hash-only behavior.
+  const conversationId = typeof data.conversationId === 'string' && data.conversationId ? data.conversationId : null;
+  const targetUrl = conversationId ? `/?conversation=${encodeURIComponent(conversationId)}#${view}` : `/#${view}`;
   event.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
     const target = windows[0];
-    return target ? target.focus().then(() => target.navigate(`/#${view}`)) : clients.openWindow(`/#${view}`);
+    return target ? target.focus().then(() => target.navigate(targetUrl)) : clients.openWindow(targetUrl);
   }));
 });
