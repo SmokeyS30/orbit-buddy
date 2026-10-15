@@ -586,6 +586,11 @@ export function createModelClient(env = process.env) {
             return output;
           } catch (error) {
             error.classification = error?.classification || classifyModelError(error);
+            // Rate limits are account-level: trying another model won't escape
+            // a 429. Throw immediately so callers hit their rate_limit
+            // silent-skip (proactive worker retries in 5 min) instead of
+            // burning through model candidates.
+            if (error.classification === 'rate_limit') throw error;
             const transient = TRANSIENT_FALLBACK_CLASSES.has(error.classification);
             if (error.classification !== 'model_access' && !transient) throw error;
             if (transient) transientAttempts += 1;
