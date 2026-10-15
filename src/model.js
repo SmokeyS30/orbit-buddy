@@ -404,7 +404,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -439,6 +439,7 @@ export function createModelClient(env = process.env) {
         // X5 "Writes like you": the learned voice applies ONLY when the user
         // asks Orbit to draft/write something — never in normal conversation.
         ...(writingVoice ? [`Personal writing voice for drafted writing only:\n${writingVoice}`] : []),
+        ...(offerWritingVoice ? [`The user is asking you to draft or write something, and they haven't enabled "Writes like you" yet. Offer it once, briefly and naturally, as part of your reply: you can learn how they write from their sent emails so drafts sound like them, and they can delete it anytime with "forget how I write". If they say yes (or "learn how I write"), call learn_writing_voice right away. If they decline or ignore the offer, never mention it again.`] : []),
         `Relevant user-approved memory:\n${memoryText}`,
         `User-controlled goals:\n${goalText}`,
         `User-controlled projects:\n${projectText}`,

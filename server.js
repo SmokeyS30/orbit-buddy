@@ -368,9 +368,16 @@ export function createOrbitServer(options={}) {
       }
       // X5 "Writes like you": inject the learned voice as a drafting-only style
       // instruction when opted in. Never in normal chat, never without opt-in.
+      // One-time offer: if the user hasn't opted in and hasn't been offered yet,
+      // let the model offer it on this writing task, then mark offered so we ask once.
       const voiceState=db.getWritingVoice(userId);
       const writingVoice=(voiceState?.optIn&&voiceState?.profile)?buildVoiceStyleDirective(voiceState.profile,user?.display_name):null;
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,
+      let offerWritingVoice=false;
+      if(!voiceState?.optIn&&!voiceState?.offered){
+        offerWritingVoice=true;
+        try{db.markWritingVoiceOffered(userId);}catch(_){}
+      }
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,
         memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
