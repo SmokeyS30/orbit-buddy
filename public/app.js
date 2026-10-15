@@ -769,15 +769,130 @@ function renderAttachPreview(){
     draw();
     chip.append(canvas,remove);root.append(chip);
   });
+  // X4: nudge the user to ask about the image they just captured/attached.
+  const chatInput=$('#chat-input');
+  if(chatInput)chatInput.placeholder=pendingAttachments.length?'Ask about this image…':(chatInput.dataset.defaultPlaceholder||chatInput.placeholder);
 }
 function clearAttachments(){pendingAttachments.length=0;renderAttachPreview();}
 function acceptImageFiles(files){for(const file of(files||[]))uploadAttachment(file);}
+// --- X4: Look at this (camera + screen capture) ---
+// The attach button opens a small menu instead of going straight to the file
+// picker: take a photo (native camera input on mobile, live getUserMedia
+// preview on desktop), share the screen (desktop getDisplayMedia; the option
+// is hidden where the API is unavailable, e.g. mobile web), or pick an image
+// from the library. Captured frames are downscaled to a JPEG and uploaded
+// through the same POST /api/chat/attachments endpoint D1 uses, so no second
+// upload path exists. Camera/screen permissions are requested only when the
+// action is tapped, never on load; denial gets a plain-language hint.
+function buildAttachMenu(){
+  const menu=$('#attach-menu');if(!menu)return;
+  menu.replaceChildren();
+  const canDisplayMedia=!!(navigator.mediaDevices&&navigator.mediaDevices.getDisplayMedia);
+  const defs=[
+    {icon:'📷',label:'Take photo',run:x4TakePhoto},
+    {icon:'🖥️',label:'Share screen',run:x4ShareScreen,show:canDisplayMedia},
+    {icon:'🖼️',label:'Choose from library',run:()=>{const p=$('#attach-picker');if(p)p.click();}},
+  ];
+  for(const def of defs){
+    if(def.show===false)continue;
+    const b=document.createElement('button');b.type='button';b.setAttribute('role','menuitem');
+    b.append(def.icon+'  ',document.createTextNode(def.label));
+    b.addEventListener('click',()=>{hideAttachMenu();def.run();});
+    menu.append(b);
+  }
+}
+function showAttachMenu(){
+  const menu=$('#attach-menu');if(!menu)return;
+  if(!menu.children.length)buildAttachMenu();
+  if(!menu.children.length){const p=$('#attach-picker');if(p)p.click();return;}
+  menu.classList.toggle('hidden');
+  if(menu.classList.contains('hidden')){x4MenuTeardown();return;}
+  setTimeout(()=>document.addEventListener('click',x4DocClick),0);
+  document.addEventListener('keydown',x4MenuKey);
+}
+function hideAttachMenu(){const m=$('#attach-menu');if(m)m.classList.add('hidden');x4MenuTeardown();}
+function x4MenuTeardown(){document.removeEventListener('click',x4DocClick);document.removeEventListener('keydown',x4MenuKey);}
+function x4DocClick(event){const m=$('#attach-menu');if(m&&!m.contains(event.target)&&event.target.id!=='attach-button')hideAttachMenu();}
+function x4MenuKey(event){if(event.key==='Escape')hideAttachMenu();}
+function x4TakePhoto(){
+  const coarse=window.matchMedia&&matchMedia('(pointer:coarse)').matches;
+  const cameraPicker=$('#camera-picker');
+  if(coarse&&cameraPicker){cameraPicker.click();return;} // native camera sheet on mobile
+  x4CameraPreview(); // desktop: live preview with a capture button
+}
+function x4MediaHint(err,kind){
+  const name=err&&err.name;
+  if(name==='NotAllowedError'||name==='SecurityError')return `${kind} access was denied — allow it in your browser's site settings, then try again.`;
+  if(name==='NotFoundError'||name==='OverconstrainedError')return `No ${kind.toLowerCase()} was found on this device.`;
+  if(name==='NotReadableError')return `The ${kind.toLowerCase()} is busy in another app — close that and try again.`;
+  return `Could not start the ${kind.toLowerCase()} — try again.`;
+}
+let x4CameraStream=null;
+async function x4CameraPreview(){
+  if(!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia)){toast('This browser cannot open the camera — use “Choose from library” instead.');return;}
+  const overlay=document.createElement('div');
+  overlay.className='camera-overlay';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-label','Take a photo');
+  const video=document.createElement('video');video.className='camera-video';video.autoplay=true;video.playsInline=true;video.muted=true;
+  const actions=document.createElement('div');actions.className='camera-actions';
+  const cancel=document.createElement('button');cancel.type='button';cancel.className='ghost';cancel.textContent='Cancel';
+  const capture=document.createElement('button');capture.type='button';capture.className='primary';capture.textContent='Capture';
+  const hint=document.createElement('p');hint.className='camera-hint hidden';
+  actions.append(cancel,capture);overlay.append(video,actions,hint);document.body.append(overlay);
+  const close=()=>{if(x4CameraStream){x4CameraStream.getTracks().forEach((t)=>t.stop());x4CameraStream=null;}document.removeEventListener('keydown',onKey);overlay.remove();};
+  const onKey=(event)=>{if(event.key==='Escape')close();};
+  document.addEventListener('keydown',onKey);
+  cancel.addEventListener('click',close);
+  try{
+    x4CameraStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
+  }catch(err){
+    hint.textContent=x4MediaHint(err,'Camera');hint.classList.remove('hidden');capture.disabled=true;return;
+  }
+  video.srcObject=x4CameraStream;
+  capture.addEventListener('click',async()=>{
+    const file=await x4GrabFrame(video,'photo.jpg');
+    close();
+    if(file)uploadAttachment(file);else toast('Could not capture that photo — try again.');
+  });
+}
+// Draw one frame from a live video element into a downscaled JPEG File.
+// Caps the long edge at 1920px so captures stay well under the 10MB upload
+// limit while keeping vision detail.
+async function x4GrabFrame(video,name){
+  try{
+    const vw=video.videoWidth||0,vh=video.videoHeight||0;
+    if(!vw||!vh)return null;
+    const scale=Math.min(1,1920/Math.max(vw,vh));
+    const canvas=document.createElement('canvas');
+    canvas.width=Math.max(1,Math.round(vw*scale));canvas.height=Math.max(1,Math.round(vh*scale));
+    const ctx=canvas.getContext('2d');if(!ctx)return null;
+    ctx.drawImage(video,0,0,canvas.width,canvas.height);
+    const blob=await new Promise((res)=>canvas.toBlob(res,'image/jpeg',0.92));
+    if(!blob)return null;
+    return new File([blob],name,{type:'image/jpeg'});
+  }catch(_){return null;}
+}
+async function x4ShareScreen(){
+  if(!(navigator.mediaDevices&&navigator.mediaDevices.getDisplayMedia)){toast('Screen sharing is not available on this device.');return;}
+  let stream=null;
+  try{stream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});}
+  catch(err){toast(x4MediaHint(err,'Screen sharing'));return;}
+  const video=document.createElement('video');video.muted=true;video.playsInline=true;
+  try{
+    video.srcObject=stream;
+    await video.play();
+    const file=await x4GrabFrame(video,'screenshot.jpg');
+    if(file)uploadAttachment(file);else toast('Could not capture that frame — try again.');
+  }catch(_){toast('Could not capture that frame — try again.');}
+  finally{if(stream)stream.getTracks().forEach((t)=>t.stop());}
+}
 // Attach affordance: quiet icon button (Orbit minimalism), picker, paste, drop.
 (function(){
-  const attachBtn=$('#attach-button'),picker=$('#attach-picker'),input=$('#chat-input'),form=$('#chat-form');
+  const attachBtn=$('#attach-button'),picker=$('#attach-picker'),cameraPicker=$('#camera-picker'),input=$('#chat-input'),form=$('#chat-form');
   if(!attachBtn||!picker||!input||!form)return;
-  attachBtn.addEventListener('click',()=>picker.click());
+  input.dataset.defaultPlaceholder=input.placeholder||'';
+  attachBtn.addEventListener('click',showAttachMenu);
   picker.addEventListener('change',()=>{acceptImageFiles(picker.files);picker.value='';});
+  if(cameraPicker)cameraPicker.addEventListener('change',()=>{acceptImageFiles(cameraPicker.files);cameraPicker.value='';});
   input.addEventListener('paste',(event)=>{
     const files=[];const items=event.clipboardData&&event.clipboardData.items;
     if(items)for(const item of items)if(item.kind==='file'&&String(item.type||'').startsWith('image/')){const f=item.getAsFile();if(f)files.push(f);}

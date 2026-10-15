@@ -183,6 +183,18 @@ body.voice-open{overflow:hidden}
 .attach-remove{position:absolute;top:-9px;right:-9px;width:24px;height:24px;border-radius:50%;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:12px;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0}
 .attach-remove:hover{background:rgba(255,151,120,.25);border-color:var(--coral)}
 .composer.dragging{outline:2px dashed var(--lime);outline-offset:-6px;border-radius:14px}
+/* --- X4: Look at this (camera + screen capture) --- */
+/* Attach option menu: quiet popup above the composer, same visual language as
+   the rest of the UI. The camera overlay is a plain fixed layer so it works
+   identically on desktop and mobile viewports. */
+.composer{position:relative}
+.attach-menu{position:absolute;left:0;bottom:calc(100% + 8px);z-index:15;display:flex;flex-direction:column;gap:2px;min-width:220px;max-width:calc(100vw - 32px);padding:6px;background:var(--panel2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow)}
+.attach-menu button{display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:9px;cursor:pointer;text-align:left}
+.attach-menu button:hover{background:rgba(255,255,255,.06)}
+.camera-overlay{position:fixed;inset:0;z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:20px;background:rgba(5,6,9,.92)}
+.camera-video{max-width:min(920px,94vw);max-height:68vh;border-radius:14px;background:#000}
+.camera-actions{display:flex;gap:10px}
+.camera-hint{color:var(--muted);font-size:14px;line-height:1.5;max-width:440px;text-align:center;margin:0}
 /* W1: per-message actions — hidden until hover (desktop) or long-press (touch). No persistent chrome. */
 .message{position:relative}
 .msg-actions{display:none;gap:6px;margin-top:10px;flex-wrap:wrap;align-items:center}
