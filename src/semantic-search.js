@@ -24,21 +24,34 @@ export function cosineSimilarity(a, b) {
 }
 
 /**
- * Fetch an embedding vector for text from the OpenAI embeddings API.
+ * Fetch an embedding vector for text.
+ * Azure path (mirrors src/model.js): when AZURE_OPENAI_ENDPOINT,
+ * AZURE_OPENAI_API_KEY and AZURE_OPENAI_EMBEDDING_DEPLOYMENT are all set,
+ * the request goes to the Azure Foundry deployment via the api-key header.
+ * Otherwise the direct OpenAI API is used, byte-identical to before.
  * Native fetch, no dependencies.
  */
 export async function getEmbedding(text, apiKey) {
   const input = String(text || '').slice(0, MAX_EMBED_CHARS);
   if (!input.trim()) throw new Error('getEmbedding: empty input');
-  const res = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model: EMBEDDING_MODEL, input }),
-    signal: AbortSignal.timeout(15_000),
-  });
+  const azureEndpoint = process.env.AZURE_OPENAI_ENDPOINT?.trim().replace(/\/+$/, '');
+  const azureApiKey = process.env.AZURE_OPENAI_API_KEY?.trim();
+  const azureDeployment = process.env.AZURE_OPENAI_EMBEDDING_DEPLOYMENT?.trim();
+  const usingAzure = Boolean(azureEndpoint && azureApiKey && azureDeployment);
+  const res = await fetch(
+    usingAzure ? `${azureEndpoint}/openai/v1/embeddings` : 'https://api.openai.com/v1/embeddings',
+    {
+      method: 'POST',
+      headers: usingAzure
+        ? { 'api-key': azureApiKey, 'Content-Type': 'application/json' }
+        : {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+      body: JSON.stringify({ model: usingAzure ? azureDeployment : EMBEDDING_MODEL, input }),
+      signal: AbortSignal.timeout(15_000),
+    }
+  );
   if (!res.ok) {
     const detail = await res.text().catch(() => '');
     throw new Error(`getEmbedding failed (${res.status}): ${detail.slice(0, 200)}`);
