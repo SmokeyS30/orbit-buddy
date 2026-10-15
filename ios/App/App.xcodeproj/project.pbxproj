@@ -16,7 +16,38 @@
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
 		50B271D11FEDC1A000F3C39B /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
 		9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9582B6822FE993A50072D4E8 /* SceneDelegate.swift */; };
+		DB33B5EA173E4E60814A85F8 /* OrbitLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = F58080AE6DED4644B91541EE /* OrbitLiveActivity.appex */; };
+		EFD560E63ADD42F6BA67309F /* OrbitAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF877C926F404970851F862A /* OrbitAttributes.swift */; };
+		B5A9E214A03A4BADBF18BF2C /* LiveActivitiesPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25DA2BA4D7514EEDB8377119 /* LiveActivitiesPlugin.swift */; };
+		CB020AE7C5B845C7A253C926 /* OrbitBridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = D16A4D0F039A49ADABDDD568 /* OrbitBridgeViewController.swift */; };
+		BE325D32D6E54B9191AC9BC8 /* OrbitAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF877C926F404970851F862A /* OrbitAttributes.swift */; };
+		70A3063238504076B740F440 /* OrbitLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BEFEA53C73B4A1A8F59AA29 /* OrbitLiveActivity.swift */; };
+		05A88763B4964698AE0239A5 /* OrbitLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B361DDDC6AB4E75BBCDACC9 /* OrbitLiveActivityBundle.swift */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		C966DEB0D2534DFDB1531B8C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 504EC2FC1FED79650016851F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9678F5A72F57444E93D3CD32;
+			remoteInfo = OrbitLiveActivity;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		68035EB519844C6285E57EDD /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				DB33B5EA173E4E60814A85F8 /* OrbitLiveActivity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
@@ -30,6 +61,15 @@
 		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
 		9582B6822FE993A50072D4E8 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
+		F58080AE6DED4644B91541EE /* OrbitLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = OrbitLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		AF877C926F404970851F862A /* OrbitAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitAttributes.swift; sourceTree = "<group>"; };
+		25DA2BA4D7514EEDB8377119 /* LiveActivitiesPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivitiesPlugin.swift; sourceTree = "<group>"; };
+		D16A4D0F039A49ADABDDD568 /* OrbitBridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitBridgeViewController.swift; sourceTree = "<group>"; };
+		9BEFEA53C73B4A1A8F59AA29 /* OrbitLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitLiveActivity.swift; sourceTree = "<group>"; };
+		4B361DDDC6AB4E75BBCDACC9 /* OrbitLiveActivityBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrbitLiveActivityBundle.swift; sourceTree = "<group>"; };
+		BDB464CCC8C0417CBEBC902E /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		16260F25A2254C94965C12E5 /* OrbitLiveActivity.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = OrbitLiveActivity.entitlements; sourceTree = "<group>"; };
+		ED767D3CC6824E3C96BB9A50 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -50,12 +90,14 @@
 				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
 				504EC3061FED79650016851F /* App */,
 				504EC3051FED79650016851F /* Products */,
+			A26BC13F82854F38B04CB15E /* OrbitLiveActivity */,
 			);
 			sourceTree = "<group>";
 		};
 		504EC3051FED79650016851F /* Products */ = {
 			isa = PBXGroup;
 			children = (
+				F58080AE6DED4644B91541EE /* OrbitLiveActivity.appex */,
 				504EC3041FED79650016851F /* App.app */,
 			);
 			name = Products;
@@ -64,6 +106,9 @@
 		504EC3061FED79650016851F /* App */ = {
 			isa = PBXGroup;
 			children = (
+				25DA2BA4D7514EEDB8377119 /* LiveActivitiesPlugin.swift */,
+				D16A4D0F039A49ADABDDD568 /* OrbitBridgeViewController.swift */,
+				ED767D3CC6824E3C96BB9A50 /* App.entitlements */,
 				9582B6822FE993A50072D4E8 /* SceneDelegate.swift */,
 				50379B222058CBB4000EE86E /* capacitor.config.json */,
 				504EC3071FED79650016851F /* AppDelegate.swift */,
@@ -77,6 +122,18 @@
 			path = App;
 			sourceTree = "<group>";
 		};
+		A26BC13F82854F38B04CB15E /* OrbitLiveActivity */ = {
+			isa = PBXGroup;
+			children = (
+				AF877C926F404970851F862A /* OrbitAttributes.swift */,
+				9BEFEA53C73B4A1A8F59AA29 /* OrbitLiveActivity.swift */,
+				4B361DDDC6AB4E75BBCDACC9 /* OrbitLiveActivityBundle.swift */,
+				BDB464CCC8C0417CBEBC902E /* Info.plist */,
+				16260F25A2254C94965C12E5 /* OrbitLiveActivity.entitlements */,
+			);
+			path = OrbitLiveActivity;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -84,6 +141,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
 			buildPhases = (
+				68035EB519844C6285E57EDD /* Embed App Extensions */,
 				504EC3001FED79650016851F /* Sources */,
 				504EC3011FED79650016851F /* Frameworks */,
 				504EC3021FED79650016851F /* Resources */,
@@ -91,6 +149,7 @@
 			buildRules = (
 			);
 			dependencies = (
+				44A013E0B84E4F4589555512 /* PBXTargetDependency */,
 			);
 			name = App;
 			packageProductDependencies = (
@@ -99,6 +158,21 @@
 			productName = App;
 			productReference = 504EC3041FED79650016851F /* App.app */;
 			productType = "com.apple.product-type.application";
+		};
+		9678F5A72F57444E93D3CD32 /* OrbitLiveActivity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 266FC6A77E014A8F940A569B /* Build configuration list for PBXNativeTarget "OrbitLiveActivity" */;
+			buildPhases = (
+				997697817E604675858AFABB /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OrbitLiveActivity;
+			productName = OrbitLiveActivity;
+			productReference = F58080AE6DED4644B91541EE /* OrbitLiveActivity.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
 
@@ -134,6 +208,7 @@
 			projectRoot = "";
 			targets = (
 				504EC3031FED79650016851F /* App */,
+				9678F5A72F57444E93D3CD32 /* OrbitLiveActivity */,
 			);
 		};
 /* End PBXProject section */
@@ -159,12 +234,33 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				EFD560E63ADD42F6BA67309F /* OrbitAttributes.swift in Sources */,
+				B5A9E214A03A4BADBF18BF2C /* LiveActivitiesPlugin.swift in Sources */,
+				CB020AE7C5B845C7A253C926 /* OrbitBridgeViewController.swift in Sources */,
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		997697817E604675858AFABB /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BE325D32D6E54B9191AC9BC8 /* OrbitAttributes.swift in Sources */,
+				70A3063238504076B740F440 /* OrbitLiveActivity.swift in Sources */,
+				05A88763B4964698AE0239A5 /* OrbitLiveActivityBundle.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		44A013E0B84E4F4589555512 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9678F5A72F57444E93D3CD32 /* OrbitLiveActivity */;
+			targetProxy = C966DEB0D2534DFDB1531B8C /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXVariantGroup section */
 		504EC30B1FED79650016851F /* Main.storyboard */ = {
@@ -311,6 +407,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -333,6 +430,7 @@
 		504EC3181FED79650016851F /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = App/App.entitlements;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -348,6 +446,64 @@
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		424AC68E317D4D159C3E6B56 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = OrbitLiveActivity/OrbitLiveActivity.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = S6L62N62M4;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = OrbitLiveActivity/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = OrbitLiveActivity;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.smokeys30.orbitbuddy.OrbitLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		ED6D83C3B361446CAA45DF58 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = OrbitLiveActivity/OrbitLiveActivity.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = S6L62N62M4;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = OrbitLiveActivity/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = OrbitLiveActivity;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.1;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.smokeys30.orbitbuddy.OrbitLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
 			};
 			name = Release;
 		};
@@ -368,6 +524,15 @@
 			buildConfigurations = (
 				504EC3171FED79650016851F /* Debug */,
 				504EC3181FED79650016851F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		266FC6A77E014A8F940A569B /* Build configuration list for PBXNativeTarget "OrbitLiveActivity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				424AC68E317D4D159C3E6B56 /* Debug */,
+				ED6D83C3B361446CAA45DF58 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
