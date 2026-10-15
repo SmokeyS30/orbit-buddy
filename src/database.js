@@ -389,6 +389,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    // W1: per-message actions.
+    getMessage: db.prepare('SELECT * FROM messages WHERE id=? AND user_id=?'),
+    getMessageAny: db.prepare('SELECT * FROM messages WHERE id=?'),
+    deleteMessageRow: db.prepare('DELETE FROM messages WHERE id=? AND user_id=?'),
+    retimeMessageRow: db.prepare('UPDATE messages SET created_at=? WHERE id=? AND user_id=?'),
     addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL, ?)`),
     listMemories: db.prepare("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,rowid DESC LIMIT 100"),
@@ -634,6 +639,33 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
+    // W1: per-message actions.
+    getMessage:(userId,id)=>s.getMessage.get(id,userId),
+    messageExists:(id)=>!!s.getMessageAny.get(id),
+    deleteMessage(userId,id){return s.deleteMessageRow.run(id,userId).changes>0;},
+    // W1: move a message to an explicit position in conversation order
+    // (regenerate re-inserts the new answer where the old one was).
+    retimeMessage(userId,id,createdAt){return s.retimeMessageRow.run(createdAt,id,userId).changes>0;},
+    // Deletes a whole turn: the target message plus the adjacent partner that
+    // completes it. Deleting an assistant reply also removes the user message
+    // it answered; deleting a user message also removes the assistant reply
+    // that followed it, if any. Returns the deleted ids, or null when the
+    // message does not exist for this user.
+    deleteMessageTurn(userId,messageId){
+      const target=s.getMessage.get(messageId,userId);
+      if(!target)return null;
+      const ordered=s.listConversationMessages.all(userId,target.conversation_id,200).reverse();
+      const idx=ordered.findIndex((m)=>m.id===messageId);
+      const ids=[messageId];
+      const prev=idx>0?ordered[idx-1]:null;
+      const next=idx>=0&&idx<ordered.length-1?ordered[idx+1]:null;
+      if(target.role==='assistant'&&prev&&prev.role==='user')ids.push(prev.id);
+      if(target.role==='user'&&next&&next.role==='assistant')ids.push(next.id);
+      db.exec('BEGIN IMMEDIATE');
+      try{for(const id of ids)s.deleteMessageRow.run(id,userId);db.exec('COMMIT');}
+      catch(error){db.exec('ROLLBACK');throw error;}
+      return ids;
+    },
     addMemory(userId, content, options={}) {
       const now=timestamp();
       const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now,
