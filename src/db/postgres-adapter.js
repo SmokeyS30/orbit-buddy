@@ -471,15 +471,18 @@ const indexMigrations = [
     getGoal: async (userId, id) => (await get('SELECT * FROM goals WHERE id=? AND user_id=?', id, userId)) || null,
     listGoals: async (userId) => all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
     async listActiveGoals(userId, limit=10) { return rankGoals(await all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId), limit); },
-    async updateGoal(userId, id, { progress, status, nextStep, note=null }={}) {
+    async updateGoal(userId, id, { progress, status, nextStep, note=null, title, priority, targetDate }={}) {
       const current = await get('SELECT * FROM goals WHERE id=? AND user_id=?', id, userId);
       if (!current) return null;
       const nextProgress = Math.max(0, Math.min(Math.round(Number(progress ?? current.progress)), 100));
       let nextStatus = ['active','paused','completed'].includes(status) ? status : current.status;
       if (nextProgress >= 100) nextStatus = 'completed';
       const completedAt = nextStatus === 'completed' ? (current.completed_at || timestamp()) : null;
+      const nextTitle = title === undefined ? current.title : (String(title || '').trim().slice(0, 120) || current.title);
+      const nextPriority = priority === undefined ? current.priority : normalizePriority(priority);
+      const nextTarget = targetDate === undefined ? current.target_date : (targetDate ? validDateString(targetDate) : null);
       const updated = timestamp();
-      await run('UPDATE goals SET progress=?,status=?,next_step=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?', nextProgress, nextStatus, nextStep === undefined ? current.next_step : (nextStep || null), updated, completedAt, id, userId);
+      await run('UPDATE goals SET progress=?,status=?,next_step=?,title=?,priority=?,target_date=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?', nextProgress, nextStatus, nextStep === undefined ? current.next_step : (nextStep || null), nextTitle, nextPriority, nextTarget, updated, completedAt, id, userId);
       if (note || nextProgress !== current.progress) await run('INSERT INTO goal_checkins(id,goal_id,user_id,progress,note,created_at) VALUES(?,?,?,?,?,?)', randomUUID(), id, userId, nextProgress, note ? String(note).slice(0, 1000) : null, updated);
       return get('SELECT * FROM goals WHERE id=? AND user_id=?', id, userId);
     },
@@ -501,6 +504,19 @@ const indexMigrations = [
     getRoutine: async (userId, id) => (await get('SELECT * FROM routines WHERE id=? AND user_id=?', id, userId)) || null,
     listRoutines: async (userId) => all('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,LOWER(title)', userId),
     setRoutineEnabled: async (userId, id, enabled) => (await run('UPDATE routines SET enabled=?,lease_date=NULL,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?', enabled ? 1 : 0, timestamp(), id, userId)).changes > 0,
+    async updateRoutine(userId, id, { title, timeLocal, cadence, dayOfWeek, enabled }={}) {
+      const current = await get('SELECT * FROM routines WHERE id=? AND user_id=?', id, userId);
+      if (!current) return null;
+      const now = timestamp();
+      const nextTitle = title === undefined ? current.title : (String(title || '').trim().slice(0, 120) || current.title);
+      const nextTime = timeLocal === undefined ? current.time_local : validTimeString(timeLocal, '09:00');
+      const nextCadence = cadence === undefined ? current.cadence : (['daily','weekdays','weekly'].includes(cadence) ? cadence : current.cadence);
+      const requestedDay = Number(dayOfWeek);
+      const nextDay = dayOfWeek === undefined ? current.day_of_week : (nextCadence === 'weekly' && Number.isInteger(requestedDay) && requestedDay >= 0 && requestedDay <= 6 ? requestedDay : (nextCadence === 'weekly' ? 1 : null));
+      const nextEnabled = enabled === undefined ? current.enabled : (enabled ? 1 : 0);
+      await run('UPDATE routines SET title=?,time_local=?,cadence=?,day_of_week=?,enabled=?,updated_at=? WHERE id=? AND user_id=?', nextTitle, nextTime, nextCadence, nextDay, nextEnabled, now, id, userId);
+      return get('SELECT * FROM routines WHERE id=? AND user_id=?', id, userId);
+    },
     deleteRoutine: async (userId, id) => (await run('DELETE FROM routines WHERE id=? AND user_id=?', id, userId)).changes > 0,
     claimRoutine: async (userId, id, localDate, leaseMs=2*60_000) => {
       const now = timestamp();
@@ -818,6 +834,17 @@ const indexMigrations = [
     listTasks: async (userId) => all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),
     getTask: async (userId, id) => get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId),
     setTaskStatus: async (userId, id, status) => (await run('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?', status, timestamp(), id, userId)).changes > 0,
+    async updateTask(userId, id, { title, prompt, scheduleAt, recurrence }={}) {
+      const current = await get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
+      if (!current) return null;
+      const now = timestamp();
+      const nextTitle = title === undefined ? current.title : (String(title || '').trim().slice(0, 120) || current.title);
+      const nextPrompt = prompt === undefined ? current.prompt : (String(prompt || '').trim().slice(0, 6000) || current.prompt);
+      const nextSchedule = scheduleAt === undefined ? current.schedule_at : (scheduleAt ? new Date(scheduleAt).toISOString() : null);
+      const nextRecurrence = recurrence === undefined ? current.recurrence : (['none','daily','weekly'].includes(recurrence) ? recurrence : current.recurrence);
+      await run('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?', nextTitle, nextPrompt, nextSchedule, nextRecurrence, now, id, userId);
+      return get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
+    },
     deleteTask: async (userId, id) => (await run('DELETE FROM tasks WHERE id=? AND user_id=?', id, userId)).changes > 0,
     startTask: async (userId, id, leaseMs=2*60_000) => (await run("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId)).changes > 0,
     recoverStaleTasks: async () => {

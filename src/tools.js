@@ -544,21 +544,6 @@ export function toolCreateGoal(args = {}, ctx = null) {
   return { id: goal.id, title: goal.title, priority: goal.priority, targetDate: goal.target_date, note: 'Goal created. Progress stays user-controlled.' };
 }
 
-export function toolUpdateGoal(args = {}, ctx = null) {
-  const { db, userId } = writeContext(ctx, 'update_goal');
-  const goalId = cleanArg(args.goalId, 80, 'goalId');
-  const progressValue = Number(args.progress);
-  if (args.progress !== undefined && (!Number.isFinite(progressValue) || progressValue < 0 || progressValue > 100)) throw new Error('progress must be a number from 0 to 100.');
-  const progress = args.progress === undefined ? undefined : Math.round(progressValue);
-  const status = args.status === undefined ? undefined : (['active', 'paused', 'completed'].includes(args.status) ? args.status : null);
-  if (args.status !== undefined && !status) throw new Error('status must be active, paused, or completed.');
-  const nextStep = args.nextStep === undefined ? undefined : String(args.nextStep || '').trim().slice(0, 500);
-  const note = typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 1000) : null;
-  const goal = db.updateGoal(userId, goalId, { progress, status, nextStep, note });
-  if (!goal) throw new Error('Goal not found.');
-  return { id: goal.id, title: goal.title, progress: goal.progress, status: goal.status, nextStep: goal.next_step, note: 'Goal updated.' };
-}
-
 export function toolCreateProject(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'create_project');
   const title = cleanArg(args.title, 120, 'title');
@@ -586,6 +571,307 @@ export function toolUpdateProjectStep(args = {}, ctx = null) {
   const step = db.updateProjectStep(userId, stepId, { status, details: args.note === undefined ? undefined : String(args.note || '').slice(0, 1000) });
   if (!step) throw new Error('Project step not found.');
   return { id: step.id, title: step.title, status: step.status, note: 'Project step updated from the user’s explicit report.' };
+}
+
+// ---- D2: chat-as-manager (in-chat updates + confirm-gated deletion) ----
+// Everything here is scoped to the caller's own userId through writeContext,
+// exactly like the creation tools — no wider multi-user surface.
+
+// Resolve a date phrase to YYYY-MM-DD in the user's timezone. Accepts an ISO
+// date or a relative phrase ("today", "tomorrow", "day after tomorrow",
+// "Friday", "next Friday", "next week"). Bare weekday names resolve to the
+// upcoming one (today when it is that weekday); "next <weekday>" skips a
+// week. Returns null when the phrase cannot be resolved. `now` is injectable
+// for tests.
+export function resolveRelativeDate(value, timeZone = DEFAULT_ZONE, now = new Date()) {
+  const raw = String(value || '').trim();
+  const iso = validDateString(raw);
+  if (iso) return iso;
+  const zone = validTimeZone(timeZone, DEFAULT_ZONE);
+  const local = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+  const [y, m, d] = local.split('-').map(Number);
+  const base = new Date(Date.UTC(y, m - 1, d));
+  const fmt = (dt) => dt.toISOString().slice(0, 10);
+  const addDays = (dt, n) => new Date(dt.getTime() + n * 86400000);
+  const q = raw.toLowerCase().replace(/\s+/g, ' ');
+  if (q === 'today' || q === 'tonight') return fmt(base);
+  if (q === 'tomorrow') return fmt(addDays(base, 1));
+  if (q === 'day after tomorrow') return fmt(addDays(base, 2));
+  if (q === 'next week') return fmt(addDays(base, 7));
+  const weekdays = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+  const named = /^(next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/.exec(q);
+  if (named) {
+    const target = weekdays[named[2]];
+    const dow = base.getUTCDay();
+    if (named[1]) return fmt(addDays(base, ((target - dow + 7) % 7 || 7) + 7));
+    return fmt(addDays(base, (target - dow + 7) % 7));
+  }
+  return null;
+}
+
+// Interpret a YYYY-MM-DD date + HH:MM time in the user's timezone as an ISO
+// UTC instant (used when the model reschedules a task with a bare phrase).
+function zonedTimeToIso(dateStr, timeStr, timeZone) {
+  const [y, mo, d] = dateStr.split('-').map(Number);
+  const [h, mi] = String(timeStr).split(':').map(Number);
+  const guess = new Date(Date.UTC(y, mo - 1, d, h, mi));
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone, hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(guess);
+  const get = (t) => Number(parts.find((p) => p.type === t)?.value);
+  const asIfUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+  return new Date(guess.getTime() - (asIfUtc - guess.getTime())).toISOString();
+}
+
+// Fuzzy-match a manage target by title: exact (case-insensitive) wins, a
+// single substring hit is taken, multiple hits come back as candidates so the
+// model asks instead of guessing. Returns { match, candidates }.
+function findManageTarget(items, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q || !items.length) return { match: null, candidates: [] };
+  const text = (item) => String(item.title || '').trim().toLowerCase();
+  const exact = items.find((item) => text(item) === q);
+  if (exact) return { match: exact, candidates: [] };
+  const hits = items.filter((item) => text(item).includes(q));
+  if (hits.length <= 1) return { match: hits[0] || null, candidates: [] };
+  hits.sort((a, b) => String(a.title).length - String(b.title).length);
+  return { match: null, candidates: hits.slice(0, 5) };
+}
+
+function ambiguousTarget(objectType, candidates, detail) {
+  return {
+    ambiguous: true,
+    objectType,
+    candidates: candidates.map((c) => ({ id: c.id, title: c.title, detail: detail(c) })),
+    note: `More than one ${objectType} matches. Ask the user which one they mean in chat with ONE short question and wait for the answer — never pick one for them and never apply the change twice.`
+  };
+}
+
+function resolveGoalForManage(db, userId, args) {
+  const goalId = String(args.goalId || '').trim();
+  if (goalId) {
+    const goal = db.getGoal(userId, goalId);
+    if (!goal) throw new Error('Goal not found. Ask the user which goal they mean.');
+    return { match: goal, candidates: [] };
+  }
+  const query = String(args.title || '').trim();
+  if (!query) throw new Error('Provide goalId or title to identify the goal.');
+  return findManageTarget(db.listGoals(userId), query);
+}
+
+export function toolUpdateGoal(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_goal');
+  const { match: goal, candidates } = resolveGoalForManage(db, userId, args);
+  if (candidates.length) return ambiguousTarget('goal', candidates, (g) => `${g.progress}% complete, ${g.status}${g.target_date ? `, target ${g.target_date}` : ''}`);
+  if (!goal) throw new Error('No goal found matching that. Ask the user which goal they mean.');
+  const progressValue = Number(args.progress);
+  if (args.progress !== undefined && (!Number.isFinite(progressValue) || progressValue < 0 || progressValue > 100)) throw new Error('progress must be a number from 0 to 100.');
+  const progress = args.progress === undefined ? undefined : Math.round(progressValue);
+  const status = args.status === undefined ? undefined : (['active', 'paused', 'completed'].includes(args.status) ? args.status : null);
+  if (args.status !== undefined && !status) throw new Error('status must be active, paused, or completed.');
+  const nextStep = args.nextStep === undefined ? undefined : String(args.nextStep || '').trim().slice(0, 500);
+  const note = typeof args.note === 'string' && args.note.trim() ? args.note.trim().slice(0, 1000) : null;
+  const newTitle = args.newTitle === undefined ? undefined : String(args.newTitle || '').trim().slice(0, 120);
+  if (newTitle !== undefined && !newTitle) throw new Error('newTitle must not be empty.');
+  const priority = args.priority === undefined ? undefined : normalizePriority(args.priority);
+  let targetDate;
+  if (args.targetDate !== undefined) {
+    if (args.targetDate === null || args.targetDate === '') targetDate = null;
+    else {
+      const resolved = resolveRelativeDate(args.targetDate, validTimeZone(ctx?.timeZone, DEFAULT_ZONE));
+      if (!resolved) throw new Error('targetDate must be YYYY-MM-DD or a relative phrase like "Friday" or "next week".');
+      targetDate = resolved;
+    }
+  }
+  const updated = db.updateGoal(userId, goal.id, {
+    ...(progress !== undefined ? { progress } : {}),
+    ...(status !== undefined ? { status } : {}),
+    ...(nextStep !== undefined ? { nextStep } : {}),
+    ...(note !== null ? { note } : {}),
+    ...(newTitle !== undefined ? { title: newTitle } : {}),
+    ...(priority !== undefined ? { priority } : {}),
+    ...(targetDate !== undefined ? { targetDate } : {})
+  });
+  if (!updated) throw new Error('Goal not found.');
+  const changed = [];
+  if (newTitle !== undefined) changed.push(`renamed to “${updated.title}”`);
+  if (priority !== undefined) changed.push(`priority ${updated.priority}`);
+  if (targetDate !== undefined) changed.push(targetDate ? `target moved to ${updated.target_date}` : 'target date cleared');
+  if (progress !== undefined) changed.push(`progress ${updated.progress}%`);
+  if (status !== undefined) changed.push(`status ${updated.status}`);
+  if (nextStep !== undefined) changed.push('next step updated');
+  return {
+    id: updated.id, title: updated.title, progress: updated.progress, status: updated.status,
+    priority: updated.priority, targetDate: updated.target_date, nextStep: updated.next_step,
+    note: changed.length ? `Goal updated: ${changed.join('; ')}.` : 'Goal saved (no changes).'
+  };
+}
+
+export function toolUpdateTask(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_task');
+  const query = String(args.task || args.title || '').trim();
+  if (!query) throw new Error('Provide task (a title) to identify the task.');
+  const open = db.listTasks(userId).filter((t) => !['completed', 'cancelled', 'failed'].includes(t.status));
+  const { match: task, candidates } = findManageTarget(open, query);
+  if (candidates.length) return ambiguousTarget('task', candidates, (t) => `${String(t.status).replaceAll('_', ' ')}${t.schedule_at ? `, runs ${t.schedule_at}` : ''}`);
+  if (!task) throw new Error(`No open task found matching “${query}”. Ask the user which task they mean.`);
+  const patch = {};
+  if (args.newTitle !== undefined) {
+    const v = String(args.newTitle || '').trim().slice(0, 120);
+    if (!v) throw new Error('newTitle must not be empty.');
+    patch.title = v;
+  }
+  if (args.newPrompt !== undefined) {
+    const v = String(args.newPrompt || '').trim().slice(0, 6000);
+    if (!v) throw new Error('newPrompt must not be empty.');
+    patch.prompt = v;
+  }
+  if (args.scheduleAt !== undefined) {
+    if (args.scheduleAt === null || args.scheduleAt === '') patch.scheduleAt = null;
+    else {
+      const direct = new Date(args.scheduleAt);
+      if (!Number.isNaN(direct.valueOf())) patch.scheduleAt = direct.toISOString();
+      else {
+        const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
+        const resolved = resolveRelativeDate(args.scheduleAt, zone);
+        if (!resolved) throw new Error('scheduleAt must be an ISO date/time or a relative phrase like "tomorrow" or "Friday".');
+        patch.scheduleAt = zonedTimeToIso(resolved, '09:00', zone);
+      }
+    }
+  }
+  if (args.recurrence !== undefined) {
+    if (!['none', 'daily', 'weekly'].includes(args.recurrence)) throw new Error('recurrence must be none, daily, or weekly.');
+    patch.recurrence = args.recurrence;
+  }
+  const updated = db.updateTask(userId, task.id, patch);
+  if (!updated) throw new Error('Task not found.');
+  const changed = [];
+  if (patch.title !== undefined) changed.push(`renamed to “${updated.title}”`);
+  if (patch.prompt !== undefined) changed.push('instructions updated');
+  if (patch.scheduleAt !== undefined) changed.push(patch.scheduleAt ? `rescheduled to ${updated.schedule_at}` : 'schedule cleared');
+  if (patch.recurrence !== undefined) changed.push(`recurrence ${updated.recurrence}`);
+  return {
+    id: updated.id, title: updated.title, scheduleAt: updated.schedule_at, recurrence: updated.recurrence,
+    note: changed.length ? `Task updated: ${changed.join('; ')}.` : 'Task saved (no changes).'
+  };
+}
+
+export function toolUpdateRoutine(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_routine');
+  const query = String(args.routine || args.title || '').trim();
+  if (!query) throw new Error('Provide routine (a title) to identify the routine.');
+  const { match: routine, candidates } = findManageTarget(db.listRoutines(userId), query);
+  if (candidates.length) return ambiguousTarget('routine', candidates, (r) => `${r.cadence} at ${r.time_local}${r.enabled ? '' : ' (paused)'}`);
+  if (!routine) throw new Error(`No routine found matching “${query}”. Ask the user which routine they mean.`);
+  const patch = {};
+  if (args.newTitle !== undefined) {
+    const v = String(args.newTitle || '').trim().slice(0, 120);
+    if (!v) throw new Error('newTitle must not be empty.');
+    patch.title = v;
+  }
+  if (args.timeLocal !== undefined) {
+    const v = validTimeString(args.timeLocal);
+    if (!v) throw new Error('timeLocal must be HH:MM in 24-hour time.');
+    patch.timeLocal = v;
+  }
+  if (args.cadence !== undefined) {
+    if (!['daily', 'weekdays', 'weekly'].includes(args.cadence)) throw new Error('cadence must be daily, weekdays, or weekly.');
+    patch.cadence = args.cadence;
+  }
+  if (args.dayOfWeek !== undefined) {
+    const n = Number(args.dayOfWeek);
+    if (!Number.isInteger(n) || n < 0 || n > 6) throw new Error('dayOfWeek must be an integer from 0 (Sunday) through 6 (Saturday).');
+    patch.dayOfWeek = n;
+  }
+  if (args.enabled !== undefined) patch.enabled = !!args.enabled;
+  const updated = db.updateRoutine(userId, routine.id, patch);
+  if (!updated) throw new Error('Routine not found.');
+  const changed = [];
+  if (patch.title !== undefined) changed.push(`renamed to “${updated.title}”`);
+  if (patch.timeLocal !== undefined) changed.push(`time ${updated.time_local}`);
+  if (patch.cadence !== undefined) changed.push(`cadence ${updated.cadence}`);
+  if (patch.dayOfWeek !== undefined) changed.push(`day ${updated.day_of_week}`);
+  if (patch.enabled !== undefined) changed.push(updated.enabled ? 'resumed' : 'paused');
+  return {
+    id: updated.id, title: updated.title, timeLocal: updated.time_local, cadence: updated.cadence,
+    dayOfWeek: updated.day_of_week, enabled: !!updated.enabled,
+    note: changed.length ? `Routine updated: ${changed.join('; ')}.` : 'Routine saved (no changes).'
+  };
+}
+
+// Deletion is always a two-step, confirm-in-chat flow: the delete_* tools only
+// STAGE a request as a pending approval (nothing is removed), and
+// confirm_delete_approval executes it after the user's explicit yes in chat.
+const DELETE_APPROVAL_KINDS = ['delete_goal', 'delete_task', 'delete_routine'];
+
+function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
+  const { db, userId } = writeContext(ctx, kind);
+  const approval = db.addApproval(userId, {
+    kind,
+    title: `Delete ${objectType} “${title}”`,
+    summary: preview,
+    payload: { id, title, objectType },
+    sourceMessageId: ctx?.messageId || null
+  });
+  db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for in-chat confirmation.`);
+  return {
+    approvalId: approval.id, objectType, id, title, preview,
+    note: 'NOT deleted — this only staged a delete request. Present the preview in your visible reply (exactly what will be deleted), then wait for the user’s explicit yes. Only after they confirm, call confirm_delete_approval with this approvalId. Never call confirm_delete_approval without that explicit yes, and never stage or confirm a deletion from an ambiguous single message.'
+  };
+}
+
+export function toolDeleteGoal(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'delete_goal');
+  const { match: goal, candidates } = resolveGoalForManage(db, userId, args);
+  if (candidates.length) return ambiguousTarget('goal', candidates, (g) => `${g.progress}% complete, ${g.status}${g.target_date ? `, target ${g.target_date}` : ''}`);
+  if (!goal) throw new Error('No goal found matching that. Ask the user which goal they mean.');
+  const preview = `Goal “${goal.title}” — ${goal.status}, ${goal.progress}% complete${goal.target_date ? `, target ${goal.target_date}` : ''}${goal.next_step ? `, next: ${goal.next_step}` : ''}. Deleting also removes its progress history.`;
+  return stageDeleteApproval(ctx, 'delete_goal', 'goal', goal.id, goal.title, preview);
+}
+
+export function toolDeleteTask(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'delete_task');
+  const query = String(args.task || args.title || '').trim();
+  if (!query) throw new Error('Provide task (a title) to identify the task.');
+  const { match: task, candidates } = findManageTarget(db.listTasks(userId), query);
+  if (candidates.length) return ambiguousTarget('task', candidates, (t) => `${String(t.status).replaceAll('_', ' ')}${t.schedule_at ? `, runs ${t.schedule_at}` : ''}`);
+  if (!task) throw new Error(`No task found matching “${query}”. Ask the user which task they mean.`);
+  const preview = `Task “${task.title}” — ${String(task.status).replaceAll('_', ' ')}${task.schedule_at ? `, scheduled ${task.schedule_at}` : ''}${task.recurrence && task.recurrence !== 'none' ? `, repeats ${task.recurrence}` : ''}.`;
+  return stageDeleteApproval(ctx, 'delete_task', 'task', task.id, task.title, preview);
+}
+
+const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+export function toolDeleteRoutine(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'delete_routine');
+  const query = String(args.routine || args.title || '').trim();
+  if (!query) throw new Error('Provide routine (a title) to identify the routine.');
+  const { match: routine, candidates } = findManageTarget(db.listRoutines(userId), query);
+  if (candidates.length) return ambiguousTarget('routine', candidates, (r) => `${r.cadence} at ${r.time_local}${r.enabled ? '' : ' (paused)'}`);
+  if (!routine) throw new Error(`No routine found matching “${query}”. Ask the user which routine they mean.`);
+  const day = routine.cadence === 'weekly' && routine.day_of_week != null ? ` on ${WEEKDAY_NAMES[routine.day_of_week]}` : '';
+  const preview = `Routine “${routine.title}” — ${routine.cadence}${day} at ${routine.time_local}${routine.enabled ? '' : ' (currently paused)'}.`;
+  return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine.id, routine.title, preview);
+}
+
+export function toolConfirmDeleteApproval(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'confirm_delete_approval');
+  const approvalId = cleanArg(args.approvalId, 80, 'approvalId');
+  const approval = db.getApproval(userId, approvalId);
+  if (!approval || !DELETE_APPROVAL_KINDS.includes(approval.kind)) throw new Error('No pending deletion found for that approval.');
+  if (approval.status !== 'pending') throw new Error('That deletion request was already reviewed — nothing to confirm.');
+  const claimed = db.claimApproval(userId, approval.id);
+  if (!claimed) throw new Error('That deletion request is already being handled.');
+  const { id, title, objectType } = claimed.payload || {};
+  let ok = false;
+  if (claimed.kind === 'delete_goal') ok = db.deleteGoal(userId, id);
+  else if (claimed.kind === 'delete_task') ok = db.deleteTask(userId, id);
+  else if (claimed.kind === 'delete_routine') ok = db.deleteRoutine(userId, id);
+  if (!ok) {
+    db.finishApproval(userId, approval.id, 'failed', { error: 'The item was already gone.' });
+    throw new Error(`That ${objectType || 'item'} no longer exists — nothing was deleted.`);
+  }
+  db.finishApproval(userId, approval.id, 'executed', { result: { deleted: claimed.kind, id, title } });
+  db.addEvent(userId, `${objectType}_deleted`, `Deleted ${objectType} “${title}” via chat after explicit confirmation.`);
+  return { deleted: true, objectType, id, title, note: `Deleted the ${objectType} “${title}”. Say so plainly in your visible reply.` };
 }
 
 export function toolProposeCalendarEvent(args = {}, ctx = null) {
@@ -992,15 +1278,101 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'update_goal',
-    description: 'Update a goal only when the user clearly reports progress, changes its status, or asks to change its next step. Never infer completion.',
+    description: 'Update a goal from chat: report progress, change status or next step, rename it (newTitle), reprioritize it (priority 1 low, 2 normal, 3 high), or move its deadline (targetDate as YYYY-MM-DD or a relative phrase like "Friday", resolved in the user’s timezone; null clears it). Identify the goal with goalId (from context) or title (fuzzy match). If the result has ambiguous:true, ask the user which goal they mean in chat and wait — never guess.',
     parameters: {
       type: 'object',
       properties: {
-        goalId: { type: 'string' }, progress: { type: 'number', description: '0 to 100.' },
+        goalId: { type: 'string', description: 'Goal ID from context. Use title instead when you do not have it.' },
+        title: { type: 'string', description: 'Goal title to find (fuzzy). Ignored when goalId is given.' },
+        progress: { type: 'number', description: '0 to 100.' },
         status: { type: 'string', enum: ['active', 'paused', 'completed'] },
-        nextStep: { type: 'string' }, note: { type: 'string' }
+        nextStep: { type: 'string' }, note: { type: 'string' },
+        newTitle: { type: 'string', description: 'Rename the goal.' },
+        priority: { type: 'number', description: '1 low, 2 normal, or 3 high.' },
+        targetDate: { type: 'string', description: 'YYYY-MM-DD or a relative phrase like "Friday".' }
       },
-      required: ['goalId'], additionalProperties: false
+      required: [], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'update_task',
+    description: 'Update one of the user’s tasks from chat: rename it (newTitle), change what it does (newPrompt), reschedule it (scheduleAt as ISO date/time, or a relative phrase like "tomorrow" or "Friday" which resolves to 9:00 AM in their timezone; null clears the schedule), or change its recurrence. Identify the task with task (fuzzy title match). If the result has ambiguous:true, ask the user which task they mean in chat and wait — never guess.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Task title to find (fuzzy).' },
+        newTitle: { type: 'string' }, newPrompt: { type: 'string' },
+        scheduleAt: { type: 'string', description: 'ISO date/time or relative phrase ("tomorrow", "Friday"). Null clears the schedule.' },
+        recurrence: { type: 'string', enum: ['none', 'daily', 'weekly'] }
+      },
+      required: ['task'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'update_routine',
+    description: 'Update one of the user’s routines from chat: rename it (newTitle), change its time (timeLocal HH:MM), cadence (daily/weekdays/weekly), weekly day (dayOfWeek 0 Sunday through 6 Saturday), or pause/resume it (enabled true/false). Identify the routine with routine (fuzzy title match). If the result has ambiguous:true, ask the user which routine they mean in chat and wait — never guess.',
+    parameters: {
+      type: 'object',
+      properties: {
+        routine: { type: 'string', description: 'Routine title to find (fuzzy).' },
+        newTitle: { type: 'string' },
+        timeLocal: { type: 'string', description: 'Local 24-hour HH:MM time.' },
+        cadence: { type: 'string', enum: ['daily', 'weekdays', 'weekly'] },
+        dayOfWeek: { type: 'number', description: 'For weekly routines: 0 Sunday through 6 Saturday.' },
+        enabled: { type: 'boolean', description: 'False pauses the routine, true resumes it.' }
+      },
+      required: ['routine'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'delete_goal',
+    description: 'STAGE a goal deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_goal speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which goal in chat and wait.',
+    parameters: {
+      type: 'object',
+      properties: {
+        goalId: { type: 'string', description: 'Goal ID from context. Use title instead when you do not have it.' },
+        title: { type: 'string', description: 'Goal title to find (fuzzy). Ignored when goalId is given.' }
+      },
+      required: [], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'delete_task',
+    description: 'STAGE a task deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_task speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which task in chat and wait.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task: { type: 'string', description: 'Task title to find (fuzzy).' }
+      },
+      required: ['task'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'delete_routine',
+    description: 'STAGE a routine deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_routine speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which routine in chat and wait.',
+    parameters: {
+      type: 'object',
+      properties: {
+        routine: { type: 'string', description: 'Routine title to find (fuzzy).' }
+      },
+      required: ['routine'], additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'confirm_delete_approval',
+    description: 'Execute a staged deletion AFTER the user explicitly confirmed it in chat (said yes to the exact preview shown). Takes the approvalId returned by delete_goal, delete_task, or delete_routine. Call this only after that explicit in-chat yes — never on the same turn as the delete_* call, never speculatively.',
+    parameters: {
+      type: 'object',
+      properties: {
+        approvalId: { type: 'string', description: 'The approvalId returned by delete_goal/delete_task/delete_routine.' }
+      },
+      required: ['approvalId'], additionalProperties: false
     }
   },
   {
@@ -1152,7 +1524,13 @@ const TOOL_SUMMARIES = {
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
   create_goal: (args) => String(args.title || '').slice(0, 80),
-  update_goal: (args) => String(args.goalId || '').slice(0, 80),
+  update_goal: (args) => String(args.goalId || args.title || '').slice(0, 80),
+  update_task: (args) => String(args.task || '').slice(0, 80),
+  update_routine: (args) => String(args.routine || '').slice(0, 80),
+  delete_goal: (args) => `Stage delete goal: ${String(args.goalId || args.title || '').slice(0, 60)}`,
+  delete_task: (args) => `Stage delete task: ${String(args.task || '').slice(0, 60)}`,
+  delete_routine: (args) => `Stage delete routine: ${String(args.routine || '').slice(0, 60)}`,
+  confirm_delete_approval: (args) => `Confirm deletion: ${String(args.approvalId || '').slice(0, 40)}`,
   create_routine: (args) => String(args.title || '').slice(0, 80),
   create_project: (args) => String(args.title || '').slice(0, 80),
   update_project_step: (args) => String(args.stepId || '').slice(0, 80),
@@ -1246,7 +1624,31 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     }
     case 'update_goal': {
       const result = toolUpdateGoal(clean, ctx);
-      return { result, summary: String(clean.goalId || '').slice(0, 80) };
+      return { result, summary: String(clean.goalId || clean.title || '').slice(0, 80) };
+    }
+    case 'update_task': {
+      const result = toolUpdateTask(clean, ctx);
+      return { result, summary: String(clean.task || '').slice(0, 80) };
+    }
+    case 'update_routine': {
+      const result = toolUpdateRoutine(clean, ctx);
+      return { result, summary: String(clean.routine || '').slice(0, 80) };
+    }
+    case 'delete_goal': {
+      const result = toolDeleteGoal(clean, ctx);
+      return { result, summary: result.ambiguous ? `Ambiguous delete target: ${String(clean.goalId || clean.title || '').slice(0, 60)}` : `Staged delete goal: ${String(result.title || '').slice(0, 60)}` };
+    }
+    case 'delete_task': {
+      const result = toolDeleteTask(clean, ctx);
+      return { result, summary: result.ambiguous ? `Ambiguous delete target: ${String(clean.task || '').slice(0, 60)}` : `Staged delete task: ${String(result.title || '').slice(0, 60)}` };
+    }
+    case 'delete_routine': {
+      const result = toolDeleteRoutine(clean, ctx);
+      return { result, summary: result.ambiguous ? `Ambiguous delete target: ${String(clean.routine || '').slice(0, 60)}` : `Staged delete routine: ${String(result.title || '').slice(0, 60)}` };
+    }
+    case 'confirm_delete_approval': {
+      const result = toolConfirmDeleteApproval(clean, ctx);
+      return { result, summary: `Deleted ${String(result.objectType || 'item')}: ${String(result.title || '').slice(0, 60)}` };
     }
     case 'create_routine': {
       const result = toolCreateRoutine(clean, ctx);

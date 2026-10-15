@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 30);
+  assert.equal(TOOL_DEFINITIONS.length, 36);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_ambient_context', 'set_buddy_name', 'update_goal', 'update_project_step', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'confirm_delete_approval', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'delete_goal', 'delete_routine', 'delete_task', 'enable_gift_reminder', 'fetch_url', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_ambient_context', 'set_buddy_name', 'update_goal', 'update_project_step', 'update_routine', 'update_task', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {
@@ -503,6 +503,8 @@ function writeCtx() {
         calls.push(['updateGoal', userId, goalId, update]);
         return { id: goalId, title: 'Certification', progress: update.progress ?? 25, status: update.status || 'active', next_step: update.nextStep || null };
       },
+      getGoal: (userId, goalId) => ({ id: goalId, title: 'Certification', progress: 25, status: 'active', priority: 2, target_date: null, next_step: null }),
+      listGoals: () => [],
       addRoutine: (userId, routine) => {
         calls.push(['addRoutine', userId, routine]);
         return { id: 'routine-1', ...routine, time_local: routine.timeLocal };
@@ -691,7 +693,7 @@ test('goal tools create and update user-controlled progress', async () => {
   assert.deepEqual(ctx.calls[0], ['addGoal', 'user-1', { title: 'Certification', description: null, priority: 3, targetDate: '2026-12-01', nextStep: 'Book exam' }]);
   const updated = await executeTool('update_goal', { goalId: 'goal-1', progress: 40, note: 'Finished a module' }, {}, ctx);
   assert.equal(updated.result.progress, 40);
-  assert.deepEqual(ctx.calls[1], ['updateGoal', 'user-1', 'goal-1', { progress: 40, status: undefined, nextStep: undefined, note: 'Finished a module' }]);
+  assert.deepEqual(ctx.calls[1], ['updateGoal', 'user-1', 'goal-1', { progress: 40, note: 'Finished a module' }]);
   await assert.rejects(() => executeTool('update_goal', { goalId: 'goal-1', progress: 101 }, {}, ctx), /0 to 100/);
 });
 

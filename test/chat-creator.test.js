@@ -16,8 +16,16 @@ test('developer prompt requires confirm-in-chat instead of guessing', () => {
   assert.match(prompt, /ONE short clarifying question/);
 });
 
-test('developer prompt keeps deletion in the tab UIs', () => {
+test('developer prompt routes chat deletion through confirm-in-chat', () => {
   const prompt = buildStableDeveloperPrompt();
-  assert.match(prompt, /Deletion stays in the tabs/);
-  assert.match(prompt, /no delete tools in chat/);
+  assert.match(prompt, /delete_goal\/delete_task\/delete_routine/);
+  assert.match(prompt, /confirm_delete_approval/);
+  assert.match(prompt, /explicit yes/);
+  assert.match(prompt, /Never delete on a single ambiguous message/);
+});
+
+test('developer prompt frames chat as the universal manager for updates', () => {
+  const prompt = buildStableDeveloperPrompt();
+  assert.match(prompt, /universal manager/);
+  assert.match(prompt, /move that deadline to Friday/);
 });
