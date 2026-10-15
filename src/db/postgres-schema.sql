@@ -312,6 +312,9 @@ CREATE TABLE IF NOT EXISTS user_preferences (
   briefing_tone TEXT NOT NULL DEFAULT 'motivational',
   briefing_length TEXT NOT NULL DEFAULT 'quick',
   buddy_name TEXT,
+  writing_voice_opt_in INTEGER NOT NULL DEFAULT 0,
+  writing_voice_profile TEXT,
+  writing_voice_updated_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

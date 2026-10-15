@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added "Writes like you" personal writing voice: explicit opt-in via chat ("learn how I write") or the new Safety panel, learns a compact style profile from up to 30 recent sent emails (full bodies never stored), injects it as a drafting-only style instruction when Orbit drafts emails/messages/copy, and deletes profile + opt-in immediately on "forget how I write". Includes a Safety toggle to turn the voice off without deleting, per-user additive DB columns, and `/api/writing-voice` endpoints (the profile text never leaves the server).
+
 - Added image attachments in chat: the composer attach button (file picker incl. iPhone camera roll, clipboard paste, drag-and-drop) uploads to a new authed POST /api/chat/attachments endpoint, shows a thumbnail preview, and sends the image through a shared vision pipeline with a text placeholder in history (bytes never persisted or logged).
 - WhatsApp inbound photos now run through the same vision pipeline (Twilio MediaUrl0 download, first image only); the configured chat model is tried first with a one-time sol fallback if the model rejects image input.
 - Published production images with GitHub's short-lived repository token instead of a stored GHCR personal access token.

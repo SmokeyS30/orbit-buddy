@@ -324,6 +324,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
+  // X5 "Writes like you": opt-in flag + distilled style profile (additive only).
+  ensureColumn(db, 'user_preferences', 'writing_voice_opt_in', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'user_preferences', 'writing_voice_profile', 'TEXT');
+  ensureColumn(db, 'user_preferences', 'writing_voice_updated_at', 'TEXT');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
@@ -472,6 +476,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
       WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
     getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),
+    getWritingVoiceState: db.prepare('SELECT writing_voice_opt_in AS opt_in, writing_voice_profile AS profile, writing_voice_updated_at AS updated_at FROM user_preferences WHERE user_id=?'),
+    setWritingVoiceOptIn: db.prepare('UPDATE user_preferences SET writing_voice_opt_in=?, updated_at=? WHERE user_id=?'),
+    setWritingVoiceProfile: db.prepare('UPDATE user_preferences SET writing_voice_opt_in=1, writing_voice_profile=?, writing_voice_updated_at=?, updated_at=? WHERE user_id=?'),
+    clearWritingVoice: db.prepare('UPDATE user_preferences SET writing_voice_opt_in=0, writing_voice_profile=NULL, writing_voice_updated_at=NULL, updated_at=? WHERE user_id=?'),
     trackPersonMention: db.prepare(`INSERT INTO people_mentions(user_id,person_name,last_mentioned_at,last_nudged_at,dismissed,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,person_name) DO UPDATE SET last_mentioned_at=excluded.last_mentioned_at,
       dismissed=0,updated_at=excluded.updated_at`),
@@ -818,6 +826,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
     setBuddyName(userId,name){this.getPreferences(userId);const clean=String(name||'').trim().slice(0,40);if(!clean)throw new Error('Provide a name for your buddy (1-40 characters).');s.setBuddyName.run(clean,timestamp(),userId);return clean;},
+    // X5 "Writes like you": per-user writing voice opt-in + distilled profile.
+    // Additive columns only; the explicit-column upserts never touch them.
+    getWritingVoice(userId){this.getPreferences(userId);const row=s.getWritingVoiceState.get(userId);return {optIn:row?.opt_in===1,profile:row?.profile||null,updatedAt:row?.updated_at||null};},
+    setWritingVoiceOptIn(userId,optIn){this.getPreferences(userId);s.setWritingVoiceOptIn.run(optIn?1:0,timestamp(),userId);return this.getWritingVoice(userId);},
+    setWritingVoiceProfile(userId,profile){this.getPreferences(userId);const clean=String(profile||'').trim().slice(0,1200);if(!clean)throw new Error('A writing voice profile is required.');s.setWritingVoiceProfile.run(clean,timestamp(),timestamp(),userId);return this.getWritingVoice(userId);},
+    clearWritingVoice(userId){this.getPreferences(userId);s.clearWritingVoice.run(timestamp(),userId);return this.getWritingVoice(userId);},
     trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
     dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,

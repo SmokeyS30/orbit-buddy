@@ -661,6 +661,28 @@
             </form>
           </section>
           <section class="panel">
+            <h2>Writing voice</h2>
+            <p class="muted">
+              Orbit can learn how you write from your sent emails and draft in
+              your voice instead of generic AI voice. Learning is opt-in only —
+              nothing is learned until you ask, and only a short style
+              description is kept (never your email bodies).
+            </p>
+            <p class="hint" id="writing-voice-status">Checking…</p>
+            <label class="check"
+              ><input id="writing-voice-optin" type="checkbox" /> Use my
+              writing voice when Orbit drafts things</label
+            >
+            <div class="actions block-top" style="justify-content:flex-start">
+              <button id="writing-voice-learn" class="primary">
+                Learn how I write
+              </button>
+              <button id="writing-voice-forget" class="danger">
+                Forget how I write
+              </button>
+            </div>
+          </section>
+          <section class="panel">
             <h2>Push notifications</h2>
             <p class="muted">
               Receive task completion and safety alerts on supported devices.

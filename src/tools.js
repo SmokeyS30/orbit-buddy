@@ -922,6 +922,7 @@ function validDateStr(value) {
 }
 
 import { searchEmails, readEmail } from './gmail.js';
+import { learnWritingVoice } from './writing-voice.js';
 
 function gmailContext(ctx, tool) {
   const { db, userId } = writeContext(ctx, tool);
@@ -973,6 +974,26 @@ export async function toolGmailDelete(args = {}, ctx = null) {
     sourceMessageId: ctx?.messageId || null
   });
   return { ...approval, note: 'Email prepared for approval. Nothing is moved until the user approves it in Approvals.' };
+}
+
+// X5 "Writes like you": learn the user's personal writing voice from their
+// sent emails. Explicit opt-in only — the tool description gates this to an
+// explicit user ask, and the profile (never full email bodies) is stored.
+export async function toolLearnWritingVoice(args = {}, ctx = null) {
+  const { db, userId, gmail } = gmailContext(ctx, 'learn_writing_voice');
+  const model = ctx?.model;
+  if (!model || typeof model.respond !== 'function') throw new Error('learn_writing_voice is not available in this context.');
+  const result = await learnWritingVoice({ db, userId, getToken: () => gmail.getToken(), model });
+  return { ...result, note: 'Writing voice learned and saved. Drafts you write for the user will now match their voice.' };
+}
+
+// X5 "Writes like you": "forget how I write" — delete the learned profile and
+// opt-in flag immediately. No confirmation staging; the user asked directly.
+export function toolForgetWritingVoice(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'forget_writing_voice');
+  db.clearWritingVoice(userId);
+  db.addEvent(userId, 'writing_voice_forgotten', 'Deleted the learned writing voice and opt-in.');
+  return { forgotten: true };
 }
 
 export async function toolReadCalendar(args = {}, ctx = null) {
@@ -1500,6 +1521,26 @@ export const TOOL_DEFINITIONS = [
       required: ['id'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'learn_writing_voice',
+    description: 'Learn the user\'s personal writing voice from their recent sent emails. Call ONLY when the user explicitly asks — e.g. "learn how I write", "study how I write", "relearn how I write", "update my writing voice" — or when they turn the writing-voice toggle on in Safety and ask you to run it. Never call unprompted: no silent learning. Reads up to 30 sent emails, distills a compact style profile (full email bodies are never stored), and opts the user in. Requires Gmail to be connected.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'forget_writing_voice',
+    description: 'Delete the user\'s learned writing voice profile and opt-in immediately. Call when the user says "forget how I write" or any clear variant ("delete my writing voice", "stop learning how I write", "erase my writing style"). This deletes at once — no confirmation staging. After it succeeds, confirm in one line that it\'s gone.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1539,7 +1580,9 @@ const TOOL_SUMMARIES = {
   gmail_send: (args) => `${String(args.to || '').slice(0, 40)}: ${String(args.subject || '').slice(0, 40)}`,
   gmail_search: (args) => String(args.query || '').slice(0, 80),
   gmail_read: (args) => String(args.query || '').slice(0, 80),
-  gmail_delete: (args) => `Trash email: ${String(args.id || '').slice(0, 40)}`
+  gmail_delete: (args) => `Trash email: ${String(args.id || '').slice(0, 40)}`,
+  learn_writing_voice: () => 'Learned writing voice',
+  forget_writing_voice: () => 'Forgot writing voice'
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -1685,6 +1728,14 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'gmail_delete': {
       const result = await toolGmailDelete(clean, ctx);
       return { result, summary: `Trashed email ${String(clean.id || '').slice(0, 40)}` };
+    }
+    case 'learn_writing_voice': {
+      const result = await toolLearnWritingVoice(clean, ctx);
+      return { result, summary: `Learned writing voice from ${result.sampleCount || 0} sent emails` };
+    }
+    case 'forget_writing_voice': {
+      const result = toolForgetWritingVoice(clean, ctx);
+      return { result, summary: 'Forgot writing voice' };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
