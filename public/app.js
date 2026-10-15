@@ -846,6 +846,91 @@ async function openCanvasRender(){
     else toast('Could not prepare the document.');
   }catch(error){toast(error.message);}
 }
+
+// --- W3: conversation share/export ---
+// Entry point is a chat command ("share this conversation" / "export this
+// chat", optional "as markdown|pdf"), matching the established Canvas
+// command pattern (isCanvasCommand / "print this" / "share this"). Rationale
+// for the choice: the command already routes through sendChatMessage before
+// anything hits the server, it's a hidden affordance (Orbit minimalism —
+// no persistent buttons), it needs no pointing device, and it behaves
+// identically on desktop and mobile. (Long-pressing a thread chip was the
+// alternative; it would need a second gesture pipeline on both viewports.)
+// Flow: choose format -> generate -> download (markdown) or print-preview
+// (PDF). PDF reuses the Canvas print flow: the thread's markdown is minted
+// as a short-lived /api/canvas/render and opened on the printable page,
+// whose toolbar already offers Done / Share / PDF / Print.
+const SHARE_CONVO_RE=/^(share|export|download)\s+(this|it|the)\s+(conversation|chat)(?:\s+(?:as\s+)?(markdown|md|pdf))?[\s.!?]*$/i;
+function parseShareConversationCommand(text){
+  const m=SHARE_CONVO_RE.exec(String(text||'').trim());
+  if(!m)return null;
+  const fmt=(m[4]||'').toLowerCase();
+  return {format:fmt==='md'?'markdown':(fmt||null)};
+}
+function shareExportConversationId(){
+  return activeConversationId||(state.snapshot&&state.snapshot.activeConversation&&state.snapshot.activeConversation.id)||null;
+}
+function shareExportTitle(convoId){
+  const c=((state.snapshot&&state.snapshot.conversations)||[]).find((item)=>item.id===convoId);
+  return (c&&c.title)||'Conversation';
+}
+function safeExportFilename(title){
+  const t=String(title||'conversation').replace(/[^\w\-. ]+/g,'').trim().slice(0,60);
+  return t||'conversation';
+}
+function openBlankWindow(){try{return window.open('about:blank','_blank','noopener');}catch(_){return null;}}
+async function fetchConversationMarkdown(convoId){
+  const response=await fetch(API_BASE+`/api/chat/conversations/${encodeURIComponent(convoId)}/export?format=markdown`,{credentials:NATIVE_CREDENTIALS,headers:{...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{})}});
+  if(!response.ok){const err=await response.json().catch(()=>null);throw new Error((err&&err.error)||`Export failed (${response.status}).`);}
+  return response.text();
+}
+async function downloadConversationMarkdown(convoId,title){
+  // Download pattern mirrors the encrypted backup download (#export-backup).
+  try{
+    const response=await fetch(API_BASE+`/api/chat/conversations/${encodeURIComponent(convoId)}/export?format=markdown`,{credentials:NATIVE_CREDENTIALS,headers:{...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{})}});
+    if(!response.ok){const err=await response.json().catch(()=>null);throw new Error((err&&err.error)||`Export failed (${response.status}).`);}
+    const blob=await response.blob();
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');link.href=url;link.download=safeExportFilename(title)+'.md';
+    document.body.append(link);link.click();link.remove();URL.revokeObjectURL(url);
+    toast('Conversation downloaded.');
+  }catch(error){toast(error.message);}
+}
+async function printPreviewConversation(convoId,title){
+  // Opened synchronously (before any await) so popup blockers leave it alone.
+  const popup=openBlankWindow();
+  try{
+    const markdown=await fetchConversationMarkdown(convoId);
+    const res=await api('/api/canvas/render',{method:'POST',body:JSON.stringify({title:title||'Conversation',markdown})});
+    if(!res||!res.token)throw new Error('Could not prepare the document.');
+    const url=API_BASE+'/api/canvas/render/'+encodeURIComponent(res.token);
+    if(popup)popup.location.href=url;else window.open(url,'_blank','noopener');
+  }catch(error){if(popup){try{popup.close();}catch(_){}}toast(error.message);}
+}
+async function runShareExport(format){
+  const convoId=shareExportConversationId();
+  if(!convoId){toast('Open a conversation first.');return;}
+  const title=shareExportTitle(convoId);
+  if(format==='pdf')await printPreviewConversation(convoId,title);
+  else await downloadConversationMarkdown(convoId,title);
+}
+function showSharePicker(){
+  if($('#share-picker')||!$('#chat-form'))return;
+  const card=document.createElement('div');card.id='share-picker';card.className='followup-nudge';
+  const text=document.createElement('p');text.textContent='How do you want this conversation?';
+  const actions=document.createElement('div');actions.className='mini-actions';
+  actions.append(
+    button('Markdown','primary',()=>{card.remove();runShareExport('markdown');}),
+    button('PDF / Print','ghost',()=>{card.remove();runShareExport('pdf');}),
+    button('Cancel','ghost',()=>card.remove())
+  );
+  card.append(text,actions);
+  $('#chat-form').before(card);
+}
+function handleShareConversationCommand(cmd){
+  if(cmd.format)runShareExport(cmd.format);
+  else showSharePicker();
+}
 async function sendChatMessage(text){
   const input=$('#chat-input');
   const submit=document.querySelector('#chat-form button[type="submit"]');
@@ -854,6 +939,8 @@ async function sendChatMessage(text){
   if(!message&&!attachmentIds.length){toast('Type a message or attach an image.');return;}
   if(isVoiceModeCommand(message)){openVoiceMode();return;}
   if(isCanvasCommand(message)){openCanvasRender();return;}
+  const shareCmd=parseShareConversationCommand(message);
+  if(shareCmd){handleShareConversationCommand(shareCmd);return;}
   if(submit)submit.disabled=true;
   if(!navigator.onLine){
     // The offline text queue can't carry staged images — keep the thumbnails

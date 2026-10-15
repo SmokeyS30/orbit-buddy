@@ -187,6 +187,21 @@ export function stripSuggestMarkers(text){
 }
 export function stripModelMarkers(text){return stripCitationMarkers(stripSuggestMarkers(stripFollowUpMarkers(text)));}
 function sanitizeAssistantMessages(messages){return messages.map((message)=>message.role==='assistant'?{...message,content:stripModelMarkers(message.content)}:message);}
+// W3: conversation share/export — clean markdown for a whole thread:
+// title, roles with timestamps, code blocks preserved, no internal
+// metadata (model markers stripped, ids/sessions omitted).
+function renderConversationMarkdown(conversation,messages,buddyName,timeZone){
+  const title=String(conversation.title||'Conversation').trim()||'Conversation';
+  const tz=timeZone||'America/New_York';
+  const stamp=(iso)=>{try{return new Intl.DateTimeFormat('en-US',{dateStyle:'medium',timeStyle:'short',timeZone:tz}).format(new Date(iso));}catch(_){return String(iso||'');}};
+  const lines=[`# ${title}`,'',`Exported from Orbit on ${stamp(new Date().toISOString())}`,''];
+  for(const m of messages||[]){
+    const role=m.role==='assistant'?(buddyName||'Orbit'):'You';
+    const body=m.role==='assistant'?stripModelMarkers(m.content):String(m.content||'');
+    lines.push('---','',`## ${role} · ${stamp(m.created_at)}`,'',body.trim(),'');
+  }
+  return lines.join('\n');
+}
 // Quiet-nudge timing: idle >48h since the user's last message, and no nudge in the last 7 days.
 // Detects when the user is correcting a misunderstanding — a high-value learning signal.
 export function isCorrectionMessage(text){
@@ -2211,6 +2226,32 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
         if(req.method==='POST'&&url.pathname==='/api/conversations'){const body=await readJson(req);const raw=String(body.title||'').trim();const title=raw?cleanText(raw,80,'title'):'New chat';return json(res,201,db.createConversation(userId,title));}
         const convoMatch=url.pathname.match(/^\/api\/conversations\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&convoMatch){if(!db.deleteConversation(userId,convoMatch[1]))throw Object.assign(new Error('Conversation not found.'),{status:404});return json(res,200,{ok:true});}
+        // W3: conversation share/export (own conversations only; the
+        // existence check is user-agnostic so a foreign id 403s while a
+        // truly unknown id 404s — same pattern as W1's message endpoints).
+        const convoExportMatch=url.pathname.match(/^\/api\/chat\/conversations\/([0-9a-f-]+)\/export$/);
+        if(req.method==='GET'&&convoExportMatch){
+          const convoId=convoExportMatch[1];
+          if(userRateLimited(userId,'conversation-export',30,60*60_000))throw Object.assign(new Error('Too many export requests. Try again later.'),{status:429});
+          if(!db.conversationExists(convoId))throw Object.assign(new Error('Conversation not found.'),{status:404});
+          const conversation=db.getConversation(userId,convoId);
+          if(!conversation)throw Object.assign(new Error('You can only export your own conversations.'),{status:403});
+          const format=String(url.searchParams.get('format')||'markdown').toLowerCase();
+          if(format!=='markdown'&&format!=='pdf')throw Object.assign(new Error('format must be "markdown" or "pdf".'),{status:400});
+          const prefs=db.getPreferences(userId);
+          const messages=db.listConversationMessages(userId,convoId,200);
+          const markdown=renderConversationMarkdown(conversation,messages,buddyNameFor(userId),prefs&&prefs.time_zone);
+          const base=(String(conversation.title||'conversation').replace(/[^\w\-. ]+/g,'').trim().slice(0,60))||'conversation';
+          if(format==='pdf'){
+            // Reuse the Canvas print-flow PDF pipeline (same markdownToPdfBuffer
+            // as GET /api/canvas/render/:token?format=pdf) — no second pipeline.
+            const pdf=await markdownToPdfBuffer(markdown);
+            res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':`inline; filename="${base}.pdf"`.replace(/["\r\n]/g,''),'Cache-Control':'no-store'});
+            return res.end(pdf);
+          }
+          res.writeHead(200,{'Content-Type':'text/markdown; charset=utf-8','Content-Disposition':`attachment; filename="${base}.md"`.replace(/["\r\n]/g,''),'Cache-Control':'no-store'});
+          return res.end(markdown);
+        }
         if(req.method==='GET'&&url.pathname==='/api/import/status'){
           return json(res,200,{jobs:db.listImportJobs(userId)});
         }

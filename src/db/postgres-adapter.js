@@ -310,6 +310,8 @@ const indexMigrations = [
     },
     listConversations: async (userId) => all('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,id DESC', userId),
     getConversation: async (userId, id) => get('SELECT * FROM conversations WHERE id=? AND user_id=?', id, userId),
+    // W3: conversation share/export — user-agnostic existence check (404 vs 403).
+    conversationExists: async (id) => !!(await get('SELECT id FROM conversations WHERE id=?', id)),
     touchConversation: async (userId, id) => (await run('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?', timestamp(), id, userId)).changes > 0,
     async deleteConversation(userId, id) {
       return withTransaction(async ({ run: tRun }) => {
