@@ -11,7 +11,7 @@ import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAg
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
+import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
 import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone } from './src/ambient.js';
@@ -23,6 +23,8 @@ import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
+import { seedStudyBank } from './src/study-seed.js';
+import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -226,6 +228,8 @@ export function createOrbitServer(options={}) {
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
   const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey,databaseUrl:env.DATABASE_URL});
+  // Study coach: seed the quiz question bank once (no-op when populated).
+  try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=createModelClient(env);
   const push=createPushService(env,db);
@@ -1366,7 +1370,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(taskDeadlineCtx)parts.push(taskDeadlineCtx.replace(/^\n\nTask deadlines \(incomplete tasks with due dates — keep nagging until completed or cancelled\): /,'TASK DEADLINES (nag until done): '));
             if(parts.length)upcomingCtx=`\n\nWhat's coming up (weave into the briefing naturally, like a friend who pays attention — not a list, not a notification): ${parts.join(' ')}`;
           }catch(e){}
-          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${upcomingCtx}${emoGuide}`;
+          // Study coach: weak-topic nudge — only when there are actual weak
+          // topics; buildStudyNudgeLine returns '' when empty (never nags).
+          let studyCtx='';
+          try{
+            const nudge=buildStudyNudgeLine(db,user.id);
+            if(nudge)studyCtx=`\n\nStudy coach: ${nudge} Mention it once as a friendly nudge — suggest a quick quiz like "quiz me on Security+". One encouraging line, never a guilt trip.`;
+          }catch(e){}
+          genPrompt=`Write a ${toneDesc} morning briefing (${lengthDesc}, plain text). Include one goal momentum update. If a goal is behind pace, briefly suggest a specific action to catch up (not just "you're behind"). End with one helpful suggestion for the day. Sound like a caring friend who pays attention, not a notification. Do not mention that this is automated.${contextStr}${flashbackCtx}${emailDigestCtx}${streakCtx}${predictCtx}${motCtx}${upcomingCtx}${studyCtx}${emoGuide}`;
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
@@ -1583,7 +1594,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
@@ -1604,6 +1615,105 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         });
       }
     }catch(error){console.error('project radar failed',error&&error.message);}
+  }
+  // Study coach (proactive): nudges tied to study sessions on the user's
+  // calendar (warm-up before, review offer after), weekly study-slot
+  // suggestions from calendar gaps when there's no study schedule, and a
+  // gentle re-engagement offer after 3+ idle days. Reuses the shared pipeline:
+  // quiet hours + claimProactiveSlot (the 3/day cap shared by all proactive
+  // features). Calendar reads are throttled to one pass per user per 15 min
+  // (iCal feeds are network fetches). Never auto-schedules: slot suggestions
+  // are conversational and flow through propose_calendar_event on his yes.
+  // Never throws: a study-coaching failure must not break the proactive loop.
+  function studyDateMinus(n,todayStr){
+    const parts=String(todayStr||'').split('-').map(Number);
+    if(parts.length!==3||parts.some((x)=>!Number.isFinite(x)))return '';
+    return new Date(Date.UTC(parts[0],parts[1]-1,parts[2])-n*86400_000).toISOString().slice(0,10);
+  }
+  async function runStudyCoaching(nowMs){
+    try{
+      for(const user of db.listUsers()){
+        if(user.disabled)continue;
+        const preferences=db.getPreferences(user.id);
+        if(isQuietHours(preferences,nowMs))continue;
+        const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
+        const today=todayInZone(timeZone,nowMs);
+        const lastPass=Number(db.getSetting(`study_coach_last_${user.id}`)||0);
+        if(nowMs-lastPass<15*60_000)continue;
+        db.setSetting(`study_coach_last_${user.id}`,String(nowMs));
+        try{await runStudyCoachingForUser(user,timeZone,today,nowMs);}
+        catch(error){console.error('study coaching user failed',error&&error.message);}
+      }
+    }catch(error){console.error('study coaching failed',error&&error.message);}
+  }
+  async function runStudyCoachingForUser(user,timeZone,today,nowMs){
+    // At most one study nudge per pass; pre-session nudges take priority.
+    let events=[];
+    let feeds=[];
+    try{
+      const range=await getEventsForRange(db,user.id,nowMs-2*3600_000,nowMs+7*86400_000,timeZone);
+      events=range.events||[];
+      feeds=range.feeds||[];
+    }catch{events=[];feeds=[];}
+    const studyEvents=findStudyEvents(events);
+    // 1. Pre-session nudge: study session starting within 45 minutes.
+    const upcoming=studyEvents.find((e)=>e.startMs>nowMs&&e.startMs-nowMs<=45*60_000);
+    if(upcoming){
+      const key=`study_pre_${user.id}_${upcoming.startMs}`;
+      if(db.getSetting(key)!==today){
+        if(!db.claimProactiveSlot(user.id,today))return;
+        const mins=Math.max(1,Math.round((upcoming.startMs-nowMs)/60000));
+        const exam=normalizeStudyExam(upcoming.title);
+        const quizBit=exam?` Want a warm-up quiz? Just say "quiz me on ${exam}".`:'';
+        await deliverProactive(user,`Heads up: "${upcoming.title}" starts in about ${mins} min.${quizBit}`,'study_nudge_sent',`Pre-session study nudge for "${upcoming.title}".`);
+        db.setSetting(key,today);
+        db.setSetting(`study_nudged_${user.id}`,today);
+        return;
+      }
+    }
+    // 2. Post-session review offer: study session ended within the last 90 min.
+    const recent=studyEvents.find((e)=>e.endMs&&e.endMs<=nowMs&&nowMs-e.endMs<=90*60_000);
+    if(recent){
+      const key=`study_post_${user.id}_${recent.startMs}`;
+      if(db.getSetting(key)!==today){
+        if(!db.claimProactiveSlot(user.id,today))return;
+        const exam=normalizeStudyExam(recent.title);
+        const quizBit=exam?` Say "quiz me on ${exam}" for a quick review quiz to lock it in.`:' Want a quick review quiz to lock it in? Just say the word.';
+        await deliverProactive(user,`How did "${recent.title}" go?${quizBit}`,'study_nudge_sent',`Post-session study nudge for "${recent.title}".`);
+        db.setSetting(key,today);
+        db.setSetting(`study_nudged_${user.id}`,today);
+        return;
+      }
+    }
+    // 3. No study schedule: suggest 2-3 slots from calendar gaps (weekly).
+    // Only when a calendar is actually connected — without feeds there are no
+    // real gaps to reason about, and the suggestion would be noise.
+    const hasUpcomingStudy=studyEvents.some((e)=>e.startMs>nowMs);
+    if(!hasUpcomingStudy&&feeds.length){
+      const lastSuggest=db.getSetting(`study_suggest_${user.id}`)||'';
+      if(lastSuggest<studyDateMinus(7,today)){
+        const slots=findFreeStudySlots(events,timeZone,today,nowMs,{days:7,minMinutes:60,maxSlots:3});
+        if(slots.length>=2&&db.claimProactiveSlot(user.id,today)){
+          const lines=slots.map((s)=>`• ${s.label}`).join('\n');
+          await deliverProactive(user,`I don't see any study time on your calendar for the next week. How about one of these?\n${lines}\nReply with one that works (or a time that suits you better) and I'll add it — I won't schedule anything without your yes.`,'study_nudge_sent','Suggested study slots from calendar gaps.');
+          db.setSetting(`study_suggest_${user.id}`,today);
+          db.setSetting(`study_nudged_${user.id}`,today);
+          return;
+        }
+        if(slots.length<2)db.setSetting(`study_suggest_${user.id}`,today); // no usable gaps: don't retry for a week
+      }
+    }
+    // 4. Idle re-engagement: studied before, but nothing in 3+ days. One
+    // gentle offer, suppressed for 3 days after each send. Never guilt-trips.
+    if(db.getSetting(`study_nudged_${user.id}`)===today)return;
+    const lastActive=getLastStudyActivity(db,user.id);
+    const lastIdle=db.getSetting(`study_idle_${user.id}`)||'';
+    if(lastActive&&nowMs-new Date(lastActive).valueOf()>=3*86400_000&&lastIdle<studyDateMinus(3,today)){
+      if(!db.claimProactiveSlot(user.id,today))return;
+      await deliverProactive(user,`It's been a few days since your last quiz — no pressure, but a quick warm-up keeps things fresh. Say "quiz me" and pick an exam whenever you feel like it.`,'study_nudge_sent','Idle study re-engagement nudge.');
+      db.setSetting(`study_idle_${user.id}`,today);
+      db.setSetting(`study_nudged_${user.id}`,today);
+    }
   }
 
   let backupBusy=false;

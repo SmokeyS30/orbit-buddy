@@ -177,6 +177,18 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         muted_at TEXT NOT NULL,
         PRIMARY KEY (user_id, repo)
       )`,
+      // Study coach: question bank + quiz attempts (drives weak spots + streaks).
+      // Lesson learned: production only runs THIS migrations array — tables added
+      // solely to the SQLite/query layer never reach production.
+      `CREATE TABLE IF NOT EXISTS study_questions (
+        id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
+        question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
+        explanation TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'seed'
+      )`,
+      `CREATE TABLE IF NOT EXISTS study_attempts (
+        id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL,
+        correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
+      )`,
     ];
 const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
@@ -184,6 +196,8 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam)',
+      'CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -1006,6 +1020,23 @@ const indexMigrations = [
     muteRadarRepo: async (userId, repo) => { await run('INSERT INTO radar_mutes(user_id,repo,muted_at) VALUES(?,?,?) ON CONFLICT(user_id,repo) DO NOTHING', userId, String(repo).toLowerCase(), timestamp()); },
     unmuteRadarRepo: async (userId, repo) => (await run('DELETE FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())).changes > 0,
     listRadarMutes: async (userId) => all('SELECT * FROM radar_mutes WHERE user_id=? ORDER BY muted_at DESC', userId),
+    // Study coach: question bank + quiz attempts (drives weak spots + streaks).
+    addStudyQuestion: async ({ id, exam, topic, question, choices, correctIndex, explanation, source }) => {
+      await run('INSERT INTO study_questions(id,exam,topic,question,choices,correct_index,explanation,created_at,source) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING',
+        id, exam, topic, question, JSON.stringify(choices), correctIndex, explanation, timestamp(), source || 'chat');
+    },
+    getStudyQuestion: async (id) => (await get('SELECT * FROM study_questions WHERE id=?', id)) || null,
+    listStudyQuestions: async (exam) => all('SELECT * FROM study_questions WHERE exam=? ORDER BY created_at', exam),
+    countStudyQuestions: async () => Number((await get('SELECT COUNT(*) AS c FROM study_questions')).c),
+    recordStudyAttempt: async ({ id, userId, questionId, correct }) => {
+      await run('INSERT INTO study_attempts(id,user_id,question_id,correct,attempted_at) VALUES(?,?,?,?,?)', id, userId, questionId, correct ? 1 : 0, timestamp());
+    },
+    getStudyAttemptsByTopic: async (userId, cutoff) => all(`SELECT q.exam AS exam, q.topic AS topic, COUNT(*) AS total,
+        SUM(CASE WHEN a.correct=0 THEN 1 ELSE 0 END) AS wrong
+      FROM study_attempts a JOIN study_questions q ON q.id=a.question_id
+      WHERE a.user_id=? AND a.attempted_at>=? GROUP BY q.exam,q.topic`, userId, cutoff),
+    getStudyActiveDates: async (userId) => (await all('SELECT DISTINCT SUBSTR(attempted_at,1,10) AS day FROM study_attempts WHERE user_id=? ORDER BY day DESC LIMIT 400', userId)).map((r) => r.day),
+    getLastStudyActivity: async (userId) => (await get('SELECT MAX(attempted_at) AS last_at FROM study_attempts WHERE user_id=?', userId))?.last_at || null,
     isRadarMuted: async (userId, repo) => Boolean(await get('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())),
 
     // --- OAuth states ---
