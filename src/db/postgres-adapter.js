@@ -189,6 +189,18 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL,
         correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
       )`,
+      // "Catch me up" digest: seen/dismissed item keys (additive). The
+      // last_app_open_at column is added below via ALTER TABLE.
+      // Lesson re-learned: production only runs THIS migrations array —
+      // tables added solely to the SQLite/query layer never reach prod.
+      `CREATE TABLE IF NOT EXISTS catchup_seen (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_key TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        dismissed_at TEXT,
+        PRIMARY KEY (user_id, item_key)
+      )`,
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
@@ -198,6 +210,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam)',
       'CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -1038,6 +1051,50 @@ const indexMigrations = [
     getStudyActiveDates: async (userId) => (await all('SELECT DISTINCT SUBSTR(attempted_at,1,10) AS day FROM study_attempts WHERE user_id=? ORDER BY day DESC LIMIT 400', userId)).map((r) => r.day),
     getLastStudyActivity: async (userId) => (await get('SELECT MAX(attempted_at) AS last_at FROM study_attempts WHERE user_id=?', userId))?.last_at || null,
     isRadarMuted: async (userId, repo) => Boolean(await get('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())),
+
+    // --- "Catch me up" digest: last app-open tracking + seen/dismissed item keys ---
+    getLastAppOpen: async (userId) => (await get('SELECT last_app_open_at FROM proactive_state WHERE user_id=?', userId))?.last_app_open_at || null,
+    setLastAppOpen: async (userId, iso) => {
+      await run(`INSERT INTO proactive_state(user_id,last_app_open_at) VALUES(?,?)
+        ON CONFLICT(user_id) DO UPDATE SET last_app_open_at=excluded.last_app_open_at`, userId, iso);
+    },
+    listCatchupSeenKeys: async (userId) => (await all('SELECT item_key FROM catchup_seen WHERE user_id=?', userId)).map((r) => r.item_key),
+    async markCatchupSeen(userId, keys) {
+      const now = timestamp();
+      for (const key of new Set((keys || []).map((k) => String(k || '').slice(0, 200)).filter(Boolean))) {
+        await run('INSERT INTO catchup_seen(user_id,item_key,seen_at,dismissed_at) VALUES(?,?,?,NULL) ON CONFLICT(user_id,item_key) DO NOTHING', userId, key, now);
+      }
+    },
+    async dismissCatchupItems(userId, keys) {
+      const now = timestamp();
+      let n = 0;
+      for (const key of new Set((keys || []).map((k) => String(k || '').slice(0, 200)).filter(Boolean))) {
+        await run(`INSERT INTO catchup_seen(user_id,item_key,seen_at,dismissed_at) VALUES(?,?,?,?)
+          ON CONFLICT(user_id,item_key) DO UPDATE SET dismissed_at=excluded.dismissed_at`, userId, key, now, now);
+        n++;
+      }
+      return n;
+    },
+    listCatchupEvents: async (userId, sinceIso, limit = 60) => all(`SELECT id,type,message,detail,created_at FROM events
+      WHERE user_id=? AND created_at>? AND type IN ('smart_checkin_sent','quiet_nudge_sent','radar_checkin_sent','followup_sent','routine_sent','weekly_review_sent','email_urgent_sent','study_nudge_sent','calendar_feed_added','calendar_feed_removed')
+      ORDER BY created_at DESC LIMIT ?`, userId, sinceIso, Math.max(1, Math.min(100, Number(limit) || 60))),
+    listUndeliveredRadarFindingsSince: async (userId, sinceIso, limit = 15) => all(`SELECT f.* FROM radar_findings f
+      LEFT JOIN radar_deliveries d ON d.finding_key=f.finding_key AND d.user_id=?
+      WHERE f.found_at>? AND d.finding_key IS NULL
+      ORDER BY f.found_at DESC LIMIT ?`, userId, sinceIso, Math.max(1, Math.min(50, Number(limit) || 15))),
+    listUnrecoveredFailureDetails: async (limit = 10) => all(`SELECT f.repo,f.workflow,f.branch,f.title,f.url,f.found_at FROM radar_findings f
+      WHERE f.kind='run' AND f.signal='high' AND f.workflow IS NOT NULL AND f.branch IS NOT NULL
+      AND f.created_at=(SELECT MAX(r.created_at) FROM radar_findings r
+        WHERE r.repo=f.repo AND r.kind='run' AND r.signal='high' AND r.workflow=f.workflow AND r.branch=f.branch)
+      AND NOT EXISTS (
+        SELECT 1 FROM radar_findings r2
+        WHERE r2.repo=f.repo AND r2.kind='run' AND r2.workflow=f.workflow AND r2.branch=f.branch
+          AND r2.finding_key LIKE '%:recovered' AND r2.created_at>=f.created_at)
+      ORDER BY f.found_at DESC LIMIT ?`, Math.max(1, Math.min(25, Number(limit) || 10))),
+    listTasksDueBefore: async (userId, cutoffIso, limit = 10) => all(`SELECT id,title,schedule_at,status,created_at FROM tasks
+      WHERE user_id=? AND status NOT IN ('completed','cancelled','failed')
+        AND schedule_at IS NOT NULL AND schedule_at<=?
+      ORDER BY schedule_at ASC LIMIT ?`, userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
 
     // --- OAuth states ---
     addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },

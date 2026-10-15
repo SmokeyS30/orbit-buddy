@@ -3,6 +3,7 @@ import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
 import { startQuizSession, answerQuizQuestion, stopQuizSession, getStudyWeakSpots, getStudyStreak, normalizeStudyExam, STUDY_EXAMS } from './study-coach.js';
+import { buildCatchupDigest } from './catchup.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -1089,6 +1090,26 @@ export function toolStudyAddQuestion(args = {}, ctx = null) {
   return { added: true, id, exam, topic };
 }
 
+// "Catch me up" digest: one-shot "what happened while you were away" summary.
+// Read-only over existing signals (proactive deliveries, radar findings,
+// calendar, tasks); the only writes are catchup_seen marks so a shown item
+// never appears again — including on the Today-tab card.
+export async function toolCatchMeUp(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'catch_me_up');
+  const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
+  const nowMs = Date.now();
+  const lastOpen = db.getLastAppOpen(userId);
+  const sinceMs = lastOpen ? Date.parse(lastOpen) : nowMs - 24 * 3600_000;
+  const digest = await buildCatchupDigest(db, userId, { sinceMs, nowMs, timeZone: zone });
+  db.markCatchupSeen(userId, digest.items.map((i) => i.key));
+  return {
+    items: digest.items,
+    generatedAt: digest.generatedAt,
+    windowStart: digest.windowStart,
+    empty: digest.items.length === 0,
+  };
+}
+
 export async function toolReadCalendar(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'read_calendar');
   const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
@@ -1738,6 +1759,17 @@ export const TOOL_DEFINITIONS = [
       required: ['exam', 'topic', 'question', 'choices', 'correctIndex', 'explanation'],
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'catch_me_up',
+    description: 'Compose the "what happened while you were away" digest. Call when the user says "catch me up", "what did I miss", "what happened while I was away", "anything new", or asks for a summary of missed check-ins, alerts, or what\'s coming up. Returns digest items newest-first (missed proactive check-ins, undelivered project-radar findings, still-failing CI, calendar changes, then what\'s coming up today/tomorrow), each with a short title, detail, timestamp, and deep-link or URL. Present them as a tight skim — one short line per item, newest first — not a report. Link radar/CI items to their URLs. Shown items are marked seen and won\'t repeat.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1787,7 +1819,8 @@ const TOOL_SUMMARIES = {
   study_quiz_answer: (args) => `Quiz answer: ${String(args.answer || '').slice(0, 40)}`,
   study_quiz_stop: () => 'Quiz stopped',
   study_weak_spots: (args) => `Weak spots${args.exam ? `: ${String(args.exam).slice(0, 40)}` : ''}`,
-  study_add_question: (args) => `Added ${String(args.exam || '').slice(0, 40)} question: ${String(args.topic || '').slice(0, 60)}`
+  study_add_question: (args) => `Added ${String(args.exam || '').slice(0, 40)} question: ${String(args.topic || '').slice(0, 60)}`,
+  catch_me_up: () => 'Catch-up digest'
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -1973,6 +2006,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'study_add_question': {
       const result = toolStudyAddQuestion(clean, ctx);
       return { result, summary: `Added study question (${String(result.exam || '').slice(0, 30)})` };
+    }
+    case 'catch_me_up': {
+      const result = await toolCatchMeUp(clean, ctx);
+      return { result, summary: `Catch-up digest (${result.items.length} item${result.items.length === 1 ? '' : 's'})` };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
