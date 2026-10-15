@@ -27,6 +27,15 @@ import {
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const publicRoot = path.join(root, 'public');
+
+// ===== MAINTENANCE MODE (overnight mega-build) =====
+// Flip to false in a follow-up PR at the end of the night. Deliberately a
+// constant in this file — flipping must be a reviewable commit, not a config toggle.
+// Temporary bypass token (random, unguessable): removed at dawn with the rest
+// of this block.
+const MAINTENANCE_MODE = true;
+export const MAINT_BYPASS_TOKEN = '03fa0ae23f6bb958372f62feb96beb5b';
+// ===== END MAINTENANCE MODE =====
 const mime = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.webmanifest':'application/manifest+json' };
 const now = () => new Date().toISOString();
 
@@ -205,6 +214,15 @@ export function createOrbitServer(options={}) {
     }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
   }
   const production=env.NODE_ENV==='production';
+  const maintenanceOn = MAINTENANCE_MODE && env.NODE_ENV !== 'test';
+  const maintenanceHtml = maintenanceOn
+    ? fs.readFileSync(path.join(publicRoot, 'maintenance.html'), 'utf8')
+    : null;
+  function maintenanceBypass(req, url) {
+    const token = req.headers['x-maint-bypass'] || url.searchParams.get('maint_bypass');
+    return typeof token === 'string' && token === MAINT_BYPASS_TOKEN;
+  }
+  // ===== END MAINTENANCE MODE =====
   const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
@@ -1579,6 +1597,17 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const backup=backupStatus();
       return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
     }
+    // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
+    // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
+    if(maintenanceOn&&!maintenanceBypass(req,url)){
+      if(url.pathname.startsWith('/api/whatsapp')){
+        return json(res,503,{ok:false,maintenance:true}); // Twilio retries on 503; nothing is silently dropped
+      }
+      res.setHeader('Content-Type','text/html; charset=utf-8');
+      res.setHeader('Cache-Control','no-store');
+      res.writeHead(503);res.end(maintenanceHtml);return;
+    }
+    // ===== END MAINTENANCE MODE =====
     if(req.method==='GET'&&(url.pathname==='/privacy'||url.pathname==='/terms')){
       const file=url.pathname==='/privacy'?'privacy.html':'terms.html';
       try{

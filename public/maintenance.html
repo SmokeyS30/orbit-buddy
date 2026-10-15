@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>Orbit Buddy — Major update in progress</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    background: #101117;
+    color: #e8eaf2;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100dvh; overflow: hidden; position: relative;
+    padding: 2rem 1.25rem;
+  }
+  /* Ambient glows */
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(42rem 30rem at 18% 12%, rgba(139, 92, 246, 0.22), transparent 60%),
+      radial-gradient(46rem 34rem at 84% 88%, rgba(34, 211, 238, 0.16), transparent 60%),
+      radial-gradient(30rem 24rem at 78% 14%, rgba(217, 249, 157, 0.06), transparent 60%);
+  }
+  .card {
+    position: relative; text-align: center; max-width: 36rem; width: 100%;
+    padding: 3rem 2.5rem; border-radius: 1.25rem;
+    background: rgba(23, 25, 36, 0.72);
+    border: 1px solid rgba(139, 92, 246, 0.22);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(8px);
+  }
+  .eyebrow {
+    color: #d9f99d; letter-spacing: 0.35em; font-size: 0.78rem; font-weight: 700;
+    text-transform: uppercase; margin-bottom: 1.6rem;
+  }
+  /* Floating orb with orbit rings */
+  .orb-wrap { position: relative; width: 9rem; height: 9rem; margin: 0 auto 1.8rem; }
+  .orb {
+    position: absolute; inset: 2rem; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #c4b5fd, #8b5cf6 45%, #4c1d95 100%);
+    box-shadow: 0 0 2.5rem rgba(139, 92, 246, 0.55), 0 0 5rem rgba(34, 211, 238, 0.18);
+    animation: float 4.5s ease-in-out infinite;
+  }
+  .ring {
+    position: absolute; inset: 0; border-radius: 50%;
+    border: 1.5px solid rgba(34, 211, 238, 0.35);
+  }
+  .ring.r1 { animation: spin 9s linear infinite; transform: rotateX(64deg); }
+  .ring.r2 { animation: spin 13s linear infinite reverse; transform: rotateX(64deg) rotateY(38deg); border-color: rgba(217, 249, 157, 0.28); }
+  .ring.r3 { animation: spin 17s linear infinite; transform: rotateX(64deg) rotateY(-38deg); border-color: rgba(139, 92, 246, 0.4); }
+  @keyframes spin { from { transform: rotateZ(0deg); } to { transform: rotateZ(360deg); } }
+  @keyframes float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-0.55rem); } }
+  h1 { font-size: 2.1rem; line-height: 1.2; font-weight: 750; margin-bottom: 1rem; letter-spacing: -0.01em; }
+  h1 .accent {
+    background: linear-gradient(100deg, #a78bfa, #22d3ee);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  p { color: #b8bdd0; line-height: 1.65; font-size: 1.02rem; }
+  p + p { margin-top: 0.9rem; }
+  .note { font-size: 0.9rem; color: #8b91a6; }
+  /* Working indicator: animated dots + shimmer bar */
+  .dots { display: inline-flex; gap: 0.35rem; margin-top: 1.9rem; justify-content: center; }
+  .dots span {
+    width: 0.6rem; height: 0.6rem; border-radius: 50%;
+    background: #8b5cf6; animation: pulse 1.4s ease-in-out infinite;
+  }
+  .dots span:nth-child(2) { animation-delay: 0.18s; background: #22d3ee; }
+  .dots span:nth-child(3) { animation-delay: 0.36s; background: #d9f99d; }
+  @keyframes pulse { 0%, 100% { opacity: 0.25; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1.15); } }
+  .shimmer {
+    margin: 1.6rem auto 0; height: 0.45rem; border-radius: 999px; max-width: 16rem;
+    background: linear-gradient(100deg, rgba(139,92,246,0.25) 30%, rgba(139,92,246,0.9) 50%, rgba(139,92,246,0.25) 70%);
+    background-size: 200% 100%;
+    animation: slide 2.2s linear infinite;
+  }
+  @keyframes slide { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (max-width: 480px) {
+    .card { padding: 2.2rem 1.4rem; border-radius: 1rem; }
+    h1 { font-size: 1.55rem; }
+    p { font-size: 0.95rem; }
+    .orb-wrap { width: 7rem; height: 7rem; }
+    .eyebrow { font-size: 0.68rem; letter-spacing: 0.28em; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .orb, .ring, .dots span, .shimmer { animation: none; }
+  }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="eyebrow">Orbit Buddy</div>
+    <div class="orb-wrap" aria-hidden="true">
+      <div class="ring r1"></div>
+      <div class="ring r2"></div>
+      <div class="ring r3"></div>
+      <div class="orb"></div>
+    </div>
+    <h1><span class="accent">Major update</span> in progress</h1>
+    <p>Orbit is getting a big upgrade tonight &mdash; new features, fresh polish, the works. Hang tight, it&rsquo;ll be worth it.</p>
+    <p class="note">This page refreshes automatically. Come back soon.</p>
+    <div class="dots" aria-hidden="true"><span></span><span></span><span></span></div>
+    <div class="shimmer" aria-hidden="true"></div>
+  </main>
+</body>
+</html>
