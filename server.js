@@ -315,12 +315,19 @@ export function createOrbitServer(options={}) {
   // with the full model pipeline, stores it, and returns the answer text.
   // `images` carries Responses API input_image blocks (from processImageInput)
   // for vision turns; the stored user message stays text-only.
-  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[]}){
+  // `historyOverride` lets regenerate resubmit the conversation only up to
+  // the target turn (messages after it are not fed to the model).
+  // `insertCreatedAt` re-inserts the new assistant message at an explicit
+  // position in conversation order (regenerate replaces the old answer
+  // in place instead of appending it at the end).
+  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null}){
     if(!db.getConversation(userId,conversation.id))return null;
     const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
     let answer=null;
+    const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);return stored;};
     try{
-      const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
+      const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
+      const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
       const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
       const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
       let needsBuddyName=false;
@@ -349,12 +356,12 @@ export function createOrbitServer(options={}) {
       for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
       for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
       answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
-      db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       if(db.getSetting(`ambient_context_${userId}`)==='granted'){
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
       }
-    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';db.addMessage(userId,conversation.id,'assistant',answer);}
+    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';storeAssistantMessage(answer);}
     streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
     await maybeRefreshConversationSummary(user,conversation);
     if(isCorrectionMessage(message)){
@@ -2080,6 +2087,56 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
           enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+        }
+        // W1: per-message actions.
+        // Regenerate re-runs an assistant turn through the same pipeline as a
+        // normal send: same model, same rate limit, same owner gating. The old
+        // assistant message is replaced (deleted before the job runs) and the
+        // reply streams through the usual /api/chat/stream-state channel, so
+        // the client reuses its normal send machinery.
+        const regenMatch=url.pathname.match(/^\/api\/chat\/messages\/([0-9a-f-]{36})\/regenerate$/);
+        if(req.method==='POST'&&regenMatch){
+          if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
+          if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
+          if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
+          const target=db.getMessage(userId,regenMatch[1]);
+          if(!target)throw Object.assign(new Error('Message not found.'),{status:404});
+          if(target.role!=='assistant')throw Object.assign(new Error('Only assistant replies can be regenerated.'),{status:400});
+          const conversation=db.getConversation(userId,target.conversation_id);
+          if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});
+          const ordered=db.listConversationMessages(userId,conversation.id,200);
+          const targetIdx=ordered.findIndex((m)=>m.id===target.id);
+          const userMsg=targetIdx>0&&ordered[targetIdx-1].role==='user'?ordered[targetIdx-1]:null;
+          if(!userMsg)throw Object.assign(new Error('Nothing to regenerate: that reply has no user message.'),{status:400});
+          // In-place replace: slot the new answer exactly where the old one
+          // was (midpoint between the user message and whatever follows), so
+          // the turn keeps its position even when later turns exist.
+          const nextMsg=targetIdx<ordered.length-1?ordered[targetIdx+1]:null;
+          let insertCreatedAt=null;
+          if(nextMsg){
+            const prevMs=new Date(userMsg.created_at).valueOf(),nextMs=new Date(nextMsg.created_at).valueOf();
+            const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
+            insertCreatedAt=new Date(slotMs).toISOString();
+          }
+          db.deleteMessage(userId,target.id); // replace the turn
+          db.touchConversation(userId,conversation.id);
+          const historyOverride=ordered.slice(Math.max(0,targetIdx-24),targetIdx);
+          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:userMsg.content,userMsg,images:[],historyOverride,insertCreatedAt}));
+          return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
+        }
+        // W1: delete a message turn (own conversations only; getMessage is
+        // user-scoped, so a foreign id 403s while a truly unknown id 404s).
+        const msgDeleteMatch=url.pathname.match(/^\/api\/chat\/messages\/([0-9a-f-]{36})$/);
+        if(req.method==='DELETE'&&msgDeleteMatch){
+          const messageId=msgDeleteMatch[1];
+          if(!db.messageExists(messageId))throw Object.assign(new Error('Message not found.'),{status:404});
+          const owned=db.getMessage(userId,messageId);
+          if(!owned)throw Object.assign(new Error('You can only delete your own messages.'),{status:403});
+          const conversationId=owned.conversation_id;
+          const deleted=db.deleteMessageTurn(userId,messageId)||[];
+          db.touchConversation(userId,conversationId);
+          db.addEvent(userId,'message_deleted',`Deleted a chat turn (${deleted.length} message${deleted.length===1?'':'s'}).`);
+          return json(res,200,{ok:true,deleted});
         }
         // R1 voice mode: Whisper transcription fallback for browsers without
         // Web Speech API. Audio is processed in memory and never persisted.

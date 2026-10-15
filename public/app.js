@@ -37,7 +37,91 @@ function settlePendingReplies(messages,convoId){const set=pendingReplies.get(con
 function syncTypingBubble(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!typingActive)showTyping(false);else if(!want&&typingActive)hideTyping();}
 let lastMessageFingerprint='';
 let renderedConversationId=null;
-function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id)el.id='msg-'+item.id;if(item.role==='assistant'){if(isCanvasWorthy(item.content))renderCanvasDoc(el,item.content);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(isCanvasWorthy(item.content))renderCanvasDoc(el,item.content);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+
+// --- W1: per-message actions (regenerate / copy / delete) ---
+// Assistant messages: long-press (touch) or hover (desktop) reveals a small
+// action row — Regenerate (re-run the turn), Copy (markdown source), Delete
+// (remove the turn). User messages get Copy + Delete. The row stays hidden
+// until revealed (Orbit minimalism — no persistent chrome), and deleting a
+// turn gets an inline confirm, not a blocking dialog.
+function messageById(id){return (state.snapshot&&state.snapshot.messages||[]).find((m)=>m.id===id)||null;}
+function hideMessageActionRows(){for(const m of $$('.message.show-actions')){m.classList.remove('show-actions');const row=m.querySelector(':scope > .msg-actions');if(row)row.remove();}}
+function msgActionButton(label,kind,handler){const b=document.createElement('button');b.type='button';b.className='msg-action msg-'+kind;b.textContent=label;b.setAttribute('aria-label',label);b.addEventListener('click',(event)=>{event.stopPropagation();handler();});return b;}
+async function copyMessageSource(id){
+  const msg=messageById(id);
+  if(!msg){toast('Could not find that message.');return;}
+  try{await navigator.clipboard.writeText(String(msg.content||''));toast('Copied.');}
+  catch(_){toast('Copy failed — select the text manually.');}
+}
+async function deleteMessageTurn(id){
+  try{await api(`/api/chat/messages/${encodeURIComponent(id)}`,{method:'DELETE'});await refresh();toast('Turn deleted.');}
+  catch(error){toast(error.message);}
+}
+async function regenerateMessage(id,row){
+  row.classList.add('busy');
+  try{
+    const sent=await api(`/api/chat/messages/${encodeURIComponent(id)}/regenerate`,{method:'POST'});
+    // Same client machinery as a fresh send: the typing bubble appears and
+    // the stream poller picks up the new turn via stream-state.
+    const conversationId=sent.conversationId||activeConversationId;
+    pendingFor(conversationId).set(sent.id,Date.now());
+    await refresh();
+  }catch(error){toast(error.message);}
+  finally{row.classList.remove('busy');}
+}
+function fillMessageActionRow(row,el){
+  const id=el.dataset.messageId,role=el.dataset.role;
+  row.replaceChildren();
+  if(role==='assistant')row.append(msgActionButton('↻ Regenerate','regen',()=>regenerateMessage(id,row)));
+  row.append(msgActionButton('⧉ Copy','copy',()=>copyMessageSource(id)));
+  row.append(msgActionButton('Delete','delete',()=>{
+    row.replaceChildren();
+    const label=document.createElement('span');label.className='msg-confirm-label';label.textContent='Delete this turn?';
+    row.append(label,
+      msgActionButton('Delete','delete',()=>{hideMessageActionRows();deleteMessageTurn(id);}),
+      msgActionButton('Keep','keep',()=>fillMessageActionRow(row,el)));
+  }));
+}
+function buildMessageActionRow(el){
+  const row=document.createElement('div');row.className='msg-actions';row.setAttribute('role','toolbar');row.setAttribute('aria-label','Message actions');
+  fillMessageActionRow(row,el);
+  el.append(row);
+}
+function showMessageActionRow(el){
+  hideMessageActionRows();
+  el.classList.add('show-actions');
+  if(!el.querySelector(':scope > .msg-actions'))buildMessageActionRow(el);
+}
+(function initMessageActions(){
+  const root=$('#messages');
+  if(!root)return;
+  const actionable=(event)=>{const el=event.target.closest('.message');return el&&el.dataset.messageId&&!el.classList.contains('typing-bubble')?el:null;};
+  // Touch: long-press reveals the row. Desktop: CSS :hover reveals it (see
+  // styles.css) — no JS needed there.
+  let timer=null,pressEl=null,startX=0,startY=0;
+  const LONG_PRESS_MS=600;
+  const cancel=()=>{clearTimeout(timer);timer=null;pressEl=null;};
+  root.addEventListener('pointerdown',(event)=>{
+    if(event.pointerType!=='touch')return;
+    const el=actionable(event);
+    if(!el)return;
+    pressEl=el;startX=event.clientX;startY=event.clientY;
+    clearTimeout(timer);
+    timer=setTimeout(()=>{timer=null;showMessageActionRow(pressEl);},LONG_PRESS_MS);
+  });
+  root.addEventListener('pointermove',(event)=>{
+    if(!timer)return;
+    if(Math.hypot(event.clientX-startX,event.clientY-startY)>12)cancel();
+  });
+  root.addEventListener('pointerup',cancel);
+  root.addEventListener('pointercancel',cancel);
+  // Long-press on mobile fires a native context menu — suppress it on message
+  // bubbles so the action row owns the gesture.
+  root.addEventListener('contextmenu',(event)=>{if(actionable(event))event.preventDefault();});
+  // Tapping anywhere outside an open row dismisses it.
+  document.addEventListener('pointerdown',(event)=>{if(!event.target.closest('.msg-actions'))hideMessageActionRows();},true);
+})();
 
 function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$('#task-count').textContent=String(items.filter((task)=>!['completed','cancelled','failed'].includes(task.status)).length);if(!items.length)return empty(root,'No tasks yet. Give Orbit one clear outcome to prepare.');for(const task of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=task.title;const prompt=document.createElement('p');prompt.textContent=task.prompt;wrap.append(h,prompt);const status=document.createElement('span');status.className=`badge ${task.status}`;status.textContent=task.status.replaceAll('_',' ');head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';for(const value of [task.risk==='external'?'approval gated':'think only',task.recurrence,formatDate(task.schedule_at)]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}card.append(meta);if(task.result){const result=document.createElement('p');result.className='result';result.textContent=task.result;card.append(result);}if(task.status==='waiting_approval'){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve plan','primary',()=>taskAction(task.id,'approve')),button('Cancel','danger',()=>taskAction(task.id,'cancel')));card.append(actions);}else if(!['completed','failed','cancelled'].includes(task.status)){const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Cancel','danger',()=>taskAction(task.id,'cancel')),button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}else{const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Delete','danger',()=>taskDelete(task.id)));card.append(actions);}root.append(card);}}
 // --- B1: Today tab morning briefing ---
