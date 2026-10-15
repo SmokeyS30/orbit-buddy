@@ -13,6 +13,7 @@
 //
 // Pure helpers (isVoiceModeCommand, speechText, pickVoice) are exported for
 // unit tests. The VoiceMode controller is DOM-dependent and wired from app.js.
+import { startVoiceActivity, endVoiceActivity } from './live-activities.js';
 
 /** Typed chat commands that open voice mode instead of sending a message. */
 export function isVoiceModeCommand(text) {
@@ -342,9 +343,11 @@ export function createVoiceMode(deps) {
     els.name = $('voice-name');
     if (!els.overlay) return;
     if (state !== 'closed') return;
+    let buddy = 'Orbit';
     try {
       const name = deps.buddyName ? deps.buddyName() : 'Orbit';
       if (els.name) els.name.textContent = name || 'Orbit';
+      if (name) buddy = name;
     } catch (_) {}
     els.transcript.replaceChildren();
     els.overlay.classList.remove('hidden');
@@ -365,11 +368,16 @@ export function createVoiceMode(deps) {
       }
     } catch (_) {}
     startListen();
+    // Native iOS: surface a Live Activity for the voice session
+    // (no-op on web/Android — see live-activities.js).
+    startVoiceActivity({ buddyName: buddy });
   }
 
   function close() {
     state = 'closed';
     stopAll();
+    // Native iOS: dismiss the voice Live Activity (no-op elsewhere).
+    endVoiceActivity();
     if (els.overlay) els.overlay.classList.add('hidden');
     document.body.classList.remove('voice-open');
   }
