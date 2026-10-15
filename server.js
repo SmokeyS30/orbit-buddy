@@ -2,10 +2,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
-import { createModelClient, stripCitationMarkers } from './src/model.js';
+import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE } from './src/model.js';
+import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
@@ -312,7 +313,9 @@ export function createOrbitServer(options={}) {
   // Shared reply pipeline used by web chat (/api/chat) and WhatsApp.
   // The caller adds the user message first; this generates the assistant reply
   // with the full model pipeline, stores it, and returns the answer text.
-  async function runChatReplyJob({userId,user,conversation,message,userMsg}){
+  // `images` carries Responses API input_image blocks (from processImageInput)
+  // for vision turns; the stored user message stays text-only.
+  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[]}){
     if(!db.getConversation(userId,conversation.id))return null;
     const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
     let answer=null;
@@ -336,7 +339,7 @@ export function createOrbitServer(options={}) {
           needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));
         }
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,needsAmbientAsk,
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,
         memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
@@ -1863,9 +1866,38 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             });
             return json(res,200,{ok:true,voiceNote:true});
           }
-          // Phase 2 covers location + voice notes; images land later.
+          // Image attachments: download from Twilio, run through the SAME
+          // processImageInput() vision pipeline as the web composer, and feed
+          // the resulting input_image block into the normal chat pipeline.
+          // Only the first image is handled (Twilio may send several); image
+          // bytes stay in memory and are never stored or logged.
+          if(isImageContentType(mediaContentType)&&mediaUrl){
+            let imageBlock=null;
+            try{
+              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+              imageBlock=processImageInput({bytes,mimeType:mediaContentType});
+            }catch(e){
+              console.error('whatsapp image failed',e.code||e.message);
+              const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
+              try{await twilioSend(from,tooLong
+                ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
+                :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
+              return json(res,200,{ok:true,image:false});
+            }
+            const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
+            const userMsg=db.addMessage(waUserId,conversation.id,'user',WHATSAPP_IMAGE_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
+            enqueueChatReply(conversation.id,async()=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:caption||'Look at this.',userMsg,images:[imageBlock]});
+              if(answer&&from){
+                try{await twilioSend(from,answer);}
+                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+              }
+            });
+            return json(res,200,{ok:true,image:true});
+          }
+          // Other media types (video, documents) are not supported yet.
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
-          try{await twilioSend(from,'I can read text and listen to voice notes now — photo support is coming soon.');}catch(e){console.error('whatsapp media reply failed',e.message);}
+          try{await twilioSend(from,'I can read text, listen to voice notes, and look at photos — other file types aren’t supported yet.');}catch(e){console.error('whatsapp media reply failed',e.message);}
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
@@ -2001,15 +2033,52 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:db.listCalendarFeeds(userId).map(publicFeed)});
         if(req.method==='POST'&&url.pathname==='/api/calendar-feeds'){const body=await readJson(req);const label=cleanText(body.label,60,'label');const feedUrl=normalizeFeedUrl(cleanText(body.url,2000,'url'));let text;try{text=await fetchFeedText(feedUrl);}catch(error){throw Object.assign(new Error(`Could not read that calendar: ${error.message}`),{status:400});}const vevents=parseIcs(text);if(!vevents.length)throw Object.assign(new Error('That URL did not return a readable calendar (no events found).'),{status:400});const feed=db.addCalendarFeed(userId,{label,url:feedUrl});db.addEvent(userId,'calendar_feed_added',`Connected calendar \u201c${label}\u201d (${vevents.length} events found).`);return json(res,201,{feed:publicFeed(feed),eventsFound:vevents.length});}
         const feedMatch=url.pathname.match(/^\/api\/calendar-feeds\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&feedMatch){if(!db.deleteCalendarFeed(userId,feedMatch[1]))throw Object.assign(new Error('Calendar feed not found.'),{status:404});dropFeedCache(feedMatch[1]);db.addEvent(userId,'calendar_feed_removed','Removed a calendar feed.');return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/chat/attachments'){
+          // D1: chat image attachment upload. Multipart form data (the composer
+          // sends FormData); validated and staged ephemerally in memory. The
+          // client includes the returned id with its /api/chat send, which
+          // consumes the staged bytes in the same turn. Image bytes never
+          // touch the DB or disk, and are never logged.
+          if(userRateLimited(userId,'chat-attachments',20,60*60_000))throw Object.assign(new Error('Too many uploads. Try again shortly.'),{status:429});
+          const uploadType=req.headers['content-type']||'';
+          if(!uploadType.includes('multipart/form-data'))throw Object.assign(new Error('Send the image as multipart form data.'),{status:400});
+          const chunks=[];let size=0;
+          for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
+          const raw=Buffer.concat(chunks);
+          if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
+          const file=parseMultipartImage(raw,uploadType);
+          if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
+          if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
+          const attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType}); // validates size too
+          db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
+          return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+        }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
           // Demo users are capped on messages
           if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
-          const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;
+          const body=await readJson(req);
+          // D1: image attachments staged via POST /api/chat/attachments. Ids
+          // are consumed here (single-use) and resolved through the shared
+          // vision pipeline; the text message is optional when an image rides
+          // along. Stored history keeps a text placeholder — bytes are never
+          // persisted.
+          const attachmentIds=Array.isArray(body.attachmentIds)?body.attachmentIds.map((id)=>String(id||'')).filter(Boolean).slice(0,3):[];
+          // Two-phase: verify every id resolves BEFORE consuming any, so one
+          // stale id never silently drops the other attachments in the turn.
+          for(const attachmentId of attachmentIds){
+            if(!peekAttachment(userId,attachmentId))throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+          }
+          const imageBlocks=[];
+          for(const attachmentId of attachmentIds){
+            imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
+          }
+          const hasImages=imageBlocks.length>0;
+          const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
-          const userMsg=db.addMessage(userId,conversation.id,'user',message);db.touchConversation(userId,conversation.id);
-          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message,userMsg}));
+          const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
+          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
         // R1 voice mode: Whisper transcription fallback for browsers without

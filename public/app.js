@@ -15,7 +15,7 @@ const $=(selector)=>document.querySelector(selector);const $$=(selector)=>[...do
 const IS_NATIVE=typeof window!=='undefined'&&window.Capacitor?.isNativePlatform?.()===true;
 const API_BASE=IS_NATIVE?'https://orbitbuddy.app':'';
 const NATIVE_CREDENTIALS=IS_NATIVE?'include':'same-origin';
-async function api(url,options={}){const headers={...(options.body?{'Content-Type':'application/json'}:{}),...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{}),...(options.headers||{})};const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),30000);try{const response=await fetch((String(url).startsWith('/')?API_BASE:'')+url,{credentials:NATIVE_CREDENTIALS,...options,headers,signal:ctrl.signal});const type=response.headers.get('content-type')||'';const body=type.includes('json')?await response.json().catch(()=>({})):null;if(response.status===401)throw Object.assign(new Error(body?.error||'Authentication required.'),{auth:true});if(!response.ok)throw new Error(body?.error||`Request failed (${response.status}).`);return body??response;}catch(e){if(e.name==='AbortError')throw new Error('Request timed out. Check your connection and try again.');throw e;}finally{clearTimeout(timer);}}
+async function api(url,options={}){const isForm=options.body instanceof FormData;const headers={...(!isForm&&options.body?{'Content-Type':'application/json'}:{}),...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{}),...(options.headers||{})};const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),30000);try{const response=await fetch((String(url).startsWith('/')?API_BASE:'')+url,{credentials:NATIVE_CREDENTIALS,...options,headers,signal:ctrl.signal});const type=response.headers.get('content-type')||'';const body=type.includes('json')?await response.json().catch(()=>({})):null;if(response.status===401)throw Object.assign(new Error(body?.error||'Authentication required.'),{auth:true});if(!response.ok)throw new Error(body?.error||`Request failed (${response.status}).`);return body??response;}catch(e){if(e.name==='AbortError')throw new Error('Request timed out. Check your connection and try again.');throw e;}finally{clearTimeout(timer);}}
 function toast(message){const el=$('#toast');el.textContent=message;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2800);}
 function formatDate(value){if(!value)return'Ready now';return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(value));}
 function empty(root,text){const p=document.createElement('p');p.className='empty';p.textContent=text;root.append(p);}
@@ -512,13 +512,82 @@ async function flushChatQueue(){
 }
 window.addEventListener('online',()=>{flushChatQueue().catch(()=>{});});
 
+// --- D1: image attachments ---
+// The composer attach button (file picker incl. iPhone camera roll via
+// accept="image/*"), clipboard paste, and drag-drop onto the composer all
+// funnel here. Files upload immediately to POST /api/chat/attachments; the
+// returned id rides along with the next /api/chat send and is consumed
+// server-side in the same turn (single-use, expires after 10 minutes).
+const pendingAttachments=[]; // {id, mimeType, file} — staged server-side; sent with the next chat turn
+const MAX_ATTACH_BYTES=10*1024*1024;
+async function uploadAttachment(file){
+  if(!file||!String(file.type||'').startsWith('image/')){toast('Only image files can be attached.');return;}
+  if(file.size>MAX_ATTACH_BYTES){toast('That image is too large (10MB max).');return;}
+  const form=new FormData();form.append('image',file,file.name||'image');
+  try{
+    const data=await api('/api/chat/attachments',{method:'POST',body:form});
+    pendingAttachments.push({id:data.id,mimeType:data.mimeType,file});
+    renderAttachPreview();
+  }catch(error){toast(error.message||'Could not upload that image.');}
+}
+function renderAttachPreview(){
+  const root=$('#attach-preview');if(!root)return;
+  root.replaceChildren();
+  root.classList.toggle('hidden',!pendingAttachments.length);
+  pendingAttachments.forEach((att,index)=>{
+    const chip=document.createElement('div');chip.className='attach-chip';
+    const remove=document.createElement('button');remove.type='button';remove.className='attach-remove';remove.textContent='✕';remove.setAttribute('aria-label','Remove attached image');
+    remove.addEventListener('click',()=>{pendingAttachments.splice(index,1);renderAttachPreview();});
+    // Thumbnail: decode the file and draw it into a small canvas. No URL
+    // strings ever touch the DOM (no tainted-string sinks), the preview is
+    // downscaled to thumbnail size, and iPhone EXIF orientation is honored.
+    // Undecodable files fall back to a generic icon instead of failing.
+    const canvas=document.createElement('canvas');canvas.width=144;canvas.height=144;canvas.className='attach-thumb';canvas.setAttribute('aria-label','Attached image');
+    const draw=async()=>{
+      try{
+        const bitmap=await createImageBitmap(att.file,{imageOrientation:'from-image'});
+        try{
+          if(!bitmap.width||!bitmap.height)throw new Error('empty image');
+          const ctx=canvas.getContext('2d');
+          if(!ctx)throw new Error('no 2d context');
+          const scale=Math.max(canvas.width/bitmap.width,canvas.height/bitmap.height);
+          const w=bitmap.width*scale,h=bitmap.height*scale;
+          ctx.drawImage(bitmap,(canvas.width-w)/2,(canvas.height-h)/2,w,h);
+        }finally{bitmap.close();}
+      }catch(_){
+        const fallback=document.createElement('div');fallback.className='attach-thumb attach-thumb-fallback';fallback.textContent='🖼';
+        canvas.replaceWith(fallback);
+      }
+    };
+    draw();
+    chip.append(canvas,remove);root.append(chip);
+  });
+}
+function clearAttachments(){pendingAttachments.length=0;renderAttachPreview();}
+function acceptImageFiles(files){for(const file of(files||[]))uploadAttachment(file);}
+// Attach affordance: quiet icon button (Orbit minimalism), picker, paste, drop.
+(function(){
+  const attachBtn=$('#attach-button'),picker=$('#attach-picker'),input=$('#chat-input'),form=$('#chat-form');
+  if(!attachBtn||!picker||!input||!form)return;
+  attachBtn.addEventListener('click',()=>picker.click());
+  picker.addEventListener('change',()=>{acceptImageFiles(picker.files);picker.value='';});
+  input.addEventListener('paste',(event)=>{
+    const files=[];const items=event.clipboardData&&event.clipboardData.items;
+    if(items)for(const item of items)if(item.kind==='file'&&String(item.type||'').startsWith('image/')){const f=item.getAsFile();if(f)files.push(f);}
+    if(files.length){event.preventDefault();acceptImageFiles(files);}
+  });
+  form.addEventListener('dragover',(event)=>{event.preventDefault();form.classList.add('dragging');});
+  form.addEventListener('dragleave',()=>form.classList.remove('dragging'));
+  form.addEventListener('drop',(event)=>{event.preventDefault();form.classList.remove('dragging');acceptImageFiles(event.dataTransfer&&event.dataTransfer.files);});
+})();
+
 // Shared send path: the composer submit handler and the B3 follow-up nudge
 // ("Pick it up") both go through here.
-async function postChatMessage(text){
+async function postChatMessage(text,attachmentIds=[]){
   const message=String(text||'').trim();
-  if(!message)throw new Error('Nothing to send.');
+  if(!message&&!attachmentIds.length)throw new Error('Nothing to send.');
   if(!navigator.onLine)throw Object.assign(new Error('offline'),{offline:true});
-  const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,conversationId:activeConversationId})});
+  const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,attachmentIds,conversationId:activeConversationId})});
   const conversationId=sent.conversationId||activeConversationId;
   pendingFor(conversationId).set(sent.id,Date.now());
   await refresh();
@@ -590,16 +659,27 @@ async function sendChatMessage(text){
   const input=$('#chat-input');
   const submit=document.querySelector('#chat-form button[type="submit"]');
   const message=String(text||'').trim();
-  if(!message)return;
+  const attachmentIds=pendingAttachments.map((att)=>att.id);
+  if(!message&&!attachmentIds.length){toast('Type a message or attach an image.');return;}
   if(isVoiceModeCommand(message)){openVoiceMode();return;}
   if(isCanvasCommand(message)){openCanvasRender();return;}
   if(submit)submit.disabled=true;
-  if(!navigator.onLine){queueOfflineMessage(message);if(submit)submit.disabled=false;return;}
-  const el=appendOptimisticMessage(message);
+  if(!navigator.onLine){
+    // The offline text queue can't carry staged images — keep the thumbnails
+    // so the user can send once they're back online.
+    if(attachmentIds.length)toast('Attachments need a connection — they’ll stay ready to send.');
+    else queueOfflineMessage(message);
+    if(submit)submit.disabled=false;return;
+  }
+  const el=appendOptimisticMessage(message||'[Image attached]');
   try{
-    await postChatMessage(message);
+    await postChatMessage(message,attachmentIds);
+    clearAttachments(); // ids are single-use; drop thumbnails once the turn is accepted
   }catch(error){
-    if(isNetworkError(error))queueOfflineMessage(message,el);
+    if(isNetworkError(error)){
+      if(attachmentIds.length)toast('Connection lost — your image is staged and ready to resend.');
+      else queueOfflineMessage(message,el);
+    }
     else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
   }finally{if(submit)submit.disabled=false;}
 }

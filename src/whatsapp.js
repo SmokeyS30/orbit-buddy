@@ -132,6 +132,12 @@ export function formatLocationMessage({ lat, lng }, label = '') {
  */
 export const LOCATION_STORED_MESSAGE = '[Shared location]';
 
+/**
+ * Stored in the conversation history in place of a WhatsApp image.
+ * Image bytes are NEVER persisted — only the model turn sees them.
+ */
+export const WHATSAPP_IMAGE_STORED_MESSAGE = '[WhatsApp image]';
+
 /** WhatsApp's customer-service messaging window: free-form outbound messages
  * are only allowed within 24h of the user's last inbound message. Outside the
  * window only approved template messages may be sent — and this app sends no

@@ -19,6 +19,7 @@ import {
   parseWhatsAppLocation,
   formatLocationMessage,
   LOCATION_STORED_MESSAGE,
+  WHATSAPP_IMAGE_STORED_MESSAGE,
   MAX_TWILIO_MEDIA_BYTES,
   downloadTwilioMedia,
   transcribeVoiceNote,
@@ -575,9 +576,70 @@ test('webhook: oversized voice note gets the "bit long" reply and is not transcr
   }
 });
 
-test('webhook: image media still gets the photo-coming-soon reply', async (t) => {
+test('webhook: inbound image is downloaded and fed through the vision pipeline', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
-  await linkOwnerDirectly(app, base, 'owner-img@example.com');
+  const { userId } = await linkOwnerDirectly(app, base, 'owner-img@example.com');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return mediaResponse(png, { contentType: 'image/png' });
+    if (u?.hostname === 'api.twilio.com') { sent.push({ url: String(url), body: String(opts?.body || '') }); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'image/jpeg',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi/Media/MEi',
+      Body: 'look at this', MessageSid: 'SMimg',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, image: true });
+    // Stored history keeps the text placeholder — bytes are never persisted
+    const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
+    assert.equal(String(msgs[msgs.length - 1].content), WHATSAPP_IMAGE_STORED_MESSAGE);
+    // The queued reply job runs the model pipeline (demo mode here) and replies via Twilio
+    const reply = await waitForTwilioReply(sent, (u) => { try { return new URL(String(u)).hostname === 'api.twilio.com'; } catch { return false; } });
+    assert.ok(reply, 'expected a Twilio reply for the image');
+    assert.ok(decodeForm(reply.body).includes('demo mode'), 'demo-mode pipeline answered the image turn');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: failed image download gets the retry reply and no pipeline run', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base, 'owner-img2@example.com');
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return { ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' };
+    if (u?.hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'image/png',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi2/Media/MEi2',
+      Body: '', MessageSid: 'SMimg2',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, image: false });
+    assert.ok(sent.some((b) => decodeForm(b).includes('mind sending it again')), 'expected the polite retry reply');
+    const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
+    assert.ok(!msgs.some((m) => m.content === WHATSAPP_IMAGE_STORED_MESSAGE), 'no image message stored on download failure');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: non-image media gets the unsupported-type reply', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app, base, 'owner-vid@example.com');
   const sent = [];
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
@@ -587,13 +649,13 @@ test('webhook: image media still gets the photo-coming-soon reply', async (t) =>
   try {
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
-      NumMedia: '1', MediaContentType0: 'image/jpeg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi/Media/MEi',
-      Body: '', MessageSid: 'SMimg',
+      NumMedia: '1', MediaContentType0: 'video/mp4',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv3/Media/MEv3',
+      Body: '', MessageSid: 'SMvid',
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true });
-    assert.ok(sent.some((b) => decodeURIComponent(b).replace(/\+/g, ' ').includes('photo support is coming soon')));
+    assert.ok(sent.some((b) => decodeForm(b).includes('aren’t supported yet')), 'expected the unsupported-type reply');
   } finally {
     globalThis.fetch = origFetch;
   }
