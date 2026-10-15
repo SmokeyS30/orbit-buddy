@@ -8,6 +8,42 @@ const MAX_TOOL_ITERATIONS = 2;
 const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
 const MAX_TRANSIENT_MODEL_ATTEMPTS = 3;
 
+// ---- D1: image attachments ------------------------------------------------
+// Shared vision pipeline for web composer uploads and WhatsApp inbound
+// images. processImageInput() validates raw image bytes and returns the
+// Responses API `input_image` content block for a chat turn. Images are
+// processed in memory, never persisted, and never logged.
+export const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+/** Stored in conversation history in place of a web-uploaded image. Bytes are never persisted. */
+export const IMAGE_STORED_MESSAGE = '[Image attached]';
+
+/** True for the image content types Orbit accepts as vision input. */
+export function isImageContentType(mimeType) {
+  return IMAGE_MIME_TYPES.has(String(mimeType || '').toLowerCase().split(';')[0].trim());
+}
+
+/**
+ * Validate image bytes + mime type, returning the Responses API `input_image`
+ * content block to append to the turn's user message. Throws an Error with an
+ * HTTP-style `status` (415/413/400) on unsupported type, oversize, or empty
+ * payload. Image bytes are never logged.
+ */
+export function processImageInput({ bytes, mimeType }) {
+  const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
+  if (!IMAGE_MIME_TYPES.has(mime)) {
+    throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'), { status: 415, code: 'UNSUPPORTED_IMAGE_TYPE' });
+  }
+  const buffer = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || []);
+  if (!buffer.length) {
+    throw Object.assign(new Error('The image is empty.'), { status: 400, code: 'EMPTY_IMAGE' });
+  }
+  if (buffer.length > MAX_IMAGE_BYTES) {
+    throw Object.assign(new Error('The image is too large (10MB max).'), { status: 413, code: 'IMAGE_TOO_LARGE' });
+  }
+  return { type: 'input_image', image_url: `data:${mime};base64,${buffer.toString('base64')}` };
+}
+
 function normalizeModelName(value) {
   const name = String(value || '').trim();
   const aliases = { astra: 'gpt-6-astra', luna: 'gpt-6-luna', sol: 'gpt-6.1-sol' };
@@ -107,6 +143,10 @@ export function classifyModelError(error) {
   if (status === 429 && (code.includes('insufficient_quota') || message.includes('quota') || message.includes('credit'))) return 'quota';
   if (status === 429) return 'rate_limit';
   if (code.includes('model_not_found') || message.includes('does not have access to') || message.includes('do not have access to') || message.includes('model not found') || ((status === 403 || status === 404) && message.includes('model'))) return 'model_access';
+  // D1: a model that rejects image input (400/422 naming images as unsupported)
+  // is a model-capability problem, not a bad request — the image turn falls
+  // back to sol rather than failing the turn.
+  if ((status === 400 || status === 422) && /image/i.test(message) && /(not supported|unsupported|does ?not support|do ?not support|cannot process|invalid image|image input)/i.test(message)) return 'image_unsupported';
   if (!status) return 'network';
   if (status >= 500) return 'service';
   return 'request';
@@ -360,7 +400,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -494,11 +534,19 @@ export function createModelClient(env = process.env) {
         }
       };
 
+      // D1: image turns attach `input_image` content blocks (produced by
+      // processImageInput) to the user message. The text caption keeps the
+      // modelInput shape identical for text-only turns.
+      const imageParts = (Array.isArray(images) ? images : []).filter((part) => part && part.type === 'input_image');
+      const isImageTurn = imageParts.length > 0;
+      const userContent = isImageTurn
+        ? [{ type: 'input_text', text: message || 'Look at this.' }, ...imageParts]
+        : message;
       let modelInput = [
         { role: 'developer', content: [{ type: 'input_text', text: buildStableDeveloperPrompt(), prompt_cache_breakpoint: { mode: 'explicit' } }] },
         { role: 'developer', content: dynamicDeveloper },
         ...recentHistory,
-        { role: 'user', content: message }
+        { role: 'user', content: userContent }
       ];
       const toolCalls = [];
       let lastOutput = [];
@@ -540,9 +588,10 @@ export function createModelClient(env = process.env) {
         throw new Error('No compatible model was available.');
       };
       const requestOutput = async (input, stream) => {
+        const requestFn = stream ? requestModelStream : requestModel;
         let failure;
         try {
-          const output = await callWithFallback(stream ? requestModelStream : requestModel, input);
+          const output = await callWithFallback(requestFn, input);
           const usable = output.some((item) => item?.type === 'function_call' || extractText({ output: [item] }));
           if (stream && !usable) {
             const error = new Error('The streamed model response contained no usable output.');
@@ -557,6 +606,18 @@ export function createModelClient(env = process.env) {
         if (stream && ['request', 'stream'].includes(classification)) {
           try {
             return await callWithFallback(requestModel, input);
+          } catch (error) {
+            failure = error;
+            classification = error?.classification || classifyModelError(error);
+          }
+        }
+        if (isImageTurn && classification === 'image_unsupported' && selectedModel !== complexModel) {
+          // Defensive model routing: the configured model rejects image input.
+          // Retry the same turn once on sol (the documented image-capable
+          // model) instead of probing further models or failing the turn.
+          selectedModel = complexModel;
+          try {
+            return await callWithFallback(requestFn, input);
           } catch (error) {
             failure = error;
             classification = error?.classification || classifyModelError(error);

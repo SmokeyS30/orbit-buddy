@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added image attachments in chat: the composer attach button (file picker incl. iPhone camera roll, clipboard paste, drag-and-drop) uploads to a new authed POST /api/chat/attachments endpoint, shows a thumbnail preview, and sends the image through a shared vision pipeline with a text placeholder in history (bytes never persisted or logged).
+- WhatsApp inbound photos now run through the same vision pipeline (Twilio MediaUrl0 download, first image only); the configured chat model is tried first with a one-time sol fallback if the model rejects image input.
 - Published production images with GitHub's short-lived repository token instead of a stored GHCR personal access token.
 - Added a scheduled public health monitor covering PostgreSQL readiness and durable encrypted-backup freshness.
 - Reported a safe backup state from `/healthz` while keeping detailed backup diagnostics owner-only.

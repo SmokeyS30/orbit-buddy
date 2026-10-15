@@ -141,13 +141,21 @@
           <div id="messages" class="messages" aria-live="polite"></div>
           <div id="followup-nudge" aria-live="polite"></div>
           <form id="chat-form" class="composer">
+            <div id="attach-preview" class="attach-preview hidden" aria-live="polite"></div>
+            <input
+              id="attach-picker"
+              type="file"
+              accept="image/*"
+              class="sr-only"
+              aria-label="Attach an image"
+            />
             <label class="sr-only" for="chat-input">Message Orbit</label
+            ><button id="attach-button" class="icon-button" type="button" title="Attach an image" aria-label="Attach an image">📎</button
             ><textarea
               id="chat-input"
               rows="2"
               maxlength="6000"
               placeholder="Ask, plan, reflect, or decide…"
-              required
             ></textarea
             ><button id="voice-button" class="icon-button" type="button" title="Voice input" aria-label="Voice input">🎤</button
             ><button class="primary" type="submit">Send</button>
