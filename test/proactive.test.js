@@ -21,6 +21,17 @@ async function register(base, { email = 'owner@example.com', displayName = 'Owne
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
 
+// Deterministic mid-week timestamp (>= 3 days out) for proactive tests: the
+// Sunday-only weekly review would otherwise inject an extra assistant message
+// on some runs and break message-count assertions (the old "nudge fires
+// twice" flake was the weekly review, not the quiet nudge).
+function midweekFuture() {
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' });
+  let t = Date.now() + 3 * 24 * 3600_000;
+  for (let i = 0; i < 10 && !['Wed', 'Thu', 'Fri'].includes(fmt.format(new Date(t))); i++) t += 24 * 3600_000;
+  return t;
+}
+
 test('parseFollowUpMarkers extracts dated follow-ups', () => {
   assert.deepEqual(
     parseFollowUpMarkers('Sounds good!\n[FOLLOWUP: dentist appointment on 2026-10-08]'),
@@ -65,7 +76,7 @@ test('follow-up sweep checks in on due events only', async (t) => {
   assert.ok(events.some((e) => e.type === 'followup_sent'), 'followup_sent event logged');
 });
 
-test('quiet nudge fires after 48h idle, then cools down', async (t) => { // TODO: Fix cooldown bug - nudge fires twice
+test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
   app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
@@ -96,7 +107,7 @@ test('quiet nudge fires after 48h idle, then cools down', async (t) => { // TODO
   assert.ok(lastCount > 0, 'chat reply landed');
   const beforeNudge = assistants().length;
   const nudgeTimeBefore = app.db.getLastQuietNudgeAt(auth.userId);
-  const future = Date.now() + 3 * 24 * 3600_000;
+  const future = midweekFuture();
   await app.runProactiveChecks(future);
   const afterFirst = assistants().length;
   assert.ok(afterFirst > beforeNudge, 'quiet nudge message saved');
