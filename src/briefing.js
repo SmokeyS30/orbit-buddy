@@ -4,9 +4,18 @@
 // one generated morning page. Presentation lives in the frontend; this module
 // only gathers and shapes the data. No model calls: deterministic, cheap.
 
-import { toolGetWeather } from './tools.js';
+import { toolGetWeather, validBriefingCoords } from './tools.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { todayInZone, nextPersonalDateOccurrence, validTimeZone } from './intelligence.js';
+
+// Home fallback when no valid coordinates are supplied (Brewster, MA).
+export const HOME_COORDS = { latitude: 41.76, longitude: -70.08 };
+// Privacy: coords supplied by the client are used transiently for the
+// Open-Meteo fetch only — never stored, never logged, never persisted.
+// Invalid/absent coords fall back to home.
+export function resolveBriefingCoords(lat, lon) {
+  return validBriefingCoords(lat, lon) || { ...HOME_COORDS };
+}
 
 // Parse the fixed-format text returned by toolGetWeather into structured data.
 // Returns null when the text doesn't match (weather section renders as absent).
@@ -47,8 +56,9 @@ function countdownLabel(daysUntil) {
 
 // Build the full morning briefing payload for a user. `db` is the database
 // handle; `reliability` is the reliabilityFor(userId) summary (may be null).
-// `getWeather` is injectable for tests.
-export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeather, nowMs = Date.now(), reliability = null } = {}) {
+// `getWeather` is injectable for tests. `coords` is the optional validated
+// {latitude, longitude} from the client; absent → home weather (Brewster, MA).
+export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeather, nowMs = Date.now(), reliability = null, coords = null } = {}) {
   const prefs = db.getPreferences(userId) || {};
   const timeZone = validTimeZone(prefs.time_zone) || DEFAULT_ZONE;
   const todayStr = todayInZone(timeZone, nowMs);
@@ -58,7 +68,10 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
   // Weather (best effort — section hides on failure)
   let weather = null;
   try {
-    weather = parseWeatherText(await getWeather({ location: 'Brewster, MA' }));
+    const wxArgs = validBriefingCoords(coords?.latitude, coords?.longitude)
+      ? { latitude: coords.latitude, longitude: coords.longitude }
+      : { location: 'Brewster, MA' };
+    weather = parseWeatherText(await getWeather(wxArgs));
   } catch { weather = null; }
 
   // Calendar agenda: today + tomorrow (partitioned by local day)

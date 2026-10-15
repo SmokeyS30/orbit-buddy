@@ -129,13 +129,57 @@ function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$
 // memory anniversaries, open approvals, and a quiet systems line (B4).
 // Data comes from GET /api/today-briefing; cached client-side for 10 minutes
 // so the 15s refresh loop doesn't refetch it.
-const briefingState={data:null,at:0};
+const briefingState={data:null,at:0,coordsKey:''};
+// Location-aware weather: one-time browser Geolocation request (works on web
+// and in the iOS webview) so briefing weather follows the user. Coords are
+// sent with the briefing request only — never stored server-side. A stored
+// denial is respected quietly (never nag); denial/unavailability/timeout
+// silently falls back to home weather.
+const GEO_DENIED_KEY='orbit-geo-denied';
+let geoCoordsPromise=null;
+function requestBriefingCoords(){
+  if(geoCoordsPromise)return geoCoordsPromise;
+  geoCoordsPromise=new Promise((resolve)=>{
+    const done=(v)=>resolve(v);
+    let denied=false;
+    try{denied=localStorage.getItem(GEO_DENIED_KEY)==='1';}catch(_){}
+    if(denied||typeof navigator==='undefined'||!navigator.geolocation)return done(null);
+    const timer=setTimeout(()=>done(null),10000);
+    try{
+      navigator.geolocation.getCurrentPosition(
+        (pos)=>{clearTimeout(timer);const c=pos&&pos.coords;
+          done(c&&Number.isFinite(c.latitude)&&Number.isFinite(c.longitude)&&Math.abs(c.latitude)<=90&&Math.abs(c.longitude)<=180
+            ?{lat:c.latitude,lon:c.longitude}:null);},
+        (err)=>{clearTimeout(timer);
+          try{if(err&&err.code===1)localStorage.setItem(GEO_DENIED_KEY,'1');}catch(_){}
+          done(null);},
+        {enableHighAccuracy:false,timeout:9000,maximumAge:600000});
+    }catch(_){clearTimeout(timer);done(null);}
+  });
+  return geoCoordsPromise;
+}
+function fetchBriefingData(coords){
+  const qs=coords?('?lat='+encodeURIComponent(String(coords.lat))+'&lon='+encodeURIComponent(String(coords.lon))):'';
+  return api('/api/today-briefing'+qs);
+}
 async function loadBriefing(){
   if(briefingState.data&&Date.now()-briefingState.at<10*60_000){renderBriefing(briefingState.data);return;}
   try{
-    const data=await api('/api/today-briefing');
-    briefingState.data=data;briefingState.at=Date.now();
+    // Fetch now (fast, home weather) while the one-time geolocation request
+    // runs in parallel; if coords arrive, refetch once so weather is local.
+    const data=await fetchBriefingData(null);
+    briefingState.data=data;briefingState.at=Date.now();briefingState.coordsKey='';
     renderBriefing(data);
+    requestBriefingCoords().then(async(coords)=>{
+      if(!coords)return;
+      const key=coords.lat.toFixed(3)+','+coords.lon.toFixed(3);
+      if(briefingState.coordsKey===key)return;
+      try{
+        const d2=await fetchBriefingData(coords);
+        briefingState.data=d2;briefingState.at=Date.now();briefingState.coordsKey=key;
+        renderBriefing(d2);
+      }catch(_){/* keep the home-weather render; silent */}
+    });
   }catch(error){renderBriefingError();}
 }
 function renderBriefingError(){

@@ -109,3 +109,39 @@ test('buildTodayBriefing flags recent failures for the systems line', async () =
   assert.equal(b.systems.ok, false);
   assert.equal(b.systems.failureCount, 2);
 });
+
+test('resolveBriefingCoords validates and falls back to home', async () => {
+  const { resolveBriefingCoords, HOME_COORDS } = await import('../src/briefing.js');
+  assert.deepEqual(HOME_COORDS, { latitude: 41.76, longitude: -70.08 });
+  assert.deepEqual(resolveBriefingCoords(42.36, -71.06), { latitude: 42.36, longitude: -71.06 });
+  assert.deepEqual(resolveBriefingCoords('999', '0'), HOME_COORDS, 'out-of-range lat → home');
+  assert.deepEqual(resolveBriefingCoords('abc', null), HOME_COORDS, 'garbage → home');
+});
+
+test('buildTodayBriefing passes coords to getWeather, home location when absent', async () => {
+  const { buildTodayBriefing } = await import('../src/briefing.js');
+  const seen = [];
+  const b = await buildTodayBriefing(fakeDb(), 'u1', {
+    getWeather: async (args) => { seen.push(args); return WEATHER_TEXT; },
+    nowMs: NOW,
+    coords: { latitude: 42.36, longitude: -71.06 },
+  });
+  assert.deepEqual(seen[0], { latitude: 42.36, longitude: -71.06 }, 'coords forwarded as numbers');
+  assert.equal(b.weather.current.tempF, 54);
+
+  seen.length = 0;
+  const b2 = await buildTodayBriefing(fakeDb(), 'u1', {
+    getWeather: async (args) => { seen.push(args); return WEATHER_TEXT; },
+    nowMs: NOW,
+  });
+  assert.deepEqual(seen[0], { location: 'Brewster, MA' }, 'absent coords → home location');
+  assert.equal(b2.weather.current.tempF, 54);
+
+  seen.length = 0;
+  await buildTodayBriefing(fakeDb(), 'u1', {
+    getWeather: async (args) => { seen.push(args); return WEATHER_TEXT; },
+    nowMs: NOW,
+    coords: { latitude: 999, longitude: 0 },
+  });
+  assert.deepEqual(seen[0], { location: 'Brewster, MA' }, 'invalid coords → home location');
+});
