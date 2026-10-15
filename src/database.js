@@ -384,6 +384,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     createConversation: db.prepare('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES (?,?,?,?,?)'),
     listConversations: db.prepare('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,rowid DESC'),
     getConversation: db.prepare('SELECT * FROM conversations WHERE id=? AND user_id=?'),
+    // W3: conversation share/export — user-agnostic existence check so a
+    // foreign id 403s while a truly unknown id 404s (same pattern as W1).
+    getConversationAny: db.prepare('SELECT id FROM conversations WHERE id=?'),
     touchConversation: db.prepare('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?'),
     deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
@@ -637,6 +640,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     createConversation(userId,title){const now=timestamp();const row={id:randomUUID(),user_id:userId,title,created_at:now,updated_at:now};s.createConversation.run(row.id,row.user_id,row.title,row.created_at,row.updated_at);return row;},
     listConversations:(userId)=>s.listConversations.all(userId),
     getConversation:(userId,id)=>s.getConversation.get(id,userId),
+    conversationExists:(id)=>!!s.getConversationAny.get(id),
     touchConversation:(userId,id)=>s.touchConversation.run(timestamp(),id,userId).changes>0,
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
