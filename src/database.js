@@ -288,6 +288,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       muted_at TEXT NOT NULL,
       PRIMARY KEY (user_id, repo)
     );
+    CREATE TABLE IF NOT EXISTS study_questions (
+      id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
+      question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
+      explanation TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'seed'
+    );
+    CREATE TABLE IF NOT EXISTS study_attempts (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL,
+      correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam);
+    CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC);
     CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
     CREATE TABLE IF NOT EXISTS waitlist (
@@ -637,7 +648,19 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     muteRadarRepo: db.prepare('INSERT INTO radar_mutes(user_id,repo,muted_at) VALUES(?,?,?) ON CONFLICT(user_id,repo) DO NOTHING'),
     unmuteRadarRepo: db.prepare('DELETE FROM radar_mutes WHERE user_id=? AND repo=?'),
     listRadarMutes: db.prepare('SELECT * FROM radar_mutes WHERE user_id=? ORDER BY muted_at DESC'),
-    radarMute: db.prepare('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?')
+    radarMute: db.prepare('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?'),
+    addStudyQuestion: db.prepare(`INSERT INTO study_questions(id,exam,topic,question,choices,correct_index,explanation,created_at,source)
+      VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`),
+    getStudyQuestion: db.prepare('SELECT * FROM study_questions WHERE id=?'),
+    listStudyQuestions: db.prepare('SELECT * FROM study_questions WHERE exam=? ORDER BY created_at,rowid'),
+    countStudyQuestions: db.prepare('SELECT COUNT(*) AS c FROM study_questions'),
+    recordStudyAttempt: db.prepare('INSERT INTO study_attempts(id,user_id,question_id,correct,attempted_at) VALUES(?,?,?,?,?)'),
+    getStudyAttemptsByTopic: db.prepare(`SELECT q.exam AS exam, q.topic AS topic, COUNT(*) AS total,
+        SUM(CASE WHEN a.correct=0 THEN 1 ELSE 0 END) AS wrong
+      FROM study_attempts a JOIN study_questions q ON q.id=a.question_id
+      WHERE a.user_id=? AND a.attempted_at>=? GROUP BY q.exam,q.topic`),
+    getStudyActiveDates: db.prepare('SELECT DISTINCT SUBSTR(attempted_at,1,10) AS day FROM study_attempts WHERE user_id=? ORDER BY day DESC LIMIT 400'),
+    getLastStudyActivity: db.prepare('SELECT MAX(attempted_at) AS last_at FROM study_attempts WHERE user_id=?'),
   };
 
   return {
@@ -990,6 +1013,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     unmuteRadarRepo: (userId,repo) => s.unmuteRadarRepo.run(userId,String(repo).toLowerCase()).changes>0,
     listRadarMutes: (userId) => s.listRadarMutes.all(userId),
     isRadarMuted: (userId,repo) => Boolean(s.radarMute.get(userId,String(repo).toLowerCase())),
+    // Study coach: question bank + quiz attempts (drives weak spots + streaks).
+    addStudyQuestion({id,exam,topic,question,choices,correctIndex,explanation,source}) {
+      s.addStudyQuestion.run(id,exam,topic,question,JSON.stringify(choices),correctIndex,explanation,timestamp(),source||'chat');
+    },
+    getStudyQuestion: (id) => s.getStudyQuestion.get(id) || null,
+    listStudyQuestions: (exam) => s.listStudyQuestions.all(exam),
+    countStudyQuestions: () => s.countStudyQuestions.get().c,
+    recordStudyAttempt({id,userId,questionId,correct}) { s.recordStudyAttempt.run(id,userId,questionId,correct?1:0,timestamp()); },
+    getStudyAttemptsByTopic: (userId,cutoff) => s.getStudyAttemptsByTopic.all(userId,cutoff),
+    getStudyActiveDates: (userId) => s.getStudyActiveDates.all(userId).map((r)=>r.day),
+    getLastStudyActivity: (userId) => s.getLastStudyActivity.get(userId)?.last_at || null,
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },

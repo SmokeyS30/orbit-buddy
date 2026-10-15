@@ -463,6 +463,17 @@ CREATE TABLE IF NOT EXISTS radar_mutes (
   PRIMARY KEY (user_id, repo)
 );
 
+CREATE TABLE IF NOT EXISTS study_questions (
+  id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
+  question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
+  explanation TEXT NOT NULL, created_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'seed'
+);
+
+CREATE TABLE IF NOT EXISTS study_attempts (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, question_id TEXT NOT NULL,
+  correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
 
@@ -486,3 +497,5 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conver
 CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id);
+CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam);
+CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC);

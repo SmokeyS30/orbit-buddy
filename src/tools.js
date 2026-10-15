@@ -2,6 +2,7 @@ import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
+import { startQuizSession, answerQuizQuestion, stopQuizSession, getStudyWeakSpots, getStudyStreak, normalizeStudyExam, STUDY_EXAMS } from './study-coach.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -1042,6 +1043,52 @@ export function toolRadarStatus(args = {}, ctx = null) {
   };
 }
 
+// Study coach: quiz mode for CompTIA certs (A+ Core 1/2, Security+, CCNA).
+// Quiz session state lives in-memory per user (see src/study-coach.js); every
+// answer is persisted to study_attempts, so weak spots and streaks survive
+// restarts even though an in-progress session does not.
+export function toolStudyQuizStart(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'study_quiz_start');
+  return startQuizSession(db, userId, args.exam);
+}
+
+export function toolStudyQuizAnswer(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'study_quiz_answer');
+  return answerQuizQuestion(db, userId, args.answer);
+}
+
+export function toolStudyQuizStop(args = {}, ctx = null) {
+  const { userId } = writeContext(ctx, 'study_quiz_stop');
+  return stopQuizSession(userId);
+}
+
+export function toolStudyWeakSpots(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'study_weak_spots');
+  const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
+  const exam = normalizeStudyExam(args.exam);
+  let weak = getStudyWeakSpots(db, userId);
+  if (exam) weak = weak.filter((w) => w.exam === exam);
+  const streak = getStudyStreak(db, userId, zone);
+  return { weakSpots: weak, streak, exam: exam || null };
+}
+
+export function toolStudyAddQuestion(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'study_add_question');
+  const exam = normalizeStudyExam(args.exam);
+  if (!exam) throw new Error(`Unknown exam "${String(args.exam || '').slice(0, 40)}". Use one of: ${STUDY_EXAMS.join(', ')}.`);
+  const topic = cleanArg(args.topic, 120, 'topic');
+  const question = cleanArg(args.question, 2000, 'question');
+  const choices = Array.isArray(args.choices) ? args.choices.map((c) => String(c).slice(0, 500)) : [];
+  if (choices.length !== 4 || choices.some((c) => !c.trim())) throw new Error('study_add_question needs exactly 4 non-empty choices.');
+  const correctIndex = Number(args.correctIndex);
+  if (!Number.isInteger(correctIndex) || correctIndex < 0 || correctIndex > 3) throw new Error('correctIndex must be an integer 0-3.');
+  const explanation = cleanArg(args.explanation, 2000, 'explanation');
+  const id = `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  db.addStudyQuestion({ id, exam, topic, question, choices, correctIndex, explanation, source: 'chat' });
+  db.addEvent(userId, 'study_question_added', `Added a ${exam} question on ${topic}.`);
+  return { added: true, id, exam, topic };
+}
+
 export async function toolReadCalendar(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'read_calendar');
   const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
@@ -1623,6 +1670,74 @@ export const TOOL_DEFINITIONS = [
       properties: {},
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'study_quiz_start',
+    description: 'Start a study quiz for a CompTIA exam. Call when the user says "quiz me on Security+", "quiz me on A+", "quiz me on CCNA", "start an A+ Core 2 quiz", or any clear variant. Returns the first multiple-choice question (the answer is withheld) — present it with lettered choices (A-D), one question at a time. Exams: "A+ Core 1", "A+ Core 2", "Security+", "CCNA" (also accepts "A+", "220-1201", "220-1202", "SY0-701", "200-301").',
+    parameters: {
+      type: 'object',
+      properties: {
+        exam: { type: 'string', description: 'Exam to quiz on, e.g. "Security+", "A+ Core 1", "CCNA".' }
+      },
+      required: ['exam'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'study_quiz_answer',
+    description: 'Check the user\'s answer to the current quiz question. Call when the user answers during an active quiz (a letter like "B", a number, or the choice text). Returns correct/incorrect, the correct answer, a short Professor-Messer-style explanation (why the right answer is right, why the others are wrong), the session score, and the next question. Keep your reply short: confirm the verdict, give the explanation in a sentence or two, then ask the next question. Never reveal the answer before they answer.',
+    parameters: {
+      type: 'object',
+      properties: {
+        answer: { type: 'string', description: 'The user\'s answer: letter (A-D), number (1-4), or choice text.' }
+      },
+      required: ['answer'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'study_quiz_stop',
+    description: 'End the active study quiz. Call when the user says "stop quiz", "end the quiz", "enough studying", or any clear variant. Returns the final score — report it warmly with encouragement, never a guilt trip.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'study_weak_spots',
+    description: 'Show the topics the user is struggling with, per exam, based on recent wrong quiz answers (a topic counts as weak with 2+ wrong answers in the last 14 days). Also returns the current study streak (consecutive days with quiz activity). Call when the user says "my weak spots", "show my weak spots", "what should I study", or asks about study progress. Present encouragingly — celebrate the streak, never guilt-trip.',
+    parameters: {
+      type: 'object',
+      properties: {
+        exam: { type: 'string', description: 'Optional: filter to one exam, e.g. "Security+".' }
+      },
+      required: [],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'study_add_question',
+    description: 'Save a new quiz question to the study bank. Call ONLY after the user confirms the full question in chat: when they say "add a question about X", first ask for (or draft for their approval) the question text, exactly 4 answer choices, which one is correct, and a short explanation. Never invent and store a question without their explicit confirmation of the content. The saved question becomes part of future quizzes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        exam: { type: 'string', description: 'Exam, e.g. "Security+".' },
+        topic: { type: 'string', description: 'Topic label, e.g. "Subnetting".' },
+        question: { type: 'string', description: 'The question text.' },
+        choices: { type: 'array', items: { type: 'string' }, description: 'Exactly 4 answer choices.' },
+        correctIndex: { type: 'integer', description: 'Index (0-3) of the correct choice.' },
+        explanation: { type: 'string', description: 'Short explanation: why the right answer is right, why the others are wrong.' }
+      },
+      required: ['exam', 'topic', 'question', 'choices', 'correctIndex', 'explanation'],
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1667,7 +1782,12 @@ const TOOL_SUMMARIES = {
   forget_writing_voice: () => 'Forgot writing voice',
   mute_radar: (args) => `Muted radar: ${String(args.repo || '').slice(0, 60)}`,
   unmute_radar: (args) => `Unmuted radar: ${String(args.repo || '').slice(0, 60)}`,
-  radar_status: () => 'Radar status'
+  radar_status: () => 'Radar status',
+  study_quiz_start: (args) => `Quiz started: ${String(args.exam || '').slice(0, 40)}`,
+  study_quiz_answer: (args) => `Quiz answer: ${String(args.answer || '').slice(0, 40)}`,
+  study_quiz_stop: () => 'Quiz stopped',
+  study_weak_spots: (args) => `Weak spots${args.exam ? `: ${String(args.exam).slice(0, 40)}` : ''}`,
+  study_add_question: (args) => `Added ${String(args.exam || '').slice(0, 40)} question: ${String(args.topic || '').slice(0, 60)}`
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -1833,6 +1953,26 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'radar_status': {
       const result = toolRadarStatus(clean, ctx);
       return { result, summary: 'Radar status' };
+    }
+    case 'study_quiz_start': {
+      const result = toolStudyQuizStart(clean, ctx);
+      return { result, summary: `Quiz: ${String(clean.exam || '').slice(0, 40)}` };
+    }
+    case 'study_quiz_answer': {
+      const result = toolStudyQuizAnswer(clean, ctx);
+      return { result, summary: `Answered: ${String(clean.answer || '').slice(0, 40)}` };
+    }
+    case 'study_quiz_stop': {
+      const result = toolStudyQuizStop(clean, ctx);
+      return { result, summary: 'Quiz stopped' };
+    }
+    case 'study_weak_spots': {
+      const result = toolStudyWeakSpots(clean, ctx);
+      return { result, summary: 'Study weak spots' };
+    }
+    case 'study_add_question': {
+      const result = toolStudyAddQuestion(clean, ctx);
+      return { result, summary: `Added study question (${String(result.exam || '').slice(0, 30)})` };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }
