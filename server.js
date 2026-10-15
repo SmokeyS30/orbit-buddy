@@ -2278,7 +2278,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             db.addEvent(userId,'approval_rejected',`Rejected “${approval.title}”.`);
             return json(res,200,rejected);
           }
-          if(!['calendar_event','gmail_send','gmail_delete'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
+          if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
           if((approval.kind==='gmail_send'||approval.kind==='gmail_delete')&&paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
@@ -2293,6 +2293,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               const result=await sendEmail(()=>connectors.getValidToken(userId,'gmail'),approval.payload);
               const executed=db.finishApproval(userId,approval.id,'executed',{result});
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
+              return json(res,200,{approval:executed});
+            }
+            if(approval.kind==='delete_goal'||approval.kind==='delete_task'||approval.kind==='delete_routine'){
+              const {id,title,objectType}=approval.payload||{};
+              const ok=approval.kind==='delete_goal'?db.deleteGoal(userId,id):approval.kind==='delete_task'?db.deleteTask(userId,id):db.deleteRoutine(userId,id);
+              if(!ok){
+                db.finishApproval(userId,approval.id,'failed',{error:'The item was already gone.'});
+                db.addEvent(userId,'approval_failed',`Could not delete “${title||'item'}” — it no longer exists.`);
+                return json(res,200,{approval:db.getApproval(userId,approval.id)});
+              }
+              const executed=db.finishApproval(userId,approval.id,'executed',{result:{deleted:approval.kind,id,title}});
+              db.addEvent(userId,'approval_executed',`Deleted ${objectType||'item'} “${title}” after approval.`);
               return json(res,200,{approval:executed});
             }
             const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
