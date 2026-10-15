@@ -5,12 +5,12 @@ import { toolGetDatetime, parseLiteResults, assertPublicUrl, executeTool, TOOL_D
 import { createModelClient } from '../src/model.js';
 
 test('tool definitions are valid Responses API function tools', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 38);
+  assert.equal(TOOL_DEFINITIONS.length, 41);
   for (const tool of TOOL_DEFINITIONS) {
     assert.equal(tool.type, 'function');
     assert.ok(tool.name && tool.description && tool.parameters);
   }
-  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'confirm_delete_approval', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'delete_goal', 'delete_routine', 'delete_task', 'enable_gift_reminder', 'fetch_url', 'forget_writing_voice', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'learn_writing_voice', 'mark_gift_done', 'propose_calendar_event', 'propose_memory', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_ambient_context', 'set_buddy_name', 'update_goal', 'update_project_step', 'update_routine', 'update_task', 'web_search']);
+  assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name).sort(), ['calculate', 'complete_task', 'confirm_delete_approval', 'create_goal', 'create_project', 'create_routine', 'create_task', 'deep_research', 'delete_goal', 'delete_routine', 'delete_task', 'enable_gift_reminder', 'fetch_url', 'forget_writing_voice', 'get_datetime', 'get_news', 'get_sports', 'get_stock', 'get_weather', 'gmail_delete', 'gmail_read', 'gmail_search', 'gmail_send', 'learn_writing_voice', 'mark_gift_done', 'mute_radar', 'propose_calendar_event', 'propose_memory', 'radar_status', 'read_calendar', 'save_memory', 'save_personal_date', 'schedule_followup', 'set_ambient_context', 'set_buddy_name', 'unmute_radar', 'update_goal', 'update_project_step', 'update_routine', 'update_task', 'web_search']);
 });
 
 test('get_datetime returns current time and falls back on bad timezone', () => {

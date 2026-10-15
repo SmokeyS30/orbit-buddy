@@ -22,6 +22,7 @@ import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MES
 import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
+import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -1575,8 +1576,27 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);}
     finally{proactiveBusy=false;}
+  }
+  // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
+  // Polls at most every 30 minutes (see src/radar.js); high-signal findings
+  // become check-ins via the shared proactive pipeline, quieter ones surface
+  // in the Today-tab briefing. Never throws: a radar failure must not break
+  // the rest of the proactive loop.
+  async function runProjectRadar(nowMs){
+    try{
+      const poll=await runRadarPoll({db,env,nowMs});
+      if(poll.surfaced.length){
+        await deliverRadarFindings({
+          db,surfaced:poll.surfaced,nowMs,
+          isQuiet:(prefs)=>isQuietHours(prefs,nowMs),
+          deliver:async({user,finding,text})=>{
+            await deliverProactive(user,text,'radar_checkin_sent',`Project radar: ${finding.title}`);
+          },
+        });
+      }
+    }catch(error){console.error('project radar failed',error&&error.message);}
   }
 
   let backupBusy=false;

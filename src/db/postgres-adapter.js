@@ -953,6 +953,29 @@ const indexMigrations = [
     setWhatsAppLastInbound: async (userId, at = timestamp()) => (await run('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?', at, userId)).changes > 0,
     unlinkWhatsApp: async (userId) => (await run('DELETE FROM whatsapp_links WHERE user_id=?', userId)).changes > 0,
 
+    // --- X6 project radar: surfaced findings (dedupe), per-user deliveries, per-user repo mutes ---
+    radarFindingSeen: async (key) => Boolean(await get('SELECT 1 FROM radar_findings WHERE finding_key=?', key)),
+    storeRadarFinding: async (f) => {
+      const now = timestamp();
+      await run(`INSERT INTO radar_findings(finding_key,repo,kind,signal,title,detail,url,workflow,branch,found_at,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(finding_key) DO NOTHING`,
+        f.key, f.repo, f.kind, f.signal, f.title, f.detail || null, f.url || null, f.workflow || null, f.branch || null, f.foundAt || now, now);
+    },
+    listRecentRadarFindings: async (limit = 20) => all('SELECT * FROM radar_findings ORDER BY found_at DESC, created_at DESC LIMIT ?', Math.max(1, Math.min(100, Number(limit) || 20))),
+    listRadarUnrecoveredFailures: async (repo) => all(`SELECT workflow, branch FROM radar_findings f
+      WHERE repo=? AND kind='run' AND signal='high' AND workflow IS NOT NULL AND branch IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM radar_findings r
+        WHERE r.repo=f.repo AND r.kind='run' AND r.workflow=f.workflow AND r.branch=f.branch
+          AND r.finding_key LIKE '%:recovered' AND r.created_at>=f.created_at
+      )`, repo),
+    radarFindingDelivered: async (key, userId) => Boolean(await get('SELECT 1 FROM radar_deliveries WHERE finding_key=? AND user_id=?', key, userId)),
+    markRadarFindingDelivered: async (key, userId) => { await run('INSERT INTO radar_deliveries(finding_key,user_id,delivered_at) VALUES(?,?,?) ON CONFLICT(finding_key,user_id) DO NOTHING', key, userId, timestamp()); },
+    muteRadarRepo: async (userId, repo) => { await run('INSERT INTO radar_mutes(user_id,repo,muted_at) VALUES(?,?,?) ON CONFLICT(user_id,repo) DO NOTHING', userId, String(repo).toLowerCase(), timestamp()); },
+    unmuteRadarRepo: async (userId, repo) => (await run('DELETE FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())).changes > 0,
+    listRadarMutes: async (userId) => all('SELECT * FROM radar_mutes WHERE user_id=? ORDER BY muted_at DESC', userId),
+    isRadarMuted: async (userId, repo) => Boolean(await get('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())),
+
     // --- OAuth states ---
     addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },
     async consumeOauthState(hash) {

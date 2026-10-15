@@ -263,6 +263,33 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       last_inbound_at TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS radar_findings (
+      finding_key TEXT PRIMARY KEY,
+      repo TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      signal TEXT NOT NULL,
+      title TEXT NOT NULL,
+      detail TEXT,
+      url TEXT,
+      workflow TEXT,
+      branch TEXT,
+      found_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS radar_deliveries (
+      finding_key TEXT NOT NULL REFERENCES radar_findings(finding_key) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      delivered_at TEXT NOT NULL,
+      PRIMARY KEY (finding_key, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS radar_mutes (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      repo TEXT NOT NULL,
+      muted_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, repo)
+    );
+    CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
     CREATE TABLE IF NOT EXISTS waitlist (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
       status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
@@ -591,7 +618,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getWhatsAppLink: db.prepare('SELECT * FROM whatsapp_links WHERE user_id=?'),
     getUserByWhatsApp: db.prepare('SELECT * FROM whatsapp_links WHERE phone_e164=?'),
     setWhatsAppLastInbound: db.prepare('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?'),
-    unlinkWhatsApp: db.prepare('DELETE FROM whatsapp_links WHERE user_id=?')
+    unlinkWhatsApp: db.prepare('DELETE FROM whatsapp_links WHERE user_id=?'),
+    radarFindingSeen: db.prepare('SELECT 1 FROM radar_findings WHERE finding_key=?'),
+    storeRadarFinding: db.prepare(`INSERT INTO radar_findings(finding_key,repo,kind,signal,title,detail,url,workflow,branch,found_at,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(finding_key) DO NOTHING`),
+    listRecentRadarFindings: db.prepare('SELECT * FROM radar_findings ORDER BY found_at DESC, created_at DESC LIMIT ?'),
+    radarUnrecoveredFailures: db.prepare(`SELECT workflow, branch FROM radar_findings f
+      WHERE repo=? AND kind='run' AND signal='high' AND workflow IS NOT NULL AND branch IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM radar_findings r
+        WHERE r.repo=f.repo AND r.kind='run' AND r.workflow=f.workflow AND r.branch=f.branch
+          AND r.finding_key LIKE '%:recovered' AND r.created_at>=f.created_at
+      )`),
+    radarFindingDelivered: db.prepare('SELECT 1 FROM radar_deliveries WHERE finding_key=? AND user_id=?'),
+    markRadarFindingDelivered: db.prepare('INSERT INTO radar_deliveries(finding_key,user_id,delivered_at) VALUES(?,?,?) ON CONFLICT(finding_key,user_id) DO NOTHING'),
+    muteRadarRepo: db.prepare('INSERT INTO radar_mutes(user_id,repo,muted_at) VALUES(?,?,?) ON CONFLICT(user_id,repo) DO NOTHING'),
+    unmuteRadarRepo: db.prepare('DELETE FROM radar_mutes WHERE user_id=? AND repo=?'),
+    listRadarMutes: db.prepare('SELECT * FROM radar_mutes WHERE user_id=? ORDER BY muted_at DESC'),
+    radarMute: db.prepare('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?')
   };
 
   return {
@@ -932,6 +976,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
     setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,
     unlinkWhatsApp: (userId) => s.unlinkWhatsApp.run(userId).changes>0,
+    // X6 project radar: surfaced findings (dedupe), per-user deliveries, per-user repo mutes.
+    radarFindingSeen: (key) => Boolean(s.radarFindingSeen.get(key)),
+    storeRadarFinding(f) { const now=timestamp(); s.storeRadarFinding.run(f.key,f.repo,f.kind,f.signal,f.title,f.detail||null,f.url||null,f.workflow||null,f.branch||null,f.foundAt||now,now); },
+    listRecentRadarFindings: (limit=20) => s.listRecentRadarFindings.all(Math.max(1,Math.min(100,Number(limit)||20))),
+    listRadarUnrecoveredFailures: (repo) => s.radarUnrecoveredFailures.all(repo),
+    radarFindingDelivered: (key,userId) => Boolean(s.radarFindingDelivered.get(key,userId)),
+    markRadarFindingDelivered(key,userId) { s.markRadarFindingDelivered.run(key,userId,timestamp()); },
+    muteRadarRepo: (userId,repo) => { s.muteRadarRepo.run(userId,String(repo).toLowerCase(),timestamp()); },
+    unmuteRadarRepo: (userId,repo) => s.unmuteRadarRepo.run(userId,String(repo).toLowerCase()).changes>0,
+    listRadarMutes: (userId) => s.listRadarMutes.all(userId),
+    isRadarMuted: (userId,repo) => Boolean(s.radarMute.get(userId,String(repo).toLowerCase())),
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
