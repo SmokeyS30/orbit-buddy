@@ -928,3 +928,35 @@ test('set_ambient_context records the permission choice', async () => {
   await assert.rejects(() => executeTool('set_ambient_context', {}, {}, ctx), /granted.*declined/);
   db.close();
 });
+
+test('validBriefingCoords accepts only finite in-range coordinates', async () => {
+  const { validBriefingCoords } = await import('../src/tools.js');
+  assert.deepEqual(validBriefingCoords(42.36, -71.06), { latitude: 42.36, longitude: -71.06 });
+  assert.deepEqual(validBriefingCoords('42.36', '-71.06'), { latitude: 42.36, longitude: -71.06 });
+  assert.equal(validBriefingCoords(91, 0), null);
+  assert.equal(validBriefingCoords(0, 181), null);
+  assert.equal(validBriefingCoords(NaN, 0), null);
+  assert.equal(validBriefingCoords(Infinity, 0), null);
+  assert.equal(validBriefingCoords(null, null), null);
+  assert.equal(validBriefingCoords('', ''), null);
+  assert.equal(validBriefingCoords('abc', 0), null);
+});
+
+test('get_weather with latitude/longitude skips geocoding and uses them in the forecast URL', async (t) => {
+  const { toolGetWeather } = await import('../src/tools.js');
+  const realFetch = global.fetch;
+  t.after(() => { global.fetch = realFetch; });
+  const seen = [];
+  global.fetch = async (url) => {
+    seen.push(String(url));
+    return { json: async () => ({ current: { temperature_2m: 60, weather_code: 1, wind_speed_10m: 5 }, daily: { time: ['2026-10-15'], weather_code: [1], temperature_2m_max: [65], temperature_2m_min: [50] } }) };
+  };
+  const result = await toolGetWeather({ latitude: 42.36, longitude: -71.06 });
+  assert.ok(result.startsWith('Weather for Current location:'), 'labels direct-coord weather');
+  assert.ok(result.includes('60°F'));
+  const wxCall = seen.find((u) => u.includes('api.open-meteo.com/v1/forecast'));
+  assert.ok(wxCall, 'forecast fetch happened');
+  assert.ok(wxCall.includes('latitude=42.36'), 'lat used in forecast URL');
+  assert.ok(wxCall.includes('longitude=-71.06'), 'lon used in forecast URL');
+  assert.ok(!seen.some((u) => u.includes('geocoding-api')), 'no geocoding request made');
+});

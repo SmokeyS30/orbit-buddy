@@ -64,6 +64,8 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Orbit Buddy uses your location only to show weather for where you are in the Today tab. Your coordinates are never stored or shared.</string>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
 </dict>

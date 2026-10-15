@@ -141,21 +141,40 @@ export async function toolFetchUrl(args = {}) {
 }
 
 const geoCache = new Map();
+// Privacy: when latitude/longitude are supplied they are used transiently for
+// the Open-Meteo fetch only — never stored, never logged, never persisted.
+export function validBriefingCoords(latitude, longitude) {
+  for (const v of [latitude, longitude]) {
+    if (v == null) return null; // null/undefined → absent, not 0
+    if (typeof v === 'string' && v.trim() === '') return null; // '' → absent, not 0
+  }
+  const lat = Number(latitude), lon = Number(longitude);
+  return Number.isFinite(lat) && Number.isFinite(lon)
+    && Math.abs(lat) <= 90 && Math.abs(lon) <= 180
+    ? { latitude: lat, longitude: lon } : null;
+}
 export async function toolGetWeather(args = {}) {
-  const location = String(args.location || '').trim().slice(0, 100) || 'Brewster, MA';
-  // Geocode the location (Open-Meteo, free, no key) - cached to avoid repeat lookups
-  const cacheKey = location.toLowerCase();
-  let geo = geoCache.get(cacheKey);
-  if (!geo) {
-    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
-    try {
-      const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      const data = await res.json();
-      if (!data.results?.length) throw new Error('Location not found.');
-      geo = data.results[0];
-      geoCache.set(cacheKey, geo);
-    } catch (e) {
-      throw new Error(`Could not find "${location}": ${e.message}`);
+  // Direct coordinates (location-aware briefing): skip geocoding entirely.
+  const direct = validBriefingCoords(args.latitude, args.longitude);
+  let geo;
+  if (direct) {
+    geo = { ...direct, name: 'Current location', admin1: '' };
+  } else {
+    const location = String(args.location || '').trim().slice(0, 100) || 'Brewster, MA';
+    // Geocode the location (Open-Meteo, free, no key) - cached to avoid repeat lookups
+    const cacheKey = location.toLowerCase();
+    geo = geoCache.get(cacheKey);
+    if (!geo) {
+      const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
+      try {
+        const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+        const data = await res.json();
+        if (!data.results?.length) throw new Error('Location not found.');
+        geo = data.results[0];
+        geoCache.set(cacheKey, geo);
+      } catch (e) {
+        throw new Error(`Could not find "${location}": ${e.message}`);
+      }
     }
   }
   // Get weather (Fahrenheit, since user is US-based)

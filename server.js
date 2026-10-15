@@ -16,7 +16,7 @@ import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
 import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone } from './src/ambient.js';
 import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
-import { buildTodayBriefing } from './src/briefing.js';
+import { buildTodayBriefing, resolveBriefingCoords } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
@@ -1592,7 +1592,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
   const server=http.createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');res.setHeader('X-Frame-Options','DENY');
-    res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.setHeader('Permissions-Policy','camera=(), microphone=(), geolocation=(self), payment=(), usb=()');
     res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
@@ -1991,10 +1991,16 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const prefs=db.getPreferences(userId);
           const zone=prefs.time_zone||'America/New_York';
           const today=todayInZone(zone);
-          const cached=briefingCache.get(userId);
+          // Location-aware weather: optional client-supplied lat/lon (validated,
+          // transient — used for the Open-Meteo fetch only, never stored/logged).
+          // Absent or invalid → home coords (Brewster, MA).
+          const latP=url.searchParams.get('lat'),lonP=url.searchParams.get('lon');
+          const coords=(latP!=null||lonP!=null)?resolveBriefingCoords(latP,lonP):null;
+          const cacheKey=coords?`${userId}@${coords.latitude.toFixed(2)},${coords.longitude.toFixed(2)}`:userId;
+          const cached=briefingCache.get(cacheKey);
           if(cached&&cached.date===today&&Date.now()-cached.at<10*60_000)return json(res,200,cached.data);
-          const data=await buildTodayBriefing(db,userId,{reliability:reliabilityFor(userId)});
-          briefingCache.set(userId,{date:today,at:Date.now(),data});
+          const data=await buildTodayBriefing(db,userId,{reliability:reliabilityFor(userId),coords});
+          briefingCache.set(cacheKey,{date:today,at:Date.now(),data});
           return json(res,200,data);
         }
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
