@@ -467,7 +467,9 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
     if(await tryWhatsAppProactive(user.id,text))return;
-    await push.notify(user.id,buddyNameFor(user.id),text,{view:'today'});
+    // W4: notification tap deep-linking — the check-in lives in this conversation,
+    // so carry its id in the push payload; the SW routes the tap straight to it.
+    await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
   }
   // WhatsApp delivery for a completed scheduled task: only when the 24h window
   // is open. Outside the window (or if sending fails) we fall back to push so
