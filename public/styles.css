@@ -115,6 +115,14 @@ button,.tab,.thread-chip,a{touch-action:manipulation;-webkit-tap-highlight-color
 .briefing-card{background:var(--panel);border:1px solid var(--line);border-radius:17px;padding:18px 20px}
 .briefing-card h3{margin:0 0 12px;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
 .briefing-card p{margin:0 0 8px;line-height:1.5}
+/* "Catch me up" digest card: inline + dismissible, never a modal. */
+.catchup-card{margin-bottom:16px;border-color:var(--accent,#7aa2ff)}
+.catchup-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.catchup-head h3{margin:0}
+.catchup-dismiss{background:transparent;border:0;color:var(--muted);font:inherit;font-size:15px;line-height:1;cursor:pointer;padding:6px 9px;border-radius:9px}
+.catchup-dismiss:hover{color:var(--text);background:rgba(255,255,255,.07)}
+.catchup-row .catchup-text{display:flex;flex-direction:column;gap:2px;flex:1;min-width:0;text-align:left}
+.catchup-row .agenda-title{overflow-wrap:anywhere}
 .weather-now{display:flex;align-items:center;gap:14px}
 .weather-now strong{font-size:44px;letter-spacing:-.03em;line-height:1}
 .forecast-strip{display:flex;gap:10px;margin-top:14px}

@@ -25,6 +25,7 @@ import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from 
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
+import { buildCatchupDigest, isAwayEnough, clampSinceMs } from './src/catchup.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -2145,7 +2146,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeOrigin(req.headers.origin)?'None':'Strict'}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName:buddyNameFor(user.user_id||user.id),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
-        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
+        if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}// "Catch me up": capture the previous app-open before stamping this one,
+// so the Today-tab card can tell a genuine 6h+ absence from a refresh.
+let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
         const userId=user.user_id||user.id;
         // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
         // the 15s frontend refresh doesn't refetch weather/calendar each time.
@@ -2164,6 +2167,30 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const data=await buildTodayBriefing(db,userId,{reliability:reliabilityFor(userId),coords});
           briefingCache.set(cacheKey,{date:today,at:Date.now(),data});
           return json(res,200,data);
+        }
+        // "Catch me up" digest: what happened while the user was away.
+        // GET builds the digest for ?since=<ISO> (the previous app-open, read
+        // from the snapshot payload). The 6h+ away gate is enforced here;
+        // returned items are marked seen so they never reappear.
+        if(req.method==='GET'&&url.pathname==='/api/catchup-digest'){
+          if(userRateLimited(userId,'catchup-digest',20,60_000))throw Object.assign(new Error('Too many catch-up requests. Try again shortly.'),{status:429});
+          const nowMs=Date.now();
+          const sinceMs=clampSinceMs(Date.parse(url.searchParams.get('since')||''),nowMs);
+          const awayMs=sinceMs==null?0:nowMs-sinceMs;
+          if(sinceMs==null||!isAwayEnough(sinceMs,nowMs))return json(res,200,{ok:true,away:false,awayHours:Math.floor(awayMs/3600000),items:[]});
+          const prefs=db.getPreferences(userId);
+          const digest=await buildCatchupDigest(db,userId,{sinceMs,nowMs,timeZone:prefs.time_zone||'America/New_York'});
+          try{db.markCatchupSeen(userId,digest.items.map((i)=>i.key));}catch(_){}
+          return json(res,200,{ok:true,away:true,awayHours:Math.floor(awayMs/3600000),items:digest.items,generatedAt:digest.generatedAt});
+        }
+        // Dismiss catch-up items: tapping X records dismissed_at — dismissed
+        // items never reappear, on the card or in chat.
+        if(req.method==='POST'&&url.pathname==='/api/catchup-digest/dismiss'){
+          const body=await readJson(req);
+          const keys=Array.isArray(body.keys)?body.keys.filter((k)=>typeof k==='string'&&k.length<=200).slice(0,100):[];
+          if(!keys.length)throw Object.assign(new Error('Provide item keys to dismiss.'),{status:400});
+          const dismissed=db.dismissCatchupItems(userId,keys);
+          return json(res,200,{ok:true,dismissed});
         }
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});

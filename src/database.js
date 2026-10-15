@@ -288,6 +288,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       muted_at TEXT NOT NULL,
       PRIMARY KEY (user_id, repo)
     );
+    CREATE TABLE IF NOT EXISTS catchup_seen (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      item_key TEXT NOT NULL,
+      seen_at TEXT NOT NULL,
+      dismissed_at TEXT,
+      PRIMARY KEY (user_id, item_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id);
     CREATE TABLE IF NOT EXISTS study_questions (
       id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
       question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
@@ -359,6 +367,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'people_mentions', 'sentiment', 'TEXT');
   ensureColumn(db, 'people_mentions', 'last_context_update', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'proactive_state', 'last_app_open_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
@@ -655,6 +664,35 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listStudyQuestions: db.prepare('SELECT * FROM study_questions WHERE exam=? ORDER BY created_at,rowid'),
     countStudyQuestions: db.prepare('SELECT COUNT(*) AS c FROM study_questions'),
     recordStudyAttempt: db.prepare('INSERT INTO study_attempts(id,user_id,question_id,correct,attempted_at) VALUES(?,?,?,?,?)'),
+    // "Catch me up" digest: last app-open tracking + seen/dismissed item keys.
+    getLastAppOpen: db.prepare('SELECT last_app_open_at FROM proactive_state WHERE user_id=?'),
+    setLastAppOpen: db.prepare(`INSERT INTO proactive_state(user_id,last_app_open_at) VALUES(?,?)
+      ON CONFLICT(user_id) DO UPDATE SET last_app_open_at=excluded.last_app_open_at`),
+    listCatchupSeenKeys: db.prepare('SELECT item_key FROM catchup_seen WHERE user_id=?'),
+    markCatchupSeen: db.prepare(`INSERT INTO catchup_seen(user_id,item_key,seen_at,dismissed_at) VALUES(?,?,?,NULL)
+      ON CONFLICT(user_id,item_key) DO NOTHING`),
+    dismissCatchupItem: db.prepare(`INSERT INTO catchup_seen(user_id,item_key,seen_at,dismissed_at) VALUES(?,?,?,?)
+      ON CONFLICT(user_id,item_key) DO UPDATE SET dismissed_at=excluded.dismissed_at`),
+    listCatchupEvents: db.prepare(`SELECT id,type,message,detail,created_at FROM events
+      WHERE user_id=? AND created_at>? AND type IN ('smart_checkin_sent','quiet_nudge_sent','radar_checkin_sent','followup_sent','routine_sent','weekly_review_sent','email_urgent_sent','study_nudge_sent','calendar_feed_added','calendar_feed_removed')
+      ORDER BY created_at DESC LIMIT ?`),
+    listUndeliveredRadarFindingsSince: db.prepare(`SELECT f.* FROM radar_findings f
+      LEFT JOIN radar_deliveries d ON d.finding_key=f.finding_key AND d.user_id=?
+      WHERE f.found_at>? AND d.finding_key IS NULL
+      ORDER BY f.found_at DESC LIMIT ?`),
+    listUnrecoveredFailureDetails: db.prepare(`SELECT f.repo,f.workflow,f.branch,f.title,f.url,f.found_at FROM radar_findings f
+      WHERE f.kind='run' AND f.signal='high' AND f.workflow IS NOT NULL AND f.branch IS NOT NULL
+      AND f.created_at=(SELECT MAX(r.created_at) FROM radar_findings r
+        WHERE r.repo=f.repo AND r.kind='run' AND r.signal='high' AND r.workflow=f.workflow AND r.branch=f.branch)
+      AND NOT EXISTS (
+        SELECT 1 FROM radar_findings r2
+        WHERE r2.repo=f.repo AND r2.kind='run' AND r2.workflow=f.workflow AND r2.branch=f.branch
+          AND r2.finding_key LIKE '%:recovered' AND r2.created_at>=f.created_at)
+      ORDER BY f.found_at DESC LIMIT ?`),
+    listTasksDueBefore: db.prepare(`SELECT id,title,schedule_at,status,created_at FROM tasks
+      WHERE user_id=? AND status NOT IN ('completed','cancelled','failed')
+        AND schedule_at IS NOT NULL AND schedule_at<=?
+      ORDER BY schedule_at ASC LIMIT ?`),
     getStudyAttemptsByTopic: db.prepare(`SELECT q.exam AS exam, q.topic AS topic, COUNT(*) AS total,
         SUM(CASE WHEN a.correct=0 THEN 1 ELSE 0 END) AS wrong
       FROM study_attempts a JOIN study_questions q ON q.id=a.question_id
@@ -1024,6 +1062,29 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getStudyAttemptsByTopic: (userId,cutoff) => s.getStudyAttemptsByTopic.all(userId,cutoff),
     getStudyActiveDates: (userId) => s.getStudyActiveDates.all(userId).map((r)=>r.day),
     getLastStudyActivity: (userId) => s.getLastStudyActivity.get(userId)?.last_at || null,
+    // "Catch me up" digest: last app-open tracking + seen/dismissed item keys.
+    getLastAppOpen: (userId) => s.getLastAppOpen.get(userId)?.last_app_open_at || null,
+    setLastAppOpen: (userId, iso) => { s.setLastAppOpen.run(userId, iso); },
+    listCatchupSeenKeys: (userId) => s.listCatchupSeenKeys.all(userId).map((r) => r.item_key),
+    markCatchupSeen(userId, keys) {
+      const now = timestamp();
+      for (const key of new Set((keys || []).map((k) => String(k || '').slice(0, 200)).filter(Boolean))) {
+        s.markCatchupSeen.run(userId, key, now);
+      }
+    },
+    dismissCatchupItems(userId, keys) {
+      const now = timestamp();
+      let n = 0;
+      for (const key of new Set((keys || []).map((k) => String(k || '').slice(0, 200)).filter(Boolean))) {
+        s.dismissCatchupItem.run(userId, key, now, now);
+        n++;
+      }
+      return n;
+    },
+    listCatchupEvents: (userId, sinceIso, limit = 60) => s.listCatchupEvents.all(userId, sinceIso, Math.max(1, Math.min(100, Number(limit) || 60))),
+    listUndeliveredRadarFindingsSince: (userId, sinceIso, limit = 15) => s.listUndeliveredRadarFindingsSince.all(userId, sinceIso, Math.max(1, Math.min(50, Number(limit) || 15))),
+    listUnrecoveredFailureDetails: (limit = 10) => s.listUnrecoveredFailureDetails.all(Math.max(1, Math.min(25, Number(limit) || 10))),
+    listTasksDueBefore: (userId, cutoffIso, limit = 10) => s.listTasksDueBefore.all(userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },

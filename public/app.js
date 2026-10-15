@@ -351,6 +351,64 @@ function buildRadarCard(data){
   }
   return card;
 }
+// --- "Catch me up" digest card ---
+// Inline dismissible card on the Today tab after 6+ hours away (NOT a modal).
+// Data: GET /api/catchup-digest?since=<previous app-open>. Dismissing (X)
+// records the items server-side so they never reappear. One check per page
+// load; the server marks returned items seen.
+const catchupCardState={checked:false,loading:false};
+function loadCatchupCard(){
+  if(catchupCardState.checked||catchupCardState.loading||!state.user)return;
+  const since=state.catchupSince;
+  if(since===undefined||since===null)return; // snapshot not back yet, or never tracked
+  const sinceMs=Date.parse(since);
+  if(!Number.isFinite(sinceMs)||Date.now()-sinceMs<6*3600_000){catchupCardState.checked=true;return;}
+  catchupCardState.loading=true;
+  api('/api/catchup-digest?since='+encodeURIComponent(since)).then((data)=>{
+    if(data&&data.away&&(data.items||[]).length)renderCatchupCard(data.items);
+  }).catch(()=>{/* silent; the card is a nicety, not an error */})
+  .finally(()=>{catchupCardState.loading=false;catchupCardState.checked=true;});
+}
+function catchupIconFor(kind){
+  return {checkin:'💬',radar:'📡',ci:'🔴',calendar:'📅',agenda:'🗓️',task:'✅'}[kind]||'•';
+}
+function catchupRow(item){
+  const row=document.createElement('button');row.type='button';row.className='loop-row catchup-row';
+  const icon=document.createElement('span');icon.textContent=catchupIconFor(item.kind);icon.setAttribute('aria-hidden','true');
+  const wrap=document.createElement('span');wrap.className='catchup-text';
+  const title=document.createElement('span');title.className='agenda-title';title.textContent=item.title||'Update';
+  wrap.append(title);
+  if(item.detail){const meta=document.createElement('small');meta.className='muted';meta.textContent=item.detail;wrap.append(meta);}
+  row.append(icon,wrap);
+  row.addEventListener('click',()=>{
+    if(item.url){window.open(item.url,'_blank','noopener');return;}
+    const view=item.deepLink&&item.deepLink.view;
+    if(view)activateView(view);
+  });
+  return row;
+}
+function renderCatchupCard(items){
+  const root=$('#today-briefing');if(!root||!items.length)return;
+  if(root.querySelector('#catchup-card'))return;
+  const card=document.createElement('article');
+  card.className='briefing-card catchup-card';card.id='catchup-card';
+  const head=document.createElement('div');head.className='catchup-head';
+  const h=document.createElement('h3');h.textContent='While you were away';head.append(h);
+  const x=button('✕','catchup-dismiss',async()=>{
+    x.disabled=true;
+    try{await api('/api/catchup-digest/dismiss',{method:'POST',body:JSON.stringify({keys:items.map((i)=>i.key)})});}catch(_){}
+    card.remove();
+  });
+  x.setAttribute('aria-label','Dismiss catch-up');
+  head.append(x);card.append(head);
+  const missed=items.filter((i)=>i.section!=='upcoming');
+  const upcoming=items.filter((i)=>i.section==='upcoming');
+  if(missed.length&&upcoming.length)card.append(agendaSubhead('Missed'));
+  for(const item of missed)card.append(catchupRow(item));
+  if(missed.length&&upcoming.length)card.append(agendaSubhead('Coming up'));
+  for(const item of upcoming)card.append(catchupRow(item));
+  root.prepend(card);
+}
 function buildSystemsLine(data){
   const sys=data.systems;
   const line=document.createElement('button');line.type='button';
@@ -551,7 +609,10 @@ let lastTypeAt=0;
 function isComposing(){const input=$('#chat-input');if(input&&(document.activeElement===input||input.value.trim()))return true;return Date.now()-lastTypeAt<3000;}
 document.addEventListener('input',(e)=>{if(e.target&&e.target.id==='chat-input')lastTypeAt=Date.now();},true);
 let refreshInFlight=false;
-async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{state.status=await api('/api/status');try{state.setup=await(await fetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS})).json();}catch(_){}const qs=activeConversationId?`?conversation=${encodeURIComponent(activeConversationId)}`:'';state.snapshot=await api('/api/snapshot'+qs);try{state.writingVoice=await api('/api/writing-voice');}catch(_){state.writingVoice=null;}state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();if(state.user&&$('#today').classList.contains('active'))loadBriefing();}finally{refreshInFlight=false;}}
+async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{state.status=await api('/api/status');try{state.setup=await(await fetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS})).json();}catch(_){}const qs=activeConversationId?`?conversation=${encodeURIComponent(activeConversationId)}`:'';state.snapshot=await api('/api/snapshot'+qs);// "Catch me up": keep the app-open timestamp from the FIRST snapshot of
+// this page load — later refreshes overwrite it with "just now", which would
+// erase the 6h+ absence the away card needs to detect.
+if(state.catchupSince===undefined)state.catchupSince=state.snapshot.lastAppOpenAt||null;try{state.writingVoice=await api('/api/writing-voice');}catch(_){state.writingVoice=null;}state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();if(state.user&&$('#today').classList.contains('active')){loadBriefing();loadCatchupCard();}}finally{refreshInFlight=false;}}
 async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');await refresh();maybeAskName();$('#auth-dialog').close();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await fetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(!$('#auth-dialog').open)$('#auth-dialog').showModal();}else{$('#status-text').textContent='Connection issue';$('#model-pill').textContent='Retrying connection';toast(error.message);}}}
 function setAuthMode(mode){$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';const forgot=mode==='forgot';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':forgot?'Reset password':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':forgot?'Enter your email and we\'ll send you a password reset link.':'Private by design — your conversations stay on your server and never train AI models.';$('#name-label').classList.toggle('hidden',!register);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover||forgot);$('#forgot-row').classList.toggle('hidden',mode!=='login');$('#auth-password').required=!recover&&!forgot;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':forgot?'Send reset link':'Sign in';const doorClosed=register&&state.setup&&!state.setup.needsOwner&&!state.setup.registrationOpen;$('#auth-closed').classList.toggle('hidden',!doorClosed);for(const id of['#name-label','#email-label','#password-label','#auth-submit']){const field=$(id);if(field)field.classList.toggle('hidden',!!doorClosed);}if(doorClosed){$('#auth-title').textContent='Registration is closed';$('#auth-copy').textContent='Ask the owner to open registration, then try again.';}$('#auth-error').textContent='';$('#request-form').classList.add('hidden');$('#request-status').textContent='';}
 function renderAccessRequests(){const list=$('#access-list');if(!list)return;list.replaceChildren();const pending=(state.accessRequests||[]).filter((r)=>!r.handled_at);if(!pending.length)return empty(list,'No pending requests.');for(const r of pending){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=r.name;const p=document.createElement('p');p.textContent=`${r.email} · asked ${formatDate(r.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve','primary',()=>approveRequest(r.id)),button('Deny','danger',()=>denyRequest(r.id)),button('Dismiss','ghost',()=>dismissRequest(r.id)));head.append(wrap);card.append(head,actions);list.append(card);}}
@@ -607,7 +668,7 @@ async function beginConnector(provider){try{const result=await api(`/api/connect
 async function disconnectConnector(provider){try{await api(`/api/connectors/${provider}`,{method:'DELETE'});await refresh();toast('Connector disconnected.');}catch(error){toast(error.message);}}
 async function previewConnector(provider){try{const result=await api(`/api/connectors/${provider}/preview`);const items=(result.items||[]).slice(0,5);const summary=items.map((item)=>{const label=item.name||item.start||'Item';return item.from?`${label} — ${item.from.replace(/<.*>/,'').trim().slice(0,40)}`:label;}).join(' · ');toast(summary||'Connected, with no recent items.');}catch(error){toast(error.message);}}
 
-function activateView(name,{updateHash=true}={}){if(name==='more')return true;const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));if(name==='today'&&state.user)loadBriefing();return true;}
+function activateView(name,{updateHash=true}={}){if(name==='more')return true;const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));if(name==='today'&&state.user){loadBriefing();loadCatchupCard();}return true;}
 $$('.tab').forEach((tab)=>{if(tab.dataset.view==='more')return;tab.addEventListener('click',()=>activateView(tab.dataset.view));});
 
 // --- In-chat search UI (Q3) ---
