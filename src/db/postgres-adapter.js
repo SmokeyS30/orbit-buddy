@@ -143,6 +143,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_opt_in INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_profile TEXT',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_updated_at TEXT',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_offered INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
       `CREATE TABLE IF NOT EXISTS whatsapp_links (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -724,8 +725,12 @@ const indexMigrations = [
     // X5 "Writes like you": per-user writing voice opt-in + distilled profile.
     async getWritingVoice(userId) {
       await this.getPreferences(userId);
-      const row = await get('SELECT writing_voice_opt_in AS opt_in, writing_voice_profile AS profile, writing_voice_updated_at AS updated_at FROM user_preferences WHERE user_id=?', userId);
-      return { optIn: Number(row?.opt_in) === 1, profile: row?.profile || null, updatedAt: row?.updated_at || null };
+      const row = await get('SELECT writing_voice_opt_in AS opt_in, writing_voice_profile AS profile, writing_voice_updated_at AS updated_at, writing_voice_offered AS offered FROM user_preferences WHERE user_id=?', userId);
+      return { optIn: Number(row?.opt_in) === 1, profile: row?.profile || null, updatedAt: row?.updated_at || null, offered: Number(row?.offered) === 1 };
+    },
+    async markWritingVoiceOffered(userId) {
+      await this.getPreferences(userId);
+      await run('UPDATE user_preferences SET writing_voice_offered=1, updated_at=? WHERE user_id=?', timestamp(), userId);
     },
     async setWritingVoiceOptIn(userId, optIn) {
       await this.getPreferences(userId);
