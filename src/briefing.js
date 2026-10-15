@@ -1,8 +1,9 @@
-// Today-tab morning briefing (web app bigger bet B1).
+// Time-aware Today-tab briefing (web app bigger bet B1).
 // Assembles the data the app already has — weather, calendar agenda, focus
 // goals, memory anniversaries, open approvals, follow-ups, reliability — into
-// one generated morning page. Presentation lives in the frontend; this module
-// only gathers and shapes the data. No model calls: deterministic, cheap.
+// one generated page whose label and emphasis shift through the day.
+// Presentation lives in the frontend; this module only gathers and shapes the
+// data, plus resolves the briefing phase. No model calls: deterministic, cheap.
 
 import { toolGetWeather, validBriefingCoords } from './tools.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
@@ -44,6 +45,51 @@ function greetingForHour(hour) {
   return 'Good evening';
 }
 
+// ---------------------------------------------------------------------------
+// Time-aware briefing phases (Edward's request 2026-10-14).
+// The Today-tab briefing shifts through morning → afternoon → evening. The
+// phase boundaries live ONLY here in BRIEFING_PHASES — the UI reads the
+// resolved phase from the briefing payload and never computes it itself.
+// `rhythm` is the pluggable seam for D4 (passive rhythm detection): when it
+// supplies personalized transition hours ({ morningStart, afternoonStart,
+// eveningStart } in 0–24 clock hours), those override the defaults below.
+// Evening owns the small hours (before morningStart), so a 3am check-in gets
+// the evening recap, not a premature morning plan.
+// ---------------------------------------------------------------------------
+export const BRIEFING_PHASES = [
+  { id: 'morning', startHour: 5, tabLabel: 'Morning briefing', greeting: 'Good morning' },
+  { id: 'afternoon', startHour: 12, tabLabel: 'Afternoon check-in', greeting: 'Good afternoon' },
+  { id: 'evening', startHour: 17, tabLabel: 'Evening recap', greeting: 'Good evening' },
+];
+
+function clampPhaseHour(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(24, Math.max(0, n));
+}
+
+// Resolve the briefing phase for a moment in time. `now` accepts anything the
+// Date constructor does; `rhythm` (optional) overrides the phase start hours;
+// `timeZone` is the user's zone — the same one the briefing already resolves.
+export function getBriefingPhase(now = new Date(), rhythm = null, timeZone = DEFAULT_ZONE) {
+  const zone = validTimeZone(timeZone) || DEFAULT_ZONE;
+  let hour = Number(new Date(now).toLocaleString('en-US', { timeZone: zone, hour: 'numeric', hour12: false }));
+  if (hour === 24) hour = 0; // midnight edge in some runtimes
+  const r = rhythm && typeof rhythm === 'object' ? rhythm : {};
+  const morningStart = clampPhaseHour(r.morningStart, BRIEFING_PHASES[0].startHour);
+  let afternoonStart = clampPhaseHour(r.afternoonStart, BRIEFING_PHASES[1].startHour);
+  let eveningStart = clampPhaseHour(r.eveningStart, BRIEFING_PHASES[2].startHour);
+  // Keep strict ordering so every phase owns a non-empty window.
+  if (!(afternoonStart > morningStart)) afternoonStart = Math.min(24, morningStart + 1);
+  if (!(eveningStart > afternoonStart)) eveningStart = Math.min(24, afternoonStart + 1);
+  const id = hour < morningStart ? 'evening'
+    : hour < afternoonStart ? 'morning'
+    : hour < eveningStart ? 'afternoon'
+    : 'evening';
+  const meta = BRIEFING_PHASES.find((p) => p.id === id);
+  return { id: meta.id, tabLabel: meta.tabLabel, greeting: meta.greeting };
+}
+
 function timeLabel(ms, timeZone) {
   return new Date(ms).toLocaleTimeString('en-US', { timeZone, hour: 'numeric', minute: '2-digit' });
 }
@@ -64,6 +110,9 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
   const todayStr = todayInZone(timeZone, nowMs);
   const hour = Number(new Date(nowMs).toLocaleString('en-US', { timeZone, hour: 'numeric', hour12: false }));
   const dateLabel = new Date(`${todayStr}T12:00:00Z`).toLocaleDateString('en-US', { timeZone, weekday: 'long', month: 'long', day: 'numeric' });
+  // Time-aware phase (morning/afternoon/evening) — resolved here in the one
+  // place boundaries live; the client reads it from the payload.
+  const phase = getBriefingPhase(nowMs, null, timeZone);
 
   // Weather (best effort — section hides on failure)
   let weather = null;
@@ -74,25 +123,30 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
     weather = parseWeatherText(await getWeather(wxArgs));
   } catch { weather = null; }
 
-  // Calendar agenda: today + tomorrow (partitioned by local day)
+  // Calendar agenda: today + tomorrow (partitioned by local day).
+  // Tomorrow's events are kept (not just counted) so the evening recap can
+  // preview them; startMs lets the afternoon check-in split past vs upcoming.
   let agenda = [];
+  let tomorrowAgenda = [];
   let tomorrowCount = 0;
   try {
     const { events } = await getEventsForRange(db, userId, dayStartMs(todayStr, 0, timeZone), dayStartMs(todayStr, 2, timeZone), timeZone);
     const localDay = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone });
     const tomorrowStr = new Date(Date.parse(`${todayStr}T12:00:00Z`) + 86400_000).toLocaleDateString('en-CA', { timeZone });
+    const shape = (e) => ({
+      title: e.title || 'Untitled event',
+      allDay: !!e.allDay,
+      startMs: e.startMs,
+      timeLabel: e.allDay ? 'All day' : timeLabel(e.startMs, timeZone),
+      endLabel: e.allDay || !e.endMs ? null : timeLabel(e.endMs, timeZone),
+      location: e.location || null,
+      calendar: e.calendar || null,
+    });
     for (const e of events || []) {
       const day = localDay(e.startMs);
-      if (day === tomorrowStr) { tomorrowCount++; continue; }
+      if (day === tomorrowStr) { tomorrowCount++; tomorrowAgenda.push(shape(e)); continue; }
       if (day !== todayStr) continue;
-      agenda.push({
-        title: e.title || 'Untitled event',
-        allDay: !!e.allDay,
-        timeLabel: e.allDay ? 'All day' : timeLabel(e.startMs, timeZone),
-        endLabel: e.allDay || !e.endMs ? null : timeLabel(e.endMs, timeZone),
-        location: e.location || null,
-        calendar: e.calendar || null,
-      });
+      agenda.push(shape(e));
     }
   } catch { agenda = []; }
 
@@ -160,9 +214,11 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
     date: todayStr,
     dateLabel,
     greeting: greetingForHour(hour),
+    phase: { id: phase.id, tabLabel: phase.tabLabel },
     generatedAt: new Date(nowMs).toISOString(),
     weather,
     agenda,
+    tomorrowAgenda,
     tomorrowCount,
     focusGoals,
     anniversaries,

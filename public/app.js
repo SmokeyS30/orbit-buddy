@@ -3,6 +3,7 @@ import { isNearBottom, scrollToBottom, settleAtBottom, shouldSettleAtBottom } fr
 import { renderAssistantMarkdown } from './chat-markdown.js';
 import { isVoiceModeCommand, createVoiceMode } from './voice-mode.js';
 import { isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage } from './canvas.js';
+import { briefingLayoutFor } from './briefing-layout.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
 let activeConversationId=null;try{activeConversationId=localStorage.getItem('orbit-convo');}catch(_){}
 let preferencesDirty=false;
@@ -193,132 +194,131 @@ function briefingCard(title){
   const h=document.createElement('h3');h.textContent=title;card.append(h);
   return card;
 }
-function renderBriefing(data){
-  const root=$('#today-briefing');if(!root||!data)return;root.replaceChildren();
-  const mast=document.createElement('div');mast.className='briefing-masthead';
-  const eyebrow=document.createElement('p');eyebrow.className='eyebrow';
-  eyebrow.textContent=`Morning briefing · ${data.dateLabel||''}`;
-  const h=document.createElement('h2');h.textContent=`${data.greeting||'Good morning'}.`;
-  mast.append(eyebrow,h);
-  const parts=[];
-  if((data.agenda||[]).length)parts.push(`${data.agenda.length} on the calendar`);
-  if(data.openLoopCount)parts.push(`${data.openLoopCount} open loop${data.openLoopCount===1?'':'s'}`);
-  const todayAnn=(data.anniversaries||[]).filter((a)=>a.daysUntil===0);
-  for(const a of todayAnn)parts.push(`${a.label} today`);
-  if(data.tomorrowCount)parts.push(`${data.tomorrowCount} tomorrow`);
-  const dek=document.createElement('p');dek.className='briefing-dek';
-  dek.textContent=parts.length?parts.join(' · '):'A clear day — make it count.';
-  mast.append(dek);root.append(mast);
-  const grid=document.createElement('div');grid.className='briefing-grid';
-
-  // Weather
-  if(data.weather){
-    const card=briefingCard('Weather');
-    const now=document.createElement('div');now.className='weather-now';
-    const temp=document.createElement('strong');temp.textContent=`${data.weather.current.tempF}°`;
-    const cond=document.createElement('div');
-    const c1=document.createElement('p');c1.textContent=data.weather.current.condition;
-    const c2=document.createElement('p');c2.className='muted small';
-    c2.textContent=`${data.weather.location||''} · wind ${data.weather.current.windMph} mph`.replace(/^ · /,'');
-    cond.append(c1,c2);now.append(temp,cond);card.append(now);
-    if((data.weather.forecast||[]).length){
-      const strip=document.createElement('div');strip.className='forecast-strip';
-      for(const f of data.weather.forecast){
-        const d=document.createElement('div');d.className='forecast-day';
-        const dn=document.createElement('span');dn.className='forecast-name';dn.textContent=f.day;
-        const dc=document.createElement('span');dc.className='muted small';dc.textContent=f.condition;
-        const dt=document.createElement('span');dt.className='forecast-temps';dt.textContent=`${f.highF}° / ${f.lowF}°`;
-        d.append(dn,dc,dt);strip.append(d);
-      }
-      card.append(strip);
+function agendaRow(e){
+  const row=document.createElement('div');row.className='agenda-row';
+  const t=document.createElement('span');t.className='agenda-time';t.textContent=e.allDay?'All day':e.endLabel?`${e.timeLabel} – ${e.endLabel}`:e.timeLabel;
+  const title=document.createElement('span');title.className='agenda-title';title.textContent=e.title;
+  row.append(t,title);
+  if(e.location){const loc=document.createElement('small');loc.className='muted';loc.textContent=e.location;row.append(loc);}
+  return row;
+}
+function agendaSubhead(text){
+  const p=document.createElement('p');p.className='muted small block-top';p.textContent=text;return p;
+}
+function buildWeatherCard(data){
+  if(!data.weather)return null;
+  const card=briefingCard('Weather');
+  const now=document.createElement('div');now.className='weather-now';
+  const temp=document.createElement('strong');temp.textContent=`${data.weather.current.tempF}°`;
+  const cond=document.createElement('div');
+  const c1=document.createElement('p');c1.textContent=data.weather.current.condition;
+  const c2=document.createElement('p');c2.className='muted small';
+  c2.textContent=`${data.weather.location||''} · wind ${data.weather.current.windMph} mph`.replace(/^ · /,'');
+  cond.append(c1,c2);now.append(temp,cond);card.append(now);
+  if((data.weather.forecast||[]).length){
+    const strip=document.createElement('div');strip.className='forecast-strip';
+    for(const f of data.weather.forecast){
+      const d=document.createElement('div');d.className='forecast-day';
+      const dn=document.createElement('span');dn.className='forecast-name';dn.textContent=f.day;
+      const dc=document.createElement('span');dc.className='muted small';dc.textContent=f.condition;
+      const dt=document.createElement('span');dt.className='forecast-temps';dt.textContent=`${f.highF}° / ${f.lowF}°`;
+      d.append(dn,dc,dt);strip.append(d);
     }
-    grid.append(card);
+    card.append(strip);
   }
-
-  // Agenda
-  {
-    const card=briefingCard('Today');
-    if(!(data.agenda||[]).length){
-      const p=document.createElement('p');p.className='muted';p.textContent='Nothing scheduled — the day is yours.';
+  return card;
+}
+function buildAgendaCard(data,section){
+  const card=briefingCard(section.title||'Today');
+  const events=data.agenda||[];
+  if(section.splitDay){
+    // Afternoon check-in: what's behind you vs still ahead.
+    const nowMs=Date.parse(data.generatedAt)||Date.now();
+    const past=events.filter((e)=>e.startMs&&e.startMs<nowMs);
+    const upcoming=events.filter((e)=>!e.startMs||e.startMs>=nowMs);
+    if(!past.length&&!upcoming.length){
+      const p=document.createElement('p');p.className='muted';p.textContent=section.emptyText||'Nothing on the calendar today.';
+      card.append(p);
+    }else{
+      if(upcoming.length){card.append(agendaSubhead('Still ahead'));for(const e of upcoming)card.append(agendaRow(e));}
+      if(past.length){card.append(agendaSubhead('Behind you'));for(const e of past)card.append(agendaRow(e));}
+    }
+  }else{
+    if(!events.length){
+      const p=document.createElement('p');p.className='muted';p.textContent=section.emptyText||'Nothing scheduled — the day is yours.';
       card.append(p);
     }
-    for(const e of data.agenda||[]){
-      const row=document.createElement('div');row.className='agenda-row';
-      const t=document.createElement('span');t.className='agenda-time';t.textContent=e.allDay?'All day':e.endLabel?`${e.timeLabel} – ${e.endLabel}`:e.timeLabel;
-      const title=document.createElement('span');title.className='agenda-title';title.textContent=e.title;
-      row.append(t,title);
-      if(e.location){const loc=document.createElement('small');loc.className='muted';loc.textContent=e.location;row.append(loc);}
-      card.append(row);
-    }
-    if(data.tomorrowCount){
-      const p=document.createElement('p');p.className='muted small block-top';
-      p.textContent=`Plus ${data.tomorrowCount} tomorrow.`;
-      card.append(p);
-    }
-    grid.append(card);
+    for(const e of events)card.append(agendaRow(e));
   }
-
-  // Focus goals
-  if((data.focusGoals||[]).length){
-    const card=briefingCard('Focus');
-    for(const g of data.focusGoals){
-      const wrap=document.createElement('div');wrap.className='focus-goal';
-      const title=document.createElement('strong');title.textContent=g.title;wrap.append(title);
-      const bar=document.createElement('progress');bar.className='goal-progress';bar.max=100;bar.value=g.progress;
-      bar.setAttribute('aria-label',`${g.title} progress`);wrap.append(bar);
-      const detail=document.createElement('p');detail.className='muted small';
-      const bits=[`${g.progress}%`];
-      if(g.nextStep)bits.push(`next: ${g.nextStep}`);
-      else if(g.targetDate)bits.push(`target ${g.targetDate}`);
-      if(g.streak>=2)bits.push(`🔥 ${g.streak}-day streak`);
-      detail.textContent=bits.join(' · ');wrap.append(detail);
-      card.append(wrap);
-    }
-    grid.append(card);
+  if(section.tomorrowLine&&data.tomorrowCount){
+    const p=document.createElement('p');p.className='muted small block-top';
+    p.textContent=`Plus ${data.tomorrowCount} tomorrow.`;
+    card.append(p);
   }
-
-  // Open loops: approvals, approval-gated tasks, due follow-ups
-  if(data.openLoopCount){
-    const card=briefingCard('Open loops');
-    const loops=data.openLoops||{};
-    for(const a of loops.approvals||[]){
-      const row=document.createElement('button');row.type='button';row.className='loop-row';
-      const label=document.createElement('span');label.textContent=`Approval: ${a.title}`;
-      const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
-      row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
-    }
-    for(const t of loops.waitingTasks||[]){
-      const row=document.createElement('button');row.type='button';row.className='loop-row';
-      const label=document.createElement('span');label.textContent=`Task plan: ${t.title}`;
-      const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
-      row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
-    }
-    for(const f of loops.followUps||[]){
-      const row=document.createElement('div');row.className='loop-row static';
-      const label=document.createElement('span');label.textContent=`Follow-up: ${f.description}`;
-      const hint=document.createElement('small');hint.className='muted';hint.textContent=f.overdue?`was due ${f.dueDate}`:`due ${f.dueDate}`;
-      row.append(label,hint);card.append(row);
-    }
-    grid.append(card);
+  return card;
+}
+function buildFocusCard(data,title){
+  if(!(data.focusGoals||[]).length)return null;
+  const card=briefingCard(title||'Focus');
+  for(const g of data.focusGoals){
+    const wrap=document.createElement('div');wrap.className='focus-goal';
+    const t=document.createElement('strong');t.textContent=g.title;wrap.append(t);
+    const bar=document.createElement('progress');bar.className='goal-progress';bar.max=100;bar.value=g.progress;
+    bar.setAttribute('aria-label',`${g.title} progress`);wrap.append(bar);
+    const detail=document.createElement('p');detail.className='muted small';
+    const bits=[`${g.progress}%`];
+    if(g.nextStep)bits.push(`next: ${g.nextStep}`);
+    else if(g.targetDate)bits.push(`target ${g.targetDate}`);
+    if(g.streak>=2)bits.push(`🔥 ${g.streak}-day streak`);
+    detail.textContent=bits.join(' · ');wrap.append(detail);
+    card.append(wrap);
   }
-
-  // Anniversaries / personal dates coming up
-  if((data.anniversaries||[]).length){
-    const card=briefingCard('Coming up');
-    for(const a of data.anniversaries){
-      const row=document.createElement('div');row.className='agenda-row';
-      const icon=document.createElement('span');icon.textContent=a.type==='birthday'?'🎂':a.type==='anniversary'?'💛':'📌';
-      const label=document.createElement('span');label.className='agenda-title';
-      label.textContent=a.years?`${a.label} — ${a.years} year${a.years===1?'':'s'}`:a.label;
-      const when=document.createElement('small');when.className='muted';when.textContent=a.when;
-      row.append(icon,label,when);card.append(row);
-    }
-    grid.append(card);
+  return card;
+}
+function buildLoopsCard(data,title){
+  if(!data.openLoopCount)return null;
+  const card=briefingCard(title||'Open loops');
+  const loops=data.openLoops||{};
+  for(const a of loops.approvals||[]){
+    const row=document.createElement('button');row.type='button';row.className='loop-row';
+    const label=document.createElement('span');label.textContent=`Approval: ${a.title}`;
+    const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
+    row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
   }
-
-  if(grid.children.length)root.append(grid);
-
-  // B4: Reliability is quiet by default — one status line, full tab as drill-down.
+  for(const t of loops.waitingTasks||[]){
+    const row=document.createElement('button');row.type='button';row.className='loop-row';
+    const label=document.createElement('span');label.textContent=`Task plan: ${t.title}`;
+    const hint=document.createElement('small');hint.className='muted';hint.textContent='review →';
+    row.append(label,hint);row.addEventListener('click',()=>activateView('approvals'));card.append(row);
+  }
+  for(const f of loops.followUps||[]){
+    const row=document.createElement('div');row.className='loop-row static';
+    const label=document.createElement('span');label.textContent=`Follow-up: ${f.description}`;
+    const hint=document.createElement('small');hint.className='muted';hint.textContent=f.overdue?`was due ${f.dueDate}`:`due ${f.dueDate}`;
+    row.append(label,hint);card.append(row);
+  }
+  return card;
+}
+function buildAnniversariesCard(data,title){
+  if(!(data.anniversaries||[]).length)return null;
+  const card=briefingCard(title||'Coming up');
+  for(const a of data.anniversaries){
+    const row=document.createElement('div');row.className='agenda-row';
+    const icon=document.createElement('span');icon.textContent=a.type==='birthday'?'🎂':a.type==='anniversary'?'💛':'📌';
+    const label=document.createElement('span');label.className='agenda-title';
+    label.textContent=a.years?`${a.label} — ${a.years} year${a.years===1?'':'s'}`:a.label;
+    const when=document.createElement('small');when.className='muted';when.textContent=a.when;
+    row.append(icon,label,when);card.append(row);
+  }
+  return card;
+}
+function buildTomorrowCard(data,title){
+  if(!(data.tomorrowAgenda||[]).length)return null;
+  const card=briefingCard(title||'Tomorrow');
+  for(const e of data.tomorrowAgenda)card.append(agendaRow(e));
+  return card;
+}
+function buildSystemsLine(data){
   const sys=data.systems;
   const line=document.createElement('button');line.type='button';
   line.className='systems-line'+(sys&&!sys.ok?' warn':'');
@@ -329,7 +329,70 @@ function renderBriefing(data){
   else label.textContent=`${sys.failureCount} failure${sys.failureCount===1?'':'s'} in the last 7 days — view Reliability`;
   line.append(dot,label);
   line.addEventListener('click',()=>activateView('reliability'));
-  root.append(line);
+  return line;
+}
+function briefingPhaseId(data){
+  const id=data&&data.phase&&data.phase.id;
+  return typeof id==='string'&&id?id:'morning';
+}
+function briefingDek(data,phaseId){
+  const parts=[];
+  const loopWord=(n)=>`open loop${n===1?'':'s'}`;
+  if(phaseId==='afternoon'){
+    const nowMs=Date.parse(data.generatedAt)||Date.now();
+    const upcoming=(data.agenda||[]).filter((e)=>!e.startMs||e.startMs>=nowMs).length;
+    if(upcoming)parts.push(`${upcoming} still on the calendar`);
+    if(data.openLoopCount)parts.push(`${data.openLoopCount} ${loopWord(data.openLoopCount)}`);
+    if((data.focusGoals||[]).length)parts.push(`${data.focusGoals[0].title} at ${data.focusGoals[0].progress}%`);
+    return parts.length?parts.join(' · '):'A quiet afternoon — the rest of the day is yours.';
+  }
+  if(phaseId==='evening'){
+    if((data.agenda||[]).length)parts.push(`${data.agenda.length} on today's calendar`);
+    if(data.openLoopCount)parts.push(`${data.openLoopCount} still open`);
+    if(data.tomorrowCount)parts.push(`${data.tomorrowCount} tomorrow`);
+    return parts.length?parts.join(' · '):'A quiet day — rest up for tomorrow.';
+  }
+  if((data.agenda||[]).length)parts.push(`${data.agenda.length} on the calendar`);
+  if(data.openLoopCount)parts.push(`${data.openLoopCount} ${loopWord(data.openLoopCount)}`);
+  const todayAnn=(data.anniversaries||[]).filter((a)=>a.daysUntil===0);
+  for(const a of todayAnn)parts.push(`${a.label} today`);
+  if(data.tomorrowCount)parts.push(`${data.tomorrowCount} tomorrow`);
+  return parts.length?parts.join(' · '):'A clear day — make it count.';
+}
+function renderBriefing(data){
+  const root=$('#today-briefing');if(!root||!data)return;root.replaceChildren();
+  // Time-aware briefing: the phase was resolved server-side (boundaries live
+  // in src/briefing.js#BRIEFING_PHASES) and rides in on the payload — the UI
+  // only reads it, never computes it. Stale payloads fall back to morning.
+  const phaseId=briefingPhaseId(data);
+  const layout=briefingLayoutFor(phaseId);
+  const mast=document.createElement('div');mast.className='briefing-masthead';
+  const eyebrow=document.createElement('p');eyebrow.className='eyebrow';
+  eyebrow.textContent=`${layout.tabLabel} · ${data.dateLabel||''}`;
+  const h=document.createElement('h2');h.textContent=`${data.greeting||'Good morning'}.`;
+  mast.append(eyebrow,h);
+  const dek=document.createElement('p');dek.className='briefing-dek';
+  dek.textContent=briefingDek(data,phaseId);
+  mast.append(dek);root.append(mast);
+  const grid=document.createElement('div');grid.className='briefing-grid';
+
+  // Phase-ordered sections: order and titles come from the layout config; the
+  // phase itself was resolved server-side and rides in on the payload.
+  for(const section of layout.sections){
+    let card=null;
+    if(section.key==='weather')card=buildWeatherCard(data);
+    else if(section.key==='agenda')card=buildAgendaCard(data,section);
+    else if(section.key==='focus')card=buildFocusCard(data,section.title);
+    else if(section.key==='loops')card=buildLoopsCard(data,section.title);
+    else if(section.key==='anniversaries')card=buildAnniversariesCard(data,section.title);
+    else if(section.key==='tomorrow')card=buildTomorrowCard(data,section.title);
+    if(card)grid.append(card);
+  }
+
+  if(grid.children.length)root.append(grid);
+
+  // B4: Reliability is quiet by default — one status line, full tab as drill-down.
+  root.append(buildSystemsLine(data));
 }
 function renderGoals(items){const root=$('#goals-list');if(root.contains(document.activeElement))return;root.replaceChildren();if(!items.length)return empty(root,'No goals yet. Track one outcome Orbit can help you keep in view.');for(const goal of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const title=document.createElement('h3');title.textContent=goal.title;const description=document.createElement('p');description.textContent=goal.description||goal.next_step||'No details added.';wrap.append(title,description);const status=document.createElement('span');status.className=`badge ${goal.status}`;status.textContent=goal.status;head.append(wrap,status);card.append(head);const meta=document.createElement('div');meta.className='meta';const goalStreak=state.snapshot?.streaks?.goals?.[goal.id]||0;for(const value of [`priority ${goal.priority}`,goal.target_date?`target ${goal.target_date}`:'no target date',`${goal.progress}% complete`]){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}if(goalStreak>=2){const stag=document.createElement('span');stag.className='badge streak';stag.textContent=`🔥 ${goalStreak}-day streak`;meta.append(stag);}card.append(meta);const progress=document.createElement('progress');progress.className='goal-progress';progress.max=100;progress.value=goal.progress;progress.setAttribute('aria-label',`${goal.title} progress`);card.append(progress);if(goal.next_step){const next=document.createElement('p');next.textContent=`Next: ${goal.next_step}`;card.append(next);}if(goal.status!=='completed'){const editor=document.createElement('div');editor.className='goal-editor';const amount=document.createElement('input');amount.type='number';amount.min='0';amount.max='100';amount.value=String(goal.progress);amount.setAttribute('aria-label','Progress percent');const next=document.createElement('input');next.value=goal.next_step||'';next.maxLength=500;next.placeholder='Next step';const save=button('Update','ghost',()=>updateGoal(goal.id,{progress:Number(amount.value),nextStep:next.value}));editor.append(amount,next,save);card.append(editor);}const actions=document.createElement('div');actions.className='mini-actions';if(goal.status!=='completed')actions.append(button(goal.status==='paused'?'Resume':'Pause','ghost',()=>updateGoal(goal.id,{status:goal.status==='paused'?'active':'paused'})),button('Complete','primary',()=>updateGoal(goal.id,{progress:100,status:'completed'})));actions.append(button('Delete','danger',()=>deleteGoal(goal.id,goal.title)));card.append(actions);root.append(card);}}
 function renderRoutines(items){const root=$('#routines-list');root.replaceChildren();if(!items.length)return empty(root,'No routines yet. A morning briefing is a good place to start.');const weekdays=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];for(const routine of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const title=document.createElement('h3');title.textContent=routine.title;const prompt=document.createElement('p');prompt.textContent=routine.prompt;wrap.append(title,prompt);const status=document.createElement('span');status.className=`badge ${routine.enabled?'active':'paused'}`;status.textContent=routine.enabled?'active':'paused';head.append(wrap,status);card.append(head);const cadence=routine.cadence==='weekly'?`weekly · ${weekdays[routine.day_of_week]}`:routine.cadence;const meta=document.createElement('div');meta.className='meta';const routineStreak=state.snapshot?.streaks?.routines?.[routine.id]||0;for(const value of [routine.kind,cadence,`${routine.time_local} local`,routine.last_run_at?`last ran ${formatDate(routine.last_run_at)}`:'not run yet']){const tag=document.createElement('span');tag.className='badge';tag.textContent=value;meta.append(tag);}if(routineStreak>=2){const stag=document.createElement('span');stag.className='badge streak';stag.textContent=`🔥 ${routineStreak}-day streak`;meta.append(stag);}card.append(meta);if(routine.last_error){const error=document.createElement('p');error.className='routine-error';error.textContent=`Last run: ${routine.last_error}`;card.append(error);}const actions=document.createElement('div');actions.className='mini-actions';actions.append(button(routine.enabled?'Pause':'Enable','ghost',()=>toggleRoutine(routine.id,!routine.enabled)),button('Delete','danger',()=>deleteRoutine(routine.id,routine.title)));card.append(actions);root.append(card);}}

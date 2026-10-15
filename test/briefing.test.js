@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseWeatherText, buildTodayBriefing } from '../src/briefing.js';
+import { parseWeatherText, buildTodayBriefing, getBriefingPhase, BRIEFING_PHASES } from '../src/briefing.js';
 
 const WEATHER_TEXT = [
   'Weather for Brewster, Massachusetts:',
@@ -144,4 +144,101 @@ test('buildTodayBriefing passes coords to getWeather, home location when absent'
     coords: { latitude: 999, longitude: 0 },
   });
   assert.deepEqual(seen[0], { location: 'Brewster, MA' }, 'invalid coords → home location');
+});
+
+// ---------------------------------------------------------------------------
+// Time-aware briefing phases (Edward's request 2026-10-14)
+// ---------------------------------------------------------------------------
+
+const ZONE = 'America/New_York';
+const atEdt = (h, m = 0, day = 12) => new Date(Date.UTC(2026, 9, day, h + 4, m)); // EDT = UTC-4
+
+test('BRIEFING_PHASES is the single source of boundaries', () => {
+  assert.deepEqual(BRIEFING_PHASES.map((p) => p.id), ['morning', 'afternoon', 'evening']);
+  assert.deepEqual(BRIEFING_PHASES.map((p) => p.startHour), [5, 12, 17]);
+  assert.deepEqual(BRIEFING_PHASES.map((p) => p.tabLabel), ['Morning briefing', 'Afternoon check-in', 'Evening recap']);
+});
+
+test('getBriefingPhase follows clock boundaries (brief spec cases)', () => {
+  assert.equal(getBriefingPhase(atEdt(9), null, ZONE).id, 'morning');
+  assert.equal(getBriefingPhase(atEdt(12), null, ZONE).id, 'afternoon', '12pm boundary → afternoon');
+  assert.equal(getBriefingPhase(atEdt(16, 59), null, ZONE).id, 'afternoon', '4:59pm → afternoon');
+  assert.equal(getBriefingPhase(atEdt(17), null, ZONE).id, 'evening', '5pm boundary → evening');
+  assert.equal(getBriefingPhase(new Date(Date.UTC(2026, 9, 13, 3, 0)), null, ZONE).id, 'evening', '11pm → evening');
+});
+
+test('getBriefingPhase wraps the small hours into the evening recap', () => {
+  assert.equal(getBriefingPhase(atEdt(3), null, ZONE).id, 'evening', '3am → evening (probe expectation)');
+  assert.equal(getBriefingPhase(atEdt(4, 59), null, ZONE).id, 'evening');
+  assert.equal(getBriefingPhase(atEdt(5), null, ZONE).id, 'morning', '5am boundary → morning');
+});
+
+test('getBriefingPhase returns the warm tab label per phase', () => {
+  assert.equal(getBriefingPhase(atEdt(9), null, ZONE).tabLabel, 'Morning briefing');
+  assert.equal(getBriefingPhase(atEdt(14), null, ZONE).tabLabel, 'Afternoon check-in');
+  assert.equal(getBriefingPhase(atEdt(20), null, ZONE).tabLabel, 'Evening recap');
+});
+
+test('getBriefingPhase honors a rhythm override (D4 seam)', () => {
+  const rhythm = { morningStart: 7, afternoonStart: 13, eveningStart: 19 };
+  assert.equal(getBriefingPhase(atEdt(6, 30), rhythm, ZONE).id, 'evening', 'personalized small hours → evening');
+  assert.equal(getBriefingPhase(atEdt(8), rhythm, ZONE).id, 'morning');
+  assert.equal(getBriefingPhase(atEdt(14), rhythm, ZONE).id, 'afternoon');
+  assert.equal(getBriefingPhase(atEdt(18), rhythm, ZONE).id, 'afternoon');
+  assert.equal(getBriefingPhase(atEdt(20), rhythm, ZONE).id, 'evening');
+});
+
+test('getBriefingPhase degrades sanely on garbage rhythm input', () => {
+  assert.equal(getBriefingPhase(atEdt(9), { morningStart: 'x' }, ZONE).id, 'morning', 'non-numeric ignored');
+  const reversed = getBriefingPhase(atEdt(9), { morningStart: 12, afternoonStart: 8 }, ZONE);
+  assert.ok(['morning', 'afternoon', 'evening'].includes(reversed.id), 'unordered starts still resolve');
+});
+
+test('getBriefingPhase uses the user timezone, not the server clock', () => {
+  const instant = new Date(Date.UTC(2026, 9, 12, 16, 30)); // 12:30 EDT / 9:30 PDT
+  assert.equal(getBriefingPhase(instant, null, 'America/New_York').id, 'afternoon');
+  assert.equal(getBriefingPhase(instant, null, 'America/Los_Angeles').id, 'morning');
+});
+
+test('getBriefingPhase works with no arguments', () => {
+  const p = getBriefingPhase();
+  assert.ok(['morning', 'afternoon', 'evening'].includes(p.id));
+  assert.ok(typeof p.tabLabel === 'string' && p.tabLabel.length > 0);
+});
+
+test('buildTodayBriefing carries the phase on the payload', async () => {
+  const morning = await buildTodayBriefing(fakeDb(), 'u1', { getWeather: async () => WEATHER_TEXT, nowMs: NOW });
+  assert.deepEqual(morning.phase, { id: 'morning', tabLabel: 'Morning briefing' });
+  const afternoon = await buildTodayBriefing(fakeDb(), 'u1', { getWeather: async () => WEATHER_TEXT, nowMs: Date.UTC(2026, 9, 12, 18, 0) });
+  assert.deepEqual(afternoon.phase, { id: 'afternoon', tabLabel: 'Afternoon check-in' });
+  const evening = await buildTodayBriefing(fakeDb(), 'u1', { getWeather: async () => WEATHER_TEXT, nowMs: Date.UTC(2026, 9, 12, 23, 0) });
+  assert.deepEqual(evening.phase, { id: 'evening', tabLabel: 'Evening recap' });
+});
+
+test('buildTodayBriefing keeps tomorrow events and startMs for phase views', async () => {
+  const { dropFeedCache } = await import('../src/ical.js');
+  const realFetch = global.fetch;
+  const ics = [
+    'BEGIN:VEVENT', 'UID:today1', 'DTSTART;TZID=America/New_York:20261012T090000',
+    'DTEND;TZID=America/New_York:20261012T100000', 'SUMMARY:Standup', 'END:VEVENT',
+    'BEGIN:VEVENT', 'UID:tmr1', 'DTSTART;TZID=America/New_York:20261013T140000',
+    'DTEND;TZID=America/New_York:20261013T150000', 'SUMMARY:Dentist', 'END:VEVENT',
+  ].join('\n');
+  global.fetch = async (url) => String(url) === 'https://example.com/cal.ics'
+    ? { ok: true, arrayBuffer: async () => Buffer.from(ics) }
+    : realFetch(url);
+  const db = { ...fakeDb(), listCalendarFeeds: () => [{ id: 'f1', label: 'Cal', url: 'https://example.com/cal.ics' }] };
+  try {
+    const b = await buildTodayBriefing(db, 'u1', { getWeather: async () => WEATHER_TEXT, nowMs: NOW });
+    assert.equal(b.agenda.length, 1);
+    assert.equal(b.agenda[0].title, 'Standup');
+    assert.ok(Number.isFinite(b.agenda[0].startMs), 'agenda items carry startMs for the afternoon split');
+    assert.equal(b.tomorrowCount, 1);
+    assert.equal(b.tomorrowAgenda.length, 1);
+    assert.equal(b.tomorrowAgenda[0].title, 'Dentist');
+    assert.ok(Number.isFinite(b.tomorrowAgenda[0].startMs));
+  } finally {
+    global.fetch = realFetch;
+    dropFeedCache('f1');
+  }
 });
