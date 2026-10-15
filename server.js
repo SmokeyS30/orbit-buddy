@@ -238,7 +238,7 @@ export function createOrbitServer(options={}) {
     }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
   }
   const production=env.NODE_ENV==='production';
-  const maintenanceOn = MAINTENANCE_MODE && env.NODE_ENV !== 'test';
+  const maintenanceOn = (MAINTENANCE_MODE || env.MAINTENANCE_MODE === '1') && env.NODE_ENV !== 'test';
   const maintenanceHtml = maintenanceOn
     ? fs.readFileSync(path.join(publicRoot, 'maintenance.html'), 'utf8')
     : null;
