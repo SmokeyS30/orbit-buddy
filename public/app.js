@@ -334,6 +334,23 @@ function buildTomorrowCard(data,title){
   for(const e of data.tomorrowAgenda)card.append(agendaRow(e));
   return card;
 }
+// X6 project radar: recent repo findings as a quiet card. Null when empty so
+// the briefing stays silent when there's nothing worth surfacing. Reuses the
+// existing briefing-card / loop-row styles, so it renders the same on desktop
+// and in the iOS webview — no new screens.
+function buildRadarCard(data){
+  const items=data.radar||[];
+  if(!items.length)return null;
+  const card=briefingCard('Project radar');
+  for(const f of items){
+    const row=document.createElement('div');row.className='loop-row static';
+    const icon=document.createElement('span');icon.textContent=f.signal==='high'?'🔴':'🟢';icon.setAttribute('aria-hidden','true');
+    const label=document.createElement('span');label.className='agenda-title';label.textContent=f.title||'Repo update';
+    const hint=document.createElement('small');hint.className='muted';hint.textContent=String(f.repo||'').split('/').pop();
+    row.append(icon,label,hint);card.append(row);
+  }
+  return card;
+}
 function buildSystemsLine(data){
   const sys=data.systems;
   const line=document.createElement('button');line.type='button';
@@ -404,6 +421,10 @@ function renderBriefing(data){
     else if(section.key==='tomorrow')card=buildTomorrowCard(data,section.title);
     if(card)grid.append(card);
   }
+
+  // X6 project radar card: quiet when empty, appended after the phase sections.
+  const radarCard=buildRadarCard(data);
+  if(radarCard)grid.append(radarCard);
 
   if(grid.children.length)root.append(grid);
 

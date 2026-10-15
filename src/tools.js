@@ -1,6 +1,7 @@
 import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
+import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -996,6 +997,51 @@ export function toolForgetWritingVoice(args = {}, ctx = null) {
   return { forgotten: true };
 }
 
+// X6 "Project radar": per-project mute controls + status. These only touch
+// Orbit's local radar state (which repos get surfaced to this user) — they
+// never act on GitHub itself.
+function radarOwner(env = process.env) {
+  return String(env[RADAR_OWNER_ENV] || RADAR_DEFAULT_OWNER).replace(/^@/, '').trim() || RADAR_DEFAULT_OWNER;
+}
+
+export function toolMuteRadar(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'mute_radar');
+  const repo = normalizeRadarRepo(args.repo, radarOwner());
+  if (!repo) throw new Error('mute_radar needs a repo like "orbit-buddy" or "SmokeyS30/orbit-buddy".');
+  const display = String(args.repo).trim();
+  db.muteRadarRepo(userId, repo);
+  db.addEvent(userId, 'radar_muted', `Muted project-radar alerts for ${repo}.`);
+  return { muted: true, repo, message: `Radar muted for ${display} — I'll skip it in radar check-ins and briefings. Say "unmute radar for ${display}" to turn it back on.` };
+}
+
+export function toolUnmuteRadar(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'unmute_radar');
+  const repo = normalizeRadarRepo(args.repo, radarOwner());
+  if (!repo) throw new Error('unmute_radar needs a repo like "orbit-buddy" or "SmokeyS30/orbit-buddy".');
+  const display = String(args.repo).trim();
+  const removed = db.unmuteRadarRepo(userId, repo);
+  if (removed) db.addEvent(userId, 'radar_unmuted', `Unmuted project-radar alerts for ${repo}.`);
+  return { unmuted: removed, repo, message: removed ? `Radar unmuted for ${display} — it's back in the watch.` : `${display} wasn't muted.` };
+}
+
+export function toolRadarStatus(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'radar_status');
+  const configured = parseRepoListEnv(process.env[RADAR_REPOS_ENV]);
+  const mutes = (db.listRadarMutes(userId) || []).map((m) => m.repo);
+  const lastPollMs = Number(db.getSetting('radar_last_poll') || 0);
+  const recent = (db.listRecentRadarFindings(5) || []).map((f) => ({
+    repo: f.repo, kind: f.kind, signal: f.signal, title: f.title, url: f.url, foundAt: f.found_at,
+  }));
+  return {
+    tokenConfigured: Boolean(process.env[RADAR_TOKEN_ENV]),
+    watchRepos: configured.length ? configured : `auto-discover: top repos by recent push for ${radarOwner()}`,
+    mutedRepos: mutes,
+    lastPoll: lastPollMs ? new Date(lastPollMs).toISOString() : 'never',
+    lastError: db.getSetting('radar_last_error') || null,
+    recentFindings: recent,
+  };
+}
+
 export async function toolReadCalendar(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'read_calendar');
   const zone = validTimeZone(ctx?.timeZone, DEFAULT_ZONE);
@@ -1541,6 +1587,42 @@ export const TOOL_DEFINITIONS = [
       properties: {},
       additionalProperties: false
     }
+  },
+  {
+    type: 'function',
+    name: 'mute_radar',
+    description: 'Mute project-radar alerts for one repo. Call ONLY when the user explicitly says to mute, pause, or ignore the radar for a repo — e.g. "mute radar for orbit-buddy", "stop telling me about StudyBuddy", "ignore radar for SmokeyS30/studybuddy-ai-server". The radar keeps watching their other repos; the mute is per-user and reversible with unmute_radar. Never mute unprompted. This only changes what Orbit surfaces — it never acts on GitHub.',
+    parameters: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repo to mute: "orbit-buddy" or "SmokeyS30/orbit-buddy".' }
+      },
+      required: ['repo'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'unmute_radar',
+    description: 'Unmute project-radar alerts for one repo. Call ONLY when the user explicitly says to unmute or re-enable the radar for a repo — e.g. "unmute radar for orbit-buddy", "watch StudyBuddy again". The radar starts surfacing that repo\'s findings again from now on. This only changes what Orbit surfaces — it never acts on GitHub.',
+    parameters: {
+      type: 'object',
+      properties: {
+        repo: { type: 'string', description: 'Repo to unmute: "orbit-buddy" or "SmokeyS30/orbit-buddy".' }
+      },
+      required: ['repo'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'radar_status',
+    description: 'Show the current project-radar state: whether the GitHub token is configured, which repos are watched, which repos this user muted, when the radar last polled, and recent findings. Call when the user asks about the radar — e.g. "radar status", "what is the radar watching", "what has the radar found". Read-only.',
+    parameters: {
+      type: 'object',
+      properties: {},
+      additionalProperties: false
+    }
   }
 ];
 
@@ -1582,7 +1664,10 @@ const TOOL_SUMMARIES = {
   gmail_read: (args) => String(args.query || '').slice(0, 80),
   gmail_delete: (args) => `Trash email: ${String(args.id || '').slice(0, 40)}`,
   learn_writing_voice: () => 'Learned writing voice',
-  forget_writing_voice: () => 'Forgot writing voice'
+  forget_writing_voice: () => 'Forgot writing voice',
+  mute_radar: (args) => `Muted radar: ${String(args.repo || '').slice(0, 60)}`,
+  unmute_radar: (args) => `Unmuted radar: ${String(args.repo || '').slice(0, 60)}`,
+  radar_status: () => 'Radar status'
 };
 
 export async function executeTool(name, args = {}, env = process.env, ctx = null) {
@@ -1736,6 +1821,18 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'forget_writing_voice': {
       const result = toolForgetWritingVoice(clean, ctx);
       return { result, summary: 'Forgot writing voice' };
+    }
+    case 'mute_radar': {
+      const result = toolMuteRadar(clean, ctx);
+      return { result, summary: `Muted radar for ${String(result.repo || '').slice(0, 60)}` };
+    }
+    case 'unmute_radar': {
+      const result = toolUnmuteRadar(clean, ctx);
+      return { result, summary: `Unmuted radar for ${String(result.repo || '').slice(0, 60)}` };
+    }
+    case 'radar_status': {
+      const result = toolRadarStatus(clean, ctx);
+      return { result, summary: 'Radar status' };
     }
     default: throw new Error(`Unknown tool: ${name}`);
   }

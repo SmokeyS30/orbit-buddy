@@ -8,6 +8,7 @@
 import { toolGetWeather, validBriefingCoords } from './tools.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { todayInZone, nextPersonalDateOccurrence, validTimeZone } from './intelligence.js';
+import { getRadarBriefingItems } from './radar.js';
 
 // Home fallback when no valid coordinates are supplied (Brewster, MA).
 export const HOME_COORDS = { latitude: 41.76, longitude: -70.08 };
@@ -210,6 +211,14 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
     };
   }
 
+  // Project radar (X6): recent repo findings — muted repos excluded, quiet
+  // when empty. Low-signal findings live here; high-signal ones were already
+  // delivered as check-ins and appear as a quiet reminder.
+  let radar = [];
+  try {
+    radar = getRadarBriefingItems(db, userId, { nowMs });
+  } catch { radar = []; }
+
   return {
     date: todayStr,
     dateLabel,
@@ -225,5 +234,6 @@ export async function buildTodayBriefing(db, userId, { getWeather = toolGetWeath
     openLoops: { approvals, waitingTasks, followUps },
     openLoopCount: approvals.length + waitingTasks.length + followUps.length,
     systems,
+    radar,
   };
 }

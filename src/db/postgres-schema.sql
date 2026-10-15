@@ -435,6 +435,37 @@ CREATE TABLE IF NOT EXISTS whatsapp_links (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS radar_findings (
+  finding_key TEXT PRIMARY KEY,
+  repo TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  signal TEXT NOT NULL,
+  title TEXT NOT NULL,
+  detail TEXT,
+  url TEXT,
+  workflow TEXT,
+  branch TEXT,
+  found_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS radar_deliveries (
+  finding_key TEXT NOT NULL REFERENCES radar_findings(finding_key) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  delivered_at TEXT NOT NULL,
+  PRIMARY KEY (finding_key, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS radar_mutes (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  repo TEXT NOT NULL,
+  muted_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, repo)
+);
+
+CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_personal_dates_user ON personal_dates(user_id);
