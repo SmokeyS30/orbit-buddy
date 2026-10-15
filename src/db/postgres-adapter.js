@@ -97,13 +97,65 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     await client.query('SELECT 1');
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
+      `CREATE TABLE IF NOT EXISTS waitlist (
+        id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
+        status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )`,
+      'CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at)',
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT \'legacy\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT \'approved\'',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 1',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS expires_at TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_confirmed_at TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_mentioned_at TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding TEXT',
+      'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
+      'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 2',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS next_attempt_at TEXT',
+      'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_error TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS lease_expires_at TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_error TEXT',
+      'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS delivery_channel TEXT NOT NULL DEFAULT \'push\'',
+      'ALTER TABLE events ADD COLUMN IF NOT EXISTS user_id TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_outreach_at TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_date TEXT',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS context_summary TEXT',
+      'ALTER TABLE personal_dates ADD COLUMN IF NOT EXISTS gift_nag INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE personal_dates ADD COLUMN IF NOT EXISTS gift_done INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS sentiment TEXT',
+      'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS last_context_update TEXT',
+      'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_count INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_tone TEXT NOT NULL DEFAULT \'motivational\'',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_length TEXT NOT NULL DEFAULT \'quick\'',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS buddy_name TEXT',
+      'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
+      `CREATE TABLE IF NOT EXISTS whatsapp_links (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        phone_e164 TEXT NOT NULL UNIQUE,
+        verified_at TEXT NOT NULL,
+        last_inbound_at TEXT,
+        created_at TEXT NOT NULL
+      )`,
     ];
-    for (const sql of migrations) {
-      try { await client.query(sql); } catch (e) { /* column may already exist */ }
+const indexMigrations = [
+      'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)',
+    ];
+    for (const sql of [...migrations, ...indexMigrations]) {
+      try { await client.query(sql); } catch (e) { /* may already exist */ }
     }
   } finally {
     client.release();
@@ -754,12 +806,13 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     countConversationMessages: async (userId, conversationId) => Number((await get('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?', conversationId, userId)).count),
 
     // --- Tasks ---
-    async addTask(userId, { title, prompt, risk='internal', scheduleAt=null, recurrence='none' }) {
+    async addTask(userId, { title, prompt, risk='internal', scheduleAt=null, recurrence='none', deliveryChannel='push' }) {
       const now = timestamp();
       const status = risk === 'external' ? 'waiting_approval' : scheduleAt ? 'scheduled' : 'queued';
-      const row = { id: randomUUID(), user_id: userId, title, prompt, status, risk, schedule_at: scheduleAt, recurrence, result: null, created_at: now, updated_at: now };
-      await run(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`, row.id, row.user_id, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.created_at, row.updated_at);
+      const channel = deliveryChannel === 'whatsapp' ? 'whatsapp' : 'push';
+      const row = { id: randomUUID(), user_id: userId, title, prompt, status, risk, schedule_at: scheduleAt, recurrence, delivery_channel: channel, result: null, created_at: now, updated_at: now };
+      await run(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)`, row.id, row.user_id, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.delivery_channel, row.created_at, row.updated_at);
       return row;
     },
     listTasks: async (userId) => all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),
@@ -806,6 +859,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     },
     listArtifacts: async (userId) => all('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200', userId),
     getArtifact: async (userId, id) => get('SELECT * FROM artifacts WHERE id=? AND user_id=?', id, userId),
+    deleteArtifact: async (userId, id) => { const r = await run('DELETE FROM artifacts WHERE id=? AND user_id=?', id, userId); return (r.rowCount||r.changes||0)>0; },
 
     // --- Push subscriptions ---
     savePush: async (userId, { endpoint, keys }) => {
@@ -829,6 +883,19 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
     deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
 
+    // --- WhatsApp linking ---
+    async linkWhatsApp(userId, phoneE164) {
+      const now = timestamp();
+      await run(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+        VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,verified_at=excluded.verified_at,created_at=excluded.created_at`,
+        userId, phoneE164, now, now, now);
+      return get('SELECT * FROM whatsapp_links WHERE user_id=?', userId);
+    },
+    getWhatsAppLink: async (userId) => (await get('SELECT * FROM whatsapp_links WHERE user_id=?', userId)) || null,
+    getUserByWhatsApp: async (phoneE164) => (await get('SELECT * FROM whatsapp_links WHERE phone_e164=?', phoneE164)) || null,
+    setWhatsAppLastInbound: async (userId, at = timestamp()) => (await run('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?', at, userId)).changes > 0,
+    unlinkWhatsApp: async (userId) => (await run('DELETE FROM whatsapp_links WHERE user_id=?', userId)).changes > 0,
+
     // --- OAuth states ---
     addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },
     async consumeOauthState(hash) {
@@ -847,6 +914,12 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     listAccessRequests: async () => all('SELECT * FROM access_requests ORDER BY created_at DESC,id DESC LIMIT 100'),
     dismissAccessRequest: async (id) => (await run('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL', timestamp(), id)).changes > 0,
 
+    // --- Waitlist ---
+    addWaitlistEntry: async ({ id, email, name }) => { await run('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, name || null, 'pending', timestamp(), timestamp()); },
+    listWaitlist: async () => all('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
+    updateWaitlistStatus: async (id, status) => (await run('UPDATE waitlist SET status=?,updated_at=? WHERE id=?', status, timestamp(), id)).changes > 0,
+    waitlistPosition: async (createdAt) => (await get("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?", createdAt)).c,
+
     // --- Door tokens ---
     addDoorToken: async (tokenHash, expiresAt) => { await run('INSERT INTO door_tokens VALUES (?, ?, NULL, ?)', tokenHash, expiresAt, timestamp()); },
     async consumeDoorToken(tokenHash) {
@@ -855,6 +928,10 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       return row;
     },
     pruneDoorTokens: async () => { await run('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL', timestamp()); },
+    addPasswordResetToken: async (tokenHash, userId, expiresAt) => { await run('INSERT INTO password_reset_tokens VALUES (?, ?, ?, 0, ?)', tokenHash, userId, expiresAt, timestamp()); },
+    getPasswordResetToken: async (tokenHash) => get('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?', tokenHash, timestamp()),
+    markPasswordResetTokenUsed: async (tokenHash) => { const r = await run('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0', tokenHash); return (r.changes||0)>0; },
+    cleanExpiredPasswordResetTokens: async () => { await run('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1', timestamp()); },
 
     // --- Export / restore ---
     async exportUser(userId) {

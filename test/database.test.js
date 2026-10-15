@@ -43,6 +43,19 @@ test('external tasks wait for approval and emergency state persists', () => {
   db.close();
 });
 
+test('addTask persists deliveryChannel with a push default', () => {
+  const { db, user } = fixture();
+  const wa = db.addTask(user.id, { title: 'WhatsApp reminder', prompt: 'Text me', scheduleAt: '2026-10-13T12:00:00Z', deliveryChannel: 'whatsapp' });
+  assert.equal(wa.delivery_channel, 'whatsapp');
+  assert.equal(db.getTask(user.id, wa.id).delivery_channel, 'whatsapp');
+  const def = db.addTask(user.id, { title: 'Push reminder', prompt: 'Notify me' });
+  assert.equal(def.delivery_channel, 'push');
+  assert.equal(db.getTask(user.id, def.id).delivery_channel, 'push');
+  const bad = db.addTask(user.id, { title: 'Bogus channel', prompt: 'x', deliveryChannel: 'sms' });
+  assert.equal(bad.delivery_channel, 'push');
+  db.close();
+});
+
 test('exports and non-destructively restores a user bundle', () => {
   const { db, user } = fixture();
   const portableConvo = db.ensureDefaultConversation(user.id);

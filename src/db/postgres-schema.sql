@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   risk TEXT NOT NULL CHECK(risk IN ('internal','external')),
   schedule_at TEXT,
   recurrence TEXT NOT NULL CHECK(recurrence IN ('none','daily','weekly')),
+  delivery_channel TEXT NOT NULL DEFAULT 'push',
   result TEXT,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   lease_expires_at TEXT,
@@ -403,6 +404,36 @@ CREATE TABLE IF NOT EXISTS door_tokens (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
+
+CREATE TABLE IF NOT EXISTS waitlist (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  name TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_links (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  phone_e164 TEXT NOT NULL UNIQUE,
+  verified_at TEXT NOT NULL,
+  last_inbound_at TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
+
 CREATE INDEX IF NOT EXISTS idx_personal_dates_user ON personal_dates(user_id);
 CREATE INDEX IF NOT EXISTS idx_curiosity_user ON curiosity_gaps(user_id, dismissed, asked_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
@@ -418,3 +449,6 @@ CREATE INDEX IF NOT EXISTS idx_project_steps ON project_steps(user_id, project_i
 CREATE INDEX IF NOT EXISTS idx_approvals_user ON approvals(user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_people_stale ON people_mentions(user_id, dismissed, last_mentioned_at);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id);

@@ -252,6 +252,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS door_tokens (
       token_hash TEXT PRIMARY KEY, expires_at TEXT NOT NULL, used_at TEXT, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+      used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_links (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      phone_e164 TEXT NOT NULL UNIQUE,
+      verified_at TEXT NOT NULL,
+      last_inbound_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS waitlist (
+      id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -293,6 +311,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'tasks', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'tasks', 'lease_expires_at', 'TEXT');
   ensureColumn(db, 'tasks', 'last_error', 'TEXT');
+  ensureColumn(db, 'tasks', 'delivery_channel', "TEXT NOT NULL DEFAULT 'push'");
   ensureColumn(db, 'events', 'user_id', 'TEXT');
   ensureColumn(db, 'proactive_state', 'last_outreach_at', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_date', 'TEXT');
@@ -306,6 +325,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -491,8 +513,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
     countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
     countUserMessages: db.prepare("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'"),
-    addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,NULL,?,?)`),
+    addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)`),
     listTasks: db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 200'),
     addCalendarFeed: db.prepare(`INSERT INTO calendar_feeds(id,user_id,label,url,created_at,updated_at)
       VALUES(?,?,?,?,?,?)`),
@@ -513,6 +535,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addArtifact: db.prepare('INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     listArtifacts: db.prepare('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200'),
     getArtifact: db.prepare('SELECT * FROM artifacts WHERE id=? AND user_id=?'),
+    deleteArtifact: db.prepare('DELETE FROM artifacts WHERE id=? AND user_id=?'),
     addPush: db.prepare(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
       ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`),
     listPush: db.prepare('SELECT * FROM push_subscriptions WHERE user_id=?'),
@@ -529,13 +552,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     consumeOauthState: db.prepare('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?'),
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
+    addWaitlistEntry: db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)'),
+    listWaitlist: db.prepare('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
+    updateWaitlistStatus: db.prepare('UPDATE waitlist SET status=?,updated_at=? WHERE id=?'),
+    waitlistPosition: db.prepare("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?"),
     getAccessRequest: db.prepare('SELECT * FROM access_requests WHERE id=?'),
     listAccessRequests: db.prepare('SELECT * FROM access_requests ORDER BY created_at DESC,rowid DESC LIMIT 100'),
     dismissAccessRequest: db.prepare('UPDATE access_requests SET handled_at=? WHERE id=? AND handled_at IS NULL'),
     addDoorToken: db.prepare('INSERT INTO door_tokens VALUES (?, ?, NULL, ?)'),
     consumeDoorToken: db.prepare('SELECT * FROM door_tokens WHERE token_hash=? AND used_at IS NULL AND expires_at>?'),
     useDoorToken: db.prepare('UPDATE door_tokens SET used_at=? WHERE token_hash=? AND used_at IS NULL'),
-    pruneDoorTokens: db.prepare('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL')
+    pruneDoorTokens: db.prepare('DELETE FROM door_tokens WHERE expires_at<=? OR used_at IS NOT NULL'),
+    addPwResetToken: db.prepare('INSERT INTO password_reset_tokens VALUES (?, ?, ?, 0, ?)'),
+    getPwResetToken: db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?'),
+    usePwResetToken: db.prepare('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0'),
+    cleanPwResetTokens: db.prepare('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1'),
+    linkWhatsApp: db.prepare(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+      VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,verified_at=excluded.verified_at,created_at=excluded.created_at`),
+    getWhatsAppLink: db.prepare('SELECT * FROM whatsapp_links WHERE user_id=?'),
+    getUserByWhatsApp: db.prepare('SELECT * FROM whatsapp_links WHERE phone_e164=?'),
+    setWhatsAppLastInbound: db.prepare('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?'),
+    unlinkWhatsApp: db.prepare('DELETE FROM whatsapp_links WHERE user_id=?')
   };
 
   return {
@@ -797,10 +834,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getConversationSummary:(userId,conversationId)=>s.getConversationSummary.get(conversationId,userId)||null,
     setConversationSummary(userId,conversationId,summary,messageCount){s.upsertConversationSummary.run(conversationId,userId,summary,messageCount,timestamp());return s.getConversationSummary.get(conversationId,userId);},
     countConversationMessages:(userId,conversationId)=>s.countConversationMessages.get(conversationId,userId).count,
-    addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none'}) {
+    addTask(userId,{title,prompt,risk='internal',scheduleAt=null,recurrence='none',deliveryChannel='push'}) {
       const now=timestamp(); const status=risk==='external'?'waiting_approval':scheduleAt?'scheduled':'queued';
-      const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,result:null,created_at:now,updated_at:now};
-      s.addTask.run(row.id,row.user_id,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.created_at,row.updated_at); return row;
+      const channel=deliveryChannel==='whatsapp'?'whatsapp':'push'; // validated: only push/whatsapp
+      const row={id:randomUUID(),user_id:userId,title,prompt,status,risk,schedule_at:scheduleAt,recurrence,delivery_channel:channel,result:null,created_at:now,updated_at:now};
+      s.addTask.run(row.id,row.user_id,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.delivery_channel,row.created_at,row.updated_at); return row;
     },
     listTasks: (userId) => s.listTasks.all(userId),
     addCalendarFeed(userId, { label, url }) {
@@ -825,6 +863,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addArtifact(userId,{taskId=null,name,mimeType='text/markdown',content}) { const now=timestamp(); const size=Buffer.byteLength(content); const row={id:randomUUID(),user_id:userId,task_id:taskId,name,mime_type:mimeType,content,size_bytes:size,created_at:now}; s.addArtifact.run(row.id,row.user_id,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at); return row; },
     listArtifacts: (userId) => s.listArtifacts.all(userId),
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
+    deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
     savePush(userId,{endpoint,keys}) { s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp()); },
     listPush: (userId) => s.listPush.all(userId),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
@@ -833,13 +872,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listConnectors: (userId) => s.listConnectors.all(userId),
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
+    linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
+    getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
+    getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
+    setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,
+    unlinkWhatsApp: (userId) => s.unlinkWhatsApp.run(userId).changes>0,
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     listAccessRequests: () => s.listAccessRequests.all(),
+    addWaitlistEntry({id,email,name}) { s.addWaitlistEntry.run(id,email,name||null,'pending',timestamp(),timestamp()); },
+    listWaitlist: () => s.listWaitlist.all(),
+    updateWaitlistStatus: (id,status) => s.updateWaitlistStatus.run(status,timestamp(),id).changes>0,
+    waitlistPosition: (createdAt) => s.waitlistPosition.get(createdAt).c,
     dismissAccessRequest: (id) => s.dismissAccessRequest.run(timestamp(),id).changes>0,
     addDoorToken(tokenHash,expiresAt) { s.addDoorToken.run(tokenHash,expiresAt,timestamp()); },
     consumeDoorToken(tokenHash) { const row=s.consumeDoorToken.get(tokenHash,timestamp()); if(row)s.useDoorToken.run(timestamp(),tokenHash); return row; },
+    addPasswordResetToken(tokenHash,userId,expiresAt) { s.addPwResetToken.run(tokenHash,userId,expiresAt,timestamp()); },
+    getPasswordResetToken(tokenHash) { return s.getPwResetToken.get(tokenHash,timestamp()); },
+    markPasswordResetTokenUsed(tokenHash) { return s.usePwResetToken.run(tokenHash).changes>0; },
+    cleanExpiredPasswordResetTokens() { s.cleanPwResetTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
     exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {

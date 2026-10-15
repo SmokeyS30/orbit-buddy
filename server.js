@@ -1,6 +1,8 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomInt, randomUUID } from 'node:crypto';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers } from './src/model.js';
@@ -10,11 +12,14 @@ import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
-import { searchMessages, formatSearchResults } from './src/conversation-search.js';
+import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
+import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone } from './src/ambient.js';
 import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
+import { buildTodayBriefing } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
+import { sendEmail as sendResendEmail } from './src/email.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -29,6 +34,7 @@ function json(res,status,body,headers={}) { res.writeHead(status,{ 'Content-Type
 function cleanText(value,max,field) { if(typeof value!=='string'||!value.trim()) throw Object.assign(new Error(`${field} is required.`),{status:400}); return value.trim().slice(0,max); }
 function optionalText(value,max) { return typeof value==='string'&&value.trim()?value.trim().slice(0,max):null; }
 function safeEmail(value) { const email=String(value||'').trim().toLowerCase(); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254) throw Object.assign(new Error('A valid email is required.'),{status:400}); return email; }
+
 // Feed URLs are secrets (anyone holding one can read the calendar): never send
 // the full URL to the client, log it, or put it in activity events.
 function maskFeedUrl(raw) { try { const url=new URL(String(raw)); const tail=String(url.pathname||'').replace(/\/$/,'').slice(-4); return `${url.protocol}//${url.host}/\u2026${tail}`; } catch { return 'invalid url'; } }
@@ -36,7 +42,7 @@ function publicFeed(feed) { return { id:feed.id,label:feed.label,url:maskFeedUrl
 async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} }
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
 function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
-function markdownToHtml(md,autoPrint,printUrl){
+function markdownToHtml(md,autoPrint,printUrl,toolbarOverride=null,docTitle=''){
   const esc=(s)=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const inline=(s)=>esc(s).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/\*([^*]+)\*/g,'<em>$1</em>').replace(/`([^`]+)`/g,'<code>$1</code>');
   const lines=String(md||'').split('\n');
@@ -49,12 +55,19 @@ function markdownToHtml(md,autoPrint,printUrl){
     else{if(inList){html+='</ul>';inList=false;}if(line.trim())html+=`<p>${inline(line.trim())}</p>`;}
   }
   if(inList)html+='</ul>';
-  const shareJs=`async function sharePrint(){try{const res=await fetch(location.pathname+'?format=pdf');if(!res.ok)throw new Error('pdf');const blob=await res.blob();const file=new File([blob],'orbit-result.pdf',{type:'application/pdf'});if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:document.title});}else{alert('Sharing is not supported here.');}}catch(e){alert('Could not prepare the file.');}}`;
-  const toolbar=autoPrint
+  const toolbar=toolbarOverride||(autoPrint
     ? `<div class="toolbar"><button onclick="window.print()" style="font-size:1.2em;padding:.7em 1.5em;">Tap to Print</button></div>`
-    : `<div class="toolbar"><a href="/#files">Done</a><button onclick="sharePrint()">Print</button></div><script>${shareJs}</script>`;
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Orbit result</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
+    : `<div class="toolbar"><a href="/#files">Done</a><button onclick="sharePrint()">Print</button></div><script>${PRINT_SHARE_JS}</script>`);
+  const title=String(docTitle||'').replace(/[<>&"]/g,'').slice(0,80)||'Orbit result';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{font-family:-apple-system,system-ui,sans-serif;max-width:40em;margin:0 auto;padding:1.5em;line-height:1.6;color:#1a1a1a}h1,h2,h3,h4{line-height:1.3}code{background:#f0f0f0;padding:.1em .3em;border-radius:.25em}ul{padding-left:1.5em}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:1em;gap:.5em}.toolbar a,.toolbar button{font-size:1em;padding:.5em 1em;border:1px solid #ccc;border-radius:.5em;background:#f8f8f8;cursor:pointer;text-decoration:none;color:#1a1a1a}@media print{.toolbar{display:none}body{max-width:none;padding:0}}</style></head><body>${toolbar}${html}</body></html>`;
 }
+// Shared by the artifact print flow and R2 Canvas: fetch the page as ?format=pdf
+// and share it via the Web Share API.
+const PRINT_SHARE_JS=`async function sharePrint(){try{const res=await fetch(location.pathname+'?format=pdf');if(!res.ok)throw new Error('pdf');const blob=await res.blob();const file=new File([blob],'orbit-result.pdf',{type:'application/pdf'});if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:document.title});}else{alert('Sharing is not supported here.');}}catch(e){alert('Could not prepare the file.');}}`;
+// R2 Canvas: short-lived printable renders. Tokens are unguessable, bound to
+// the user, and expire after 10 minutes; the markdown lives in memory only.
+const canvasRenders=new Map();
+function pruneCanvasRenders(){const now=Date.now();for(const [key,entry] of canvasRenders){if(entry.expires<now)canvasRenders.delete(key);}if(canvasRenders.size>200){const drop=[...canvasRenders.keys()].slice(0,canvasRenders.size-200);for(const key of drop)canvasRenders.delete(key);}}
 function stripInlineMd(s){return String(s).replace(/\*\*([^*]+)\*\*/g,'$1').replace(/\*([^*]+)\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
 function pdfEscape(s){return String(s).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)').replace(/[\u2018\u2019]/g,"'").replace(/[\u201c\u201d]/g,'"').replace(/\u2014/g,'--').replace(/\u2013/g,'-').replace(/\u2022/g,'*').replace(/[^\x20-\x7e]/g,'?');}
 function wrapPdfText(text,size){
@@ -179,10 +192,24 @@ export function createOrbitServer(options={}) {
   const model=createModelClient(env);
   const push=createPushService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
+
+  // Send a password reset email via Resend. Returns true if sent, false otherwise (never throws).
+  async function sendPasswordResetEmail({to,resetUrl}){
+    try{
+      return await sendResendEmail(env,{
+        to,
+        subject:'Reset your Orbit password',
+        text:`Someone requested a password reset for your Orbit account.\n\nReset your password here (expires in 1 hour):\n${resetUrl}\n\nIf you didn't request this, you can safely ignore this email.`,
+        html:`<p>Someone requested a password reset for your Orbit account.</p><p><a href="${resetUrl}">Reset your password</a> (expires in 1 hour).</p><p style="color:#666;font-size:.9em;">If you didn't request this, you can safely ignore this email.</p>`
+      });
+    }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
+  }
   const production=env.NODE_ENV==='production';
   const publicBase=env.PUBLIC_BASE_URL?.replace(/\/$/,'')||null;
   if(publicBase && !/^https:\/\//.test(publicBase) && production) throw new Error('PUBLIC_BASE_URL must use HTTPS in production.');
 
+  // B1: per-user morning-briefing cache (userId -> {date, at, data}), 10-min TTL.
+  const briefingCache=new Map();
   function reliabilityFor(userId){
     const events=db.listEvents(userId,200);const since=Date.now()-7*24*60*60_000;const recent=events.filter((event)=>new Date(event.created_at).valueOf()>=since);
     const count=(type)=>recent.filter((event)=>event.type===type).length;const chats={successful:count('chat'),failed:count('chat_failed')};const tasks={successful:count('task_completed'),failed:count('task_failed')};
@@ -193,6 +220,11 @@ export function createOrbitServer(options={}) {
   function getClientIp(req){
     // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
     // Take the leftmost (original client) IP, validate format to prevent header injection.
+    const cfIp=req.headers['cf-connecting-ip'];
+    if(cfIp){
+      const ip=String(cfIp).trim();
+      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
+    }
     const fwd=req.headers['x-forwarded-for'];
     if(fwd){
       const ip=String(fwd).split(',')[0].trim();
@@ -203,7 +235,7 @@ export function createOrbitServer(options={}) {
   }
   function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
-  function hourlyLimited(req,limit,scope){const key=`${scope}:${req.socket.remoteAddress||'unknown'}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
+  function hourlyLimited(req,limit,scope){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
   const userLog=new Map();
   function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
   const paused=()=>db.getSetting('system_paused','false')==='true';
@@ -235,6 +267,96 @@ export function createOrbitServer(options={}) {
   const chatQueues=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
   function enqueueChatReply(conversationId,job){const prev=chatQueues.get(conversationId)||Promise.resolve();const next=prev.then(async()=>{try{await job();}catch(error){console.error('chat job failed',conversationId,error&&error.message);}});chatQueues.set(conversationId,next);next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});return next;}
+  // R3 ambient context ("Orbit remembers the room"). With the user's explicit
+  // permission, note the setting of a conversation: weekday, time of day, and
+  // a self-declared place label. One memory per day max; repeats of the same
+  // setting within 14 days are not re-stored (rhythms come from repetition).
+  // Everything is an ordinary memory the user can see and delete.
+  function captureAmbientContext(db,userId,message,timeZone){
+    const snap=ambientSnapshot({message,nowMs:Date.now(),timeZone});
+    const content=ambientMemoryContent(snap);
+    const recent=db.listMemoriesBySource(userId,'ambient',50);
+    const memDay=(m)=>dayInZone(new Date(m.created_at).valueOf(),timeZone);
+    if(recent.some((m)=>memDay(m)===snap.day))return; // one per day
+    const cutoffDay=dayInZone(Date.now()-14*24*3600_000,timeZone);
+    if(recent.some((m)=>m.content===content&&memDay(m)>=cutoffDay))return; // no 14-day repeats
+    db.addMemory(userId,content,{kind:'fact',source:'ambient',confidence:0.9});
+    db.addEvent(userId,'ambient_noted',`Noted ambient context: ${snap.weekday} ${snap.bucket}${snap.place?` (${snap.place})`:''}.`);
+  }
+  // Shared reply pipeline used by web chat (/api/chat) and WhatsApp.
+  // The caller adds the user message first; this generates the assistant reply
+  // with the full model pipeline, stores it, and returns the answer text.
+  async function runChatReplyJob({userId,user,conversation,message,userMsg}){
+    if(!db.getConversation(userId,conversation.id))return null;
+    const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
+    let answer=null;
+    try{
+      const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
+      const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
+      const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
+      let needsBuddyName=false;
+      if(!customBuddyName){
+        const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
+        if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
+      }
+      // R3 ambient context: one gentle permission ask in chat, never a toggle.
+      // Declined = never ask again; dodged = re-ask after 90 days at most.
+      // Only asked once the user has actually chatted a little (>=4 turns).
+      let needsAmbientAsk=false;
+      if(!db.getSetting(`ambient_context_${userId}`)){
+        const ambientAskedAt=Number(db.getSetting(`ambient_asked_${userId}`)||0);
+        const userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
+        if(userTurns>=4&&(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000)){
+          needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));
+        }
+      }
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,needsAmbientAsk,
+        memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
+          gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
+        onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
+      for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
+      // Backward compatibility for replies from older/custom models that still emit legacy markers.
+      for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
+      for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
+      answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
+      db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      if(db.getSetting(`ambient_context_${userId}`)==='granted'){
+        // R3: note the setting of this conversation. Non-blocking; in-memory only.
+        setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
+      }
+    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';db.addMessage(userId,conversation.id,'assistant',answer);}
+    streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
+    await maybeRefreshConversationSummary(user,conversation);
+    if(isCorrectionMessage(message)){
+      // Learn from the correction without blocking: figure out what was wrong and save the fix
+      setImmediate(async()=>{
+        try{
+          const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
+          const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
+          const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
+
+Conversation:
+${hist}
+
+Respond with a single JSON object: {"content":"one clear sentence capturing the corrected understanding","confidence":0.85-0.95}`,memories:[],goals:[],history:[],userTimeZone:tzNow,taskMode:true});
+          const fm=fixText.match(/\{[\s\S]*\}/);
+          if(fm){
+            const parsed=JSON.parse(fm[0]);
+            const content=String(parsed.content||'').trim().slice(0,500);
+            if(content.length>=10){
+              const existing=db.listRelevantMemories(userId,content,3);
+              if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
+                db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
+                db.addEvent(userId,'correction_learned','Learned from a user correction.');
+              }
+            }
+          }
+        }catch(e){db.addEvent(userId,'correction_learn_failed','Could not learn from a correction.',e.message);}
+      });
+    }
+    return answer;
+  }
   async function runDueTasks(){
     if(workerBusy||paused())return;workerBusy=true;
     try{
@@ -256,6 +378,10 @@ export function createOrbitServer(options={}) {
           db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
+          // Delivery channel: WhatsApp replaces push when the 24h window is open;
+          // outside the window (or on send failure) fall back to push — a reminder
+          // is never silently dropped.
+          if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
         }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
       }
@@ -264,13 +390,60 @@ export function createOrbitServer(options={}) {
 
   // A proactive message lands in the default conversation AND as a push notification,
   // so the buddy reaches out even on devices without push enabled.
+  // WhatsApp proactive send: WhatsApp REPLACES push when the 24h messaging
+  // window is open (user texted Orbit within the last 24h). Outside the window
+  // only approved template messages are allowed — this app sends none — so the
+  // push notification still fires and nothing is lost. WhatsApp linking is
+  // owner-only (enforced in the linking webhook), so a link can only ever
+  // exist for the owner.
+  async function tryWhatsAppProactive(userId, text) {
+    if (!tryWhatsAppDeliveryGate(userId)) return false;
+    const link = db.getWhatsAppLink(userId);
+    try {
+      await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: text });
+      db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');
+      return true;
+    } catch (error) {
+      console.error('whatsapp proactive send failed', error && error.message);
+      db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));
+      return false; // fall back to push below
+    }
+  }
   async function deliverProactive(user,text,eventType,eventMessage){
     const conversation=db.ensureDefaultConversation(user.id);
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
+    if(await tryWhatsAppProactive(user.id,text))return;
     await push.notify(user.id,buddyNameFor(user.id),text,{view:'today'});
+  }
+  // WhatsApp delivery for a completed scheduled task: only when the 24h window
+  // is open. Outside the window (or if sending fails) we fall back to push so
+  // a reminder is never silently dropped. The result is also written to the
+  // conversation so the web app keeps a record.
+  async function tryWhatsAppTaskResult(task, result) {
+    if (!tryWhatsAppDeliveryGate(task.user_id)) return false;
+    try {
+      const link = db.getWhatsAppLink(task.user_id);
+      await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: result });
+      const conversation = db.ensureDefaultConversation(task.user_id);
+      db.addMessage(task.user_id, conversation.id, 'assistant', result);
+      db.touchConversation(task.user_id, conversation.id);
+      db.addEvent(task.user_id, 'task_delivered_whatsapp', `Delivered task result via WhatsApp: “${task.title}”.`);
+      return true;
+    } catch (error) {
+      console.error('whatsapp task delivery failed', error && error.message);
+      db.addEvent(task.user_id, 'whatsapp_send_failed', 'Could not send WhatsApp task result.', String(error && error.message || error).slice(0, 200));
+      return false; // fall back to push
+    }
+  }
+  function tryWhatsAppDeliveryGate(userId) {
+    if (!whatsappConfigured(env)) return false;
+    const owner = db.getUserById(userId);
+    if (!owner || owner.role !== 'owner') return false; // WhatsApp linking is owner-only
+    const link = db.getWhatsAppLink(userId);
+    return Boolean(link?.phone_e164) && isWindowOpen(link.last_inbound_at);
   }
   async function maybeRefreshConversationSummary(user,conversation){
     const userId=user.user_id||user.id;
@@ -385,6 +558,28 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       }catch(error){
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
+
+      // --- R3 ambient rhythms: the same setting on 3+ distinct days becomes a
+      // rhythm memory, so Orbit can use it unprompted (e.g. Sunday-morning
+      // hike planning). Only runs with the user's explicit permission.
+      try{
+        if(db.getSetting(`ambient_context_${user.id}`)==='granted'){
+          const observations=db.listMemoriesBySource(user.id,'ambient',50)
+            .map((m)=>{const p=parseAmbientMemory(m.content);return p?{...p,day:dayInZone(new Date(m.created_at).valueOf(),timeZone)}:null;})
+            .filter(Boolean);
+          const rhythms=detectRhythms(observations);
+          const known=new Set(db.listMemoriesBySource(user.id,'ambient-rhythm',50).map((m)=>String(m.content||'').split(' ')[0]));
+          let rhythmsAdded=0;
+          for(const r of rhythms.slice(0,2)){
+            const marker=rhythmKey(r);
+            if(known.has(marker))continue;
+            const who=user.display_name||'The user';
+            db.addMemory(user.id,`${marker} ${who} ${rhythmSentence(r)}. Noticed from chat times — useful for unprompted, well-timed suggestions.`,{kind:'fact',source:'ambient-rhythm',confidence:0.7});
+            rhythmsAdded++;
+          }
+          if(rhythmsAdded>0)db.addEvent(user.id,'ambient_rhythm',`Noticed ${rhythmsAdded} chat rhythm${rhythmsAdded>1?'s':''}.`);
+        }
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
 
       // --- Monthly deep dive: mine full history for long arcs ---
       try{
@@ -1185,6 +1380,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
       }catch(error){
         db.releaseProactiveSlot(user.id,today);
+        // Silent skip on rate limits — the worker retries in 5 min; don't pollute the Reliability tab
+        if(error.classification==='rate_limit')return;
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
       }
     }
@@ -1291,6 +1488,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
       }catch(error){
+        // Silent skip on rate limits — the worker retries in 5 min
+        if(error.classification==='rate_limit')return;
+        // Distinct event for Gmail auth failures so Edward gets an actionable message
+        if(error.status===401){
+          db.addEvent(user.id,'gmail_disconnected','Gmail needs reconnecting.','Please reconnect Gmail in the Connections tab.');
+          return;
+        }
         db.addEvent(user.id,'email_triage_failed','Could not triage emails.',error.message);
       }
     }
@@ -1415,6 +1619,69 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         return json(res,201,{ok:true,id:saved.id});
       }
+      // Waitlist — public signup for launch notifications
+      if(req.method==='POST'&&url.pathname==='/api/waitlist'){
+        if(hourlyLimited(req,5,'waitlist'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);
+        const email=safeEmail(body.email);
+        const name=body.name&&String(body.name).trim()?cleanText(body.name,80,'name'):null;
+        if(!email)throw Object.assign(new Error('Valid email required.'),{status:400});
+        const id='wl_'+randomToken(12);
+        const joinedAt=new Date().toISOString();
+        try{
+          db.addWaitlistEntry({id,email,name});
+        }catch(e){
+          if(String(e.message||'').includes('UNIQUE'))throw Object.assign(new Error('This email is already on the waitlist.'),{status:409});
+          throw e;
+        }
+        let position=1,estimateText='about 1\u20132 weeks';
+        try{
+          position=Number(db.waitlistPosition(joinedAt))||1;
+          const perWeek=Math.max(1,parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10);
+          const weeks=Math.max(1,Math.ceil(position/perWeek));
+          estimateText=weeks===1?'about a week':`about ${weeks} weeks`;
+        }catch{}
+        // Confirmation email
+        try{
+          const {sendEmail}=await import('./src/email.js');
+          await sendEmail(process.env,{
+            to:email,
+            subject:'You\'re on the Orbit Buddy waitlist',
+            text:`Hi${name?` ${name}`:''},\n\nYou're on the waitlist for Orbit Buddy — your privacy-first AI companion.\n\nYou're #${position} in line. We're letting new users in gradually to keep things fast and stable, so your estimated wait is ${estimateText}. We'll email you the moment your spot is ready.\n\n— The Orbit Buddy team`,
+            html:`<p>Hi${name?` ${name}`:''},</p><p>You're on the waitlist for <strong>Orbit Buddy</strong> — your privacy-first AI companion.</p><p>We're letting new users in gradually to keep things fast and stable. <strong>You're <strong>#${position}</strong> in line, with an estimated wait of <strong>${estimateText}</strong>.</p><p>We'll email you the moment your spot is ready.</p><p>— The Orbit Buddy team</p>`
+          });
+        }catch{}
+        // Notify owner
+        const owner=db.listUsers().find((u)=>u.role==='owner');
+        if(owner)await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});
+        return json(res,201,{ok:true});
+      }
+      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
+        requireOwner(req);
+        const rows=db.listWaitlist();
+        return json(res,200,{ok:true,waitlist:rows});
+      }
+      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
+        requireOwner(req);
+        const id=url.pathname.split('/').pop();
+        const body=await readJson(req);
+        const status=String(body.status||'').trim();
+        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+        db.updateWaitlistStatus(id,status);
+        return json(res,200,{ok:true});
+      }
+      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
+        requireOwner(req);
+        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+        requireOwner(req);
+        const body=await readJson(req);
+        const n=parseInt(body.invitesPerWeek,10);
+        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
+        db.setSetting('waitlist_invites_per_week',String(n));
+        return json(res,200,{ok:true,invitesPerWeek:n});
+      }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
         if(!email)throw Object.assign(new Error('Email required.'),{status:400});
@@ -1453,6 +1720,113 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const now=new Date();const monthStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)).toISOString();
         return json(res,200,{month:monthStart.slice(0,7),braveConfigured:!!env.BRAVE_SEARCH_API_KEY?.trim(),webSearches:db.countToolUseSince('web_search',monthStart)});
       }
+      // WhatsApp webhook (Twilio). Public: Twilio authenticates via X-Twilio-Signature.
+      if(req.method==='POST'&&url.pathname==='/api/whatsapp/webhook'){
+        if(!whatsappConfigured(env))return json(res,200,{ok:true,configured:false});
+        const params=await readFormBody(req);
+        const webhookUrl=originFor(req)+'/api/whatsapp/webhook';
+        if(!verifyTwilioSignature({authToken:env.TWILIO_AUTH_TOKEN,url:webhookUrl,params,signature:req.headers['x-twilio-signature']})){
+          return json(res,403,{error:'Invalid signature.'});
+        }
+        const from=normalizePhone(params.From);
+        const body=String(params.Body||'').trim();
+        const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
+        // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
+        if(/^\d{6}$/.test(body)){
+          const record=db.getSetting(`whatsapp_link_code_${body}`);
+          if(record){
+            const sep=record.indexOf(':'); // userId is a UUID (no colons); the ISO timestamp after it has colons
+            const linkUserId=record.slice(0,sep);
+            const expiresAt=record.slice(sep+1);
+            db.setSetting(`whatsapp_link_code_${body}`,''); // single-use
+            const linkUser=linkUserId?db.getUserById(linkUserId):null; // WhatsApp is owner-only: code must belong to the owner
+            if(linkUserId&&linkUser&&linkUser.role==='owner'&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
+              try{
+                db.linkWhatsApp(linkUserId,from);
+                db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
+                try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
+              }catch(e){
+                try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
+              }
+              return json(res,200,{ok:true});
+            }
+          }
+          // Code didn't match: fall through to normal message handling below.
+        }
+        const link=from?db.getUserByWhatsApp(from):null;
+        if(!link)return json(res,200,{ok:true,ignored:true}); // unknown sender (or status callback): ignore
+        const waUserId=link.user_id;
+        if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
+        if(paused())return json(res,200,{ok:true,paused:true});
+        db.setWhatsAppLastInbound(waUserId);
+        const numMedia=parseInt(params.NumMedia||'0',10)||0;
+        const conversation=db.ensureDefaultConversation(waUserId);
+        const waUser=db.getUserById(waUserId);
+        // Location share: Latitude/Longitude form fields, no media. Coordinates are
+        // passed to the model turn only — the stored history row is redacted and
+        // nothing is logged, so the location stays ephemeral.
+        const sharedLocation=parseWhatsAppLocation(params);
+        if(sharedLocation){
+          const locationMessage=formatLocationMessage(sharedLocation,body);
+          const userMsg=db.addMessage(waUserId,conversation.id,'user',LOCATION_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
+          enqueueChatReply(conversation.id,async()=>{
+            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg});
+            if(answer&&from){
+              try{await twilioSend(from,answer);}
+              catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+            }
+          });
+          return json(res,200,{ok:true,location:true});
+        }
+        if(numMedia>0){
+          const mediaContentType=String(params.MediaContentType0||'');
+          const mediaUrl=String(params.MediaUrl0||'');
+          // Voice notes (audio/ogg): download, transcribe with Whisper, feed the
+          // transcript into the normal pipeline. Audio is never stored.
+          if(isAudioContentType(mediaContentType)&&mediaUrl){
+            let transcript=null;
+            try{
+              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+              transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
+            }catch(e){
+              console.error('whatsapp voice note failed',e.code||e.message);
+              const tooLong=e.code==='MEDIA_TOO_LARGE';
+              try{await twilioSend(from,tooLong
+                ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
+                :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
+              return json(res,200,{ok:true,voiceNote:false});
+            }
+            if(!transcript){
+              try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
+              return json(res,200,{ok:true,voiceNote:false});
+            }
+            const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
+            const userMsg=db.addMessage(waUserId,conversation.id,'user',voiceMessage);db.touchConversation(waUserId,conversation.id);
+            enqueueChatReply(conversation.id,async()=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg});
+              if(answer&&from){
+                try{await twilioSend(from,answer);}
+                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+              }
+            });
+            return json(res,200,{ok:true,voiceNote:true});
+          }
+          // Phase 2 covers location + voice notes; images land later.
+          db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
+          try{await twilioSend(from,'I can read text and listen to voice notes now — photo support is coming soon.');}catch(e){console.error('whatsapp media reply failed',e.message);}
+          return json(res,200,{ok:true});
+        }
+        if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
+        const userMsg=db.addMessage(waUserId,conversation.id,'user',body.slice(0,6000));db.touchConversation(waUserId,conversation.id);
+        enqueueChatReply(conversation.id,async()=>{
+          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg});
+          if(answer&&from){
+            try{await twilioSend(from,answer);}
+            catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+          }
+        });
+        return json(res,200,{ok:true});
+      }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
@@ -1474,6 +1848,40 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const recovered=user&&db.consumeRecoveryCode(hashToken(String(body.recoveryCode||'').trim().toUpperCase()));
         if(!recovered||recovered.user_id!==user.id)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});const password=await hashPassword(body.newPassword);db.updatePassword(user.id,password.hash,password.salt);db.deleteUserSessions(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
       }
+      if(req.method==='POST'&&url.pathname==='/api/auth/forgot-password'){
+        if(hourlyLimited(req,5,'forgot-pw'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);let email=null;try{email=safeEmail(body.email);}catch(_){}
+        if(email){
+          const user=db.getUserByEmail(email);
+          if(user&&!user.disabled){
+            const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();
+            db.addPasswordResetToken(hashToken(token),user.id,expiresAt);
+            db.cleanExpiredPasswordResetTokens();
+            const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;
+            const emailed=await sendPasswordResetEmail({to:email,resetUrl});
+            if(!emailed){
+              const owner=db.listUsers().find((u)=>u.role==='owner');
+              if(owner) await push.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});
+            }
+          }
+        }
+        return json(res,200,{ok:true});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/reset-password'){
+        if(hourlyLimited(req,10,'reset-pw'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
+        const body=await readJson(req);const token=String(body.token||'').trim();
+        if(!token)throw Object.assign(new Error('Reset token is required.'),{status:400});
+        const record=db.getPasswordResetToken(hashToken(token));
+        if(!record)throw Object.assign(new Error('This reset link is invalid or has expired.'),{status:400});
+        const newPassword=String(body.newPassword||'');
+        let hashed;try{ hashed=await hashPassword(newPassword); }catch(e){ throw Object.assign(new Error(e.message||'Password was not accepted.'),{status:400}); }
+        db.updatePassword(record.user_id,hashed.hash,hashed.salt);
+        db.markPasswordResetTokenUsed(hashToken(token));
+        db.deleteUserSessions(record.user_id);
+        db.addEvent(record.user_id,'password_reset','Password was reset via email link.');
+        db.cleanExpiredPasswordResetTokens();
+        return json(res,200,{ok:true});
+      }
 
       const callback=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/callback$/);
       if(req.method==='GET'&&callback){const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
@@ -1486,6 +1894,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed)});}
         const userId=user.user_id||user.id;
+        // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
+        // the 15s frontend refresh doesn't refetch weather/calendar each time.
+        if(req.method==='GET'&&url.pathname==='/api/today-briefing'){
+          const prefs=db.getPreferences(userId);
+          const zone=prefs.time_zone||'America/New_York';
+          const today=todayInZone(zone);
+          const cached=briefingCache.get(userId);
+          if(cached&&cached.date===today&&Date.now()-cached.at<10*60_000)return json(res,200,cached.data);
+          const data=await buildTodayBriefing(db,userId,{reliability:reliabilityFor(userId)});
+          briefingCache.set(userId,{date:today,at:Date.now(),data});
+          return json(res,200,data);
+        }
         if(req.method==='GET'&&url.pathname==='/api/timeline'){
           if(userRateLimited(userId,'timeline',10,60_000))throw Object.assign(new Error('Too many timeline requests. Try again shortly.'),{status:429});
           let months=parseInt(url.searchParams.get('months')||'12',10);
@@ -1537,62 +1957,72 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const body=await readJson(req);const message=cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
           const userMsg=db.addMessage(userId,conversation.id,'user',message);db.touchConversation(userId,conversation.id);
-          const isCorrection=isCorrectionMessage(message);
-          enqueueChatReply(conversation.id,async()=>{
-            if(!db.getConversation(userId,conversation.id))return;
-            const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
-            try{
-              const history=sanitizeAssistantMessages(db.listConversationMessages(userId,conversation.id,24)).filter((m)=>m.id!==userMsg.id);
-              const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
-              const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
-              let needsBuddyName=false;
-              if(!customBuddyName){
-                const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
-                if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
-              }
-              const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,needsBuddyName,
-                memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-                tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,
-                  gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
-                onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
-              for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
-              // Backward compatibility for replies from older/custom models that still emit legacy markers.
-              for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
-              for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
-              const answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
-              db.addMessage(userId,conversation.id,'assistant',answer);db.addEvent(userId,'chat','Orbit replied to a message.');
-            }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);db.addMessage(userId,conversation.id,'assistant',connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?');}
-            streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
-            await maybeRefreshConversationSummary(user,conversation);
-            if(isCorrection){
-              // Learn from the correction without blocking: figure out what was wrong and save the fix
-              setImmediate(async()=>{
-                try{
-                  const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
-                  const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
-                  const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
-
-Conversation:
-${hist}
-
-Respond with a single JSON object: {"content":"one clear sentence capturing the corrected understanding","confidence":0.85-0.95}`,memories:[],goals:[],history:[],userTimeZone:tzNow,taskMode:true});
-                  const fm=fixText.match(/\{[\s\S]*\}/);
-                  if(fm){
-                    const parsed=JSON.parse(fm[0]);
-                    const content=String(parsed.content||'').trim().slice(0,500);
-                    if(content.length>=10){
-                      const existing=db.listRelevantMemories(userId,content,3);
-                      if(!existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30)))){
-                        db.addMemory(userId,content,{kind:'fact',source:'auto-correction',confidence:Math.max(0.85,Math.min(Number(parsed.confidence)||0.9,0.95))});
-                        db.addEvent(userId,'correction_learned','Learned from a user correction.');
-                      }
-                    }
-                  }
-                }catch(e){db.addEvent(userId,'correction_learn_failed','Could not learn from a correction.',e.message);}
-              });
-            }
-          });
+          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message,userMsg}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+        }
+        // R1 voice mode: Whisper transcription fallback for browsers without
+        // Web Speech API. Audio is processed in memory and never persisted.
+        if(req.method==='POST'&&url.pathname==='/api/voice/transcribe'){
+          if(userRateLimited(userId,'voice-transcribe',20,60*60_000))throw Object.assign(new Error('Too many transcription requests. Try again shortly.'),{status:429});
+          const body=await readJson(req,6*1024*1024);
+          const audioBytes=Buffer.from(String(body.audio||''),'base64');
+          const mimeType=String(body.mimeType||'audio/webm').slice(0,100);
+          if(!audioBytes.length)throw Object.assign(new Error('No audio provided.'),{status:400});
+          if(audioBytes.length>4*1024*1024)throw Object.assign(new Error('Audio is too large (4MB max).'),{status:413});
+          if(!/^audio\//.test(mimeType))throw Object.assign(new Error('Unsupported audio type.'),{status:400});
+          if(!env.OPENAI_API_KEY)throw Object.assign(new Error('Voice transcription is not configured on this server.'),{status:503});
+          const text=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes,filename:'voice-turn.'+(mimeType.includes('mp4')?'m4a':'webm'),mimeType});
+          db.addEvent(userId,'voice_transcribed','Transcribed a voice-mode turn with Whisper.');
+          return json(res,200,{text});
+        }
+        // R2 Canvas: mint a short-lived printable render of a canvas document.
+        if(req.method==='POST'&&url.pathname==='/api/canvas/render'){
+          if(userRateLimited(userId,'canvas',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const body=await readJson(req,512*1024);
+          const markdown=String(body.markdown||'');
+          const title=String(body.title||'Document').slice(0,120);
+          if(!markdown.trim())throw Object.assign(new Error('Nothing to render.'),{status:400});
+          if(markdown.length>200*1024)throw Object.assign(new Error('Document is too large.'),{status:413});
+          pruneCanvasRenders();
+          const token=randomUUID();
+          canvasRenders.set(token,{userId,title,markdown,expires:Date.now()+10*60_000});
+          return json(res,200,{token});
+        }
+        // R2 Canvas: serve the printable page (or ?format=pdf) for a render token.
+        const canvasRenderMatch=url.pathname.match(/^\/api\/canvas\/render\/([0-9a-f-]{36})$/);
+        if(req.method==='GET'&&canvasRenderMatch){
+          const entry=canvasRenders.get(canvasRenderMatch[1]);
+          if(!entry||entry.expires<Date.now()||entry.userId!==userId)throw Object.assign(new Error('This document link has expired.'),{status:404});
+          if(url.searchParams.get('format')==='pdf'){
+            const pdf=await markdownToPdfBuffer(entry.markdown);
+            res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':'inline; filename="orbit-document.pdf"','Cache-Control':'no-store'});
+            return res.end(pdf);
+          }
+          const toolbar=`<div class="toolbar"><button onclick="window.close()">Done</button><button onclick="sharePrint()">Share / PDF</button><button onclick="window.print()">Print</button></div><script>${PRINT_SHARE_JS}</script>`;
+          const html=markdownToHtml(entry.markdown,false,null,toolbar,entry.title);
+          res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+          res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});
+          return res.end(html);
+        }
+        // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
+        if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
+          if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
+          requireOwner(user); // WhatsApp is owner-only
+          const code=String(randomInt(100000,1000000));
+          const expiresAt=new Date(Date.now()+10*60_000).toISOString();
+          db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
+          db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
+          return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER,deepLink:buildLinkDeepLink(env.TWILIO_WHATSAPP_NUMBER,code)});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/whatsapp/link/status'){
+          requireOwner(user); // WhatsApp is owner-only
+          const link=db.getWhatsAppLink(userId);
+          return json(res,200,{linked:!!link,phone:link?maskPhone(link.phone_e164):null,configured:whatsappConfigured(env),whatsappNumber:whatsappConfigured(env)?env.TWILIO_WHATSAPP_NUMBER:null});
+        }
+        if(req.method==='DELETE'&&url.pathname==='/api/whatsapp/link'){
+          requireOwner(user); // WhatsApp is owner-only
+          db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
+          return json(res,200,{ok:true});
         }
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
         if(req.method==='POST'&&url.pathname==='/api/conversations'){const body=await readJson(req);const raw=String(body.title||'').trim();const title=raw?cleanText(raw,80,'title'):'New chat';return json(res,201,db.createConversation(userId,title));}
@@ -1629,7 +2059,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         }
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
-        if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20);return json(res,200,{results:formatSearchResults(results)});}
+        if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20);return json(res,200,{results:formatSearchResults(results),items:formatSearchItems(results)});}
         const timelineMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)\/timeline$/);if(req.method==='GET'&&timelineMatch){const timeline=buildTimeline(timelineMatch[1],db.listMemories(userId));if(!timeline.length)throw Object.assign(new Error('Memory not found.'),{status:404});return json(res,200,{timeline:formatTimeline(timeline)});}
         const suggestMatch=url.pathname.match(/^\/api\/memory-suggestions\/([0-9a-f-]+)\/(approve|dismiss)$/);if(req.method==='POST'&&suggestMatch){const action=suggestMatch[2];const row=action==='approve'?db.approveMemorySuggestion(userId,suggestMatch[1]):(db.dismissMemorySuggestion(userId,suggestMatch[1])?{id:suggestMatch[1]}:null);if(!row)throw Object.assign(new Error('Suggestion not found.'),{status:404});db.addEvent(userId,action==='approve'?'memory_added':'memory_suggestion_dismissed',action==='approve'?`Saved a suggested memory: “${row.content}”.`:'Dismissed a memory suggestion.');return json(res,200,{ok:true});}
         const followUpMatch=url.pathname.match(/^\/api\/follow-ups\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&followUpMatch){if(!db.deleteFollowUp(userId,followUpMatch[1]))throw Object.assign(new Error('Follow-up not found.'),{status:404});db.addEvent(userId,'followup_deleted','Removed a scheduled follow-up.');return json(res,200,{ok:true});}
@@ -1694,6 +2124,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='POST'&&url.pathname==='/api/tasks'){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(userRateLimited(userId,'tasks'))throw Object.assign(new Error('Too many task requests. Try again shortly.'),{status:429});const body=await readJson(req);const risk=body.risk==='external'?'external':'internal';const recurrence=['daily','weekly'].includes(body.recurrence)?body.recurrence:'none';let scheduleAt=null;if(body.scheduleAt){const date=new Date(body.scheduleAt);if(Number.isNaN(date.valueOf()))throw Object.assign(new Error('scheduleAt must be valid.'),{status:400});scheduleAt=date.toISOString();}const task=db.addTask(userId,{title:cleanText(body.title,120,'title'),prompt:cleanText(body.prompt,6000,'prompt'),risk,scheduleAt,recurrence});db.addEvent(userId,'task_created',`Created “${task.title}”.`,risk==='external'?'Waiting for approval.':null);setImmediate(runDueTasks);return json(res,201,task);}
         const taskDeleteMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&taskDeleteMatch){const task=db.getTask(userId,taskDeleteMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});db.deleteTask(userId,task.id);db.addEvent(userId,'task_deleted',`Deleted \u201c${task.title}\u201d.`);return json(res,200,{deleted:true});}
             const taskMatch=url.pathname.match(/^\/api\/tasks\/([0-9a-f-]+)\/(approve|cancel)$/);if(req.method==='POST'&&taskMatch){const task=db.getTask(userId,taskMatch[1]);if(!task)throw Object.assign(new Error('Task not found.'),{status:404});const action=taskMatch[2];const status=action==='approve'?(task.schedule_at?'scheduled':'queued'):'cancelled';db.setTaskStatus(userId,task.id,status);db.addEvent(userId,`task_${action}d`,`${action==='approve'?'Approved':'Cancelled'} “${task.title}”.`);if(action==='approve')setImmediate(runDueTasks);return json(res,200,{...task,status});}
+        const artifactDelMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&artifactDelMatch){const ok=db.deleteArtifact(userId,artifactDelMatch[1]);if(!ok)throw Object.assign(new Error('File not found.'),{status:404});return json(res,200,{deleted:true});}
         const artifactMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='GET'&&artifactMatch){const artifact=db.getArtifact(userId,artifactMatch[1]);if(!artifact)throw Object.assign(new Error('Artifact not found.'),{status:404});if(artifact.mime_type==='text/markdown'&&url.searchParams.get('format')==='pdf'){const pdf=await markdownToPdfBuffer(artifact.content);res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':`inline; filename="${artifact.name.replace(/\.md$/,'.pdf').replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(pdf);}if(artifact.mime_type==='text/markdown'){const autoPrint=url.searchParams.get('print')==='1';const printUrl=`${publicBase||''}/api/artifacts/${artifact.id}?print=1`;const html=markdownToHtml(artifact.content,autoPrint,printUrl);res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});return res.end(html);}res.writeHead(200,{'Content-Type':artifact.mime_type,'Content-Disposition':`attachment; filename="${artifact.name.replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(artifact.content);}
         if(req.method==='GET'&&url.pathname==='/api/push/public-key')return json(res,200,{configured:push.configured,publicKey:push.publicKey});
         if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
@@ -1713,19 +2144,27 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
         if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.setSetting('registration_opened_at',open?new Date().toISOString():'');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
         const accessApprove=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/approve$/);if(req.method==='POST'&&accessApprove){requireOwner(user);const req2=db.getAccessRequest(accessApprove[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,false);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessApprove[1]);db.addEvent(user.id,'access_approved',`Approved Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,approved:true});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/reset-password'){requireOwner(user);const body=await readJson(req);const email=safeEmail(body.email);if(!email)throw Object.assign(new Error('Email required.'),{status:400});const target=db.getUserByEmail(email);if(!target)throw Object.assign(new Error('User not found.'),{status:404});const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();db.addPasswordResetToken(hashToken(token),target.id,expiresAt);db.cleanExpiredPasswordResetTokens();const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;const emailed=await sendPasswordResetEmail({to:email,resetUrl});db.addEvent(user.id,'password_reset',`Sent password reset email to ${target.email}.`);return json(res,200,{ok:true,emailed});}
         const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,true);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessDeny[1]);db.addEvent(user.id,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
         return json(res,404,{error:'API route not found.'});
       }
     } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';return json(res,error.status||500,{error:message}); }
 
-    if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});const requestPath=url.pathname==='/'?'/index.html':url.pathname;let resolved;try{resolved=path.resolve(publicRoot,`.${decodeURIComponent(requestPath)}`);}catch{return json(res,404,{error:'Not found.'});}if(!resolved.startsWith(`${publicRoot}${path.sep}`))return json(res,404,{error:'Not found.'});
-    try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();const shellAsset=['index.html','app.js','sw.js'].includes(path.basename(resolved));res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':shellAsset?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
+    if(url.pathname==='/reset-password'&&['GET','HEAD'].includes(req.method)){const resolved=path.resolve(publicRoot,'./index.html');res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);return;}
+    if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});
+    let requestPath=url.pathname;
+    if(requestPath==='/'){
+      const hasSession=!!(req.headers.cookie||'').includes('orbit_session=');
+      requestPath=hasSession?'/index.html':'/welcome.html';
+    }let resolved;try{resolved=path.resolve(publicRoot,`.${decodeURIComponent(requestPath)}`);}catch{return json(res,404,{error:'Not found.'});}if(!resolved.startsWith(`${publicRoot}${path.sep}`))return json(res,404,{error:'Not found.'});
+    try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();const shellAsset=['index.html','app.js','sw.js'].includes(path.basename(resolved));const isWelcome=path.basename(resolved)==='welcome.html';if(isWelcome)res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':shellAsset||isWelcome?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,runDueTasks,runProactiveChecks,checkDoorLeftOpen,
+  return {server,db,push,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
     startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };

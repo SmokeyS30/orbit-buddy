@@ -15,10 +15,11 @@ async function apiFetch(getToken, path, options = {}) {
 
 // RFC 2822 message -> base64url for the Gmail send API
 function encodeMessage({ to, cc, bcc, subject, body }) {
-  const lines = [`To: ${to}`];
-  if (cc) lines.push(`Cc: ${cc}`);
-  if (bcc) lines.push(`Bcc: ${bcc}`);
-  lines.push(`Subject: ${subject}`, 'Content-Type: text/plain; charset=utf-8', '', body);
+  const clean = (s) => String(s || '').replace(/[\r\n]+/g, ' ').trim();
+  const lines = [`To: ${clean(to)}`];
+  if (cc) lines.push(`Cc: ${clean(cc)}`);
+  if (bcc) lines.push(`Bcc: ${clean(bcc)}`);
+  lines.push(`Subject: ${clean(subject)}`, 'Content-Type: text/plain; charset=utf-8', '', body);
   return Buffer.from(lines.join('\r\n'), 'utf-8').toString('base64url');
 }
 
@@ -62,7 +63,13 @@ export async function readEmail(getToken, { query }) {
   // Find the single best match and return its full body
   const list = await apiFetch(getToken, `/messages?q=${encodeURIComponent(String(query).trim())}&maxResults=1`);
   if (!list.messages?.length) return { found: false };
-  const full = await apiFetch(getToken, `/messages/${list.messages[0].id}?format=full`);
+  let full;
+  try {
+    full = await apiFetch(getToken, `/messages/${list.messages[0].id}?format=full`);
+  } catch (e) {
+    console.warn(`readEmail: message ${list.messages[0].id} unavailable: ${e.message}`);
+    return { found: false };
+  }
   const headers = Object.fromEntries((full.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
   // Extract plain text body (walk MIME parts)
   let bodyText = '';

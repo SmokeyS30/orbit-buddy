@@ -1,0 +1,17 @@
+@media(min-width:1400px){
+  .shell{width:min(1320px,calc(100% - 48px))}
+  .hero-card{grid-template-columns:320px 1fr;padding:48px 72px}
+  .messages{max-height:560px}
+  .message{max-width:75%}
+  .connector-grid,.settings-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(min-width:1024px){
+  .tabs{overflow:visible;flex-wrap:wrap}
+  .tab{flex:1 1 auto;min-width:90px}
+  .topbar{padding:20px 0 28px}
+}
+@media print{
+  .tabs,.top-actions,.composer,.ambient{display:none!important}
+  .shell{width:100%;padding:0}
+  body{background:#fff;color:#000}
+}

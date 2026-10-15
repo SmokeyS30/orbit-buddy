@@ -50,7 +50,125 @@ button,.tab,.thread-chip,.check{-webkit-tap-highlight-color:transparent}
 /* Keyboard focus visibility */
 button:focus-visible,.tab:focus-visible,.thread-chip:focus-visible,a:focus-visible,.check input:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
 
+/* iOS Safari: ensure taps register as taps, not scroll/pinch gestures */
+button,.tab,.thread-chip,a{touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+
 /* Comfortable mobile touch targets */
 .mini-actions button{min-height:40px}
 .auth-links button{padding:10px 8px}
 .check{padding:6px 2px}
+.message.assistant .md{white-space:normal;overflow-wrap:anywhere}
+.message .md>:first-child{margin-top:0}
+.message .md>:last-child{margin-bottom:0}
+.message .md p{margin:0 0 10px}
+.message .md h1,.message .md h2,.message .md h3,.message .md h4{margin:14px 0 8px;line-height:1.3}
+.message .md h1{font-size:19px}
+.message .md h2{font-size:17px}
+.message .md h3{font-size:16px}
+.message .md h4{font-size:15px}
+.message .md ul,.message .md ol{margin:0 0 10px;padding-left:22px}
+.message .md li{margin:3px 0}
+.message .md li::marker{color:var(--lime)}
+.message .md blockquote{margin:0 0 10px;padding:8px 12px;border-left:3px solid var(--violet);background:rgba(169,152,255,.08);border-radius:0 10px 10px 0;color:var(--muted)}
+.message .md blockquote p{margin:0}
+.message .md code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em;background:rgba(255,255,255,.07);padding:2px 6px;border-radius:6px}
+.message .md pre{background:#101117;border:1px solid var(--line);border-radius:12px;padding:14px;overflow:auto;margin:0 0 12px}
+.message .md pre code{background:none;padding:0;font-size:12.5px;display:block}
+.message .md table{border-collapse:collapse;margin:0 0 12px;font-size:13.5px;display:block;overflow-x:auto;max-width:100%}
+.message .md th,.message .md td{border:1px solid var(--line);padding:7px 10px;text-align:left;white-space:nowrap}
+.message .md th{background:rgba(255,255,255,.05)}
+.message .md a{color:var(--cyan);text-decoration:underline;text-underline-offset:2px}
+.message .md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+.message .md img{max-width:100%;border-radius:10px}
+.codeblock{position:relative;margin:0 0 12px}
+.codeblock pre{margin:0}
+.copy-btn{position:absolute;top:8px;right:8px;border:1px solid var(--line);background:rgba(24,26,34,.92);color:var(--muted);border-radius:8px;padding:5px 10px;font-size:11.5px;font-family:inherit;cursor:pointer}
+.copy-btn:hover{color:var(--text);border-color:var(--violet)}
+.copy-btn:active{transform:scale(.96)}
+
+/* Web app quick wins: in-chat search (Q3), offline queue (Q5), tab triage (Q6) */
+.chat-search{position:relative;align-self:flex-start;flex:none}
+#chat-search-input{width:200px;padding:9px 12px;font-size:13px;border-radius:11px}
+.chat-search-results{position:absolute;right:0;top:calc(100% + 8px);width:min(360px,82vw);max-height:340px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);z-index:30;padding:8px;display:flex;flex-direction:column;gap:4px}
+.search-result{display:block;width:100%;text-align:left;background:transparent;border:0;color:var(--text);font:inherit;padding:10px 12px;border-radius:10px;cursor:pointer}
+.search-result:hover{background:rgba(255,255,255,.06)}
+.search-result-title{display:block;font-size:13px}
+.search-result-meta{display:block;font-size:11px;color:var(--muted);margin:2px 0 4px}
+.search-result-excerpt{display:block;font-size:12.5px;color:var(--muted);line-height:1.45}
+.search-empty{color:var(--muted);font-size:13px;text-align:center;padding:14px;margin:0}
+.search-hit{outline:2px solid var(--lime);outline-offset:3px}
+.queued-note{display:block;margin-top:6px;font-size:11.5px;font-weight:600;opacity:.7}
+.more-wrap{position:relative;display:none;flex:none}
+.more-tab{width:100%;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+.more-menu{position:fixed;min-width:180px;background:var(--panel2);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);z-index:30;padding:6px;display:flex;flex-direction:column;gap:2px}
+.more-menu .tab{flex:none;text-align:left;padding:11px 14px;border-radius:10px}
+.more-menu .tab.active{background:rgba(255,255,255,.08)}
+@media(max-width:760px){.more-wrap{display:block}#chat-search-input{width:150px}}
+.small{font-size:12px}
+/* --- B1: morning briefing (magazine-style) --- */
+.briefing{margin-top:22px}
+.briefing-loading{padding:18px 4px}
+.briefing-masthead{padding:6px 4px 0}
+.briefing-masthead h2{font-size:clamp(30px,4.6vw,44px);letter-spacing:-.04em;line-height:1.05;margin:6px 0 8px}
+.briefing-dek{color:var(--muted);margin:0 0 4px;line-height:1.5}
+.briefing-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.briefing-card{background:var(--panel);border:1px solid var(--line);border-radius:17px;padding:18px 20px}
+.briefing-card h3{margin:0 0 12px;font-size:13px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.briefing-card p{margin:0 0 8px;line-height:1.5}
+.weather-now{display:flex;align-items:center;gap:14px}
+.weather-now strong{font-size:44px;letter-spacing:-.03em;line-height:1}
+.forecast-strip{display:flex;gap:10px;margin-top:14px}
+.forecast-day{flex:1;background:#12141a;border:1px solid var(--line);border-radius:12px;padding:10px;text-align:center;display:flex;flex-direction:column;gap:3px}
+.forecast-name{font-weight:750;font-size:13px}
+.forecast-temps{font-size:13px}
+.agenda-row{display:flex;align-items:baseline;gap:10px;padding:9px 0;border-top:1px solid var(--line)}
+.agenda-row:first-of-type{border-top:0}
+.agenda-time{flex:0 0 auto;min-width:96px;color:var(--cyan);font-size:13px;font-weight:700}
+.agenda-title{font-weight:600}
+.focus-goal{padding:10px 0;border-top:1px solid var(--line)}
+.focus-goal:first-of-type{border-top:0;padding-top:0}
+.focus-goal strong{display:block;margin-bottom:2px}
+.loop-row{display:flex;justify-content:space-between;align-items:center;gap:10px;width:100%;text-align:left;background:#12141a;border:1px solid var(--line);border-radius:12px;padding:11px 13px;margin-top:8px;color:var(--text);font:inherit;cursor:pointer}
+.loop-row.static{cursor:default}
+/* --- B4: reliability is quiet by default — one status line, tab is the drill-down --- */
+.systems-line{display:flex;align-items:center;gap:10px;width:100%;margin-top:14px;padding:12px 16px;background:transparent;border:1px solid var(--line);border-radius:99px;color:var(--muted);font:inherit;font-size:13px;cursor:pointer}
+.systems-dot{width:9px;height:9px;border-radius:50%;background:var(--lime);box-shadow:0 0 10px var(--lime);flex:0 0 auto}
+.systems-line.warn .systems-dot{background:var(--coral);box-shadow:0 0 10px var(--coral)}
+.systems-line.warn{color:var(--coral)}
+/* --- B3: follow-up surfaced inline in chat --- */
+.followup-nudge{margin:4px 4px 12px;padding:14px 16px;border:1px dashed rgba(169,152,255,.5);border-radius:14px;background:rgba(169,152,255,.07)}
+.followup-nudge p{margin:0 0 4px;line-height:1.5;font-size:14px}
+.followup-nudge .mini-actions{margin-top:8px}
+@media(max-width:760px){.briefing-grid{grid-template-columns:1fr}.agenda-time{min-width:78px}}
+
+/* --- R1: voice conversation mode ("call Orbit") --- */
+#voice-overlay{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:rgba(10,11,15,.82);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:24px}
+.voice-shell{width:min(520px,100%);max-height:min(720px,92vh);display:flex;flex-direction:column;align-items:center;text-align:center;background:var(--panel);border:1px solid var(--line);border-radius:28px;padding:36px 30px 28px;box-shadow:var(--shadow)}
+.voice-shell h2{margin:8px 0 4px;font-size:30px;letter-spacing:-.02em}
+#voice-orb{width:120px;height:120px;border-radius:50%;margin:22px 0 14px;display:grid;place-items:center;font-size:44px;cursor:pointer;user-select:none;-webkit-user-select:none;background:linear-gradient(145deg,var(--violet),var(--cyan));box-shadow:0 0 44px rgba(169,152,255,.35);transition:transform .15s ease;touch-action:none}
+#voice-orb:active{transform:scale(.94)}
+#voice-orb.listening{animation:voice-pulse 1.6s ease-in-out infinite}
+#voice-orb.speaking{animation:voice-speak 1.1s ease-in-out infinite}
+@keyframes voice-pulse{0%,100%{box-shadow:0 0 30px rgba(169,152,255,.3);transform:scale(1)}50%{box-shadow:0 0 70px rgba(169,152,255,.65);transform:scale(1.06)}}
+@keyframes voice-speak{0%,100%{box-shadow:0 0 30px rgba(114,219,213,.3)}50%{box-shadow:0 0 60px rgba(114,219,213,.6)}}
+.voice-status{color:var(--muted);font-size:14px;margin:0 0 10px;min-height:20px}
+.voice-transcript{width:100%;flex:1;min-height:90px;max-height:260px;overflow:auto;display:flex;flex-direction:column;gap:8px;margin:6px 0 16px;text-align:left}
+.voice-line{max-width:92%;padding:10px 14px;border-radius:14px;line-height:1.5;font-size:14px;white-space:pre-wrap}
+.voice-line.user{align-self:flex-end;background:var(--lime);color:#15171e;border-bottom-right-radius:4px}
+.voice-line.assistant{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);border-bottom-left-radius:4px}
+.voice-line.live{opacity:.75;font-style:italic}
+.voice-done{background:none;border:1px solid var(--line);color:var(--muted);border-radius:99px;padding:10px 28px;font:inherit;font-size:14px;cursor:pointer}
+.voice-done:hover{color:var(--text);border-color:var(--muted)}
+body.voice-open{overflow:hidden}
+
+/* --- R2: Orbit Canvas — documents, not walls of text --- */
+.message.assistant.canvas-doc{align-self:stretch;max-width:100%;background:linear-gradient(180deg,#1e212b,#191c25);border:1px solid #3a3f4f;border-radius:20px;padding:26px 30px;box-shadow:var(--shadow)}
+.canvas-head{margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.canvas-head h3{margin:8px 0 0;font-size:21px;letter-spacing:-.01em;line-height:1.3}
+.canvas-body{line-height:1.7}
+.canvas-body .md{font-size:15px}
+.canvas-body h1,.canvas-body h2,.canvas-body h3,.canvas-body h4{margin:1.2em 0 .5em;line-height:1.3}
+.canvas-body table{width:100%;border-collapse:collapse;margin:1em 0;font-size:14px}
+.canvas-body th,.canvas-body td{border:1px solid var(--line);padding:8px 10px;text-align:left}
+.canvas-body th{background:var(--panel2)}
+.canvas-body pre{overflow:auto;background:#12141a;border:1px solid var(--line);border-radius:10px;padding:14px}

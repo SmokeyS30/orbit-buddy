@@ -140,18 +140,23 @@ export async function toolFetchUrl(args = {}) {
   return { url: finalUrl, text: text.slice(0, 6000) };
 }
 
+const geoCache = new Map();
 export async function toolGetWeather(args = {}) {
   const location = String(args.location || '').trim().slice(0, 100) || 'Brewster, MA';
-  // Geocode the location (Open-Meteo, free, no key)
-  const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
-  let geo;
-  try {
-    const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-    const data = await res.json();
-    if (!data.results?.length) throw new Error('Location not found.');
-    geo = data.results[0];
-  } catch (e) {
-    throw new Error(`Could not find "${location}": ${e.message}`);
+  // Geocode the location (Open-Meteo, free, no key) - cached to avoid repeat lookups
+  const cacheKey = location.toLowerCase();
+  let geo = geoCache.get(cacheKey);
+  if (!geo) {
+    const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`;
+    try {
+      const res = await fetch(geoUrl, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      const data = await res.json();
+      if (!data.results?.length) throw new Error('Location not found.');
+      geo = data.results[0];
+      geoCache.set(cacheKey, geo);
+    } catch (e) {
+      throw new Error(`Could not find "${location}": ${e.message}`);
+    }
   }
   // Get weather (Fahrenheit, since user is US-based)
   const wxUrl = `https://api.open-meteo.com/v1/forecast?latitude=${geo.latitude}&longitude=${geo.longitude}&current=temperature_2m,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=auto&forecast_days=3`;
@@ -377,12 +382,14 @@ export function toolCreateTask(args = {}, ctx = null) {
     if (Number.isNaN(date.valueOf())) throw new Error('scheduleAt must be a valid date.');
     scheduleAt = date.toISOString();
   }
-  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence });
+  const deliveryChannel = args.deliveryChannel === 'whatsapp' ? 'whatsapp' : 'push';
+  const task = db.addTask(userId, { title, prompt, risk, scheduleAt, recurrence, deliveryChannel });
   return {
     id: task.id,
     title: task.title,
     status: task.status,
     risk: task.risk,
+    deliveryChannel: task.delivery_channel,
     note: task.status === 'waiting_approval'
       ? 'Created and saved, waiting for the owner to approve it in the Tasks tab.'
       : 'Created and saved successfully. The task is in the Tasks tab and will run as scheduled.'
@@ -483,6 +490,18 @@ export function toolSetBuddyName(args = {}, ctx = null) {
   if (!name) throw new Error('Provide a name for your buddy (1-40 characters).');
   db.setBuddyName(userId, name);
   return { name, note: `Your buddy's name is now "${name}".` };
+}
+
+// R3 ambient context: record the user's explicit permission choice. Asked in
+// chat (never a toggle); stored as a setting, never as a memory.
+export function toolSetAmbientContext(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'set_ambient_context');
+  const value = String(args.value || '').toLowerCase().trim();
+  if (value !== 'granted' && value !== 'declined') throw new Error('value must be "granted" or "declined".');
+  db.setSetting(`ambient_context_${userId}`, value);
+  db.addEvent(userId, value === 'granted' ? 'ambient_context_granted' : 'ambient_context_declined',
+    value === 'granted' ? 'Ambient context permission granted in chat.' : 'Ambient context permission declined in chat.');
+  return { value, note: value === 'granted' ? 'Ambient context is on.' : 'Ambient context is off — it will not be asked about again.' };
 }
 
 export function toolScheduleFollowUp(args = {}, ctx = null) {
@@ -695,6 +714,19 @@ export const TOOL_DEFINITIONS = [
   },
   {
     type: 'function',
+    name: 'set_ambient_context',
+    description: 'Record the user\'s answer to the one-time ambient-context permission question (whether Orbit may note the setting of chats: time of day and self-declared place labels). Call with "granted" when they say yes, "declined" when they say no. Only call in direct response to that permission question.',
+    parameters: {
+      type: 'object',
+      properties: {
+        value: { type: 'string', description: 'The user\'s choice: "granted" or "declined".' }
+      },
+      required: ['value'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
     name: 'get_datetime',
     description: 'Get the current date and time. Use it whenever the user asks about "now", "today", or when resolving relative dates.',
     parameters: {
@@ -815,7 +847,8 @@ export const TOOL_DEFINITIONS = [
         prompt: { type: 'string', description: 'What Orbit should do for this task.' },
         risk: { type: 'string', description: '"internal" for think-only (default) or "external" for tasks that act on the world.' },
         recurrence: { type: 'string', description: '"none" (default), "daily", or "weekly".' },
-        scheduleAt: { type: 'string', description: 'ISO date/time for when the task should run. Omit to queue it now.' }
+        scheduleAt: { type: 'string', description: 'ISO date/time for when the task should run. Omit to queue it now.' },
+        deliveryChannel: { type: 'string', description: '"push" (default) or "whatsapp". Set to "whatsapp" when the user asks for the reminder via WhatsApp ("text me", "on WhatsApp", "via WhatsApp").' }
       },
       required: ['title', 'prompt'],
       additionalProperties: false
@@ -1095,6 +1128,7 @@ const TOOL_SUMMARIES = {
   mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
   complete_task: (args) => `Task done: ${String(args.title || '').slice(0, 60)}`,
   set_buddy_name: (args) => `Named buddy: ${String(args.name || '').slice(0, 40)}`,
+  set_ambient_context: (args) => `Ambient context: ${String(args.value || '').slice(0, 20)}`,
   enable_gift_reminder: (args) => `Gift reminders on: ${String(args.label || '').slice(0, 60)}`,
   propose_memory: (args) => String(args.content || '').slice(0, 80),
   schedule_followup: (args) => `${String(args.description || '').slice(0, 60)} on ${String(args.date || '').slice(0, 10)}`,
@@ -1170,6 +1204,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'set_buddy_name': {
       const result = toolSetBuddyName(clean, ctx);
       return { result, summary: `Named buddy: ${String(result.name || '').slice(0, 40)}` };
+    }
+    case 'set_ambient_context': {
+      const result = toolSetAmbientContext(clean, ctx);
+      return { result, summary: `Ambient context: ${String(result.value || '')}` };
     }
     case 'enable_gift_reminder': {
       const result = toolEnableGiftReminder(clean, ctx);
