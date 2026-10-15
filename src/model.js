@@ -121,6 +121,8 @@ export function buildStableDeveloperPrompt() {
     `- Use create_goal, create_project, or create_routine only when the user explicitly asks to track a goal/project or establish a recurring briefing/reflection. Use update_goal or update_project_step only when the user reports progress or explicitly asks for a change. Never infer progress or completion.`,
     `- Calendar changes are approval-gated. propose_calendar_event creates a review item only; never claim an external calendar was changed.`,
     `- For email send requests: gmail_send creates a review item and does not send immediately. Use it only when the user asks to send an email, then tell them the exact recipient, subject, and body are waiting in Approvals. Only say an email was sent after the approval is executed successfully.`,
+    `- Writing voice ("Writes like you"): when the user explicitly asks you to learn how they write ("learn how I write", "study my writing", "relearn how I write", "update my writing voice"), call learn_writing_voice. Never learn silently or unprompted — no opt-in means no learning. When the user says "forget how I write" (or a clear variant like "delete my writing voice"), call forget_writing_voice immediately and confirm in one line.`,
+    `- Drafting in their voice: when the user asks you to draft, write, or rewrite something for them (an email, reply, message, App Store copy, letter, or post), this conversation includes their learned writing voice as a style instruction when one is stored — apply it to the drafted writing itself. In normal conversation, keep your usual voice.`,
     `- For email delete requests: gmail_delete creates a review item and does not move mail immediately. Include the message ID, subject, and sender from gmail_search so the user can review it in Approvals. Only say it was moved after approval executes successfully.`,
     `- For in-depth research requests, use deep_research (searches multiple angles and reads sources). For quick lookups, use web_search.`,
     `- When you use a write tool, say what you did in your visible reply: what you saved, or the task you created and when it runs. The user can manage it in the matching tab: Goals for goals, Projects for projects, Memory for memories, Tasks for tasks. CRITICAL: Only ever claim you created, saved, or changed something AFTER the corresponding tool returns successfully. Never say 'done', 'created', or 'saved' based on intention — if you didn't call the tool or it returned an error, say so honestly instead of claiming success. Conversely, when a write tool DOES return successfully, the action is done — say so plainly and confidently. Never hedge with “I can’t confirm” or “I’m not sure it worked” about something a tool just confirmed.`,
@@ -401,7 +403,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -433,6 +435,9 @@ export function createModelClient(env = process.env) {
           : []),
         `Today is ${today} (YYYY-MM-DD) in the user's timezone, ${timeZone}. Use it to resolve relative dates like "Thursday", "tomorrow", or "next week".`,
         taskMode ? 'Complete the requested background thinking task and return a useful result.' : 'Answer the user directly.',
+        // X5 "Writes like you": the learned voice applies ONLY when the user
+        // asks Orbit to draft/write something — never in normal conversation.
+        ...(writingVoice ? [`Personal writing voice for drafted writing only:\n${writingVoice}`] : []),
         `Relevant user-approved memory:\n${memoryText}`,
         `User-controlled goals:\n${goalText}`,
         `User-controlled projects:\n${projectText}`,

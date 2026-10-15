@@ -140,6 +140,9 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_tone TEXT NOT NULL DEFAULT \'motivational\'',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_length TEXT NOT NULL DEFAULT \'quick\'',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS buddy_name TEXT',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_opt_in INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_profile TEXT',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_updated_at TEXT',
       'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
       `CREATE TABLE IF NOT EXISTS whatsapp_links (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -689,6 +692,31 @@ const indexMigrations = [
       if (!clean) throw new Error('Provide a name for your buddy (1-40 characters).');
       await run('UPDATE user_preferences SET buddy_name=?, updated_at=? WHERE user_id=?', clean, timestamp(), userId);
       return clean;
+    },
+
+    // X5 "Writes like you": per-user writing voice opt-in + distilled profile.
+    async getWritingVoice(userId) {
+      await this.getPreferences(userId);
+      const row = await get('SELECT writing_voice_opt_in AS opt_in, writing_voice_profile AS profile, writing_voice_updated_at AS updated_at FROM user_preferences WHERE user_id=?', userId);
+      return { optIn: Number(row?.opt_in) === 1, profile: row?.profile || null, updatedAt: row?.updated_at || null };
+    },
+    async setWritingVoiceOptIn(userId, optIn) {
+      await this.getPreferences(userId);
+      await run('UPDATE user_preferences SET writing_voice_opt_in=?, updated_at=? WHERE user_id=?', optIn ? 1 : 0, timestamp(), userId);
+      return this.getWritingVoice(userId);
+    },
+    async setWritingVoiceProfile(userId, profile) {
+      await this.getPreferences(userId);
+      const clean = String(profile || '').trim().slice(0, 1200);
+      if (!clean) throw new Error('A writing voice profile is required.');
+      const now = timestamp();
+      await run('UPDATE user_preferences SET writing_voice_opt_in=1, writing_voice_profile=?, writing_voice_updated_at=?, updated_at=? WHERE user_id=?', clean, now, now, userId);
+      return this.getWritingVoice(userId);
+    },
+    async clearWritingVoice(userId) {
+      await this.getPreferences(userId);
+      await run('UPDATE user_preferences SET writing_voice_opt_in=0, writing_voice_profile=NULL, writing_voice_updated_at=NULL, updated_at=? WHERE user_id=?', timestamp(), userId);
+      return this.getWritingVoice(userId);
     },
 
     // --- People ---

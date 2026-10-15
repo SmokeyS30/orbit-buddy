@@ -88,6 +88,34 @@ export async function readEmail(getToken, { query }) {
   };
 }
 
+// List recent SENT emails with plain-text bodies for voice learning.
+// Bodies stay in memory; nothing is persisted here. max is capped at 30.
+export async function listSentEmails(getToken, { max = 30 } = {}) {
+  const limit = Math.min(Math.max(parseInt(max, 10) || 30, 1), 30);
+  const list = await apiFetch(getToken, `/messages?q=${encodeURIComponent('in:sent')}&maxResults=${limit}`);
+  const messages = list.messages || [];
+  const emails = [];
+  for (const m of messages) {
+    try {
+      const full = await apiFetch(getToken, `/messages/${m.id}?format=full`);
+      const headers = Object.fromEntries((full.payload?.headers || []).map(h => [h.name.toLowerCase(), h.value]));
+      let bodyText = '';
+      const walk = (part) => {
+        if (part.mimeType === 'text/plain' && part.body?.data) {
+          bodyText += Buffer.from(part.body.data, 'base64url').toString('utf-8');
+        } else if (part.parts) {
+          for (const p of part.parts) walk(p);
+        }
+      };
+      walk(full.payload || {});
+      emails.push({ id: m.id, subject: headers.subject || '(no subject)', date: headers.date || '', body: bodyText.slice(0, 4000) });
+    } catch (e) {
+      console.warn(`Skipping sent email ${m.id}: ${e.message}`);
+    }
+  }
+  return { count: emails.length, emails };
+}
+
 // Move an email to trash (recoverable for 30 days) by message ID
 export async function trashEmail(getToken, { id }) {
   if (!id) throw new Error('A message ID is required.');
