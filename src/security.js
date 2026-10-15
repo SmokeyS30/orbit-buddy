@@ -39,12 +39,15 @@ export function parseCookies(header = '') {
   return output;
 }
 
-export function sessionCookie(token, { secure = true, maxAge = 60 * 60 * 24 * 30 } = {}) {
-  return `orbit_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
+export function sessionCookie(token, { secure = true, maxAge = 60 * 60 * 24 * 30, sameSite = 'Strict' } = {}) {
+  // SameSite=None is rejected by browsers without Secure — force it on.
+  const useSecure = secure || sameSite === 'None';
+  return `orbit_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${maxAge}${useSecure ? '; Secure' : ''}`;
 }
 
-export function clearSessionCookie({ secure = true } = {}) {
-  return `orbit_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`;
+export function clearSessionCookie({ secure = true, sameSite = 'Strict' } = {}) {
+  const useSecure = secure || sameSite === 'None';
+  return `orbit_session=; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=0${useSecure ? '; Secure' : ''}`;
 }
 
 export function readEncryptionKey(value) {
