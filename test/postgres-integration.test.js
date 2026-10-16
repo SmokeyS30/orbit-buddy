@@ -154,3 +154,41 @@ test('PostgreSQL sync wrapper: fails fast with bad connection string', async () 
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 15000, `failed fast in ${elapsed}ms (< 15s)`);
 });
+
+test('PostgreSQL: Memory v2 auto-recall parity (auto-save + contradiction guard)', async () => {
+  assert.ok(DATABASE_URL, 'TEST_DATABASE_URL must be set (CI provides PostgreSQL 16 service)');
+  await ensureSchema();
+  const email = `pgtest-memv2-${Date.now()}@example.com`;
+  let db = null;
+  let userId = null;
+  const memoryIds = [];
+  try {
+    db = createSyncPgAdapter(DATABASE_URL);
+    const user = db.createUser({ email, displayName: 'PG Memv2', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    userId = user.id;
+    // Fresh suggestion stays pending with the real window.
+    db.addMemorySuggestion(userId, 'PG fresh suggestion', { kind: 'fact' });
+    assert.equal(db.autoApproveMemorySuggestions(userId, 15), 0, 'fresh suggestion not auto-saved');
+    // window=0 auto-saves with source=auto-suggestion.
+    assert.equal(db.autoApproveMemorySuggestions(userId, 0), 1, 'stale suggestion auto-saved');
+    const saved = db.listMemories(userId);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0].source, 'auto-suggestion');
+    memoryIds.push(saved[0].id);
+    // Contradictory suggestion is never auto-saved.
+    db.addMemory(userId, 'Likes pepperoni pizza.', { kind: 'preference', source: 'user' });
+    memoryIds.push(db.listMemories(userId).find((m) => m.content.includes('pepperoni') && m.source === 'user').id);
+    db.addMemorySuggestion(userId, "Doesn't like pepperoni pizza.", { kind: 'preference' });
+    assert.equal(db.autoApproveMemorySuggestions(userId, 0), 0, 'contradiction stays pending');
+    assert.equal(db.listMemorySuggestions(userId).length, 1, 'contradictory suggestion still pending');
+  } finally {
+    try {
+      if (db && userId) {
+        for (const id of memoryIds) { try { db.deleteMemory(userId, id); } catch {} }
+        try { db.deleteDemoUser(userId); } catch {}
+      }
+    } finally {
+      if (db) { try { db.close(); } catch {} }
+    }
+  }
+});
