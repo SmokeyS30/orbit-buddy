@@ -21,6 +21,11 @@ async function register(base) {
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
 
+// L3: registration seeds an Orbit welcome message in the default conversation.
+// Tests asserting on conversation contents filter it out.
+const isWelcome = (m) => m.role === 'assistant' && /^Welcome, /.test(m.content || '');
+const chatOnly = (msgs) => msgs.filter((m) => !isWelcome(m));
+
 async function waitFor(fn, timeoutMs = 8000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -44,7 +49,7 @@ test('POST /api/chat returns 202 instantly and the reply lands in the background
   });
   assert.ok(landed, 'assistant reply arrived in the background');
   const convo = app.db.ensureDefaultConversation(auth.userId);
-  const roles = app.db.listConversationMessages(auth.userId, convo.id, 10).map((m) => m.role);
+  const roles = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).map((m) => m.role);
   assert.deepEqual(roles, ['user', 'assistant']);
 });
 
@@ -58,11 +63,11 @@ test('rapid sends are queued and answered in order', async (t) => {
   assert.equal(second.status, 202);
   const landed = await waitFor(() => {
     const convo = app.db.ensureDefaultConversation(auth.userId);
-    return app.db.listConversationMessages(auth.userId, convo.id, 10).filter((m) => m.role === 'assistant').length === 2;
+    return chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).filter((m) => m.role === 'assistant').length === 2;
   });
   assert.ok(landed, 'both replies arrived');
   const convo = app.db.ensureDefaultConversation(auth.userId);
-  const messages = app.db.listConversationMessages(auth.userId, convo.id, 10);
+  const messages = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10));
   assert.deepEqual(messages.map((m) => m.role), ['user', 'assistant', 'user', 'assistant']);
   assert.ok(messages[1].content.includes('first question'), 'first reply matches first message');
   assert.ok(messages[3].content.includes('second question'), 'second reply matches second message');
@@ -76,11 +81,11 @@ test('a failing model call saves a graceful reply instead of a 500', async (t) =
   assert.equal(response.status, 202, 'send itself still accepted');
   const landed = await waitFor(() => {
     const convo = app.db.ensureDefaultConversation(auth.userId);
-    return app.db.listConversationMessages(auth.userId, convo.id, 10).some((m) => m.role === 'assistant');
+    return chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).some((m) => m.role === 'assistant' && m.content.includes('connection needs attention'));
   });
   assert.ok(landed, 'a reply was saved even though the model failed');
   const convo = app.db.ensureDefaultConversation(auth.userId);
-  const reply = app.db.listConversationMessages(auth.userId, convo.id, 10).find((m) => m.role === 'assistant');
+  const reply = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).find((m) => m.role === 'assistant');
   assert.ok(reply.content.includes('connection needs attention'), 'targeted connection guidance saved');
   const events = app.db.listEvents(auth.userId, 10);
   assert.ok(events.some((e) => e.type === 'chat_failed'), 'chat_failed event logged');

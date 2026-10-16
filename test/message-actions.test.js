@@ -27,6 +27,11 @@ async function register(base, email = 'owner@example.com') {
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
 
+// L3: registration seeds an Orbit welcome message in the default conversation.
+// Tests asserting on conversation contents filter it out.
+const isWelcome = (m) => m.role === 'assistant' && /^Welcome, /.test(m.content || '');
+const chatOnly = (msgs) => msgs.filter((m) => !isWelcome(m));
+
 async function waitFor(fn, timeoutMs = 10000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -95,9 +100,9 @@ test('regenerate resubmits only up to the target turn', async (t) => {
     return idx !== -1 && msgs.slice(idx + 1).some((m) => m.role === 'assistant' && m.content.includes('EARLY-TURN-PROMPT'));
   });
   assert.ok(landed, 'new answer anchored at the target turn');
-  const roles = app.db.listConversationMessages(auth.userId, convo.id, 10).map((m) => m.role);
+  const roles = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).map((m) => m.role);
   assert.deepEqual(roles, ['user', 'assistant', 'user', 'assistant'], 'later turns are untouched, in order');
-  const ids = app.db.listConversationMessages(auth.userId, convo.id, 10).map((m) => m.id);
+  const ids = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).map((m) => m.id);
   assert.deepEqual(ids, [first.userMsg.id, ids[1], second.userMsg.id, second.assistantMsg.id], 'regenerated answer replaced the old one in place');
   assert.notEqual(ids[1], first.assistantMsg.id, 'it is a new message, not the old one');
   assert.ok(app.db.getMessage(auth.userId, second.userMsg.id), 'later user message kept');
@@ -155,7 +160,7 @@ test('delete removes the whole turn (assistant reply + the user message it answe
   assert.deepEqual(new Set(body.deleted), new Set([assistantMsg.id, userMsg.id]));
   assert.equal(app.db.getMessage(auth.userId, assistantMsg.id), undefined);
   assert.equal(app.db.getMessage(auth.userId, userMsg.id), undefined);
-  assert.deepEqual(app.db.listConversationMessages(auth.userId, convo.id, 10), []);
+  assert.deepEqual(chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)), [], 'turn fully removed; the onboarding welcome stays');
 });
 
 test('delete on a user message removes it plus the following assistant reply only', async (t) => {
@@ -171,7 +176,7 @@ test('delete on a user message removes it plus the following assistant reply onl
   const body = await response.json();
   assert.deepEqual(new Set(body.deleted), new Set([first.userMsg.id, first.assistantMsg.id]));
   const remaining = app.db.listConversationMessages(auth.userId, convo.id, 10);
-  assert.deepEqual(remaining.map((m) => m.id), [dangling.id]);
+  assert.deepEqual(chatOnly(remaining).map((m) => m.id), [dangling.id]);
 });
 
 test('delete: 404 on unknown id, 403 on another user\'s message', async (t) => {

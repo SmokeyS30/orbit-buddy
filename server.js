@@ -61,6 +61,16 @@ function optionalText(value,max) { return typeof value==='string'&&value.trim()?
 // API responses. The frontend only learns whether one is stored.
 function sanitizePreferences(prefs){ if(!prefs||typeof prefs!=='object')return prefs; const {writing_voice_profile:discard,...rest}=prefs; return {...rest,writing_voice_learned:Boolean(discard)}; }
 function safeEmail(value) { const email=String(value||'').trim().toLowerCase(); if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)||email.length>254) throw Object.assign(new Error('A valid email is required.'),{status:400}); return email; }
+// L3 multi-user polish: warm first-run onboarding. After registration the user
+// gets this single welcome message in chat from Orbit - it covers the name ask
+// conversationally, so the separate "what should I call you" modal hop is
+// skipped for new signups. Static copy: no model call, no cost.
+function welcomeMessageText(displayName) {
+  const first = String(displayName || '').trim().split(/\s+/)[0] || 'friend';
+  return 'Welcome, ' + first + "! I'm Orbit - your personal buddy, running on your own private server.\n\n" +
+    'Ask me anything: questions, reminders, plans, goals. I remember what matters, and you approve every memory before I keep it.\n\n' +
+    "I'm calling you " + first + " for now - if you'd rather I call you something else, just tell me in chat.";
+}
 
 // Feed URLs are secrets (anyone holding one can read the calendar): never send
 // the full URL to the client, log it, or put it in activity events.
@@ -1606,7 +1616,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const sinceISO=new Date(nowMs-7*24*3600_000).toISOString();
       const tasks=db.listTasksCompletedSince(user.id,sinceISO);
       const checkins=db.listGoalCheckinsSince(user.id,sinceISO);
-      const memories=db.listMemoriesSince(user.id,sinceISO);
+      const memories=db.listMemoriesSince(user.id,sinceISO).filter((m)=>m.source!=='registration'); // L3: the registration-seeded name memory is onboarding scaffolding, not week activity
       const userMessages=db.listMessages(user.id,200).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
       if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today);continue;}
 
@@ -2207,6 +2217,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
         if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const csrf=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
+        // L3: simpler onboarding — seed the default conversation with a warm welcome
+        // message (covers the name ask conversationally) and store the name from
+        // registration as an approved memory, so no extra "what should I call you" modal.
+        const welcomeConvo=db.ensureDefaultConversation(user.id);
+        db.addMessage(user.id,welcomeConvo.id,'assistant',welcomeMessageText(displayName));
+        db.addMemory(user.id,`My name is ${displayName}.`,{kind:'fact',source:'registration'});
         return json(res,201,{user:publicUser(user),csrf,recoveryCodes:codes});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
@@ -2631,6 +2647,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='DELETE'&&personalDateMatch){if(!db.deletePersonalDate(userId,personalDateMatch[1]))throw Object.assign(new Error('Personal date not found.'),{status:404});db.addEvent(userId,'personal_date_deleted','Removed an important personal date.');return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/preferences')return json(res,200,{preferences:sanitizePreferences(db.getPreferences(userId))});
         if(req.method==='POST'&&url.pathname==='/api/preferences'){const body=await readJson(req);const preferences=db.setPreferences(userId,body);db.addEvent(userId,'preferences_updated','Updated timezone, quiet hours, or proactive check-in preferences.');return json(res,200,{preferences:sanitizePreferences(preferences)});}
+        // L3 multi-user polish: dismiss the "what can Orbit do" intro card. Persisted
+        // server-side per user so it never resurfaces on a new device. Idempotent.
+        if(req.method==='POST'&&url.pathname==='/api/onboarding/intro-dismiss'){if(userRateLimited(userId,'intro-dismiss',30,5*60_000))throw Object.assign(new Error('Too many requests. Try again in a few minutes.'),{status:429});db.markIntroDismissed(userId);return json(res,200,{ok:true});}
         // X5 "Writes like you": per-user writing voice status/opt-in/learn/forget.
         // The distilled profile text itself never leaves the server.
         if(req.method==='GET'&&url.pathname==='/api/writing-voice'){return json(res,200,writingVoiceStatus(db,userId));}

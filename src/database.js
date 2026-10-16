@@ -354,6 +354,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'memories', 'relevance_score', 'REAL NOT NULL DEFAULT 1.0');
   ensureColumn(db, 'memories', 'superseded_by', 'TEXT');
   ensureColumn(db, 'memories', 'embedding', 'TEXT');
+  // L3 multi-user polish: server-side dismissal of the "what can Orbit do" intro card.
+  ensureColumn(db, 'user_preferences', 'intro_dismissed', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
   ensureColumn(db, 'memory_suggestions', 'confidence', 'REAL NOT NULL DEFAULT 0.7');
   ensureColumn(db, 'follow_ups', 'priority', 'INTEGER NOT NULL DEFAULT 2');
@@ -577,8 +579,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getTimelineNarrative: db.prepare('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?'),
     setTimelineNarrative: db.prepare(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
       ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`),
-    timelineMemories: db.prepare(`SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8`),
-    timelineConversations: db.prepare(`SELECT c.title FROM conversations c WHERE c.user_id=? AND substr(c.created_at,1,7)=? AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id) ORDER BY c.created_at DESC LIMIT 12`),
+    timelineMemories: db.prepare(`SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND source!='registration' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8`),
+    timelineConversations: db.prepare(`SELECT c.title FROM conversations c WHERE c.user_id=? AND substr(c.created_at,1,7)=? AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='user') ORDER BY c.created_at DESC LIMIT 12`),
     timelineGoalsCreated: db.prepare(`SELECT title FROM goals WHERE user_id=? AND substr(created_at,1,7)=? LIMIT 10`),
     timelineGoalsCompleted: db.prepare(`SELECT title FROM goals WHERE user_id=? AND status='completed' AND completed_at IS NOT NULL AND substr(completed_at,1,7)=? LIMIT 10`),
     timelineCheckinCount: db.prepare(`SELECT COUNT(*) AS n FROM goal_checkins WHERE user_id=? AND substr(created_at,1,7)=?`),
@@ -950,6 +952,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
     setBuddyName(userId,name){this.getPreferences(userId);const clean=String(name||'').trim().slice(0,40);if(!clean)throw new Error('Provide a name for your buddy (1-40 characters).');s.setBuddyName.run(clean,timestamp(),userId);return clean;},
+    // L3 multi-user polish: persist "what can Orbit do" intro-card dismissal per user (server-side, not localStorage).
+    markIntroDismissed(userId){this.getPreferences(userId);db.prepare('UPDATE user_preferences SET intro_dismissed=1, updated_at=? WHERE user_id=?').run(timestamp(),userId);return true;},
     // X5 "Writes like you": per-user writing voice opt-in + distilled profile.
     // Additive columns only; the explicit-column upserts never touch them.
     getWritingVoice(userId){this.getPreferences(userId);const row=s.getWritingVoiceState.get(userId);return {optIn:row?.opt_in===1,profile:row?.profile||null,updatedAt:row?.updated_at||null,offered:row?.offered===1};},

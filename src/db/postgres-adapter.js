@@ -144,6 +144,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_profile TEXT',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_updated_at TEXT',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS writing_voice_offered INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS intro_dismissed INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE approvals ADD COLUMN IF NOT EXISTS execution_started_at TEXT',
       `CREATE TABLE IF NOT EXISTS whatsapp_links (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -797,6 +798,12 @@ const indexMigrations = [
       await run('UPDATE user_preferences SET buddy_name=?, updated_at=? WHERE user_id=?', clean, timestamp(), userId);
       return clean;
     },
+    // L3 multi-user polish: persist "what can Orbit do" intro-card dismissal per user (server-side, not localStorage).
+    async markIntroDismissed(userId) {
+      await this.getPreferences(userId);
+      await run('UPDATE user_preferences SET intro_dismissed=1, updated_at=? WHERE user_id=?', timestamp(), userId);
+      return true;
+    },
 
     // X5 "Writes like you": per-user writing voice opt-in + distilled profile.
     async getWritingVoice(userId) {
@@ -941,8 +948,8 @@ const indexMigrations = [
     },
     async timelineMonthData(userId, monthKey) {
       return {
-        memories: await all("SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8", userId, monthKey),
-        conversations: await all('SELECT c.title FROM conversations c WHERE c.user_id=? AND substr(c.created_at,1,7)=? AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id) ORDER BY c.created_at DESC LIMIT 12', userId, monthKey),
+        memories: await all("SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND source!='registration' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8", userId, monthKey),
+        conversations: await all("SELECT c.title FROM conversations c WHERE c.user_id=? AND substr(c.created_at,1,7)=? AND EXISTS (SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.role='user') ORDER BY c.created_at DESC LIMIT 12", userId, monthKey),
         goalsCreated: await all('SELECT title FROM goals WHERE user_id=? AND substr(created_at,1,7)=? LIMIT 10', userId, monthKey),
         goalsCompleted: await all("SELECT title FROM goals WHERE user_id=? AND status='completed' AND completed_at IS NOT NULL AND substr(completed_at,1,7)=? LIMIT 10", userId, monthKey),
         checkins: Number((await get('SELECT COUNT(*) AS n FROM goal_checkins WHERE user_id=? AND substr(created_at,1,7)=?', userId, monthKey)).n),
