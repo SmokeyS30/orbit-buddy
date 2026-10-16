@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
   writing_voice_opt_in INTEGER NOT NULL DEFAULT 0,
   writing_voice_profile TEXT,
   writing_voice_updated_at TEXT,
+  intro_dismissed INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

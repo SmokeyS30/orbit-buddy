@@ -83,7 +83,9 @@ test('quiet nudge fires after 48h idle, then cools down', async (t) => {
   // Never chatted: no nudge, even far in the future.
   await app.runProactiveChecks(Date.now() + 30 * 24 * 3600_000);
   const convo = app.db.ensureDefaultConversation(auth.userId);
-  const assistants = () => app.db.listConversationMessages(auth.userId, convo.id, 20).filter((m) => m.role === 'assistant');
+  // L3: registration seeds an Orbit welcome message; it is not a nudge.
+  const isWelcome = (m) => m.role === 'assistant' && /^Welcome, /.test(m.content || '');
+  const assistants = () => app.db.listConversationMessages(auth.userId, convo.id, 20).filter((m) => m.role === 'assistant' && !isWelcome(m));
   assert.equal(assistants().length, 0);
   // One chat message, then 3 days pass: nudge fires once.
   const chat = await fetch(`${base}/api/chat`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({ message: 'hello' }) });
