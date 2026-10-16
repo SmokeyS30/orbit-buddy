@@ -726,19 +726,75 @@ async function jumpToSearchResult(item){
 (function initChatSearch(){
   const input=$('#chat-search-input'),resultsEl=$('#chat-search-results');
   if(!input||!resultsEl)return;
+  // L4: search v2 filters — session-only (not persisted), hidden until needed.
+  const filtersEl=$('#chat-search-filters'),toggleBtn=$('#chat-search-filters-toggle');
+  const fromEl=$('#chat-search-from'),toEl=$('#chat-search-to'),convoEl=$('#chat-search-conversation');
+  const typeBtns=filtersEl?Array.from(filtersEl.querySelectorAll('.search-type-btn')):[];
+  const clearBtn=$('#chat-search-clear');
+  const filters={from:'',to:'',conversationId:'',type:'all'};
+  const hasActiveFilters=()=>!!(filters.from||filters.to||filters.conversationId||filters.type!=='all');
   let timer=null;
   const hide=()=>{resultsEl.classList.add('hidden');resultsEl.replaceChildren();};
   const conversationTitle=(id)=>{const c=(state.snapshot?.conversations||[]).find((x)=>x.id===id);return c?.title||'Conversation';};
   const formatWhen=(iso)=>{try{return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(iso));}catch(_){return'';}};
+  function syncConversationOptions(){
+    if(!convoEl)return;
+    const keep=convoEl.value;
+    convoEl.replaceChildren();
+    const all=document.createElement('option');all.value='';all.textContent='All conversations';convoEl.append(all);
+    for(const c of (state.snapshot?.conversations||[])){
+      const o=document.createElement('option');o.value=c.id;o.textContent=c.title||'Conversation';convoEl.append(o);
+    }
+    if(keep&&[...convoEl.options].some((o)=>o.value===keep)){convoEl.value=keep;filters.conversationId=keep;}
+  }
+  function syncTypeButtons(){
+    for(const b of typeBtns)b.classList.toggle('active',b.dataset.type===filters.type);
+    if(toggleBtn)toggleBtn.classList.toggle('has-filters',hasActiveFilters());
+  }
+  function syncFilterInputs(){if(fromEl)fromEl.value=filters.from;if(toEl)toEl.value=filters.to;syncTypeButtons();}
+  function clearFilters(silent){
+    filters.from='';filters.to='';filters.conversationId='';filters.type='all';
+    if(convoEl)convoEl.value='';
+    syncFilterInputs();
+    if(!silent&&input.value.trim().length>=2)run(input.value.trim());
+  }
+  function activeFilterLabels(){
+    const labels=[];
+    if(filters.from)labels.push(`from ${filters.from}`);
+    if(filters.to)labels.push(`to ${filters.to}`);
+    if(filters.conversationId)labels.push(`in “${conversationTitle(filters.conversationId)}”`);
+    if(filters.type!=='all')labels.push(filters.type==='code'?'code only':'prose only');
+    return labels;
+  }
+  function renderChips(){
+    const labels=activeFilterLabels();
+    if(!labels.length)return null;
+    const row=document.createElement('div');row.className='search-filter-chips';
+    for(const label of labels){
+      const chip=document.createElement('span');chip.className='search-filter-chip';chip.textContent=label;row.append(chip);
+    }
+    const clear=document.createElement('button');clear.type='button';clear.className='search-filter-chip clear';clear.textContent='Clear filters';
+    clear.addEventListener('click',()=>clearFilters());
+    row.append(clear);
+    return row;
+  }
   async function run(query){
     let items=[];
-    try{const data=await api('/api/search/messages?q='+encodeURIComponent(query));items=data.items||[];}
+    try{
+      const p=new URLSearchParams({q:query});
+      if(filters.from)p.set('from',filters.from);
+      if(filters.to)p.set('to',filters.to);
+      if(filters.conversationId)p.set('conversationId',filters.conversationId);
+      if(filters.type!=='all')p.set('type',filters.type);
+      const data=await api('/api/search/messages?'+p.toString());items=data.items||[];
+    }
     catch(error){
       resultsEl.replaceChildren();
-      const p=document.createElement('p');p.className='search-empty';p.textContent='Search is unavailable right now.';
+      const p=document.createElement('p');p.className='search-empty';p.textContent=error.message||'Search is unavailable right now.';
       resultsEl.append(p);resultsEl.classList.remove('hidden');return;
     }
     resultsEl.replaceChildren();
+    const chips=renderChips();if(chips)resultsEl.append(chips);
     if(!items.length){
       const p=document.createElement('p');p.className='search-empty';p.textContent='No messages found.';
       resultsEl.append(p);
@@ -757,7 +813,20 @@ async function jumpToSearchResult(item){
   input.addEventListener('input',()=>{clearTimeout(timer);const q=input.value.trim();if(q.length<2){hide();return;}timer=setTimeout(()=>run(q),350);});
   input.addEventListener('keydown',(event)=>{if(event.key==='Escape'){input.value='';hide();input.blur();}});
   input.addEventListener('focus',()=>{if(input.value.trim().length>=2&&resultsEl.children.length)resultsEl.classList.remove('hidden');});
-  document.addEventListener('click',(event)=>{if(!event.target.closest('.chat-search'))hide();});
+  document.addEventListener('click',(event)=>{if(!event.target.closest('.chat-search')){hide();if(filtersEl)filtersEl.classList.add('hidden');if(toggleBtn)toggleBtn.setAttribute('aria-expanded','false');}});
+  if(toggleBtn&&filtersEl){
+    toggleBtn.addEventListener('click',(event)=>{
+      event.stopPropagation();
+      syncConversationOptions();
+      const open=filtersEl.classList.toggle('hidden');
+      toggleBtn.setAttribute('aria-expanded',String(!open));
+    });
+  }
+  if(fromEl)fromEl.addEventListener('change',()=>{filters.from=fromEl.value||'';syncTypeButtons();if(input.value.trim().length>=2)run(input.value.trim());});
+  if(toEl)toEl.addEventListener('change',()=>{filters.to=toEl.value||'';syncTypeButtons();if(input.value.trim().length>=2)run(input.value.trim());});
+  if(convoEl)convoEl.addEventListener('change',()=>{filters.conversationId=convoEl.value||'';syncTypeButtons();if(input.value.trim().length>=2)run(input.value.trim());});
+  for(const b of typeBtns)b.addEventListener('click',()=>{filters.type=b.dataset.type;syncTypeButtons();if(input.value.trim().length>=2)run(input.value.trim());});
+  if(clearBtn)clearBtn.addEventListener('click',()=>clearFilters());
 })();
 
 // --- Tab bar triage (Q6) ---

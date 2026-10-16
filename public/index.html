@@ -125,6 +125,37 @@
                 autocomplete="off"
                 maxlength="120"
               />
+              <button
+                id="chat-search-filters-toggle"
+                type="button"
+                class="chat-search-filters-toggle"
+                aria-expanded="false"
+                aria-controls="chat-search-filters"
+              >
+                Filters
+              </button>
+              <div id="chat-search-filters" class="chat-search-filters hidden" role="group" aria-label="Search filters">
+                <label class="search-filter-field">
+                  <span>From</span>
+                  <input id="chat-search-from" type="date" />
+                </label>
+                <label class="search-filter-field">
+                  <span>To</span>
+                  <input id="chat-search-to" type="date" />
+                </label>
+                <label class="search-filter-field search-filter-convo">
+                  <span>Conversation</span>
+                  <select id="chat-search-conversation">
+                    <option value="">All conversations</option>
+                  </select>
+                </label>
+                <div class="search-filter-type" role="group" aria-label="Content type">
+                  <button type="button" class="search-type-btn active" data-type="all">All</button>
+                  <button type="button" class="search-type-btn" data-type="code">Code</button>
+                  <button type="button" class="search-type-btn" data-type="prose">Prose</button>
+                </div>
+                <button id="chat-search-clear" type="button" class="search-filter-clear">Clear</button>
+              </div>
               <div
                 id="chat-search-results"
                 class="chat-search-results hidden"
