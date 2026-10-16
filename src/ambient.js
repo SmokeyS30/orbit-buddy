@@ -142,3 +142,93 @@ export function rhythmSentence(r) {
 export function rhythmKey(r) {
   return `rhythm:${r.weekday}|${r.bucket}|${r.place || ''}`;
 }
+
+// ---------------------------------------------------------------------------
+// D4 — passive rhythm detection: conversation-start and task-creation rhythms.
+//
+// Same privacy posture as the ambient block above:
+// - Only runs behind the `ambient_context_<user.id>` === 'granted' permission
+//   (checked by the caller); passive detection never bypasses it.
+// - Output is ordinary, visible, deletable memories (kind 'fact',
+//   source 'ambient-rhythm') — never silent behavior changes. No code path may
+//   alter suggestions, nudges, or briefing content based on these rhythms
+//   without a visible memory the user can read and delete; deleting the
+//   memory removes the rhythm entirely.
+/** Lookback window: only the last ~30 days of activity count. */
+export const ACTIVITY_RHYTHM_WINDOW_MS = 30 * 24 * 3600_000;
+/** A (day-of-week × bucket) cell becomes a rhythm at 3+ distinct days in the window. */
+export const ACTIVITY_RHYTHM_MIN_DAYS = 3;
+/** …and when it holds at least this share of the activity type's starts. */
+export const ACTIVITY_RHYTHM_MIN_SHARE = 0.4;
+
+/**
+ * Coarse time-of-day partition used only for D4 rhythm detection. Defined
+ * once, here (the R3 `timeBucket` above is a separate, coarser 4-way split):
+ *   night 22:00–04:59 · early morning 05:00–06:59 · morning 07:00–09:59
+ *   midday 10:00–13:59 · afternoon 14:00–16:59 · evening 17:00–21:59
+ * Pure.
+ */
+export function detailedTimeBucket(hour) {
+  const h = Number(hour);
+  if (h >= 5 && h < 7) return 'early morning';
+  if (h >= 7 && h < 10) return 'morning';
+  if (h >= 10 && h < 14) return 'midday';
+  if (h >= 14 && h < 17) return 'afternoon';
+  if (h >= 17 && h < 22) return 'evening';
+  return 'night';
+}
+
+/**
+ * Detect rhythms from activity start timestamps (D4).
+ * starts: [{atMs}] — timestamps of ONE activity type (conversation starts or
+ * task creations). A (day-of-week × bucket) cell becomes a rhythm when it has
+ * hits on 3+ distinct days within the last ~30 days AND holds >=40% of that
+ * activity type's starts in the window. Returns strongest-first:
+ * [{weekday, bucket, distinctDays, hits, share}]. Pure.
+ */
+export function detectActivityRhythms(starts, { nowMs, timeZone } = {}) {
+  const tz = timeZone || 'America/New_York';
+  const now = Number(nowMs);
+  if (!Number.isFinite(now)) return [];
+  const windowStart = now - ACTIVITY_RHYTHM_WINDOW_MS;
+  const hits = [];
+  for (const s of starts || []) {
+    const ms = Number(s && s.atMs);
+    if (!Number.isFinite(ms) || ms < windowStart || ms > now) continue;
+    hits.push(ms);
+  }
+  if (hits.length === 0) return [];
+  const cells = new Map();
+  for (const ms of hits) {
+    const key = `${weekdayInZone(ms, tz)}|${detailedTimeBucket(hourInZone(ms, tz))}`;
+    let c = cells.get(key);
+    if (!c) { c = { hits: 0, days: new Set() }; cells.set(key, c); }
+    c.hits += 1;
+    c.days.add(dayInZone(ms, tz));
+  }
+  const rhythms = [];
+  for (const [key, c] of cells) {
+    if (c.days.size < ACTIVITY_RHYTHM_MIN_DAYS) continue;
+    if (c.hits / hits.length < ACTIVITY_RHYTHM_MIN_SHARE) continue;
+    const [weekday, bucket] = key.split('|');
+    rhythms.push({ weekday, bucket, distinctDays: c.days.size, hits: c.hits, share: c.hits / hits.length });
+  }
+  rhythms.sort((a, b) => b.distinctDays - a.distinctDays || b.share - a.share);
+  return rhythms;
+}
+
+/** Human sentence for a D4 activity rhythm. Pure. */
+export function activityRhythmSentence(type, r) {
+  const when = `${r.weekday} ${r.bucket}s`;
+  const tail = `${r.distinctDays} separate days in the last month`;
+  if (type === 'task') return `often creates tasks on ${when} — ${tail}`;
+  return `often starts a new chat on ${when} — ${tail}`;
+}
+
+/**
+ * Machine-readable marker for D4 rhythm memories (dedup). Distinct from the
+ * R3 `rhythm:<weekday>|<bucket>|<place>` markers, so the two never collide.
+ */
+export function activityRhythmKey(type, r) {
+  return `rhythm:${type}:${r.weekday}|${r.bucket}`;
+}
