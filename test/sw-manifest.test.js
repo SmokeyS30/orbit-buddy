@@ -35,11 +35,17 @@ test('precache manifest includes the versioned styles.css', () => {
   );
 });
 
-test('precache manifest covers voice/canvas/desktop assets', () => {
+test('precache manifest covers desktop assets (W7: voice/canvas chunks excluded)', () => {
   const { sandbox } = loadSw();
   const manifest = sandbox.buildPrecacheManifest();
-  for (const asset of ['/voice-mode.js', '/canvas.js', '/desktop.css', '/pwa-install.js', '/app.js']) {
+  for (const asset of ['/desktop.css', '/pwa-install.js', '/app.js']) {
     assert.ok(manifest.includes(asset), `missing ${asset} in ${manifest.join(', ')}`);
+  }
+  // W7 code-split: the lazily-loaded chunks must not be precached — they are
+  // fetched on first use and served via the runtime stale-while-revalidate
+  // path instead.
+  for (const chunk of ['/voice-mode.js', '/canvas.js']) {
+    assert.ok(!manifest.includes(chunk), `${chunk} must not be precached (W7 code-split)`);
   }
 });
 
@@ -88,8 +94,11 @@ test('fetch handler routes: API untouched, navigations network-first, static SWR
   fetchHandler(fakeEvent(fakeRequest('/styles.css?v=20261012a', 'cors')));
   // Maintenance bypass navigation: network-first, untouched by cache logic.
   fetchHandler(fakeEvent(fakeRequest('/?maint_bypass=abc', 'navigate')));
+  // W7 code-split chunk: not precached, but still a static asset — served via
+  // stale-while-revalidate (network fetch, then cached for next time).
+  fetchHandler(fakeEvent(fakeRequest('/voice-mode.js', 'cors')));
 
-  assert.equal(calls.length, 4, 'API request must not be intercepted');
+  assert.equal(calls.length, 5, 'API request must not be intercepted');
   return Promise.all(calls.map((c) => c.promise)).then(() => {
     assert.ok(true);
   });

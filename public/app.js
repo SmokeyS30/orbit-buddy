@@ -1,8 +1,23 @@
 // Orbit Buddy frontend v2.1 - optimistic chat send
 import { isNearBottom, scrollToBottom, settleAtBottom, shouldSettleAtBottom } from './chat-scroll.js';
 import { renderAssistantMarkdown } from './chat-markdown.js';
-import { isVoiceModeCommand, createVoiceMode } from './voice-mode.js';
-import { isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage } from './canvas.js';
+// W7 code-split: voice-mode.js (~13.7KB) and canvas.js (~2.9KB) used to be
+// static imports, so they were fetched on every page view. They now load on
+// first use through the memoized dynamic imports below — one fetch no matter
+// how many callers race for the module (e.g. double-tap on the voice button),
+// and a failed load (offline) resets the memo so the next attempt retries.
+// The specifiers stay relative module URLs, so they keep resolving under the
+// Capacitor native webview (no import.meta tricks).
+let voiceModeModulePromise=null;
+function loadVoiceMode(){
+  if(!voiceModeModulePromise)voiceModeModulePromise=import('./voice-mode.js').catch((err)=>{voiceModeModulePromise=null;throw err;});
+  return voiceModeModulePromise;
+}
+let canvasModulePromise=null;
+function loadCanvas(){
+  if(!canvasModulePromise)canvasModulePromise=import('./canvas.js').catch((err)=>{canvasModulePromise=null;throw err;});
+  return canvasModulePromise;
+}
 import { briefingLayoutFor } from './briefing-layout.js';
 import { parseConversationDeepLink } from './deep-link.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
@@ -54,7 +69,10 @@ function settlePendingReplies(messages,convoId){const set=pendingReplies.get(con
 function syncTypingBubble(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!typingActive)showTyping(false);else if(!want&&typingActive)hideTyping();}
 let lastMessageFingerprint='';
 let renderedConversationId=null;
-function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(isCanvasWorthy(item.content))renderCanvasDoc(el,item.content);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+async function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;// W7: the canvas chunk is fetched on first use — detection runs per
+// assistant message, so the render waits for the (memoized) module here and
+// never drops or mis-detects. Offline-first-use falls back to plain bubbles.
+const canvasApi=await loadCanvas().catch(()=>null);const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(canvasApi&&canvasApi.isCanvasWorthy(item.content))renderCanvasDoc(el,item.content,canvasApi);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 // --- W1: per-message actions (regenerate / copy / delete) ---
 // Assistant messages: long-press (touch) or hover (desktop) reveals a small
@@ -1032,20 +1050,24 @@ async function transcribeAudio(blob){
   return String(data.text||'');
 }
 let voiceMode=null;
-function openVoiceMode(){
+async function openVoiceMode(){
+  // W7: the voice chunk loads when voice mode is first entered. The memoized
+  // loader means a double-tap shares one fetch; the !voiceMode guard below
+  // runs synchronously after the await, so the controller is built exactly once.
+  let voiceModeApi;try{voiceModeApi=await loadVoiceMode();}catch(_){toast('Voice mode needs a connection to load.');return;}
   if(!voiceMode){
-    voiceMode=createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio});
+    voiceMode=voiceModeApi.createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio});
     voiceMode.wire();
   }
   if(!voiceMode.isOpen())voiceMode.open();
 }
 // R2 Canvas: substantial assistant responses render as document panels
 // instead of chat bubbles. Detection is automatic from the response shape.
-function renderCanvasDoc(el,content){
+function renderCanvasDoc(el,content,canvasApi){
   el.classList.add('canvas-doc');
   const head=document.createElement('header');head.className='canvas-head';
   const eyebrow=document.createElement('p');eyebrow.className='eyebrow';eyebrow.textContent='Document';
-  const title=document.createElement('h3');title.textContent=canvasTitle(content);
+  const title=document.createElement('h3');title.textContent=canvasApi.canvasTitle(content);
   head.append(eyebrow,title);
   const body=document.createElement('div');body.className='canvas-body';
   if(!renderAssistantMarkdown(body,content))body.textContent=content;
@@ -1054,7 +1076,8 @@ function renderCanvasDoc(el,content){
 // R2 Canvas: "print this" / "share this" open the printable page for the
 // latest canvas document in the active conversation.
 async function openCanvasRender(){
-  const doc=findLatestCanvasMessage(state.snapshot&&state.snapshot.messages);
+  const canvasApi=await loadCanvas().catch(()=>null);
+  const doc=canvasApi?canvasApi.findLatestCanvasMessage(state.snapshot&&state.snapshot.messages):null;
   if(!doc){toast('No document in this conversation yet — ask Orbit for a plan, itinerary, or comparison first.');return;}
   try{
     const res=await api('/api/canvas/render',{method:'POST',body:JSON.stringify({title:doc.title,markdown:doc.content})});
@@ -1153,8 +1176,14 @@ async function sendChatMessage(text){
   const message=String(text||'').trim();
   const attachmentIds=pendingAttachments.map((att)=>att.id);
   if(!message&&!attachmentIds.length){toast('Type a message or attach an image.');return;}
-  if(isVoiceModeCommand(message)){openVoiceMode();return;}
-  if(isCanvasCommand(message)){openCanvasRender();return;}
+  // W7: command matchers live in the lazily-loaded chunks — fetch both in
+  // parallel once (memoized) so no command fails before its module loads. A
+  // failed load (offline) falls through to the normal send path, preserving
+  // the offline queue below.
+  let voiceModeApi=null,canvasApi=null;
+  try{[voiceModeApi,canvasApi]=await Promise.all([loadVoiceMode(),loadCanvas()]);}catch(_){}
+  if(voiceModeApi&&voiceModeApi.isVoiceModeCommand(message)){openVoiceMode();return;}
+  if(canvasApi&&canvasApi.isCanvasCommand(message)){openCanvasRender();return;}
   const shareCmd=parseShareConversationCommand(message);
   if(shareCmd){handleShareConversationCommand(shareCmd);return;}
   if(submit)submit.disabled=true;
