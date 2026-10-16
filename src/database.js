@@ -296,6 +296,22 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       PRIMARY KEY (user_id, item_key)
     );
     CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id);
+    CREATE TABLE IF NOT EXISTS soul_records (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      record_json TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS soul_history (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      version INTEGER NOT NULL,
+      record_json TEXT NOT NULL,
+      source TEXT,
+      created_at TEXT NOT NULL,
+      UNIQUE(user_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC);
     CREATE TABLE IF NOT EXISTS study_questions (
       id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
       question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
@@ -543,6 +559,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setWritingVoiceProfile: db.prepare('UPDATE user_preferences SET writing_voice_opt_in=1, writing_voice_profile=?, writing_voice_updated_at=?, updated_at=? WHERE user_id=?'),
     clearWritingVoice: db.prepare('UPDATE user_preferences SET writing_voice_opt_in=0, writing_voice_profile=NULL, writing_voice_updated_at=NULL, updated_at=? WHERE user_id=?'),
     setWritingVoiceOffered: db.prepare('UPDATE user_preferences SET writing_voice_offered=1, updated_at=? WHERE user_id=?'),
+    // Soul core: versioned personality record per user + append-only edit history.
+    getSoulRecord: db.prepare('SELECT user_id, record_json, version, updated_at FROM soul_records WHERE user_id=?'),
+    upsertSoulRecord: db.prepare(`INSERT INTO soul_records(user_id, record_json, version, updated_at) VALUES(?,?,?,?)
+      ON CONFLICT(user_id) DO UPDATE SET record_json=excluded.record_json, version=excluded.version, updated_at=excluded.updated_at`),
+    insertSoulHistory: db.prepare('INSERT INTO soul_history(id, user_id, version, record_json, source, created_at) VALUES(?,?,?,?,?,?)'),
+    listSoulHistory: db.prepare('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? ORDER BY version DESC LIMIT ?'),
+    getSoulHistoryVersion: db.prepare('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? AND version=?'),
     trackPersonMention: db.prepare(`INSERT INTO people_mentions(user_id,person_name,last_mentioned_at,last_nudged_at,dismissed,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,person_name) DO UPDATE SET last_mentioned_at=excluded.last_mentioned_at,
       dismissed=0,updated_at=excluded.updated_at`),
@@ -980,6 +1003,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     markWritingVoiceOffered(userId){this.getPreferences(userId);s.setWritingVoiceOffered.run(timestamp(),userId);},
     setWritingVoiceProfile(userId,profile){this.getPreferences(userId);const clean=String(profile||'').trim().slice(0,1200);if(!clean)throw new Error('A writing voice profile is required.');s.setWritingVoiceProfile.run(clean,timestamp(),timestamp(),userId);return this.getWritingVoice(userId);},
     clearWritingVoice(userId){this.getPreferences(userId);s.clearWritingVoice.run(timestamp(),userId);return this.getWritingVoice(userId);},
+    // Soul core: versioned personality record per user (personality only — no
+    // personal facts) + append-only edit history for "go back to how you were".
+    // Revisions are insert-only; the current record is always max(version).
+    getSoulRecord(userId){const row=s.getSoulRecord.get(userId);if(!row)return null;let record=null;try{record=JSON.parse(row.record_json);}catch{}if(!record||typeof record!=='object')return null;return {...record,version:row.version,updatedAt:row.updated_at};},
+    saveSoulRecord(userId,record,source){const current=this.getSoulRecord(userId);const version=(current?.version||0)+1;const clean={...record};delete clean.version;delete clean.updatedAt;const json=JSON.stringify(clean);const now=timestamp();s.upsertSoulRecord.run(userId,json,version,now);s.insertSoulHistory.run(randomUUID(),userId,version,json,String(source||'').slice(0,80),now);return {...clean,version,updatedAt:now};},
+    listSoulHistory(userId,limit=10){return s.listSoulHistory.all(userId,Math.max(1,Math.min(50,limit||10)));},
+    getSoulHistoryVersion(userId,version){const row=s.getSoulHistoryVersion.get(userId,version);if(!row)return null;let record=null;try{record=JSON.parse(row.record_json);}catch{}return {...row,record};},
     trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
     dismissPersonNudge:(userId,personName)=>s.dismissPersonNudge.run(timestamp(),userId,personName).changes>0,

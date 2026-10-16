@@ -475,6 +475,26 @@ CREATE TABLE IF NOT EXISTS study_attempts (
   correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
 );
 
+-- Soul core: versioned personality record per user (personality only — no
+-- personal facts) + append-only edit history. Revisions are insert-only;
+-- the current record is always max(version).
+CREATE TABLE IF NOT EXISTS soul_records (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  record_json TEXT NOT NULL,
+  version INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS soul_history (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  version INTEGER NOT NULL,
+  record_json TEXT NOT NULL,
+  source TEXT,
+  created_at TEXT NOT NULL,
+  UNIQUE(user_id, version)
+);
+
 CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
 
@@ -500,3 +520,4 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at D
 CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id);
 CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam);
 CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC);
