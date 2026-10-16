@@ -1398,23 +1398,30 @@ function handleShareConversationCommand(cmd){
   if(cmd.format)runShareExport(cmd.format);
   else showSharePicker();
 }
+let sendInFlight=false; // sweep fix: blocks double-tap sends during chunk fetch
 async function sendChatMessage(text){
   const input=$('#chat-input');
   const submit=document.querySelector('#chat-form button[type="submit"]');
   const message=String(text||'').trim();
   const attachmentIds=pendingAttachments.map((att)=>att.id);
   if(!message&&!attachmentIds.length){toast('Type a message or attach an image.');return;}
+  // Guard against double-tap: chunk fetch latency below means the send path
+  // is async before any submit state changes. Reset in finally.
+  if(sendInFlight)return;
+  sendInFlight=true;
+  if(submit)submit.disabled=true;
   // W7: command matchers live in the lazily-loaded chunks — fetch both in
   // parallel once (memoized) so no command fails before its module loads. A
   // failed load (offline) falls through to the normal send path, preserving
   // the offline queue below.
   let voiceModeApi=null,canvasApi=null;
   try{[voiceModeApi,canvasApi]=await Promise.all([loadVoiceMode(),loadCanvas()]);}catch(_){}
-  if(voiceModeApi&&voiceModeApi.isVoiceModeCommand(message)){openVoiceMode();return;}
-  if(canvasApi&&canvasApi.isCanvasCommand(message)){openCanvasRender();return;}
+  const releaseSend=()=>{sendInFlight=false;if(submit)submit.disabled=false;};
+  if(voiceModeApi&&voiceModeApi.isVoiceModeCommand(message)){releaseSend();openVoiceMode();return;}
+  if(canvasApi&&canvasApi.isCanvasCommand(message)){releaseSend();openCanvasRender();return;}
   const shareCmd=parseShareConversationCommand(message);
-  if(shareCmd){handleShareConversationCommand(shareCmd);return;}
-  if(submit)submit.disabled=true;
+  if(shareCmd){releaseSend();handleShareConversationCommand(shareCmd);return;}
+  try{
   if(!navigator.onLine){
     // The offline text queue can't carry staged images — keep the thumbnails
     // so the user can send once they're back online.
@@ -1433,6 +1440,7 @@ async function sendChatMessage(text){
     }
     else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
   }finally{if(submit)submit.disabled=false;}
+  }finally{releaseSend();}
 }
 $('#chat-form').addEventListener('submit',(event)=>{event.preventDefault();const input=$('#chat-input');const text=input.value;input.value='';sendChatMessage(text);});
 function appendOptimisticMessage(text){const root=$('#messages');if(!root)return null;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';const body=document.createElement('span');body.textContent=text;el.append(body);root.append(el);scrollToBottom(root);return el;}
