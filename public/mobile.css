@@ -41,3 +41,11 @@
   .rev-diff-cols{grid-template-columns:1fr}
   .rev-sheet-backdrop{padding:0}
 }
+
+/* --- L2: goals/projects v2 on small screens --- */
+@media(max-width:760px){
+  .kanban{grid-template-columns:repeat(4,minmax(158px,76vw))}
+  .timeline-point{flex-basis:176px}
+  .goal-arc{gap:10px}
+  .view-toggle{max-width:100%;overflow-x:auto}
+}
