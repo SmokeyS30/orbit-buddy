@@ -72,7 +72,7 @@ let renderedConversationId=null;
 async function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;// W7: the canvas chunk is fetched on first use — detection runs per
 // assistant message, so the render waits for the (memoized) module here and
 // never drops or mis-detects. Offline-first-use falls back to plain bubbles.
-const canvasApi=await loadCanvas().catch(()=>null);const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(canvasApi&&canvasApi.isCanvasWorthy(item.content))renderCanvasDoc(el,item.content,canvasApi);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+const canvasApi=await loadCanvas().catch(()=>null);const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'Start with a question, a decision, or something you want to move forward.');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(canvasApi&&canvasApi.isCanvasWorthy(item.content))renderCanvasDoc(el,item.id,item.content,canvasApi);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 // --- W1: per-message actions (regenerate / copy / delete) ---
 // Assistant messages: long-press (touch) or hover (desktop) reveals a small
@@ -1063,15 +1063,131 @@ async function openVoiceMode(){
 }
 // R2 Canvas: substantial assistant responses render as document panels
 // instead of chat bubbles. Detection is automatic from the response shape.
-function renderCanvasDoc(el,content,canvasApi){
+function renderCanvasDoc(el,messageId,content,canvasApi){
   el.classList.add('canvas-doc');
   const head=document.createElement('header');head.className='canvas-head';
   const eyebrow=document.createElement('p');eyebrow.className='eyebrow';eyebrow.textContent='Document';
   const title=document.createElement('h3');title.textContent=canvasApi.canvasTitle(content);
   head.append(eyebrow,title);
+  // L1 Canvas v2: a subtle history affordance — no permanent chrome beyond a
+  // single icon. Opens the revisions sheet for this document.
+  if(messageId&&canvasApi.lineDiff){
+    const hist=document.createElement('button');hist.type='button';hist.className='canvas-history-btn';
+    hist.textContent='🕘';hist.title='Revision history';hist.setAttribute('aria-label','Revision history');
+    hist.addEventListener('click',(e)=>{e.stopPropagation();openCanvasRevisions(messageId,canvasApi,el);});
+    head.append(hist);
+  }
   const body=document.createElement('div');body.className='canvas-body';
   if(!renderAssistantMarkdown(body,content))body.textContent=content;
   el.append(head,body);
+}
+// L1 Canvas v2: refresh the canvas panel after a restore, marking which
+// version is displayed.
+function updateCanvasPanel(panelEl,content,canvasApi,restoredVersion){
+  if(!panelEl)return;
+  const head=panelEl.querySelector('.canvas-head');
+  if(head){
+    const t=head.querySelector('h3');if(t)t.textContent=canvasApi.canvasTitle(content);
+    let note=head.querySelector('.canvas-restored-note');
+    if(!note){note=document.createElement('p');note.className='canvas-restored-note';head.append(note);}
+    note.textContent='Showing version '+restoredVersion+' (restored).';
+  }
+  const bodyEl=panelEl.querySelector('.canvas-body');
+  if(bodyEl){bodyEl.replaceChildren();if(!renderAssistantMarkdown(bodyEl,content))bodyEl.textContent=content;}
+}
+// L1 Canvas v2: revision history sheet — version list, side-by-side diff,
+// one-tap restore (inline confirm; restore is itself versioned server-side).
+async function openCanvasRevisions(messageId,canvasApi,panelEl){
+  const backdrop=document.createElement('div');backdrop.className='rev-sheet-backdrop';
+  const sheet=document.createElement('div');sheet.className='rev-sheet';sheet.setAttribute('role','dialog');sheet.setAttribute('aria-label','Revision history');
+  const head=document.createElement('div');head.className='rev-sheet-head';
+  const h2=document.createElement('h2');h2.textContent='History';
+  const close=button('×','rev-sheet-close',()=>backdrop.remove());close.setAttribute('aria-label','Close history');
+  head.append(h2,close);
+  const body=document.createElement('div');body.className='rev-sheet-body';
+  sheet.append(head,body);backdrop.append(sheet);document.body.append(backdrop);
+  backdrop.addEventListener('click',(e)=>{if(e.target===backdrop)backdrop.remove();});
+  const onKey=(e)=>{if(e.key==='Escape'){backdrop.remove();document.removeEventListener('keydown',onKey);}};
+  document.addEventListener('keydown',onKey);
+  let data=null;
+  async function loadList(){
+    data=await api('/api/canvas/'+encodeURIComponent(messageId)+'/revisions');
+  }
+  function renderRevList(note){
+    body.replaceChildren();
+    if(note){const n=document.createElement('p');n.className='rev-note';n.textContent=note;body.append(n);}
+    const cur=document.createElement('div');cur.className='rev-row current';
+    const curL=document.createElement('div');const s=document.createElement('strong');s.textContent='Current version';
+    const sm=document.createElement('small');sm.textContent=formatDate(data.current.created_at);curL.append(s,sm);
+    const tag=document.createElement('span');tag.className='rev-tag';tag.textContent='current';
+    cur.append(curL,tag);body.append(cur);
+    for(const r of data.revisions){
+      const row=document.createElement('button');row.type='button';row.className='rev-row';
+      const l=document.createElement('div');const st=document.createElement('strong');st.textContent='Version '+r.version;
+      const p=document.createElement('small');p.textContent=formatDate(r.created_at)+(r.preview?' — '+r.preview:'');l.append(st,p);
+      row.append(l);
+      row.addEventListener('click',()=>renderRevDetail(r));
+      body.append(row);
+    }
+    if(!data.revisions.length){
+      const p=document.createElement('p');p.className='muted';
+      p.textContent='No earlier versions yet. Each revision of this document is kept here.';
+      body.append(p);
+    }
+  }
+  async function renderRevDetail(rev){
+    body.replaceChildren();
+    body.append(button('← All versions','rev-back',()=>renderRevList()));
+    const title=document.createElement('h3');title.textContent='Version '+rev.version+' vs current';title.style.margin='0 0 4px';body.append(title);
+    const sub=document.createElement('p');sub.className='muted';sub.textContent=formatDate(rev.created_at);body.append(sub);
+    const loading=document.createElement('p');loading.className='muted';loading.textContent='Loading diff…';body.append(loading);
+    let full;
+    try{full=await api('/api/canvas/'+encodeURIComponent(messageId)+'/revisions/'+rev.version);}
+    catch(e){loading.textContent='Could not load this version.';return;}
+    loading.remove();
+    const cols=document.createElement('div');cols.className='rev-diff-cols';
+    const oldPane=document.createElement('div');oldPane.className='rev-diff-pane';
+    const newPane=document.createElement('div');newPane.className='rev-diff-pane';
+    const oh=document.createElement('h4');oh.textContent='Version '+rev.version;
+    const nh=document.createElement('h4');nh.textContent='Current';
+    oldPane.append(oh);newPane.append(nh);
+    for(const op of canvasApi.lineDiff(full.content,data.current.content)){
+      const left=document.createElement('div');left.className='diff-line';
+      const right=document.createElement('div');right.className='diff-line';
+      if(op.type==='del'){left.classList.add('diff-del');left.textContent=op.text;right.classList.add('blank');}
+      else if(op.type==='add'){left.classList.add('blank');right.classList.add('diff-add');right.textContent=op.text;}
+      else{left.classList.add('diff-same');right.classList.add('diff-same');left.textContent=op.text;right.textContent=op.text;}
+      oldPane.append(left);newPane.append(right);
+    }
+    cols.append(oldPane,newPane);body.append(cols);
+    const restoreBtn=button('Restore this version','rev-restore',()=>renderRestoreConfirm(rev,restoreBtn));
+    body.append(restoreBtn);
+  }
+  function renderRestoreConfirm(rev,restoreBtn){
+    const box=document.createElement('div');box.className='rev-restore-confirm';
+    const nextVersion=data.revisions.reduce((m,r)=>Math.max(m,Number(r.version)||0),0)+1;
+    const p=document.createElement('p');
+    p.textContent='Restore version '+rev.version+'? Your current version will be kept as v'+nextVersion+'.';
+    const actions=document.createElement('div');actions.className='actions';
+    actions.append(button('Keep current','ghost',()=>{box.replaceWith(restoreBtn);}));
+    const go=button('Restore','rev-restore',async()=>{
+      go.disabled=true;go.textContent='Restoring…';
+      try{
+        const out=await api('/api/canvas/'+encodeURIComponent(messageId)+'/revisions/'+rev.version+'/restore',{method:'POST'});
+        await loadList();
+        updateCanvasPanel(panelEl,out.content,canvasApi,rev.version);
+        renderRevList(out.keptAsVersion
+          ?'Restored v'+rev.version+' — your previous version is kept as v'+out.keptAsVersion+'.'
+          :'Already showing v'+rev.version+'.');
+        toast('Version '+rev.version+' restored.');
+      }catch(e){toast('Restore failed.');go.disabled=false;go.textContent='Restore';}
+    });
+    actions.append(go);box.append(p,actions);
+    restoreBtn.replaceWith(box);
+  }
+  body.innerHTML='<p class="muted">Loading history…</p>';
+  try{await loadList();renderRevList();}
+  catch(e){body.replaceChildren();const p=document.createElement('p');p.className='error';p.textContent='Could not load history.';body.append(p);}
 }
 // R2 Canvas: "print this" / "share this" open the printable page for the
 // latest canvas document in the active conversation.

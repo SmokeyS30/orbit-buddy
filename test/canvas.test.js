@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { canvasScore, isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage } from '../public/canvas.js';
+import { canvasScore, isCanvasWorthy, canvasTitle, isCanvasCommand, findLatestCanvasMessage, lineDiff } from '../public/canvas.js';
 
 const STUDY_PLAN = [
   '# CompTIA A+ Study Plan',
@@ -106,4 +106,35 @@ test('canvasScore exposes structure counts', () => {
   assert.equal(s.tables, 1);
   assert.ok(s.lists >= 10, `lists ${s.lists}`);
   assert.ok(s.length >= 1200, `length ${s.length}`);
+});
+
+test('lineDiff marks added, removed and unchanged lines', () => {
+  const oldText = 'line one\nline two\nline three';
+  const newText = 'line one\nline TWO\nline four';
+  const ops = lineDiff(oldText, newText);
+  assert.deepEqual(ops[0], { type: 'same', text: 'line one' });
+  assert.equal(ops.filter((o) => o.type === 'del').map((o) => o.text).join('\n'), 'line two\nline three');
+  assert.equal(ops.filter((o) => o.type === 'add').map((o) => o.text).join('\n'), 'line TWO\nline four');
+  assert.equal(ops.filter((o) => o.type !== 'add').map((o) => o.text).join('\n'), oldText);
+  assert.equal(ops.filter((o) => o.type !== 'del').map((o) => o.text).join('\n'), newText);
+});
+
+test('lineDiff of identical texts is all unchanged', () => {
+  const ops = lineDiff('a\nb', 'a\nb');
+  assert.ok(ops.length === 2 && ops.every((o) => o.type === 'same'));
+});
+
+test('lineDiff handles empty inputs', () => {
+  assert.deepEqual(lineDiff('', ''), [{ type: 'same', text: '' }]);
+  assert.deepEqual(lineDiff('', 'x'), [{ type: 'del', text: '' }, { type: 'add', text: 'x' }]);
+});
+
+test('lineDiff reconstructs both sides from the op list', () => {
+  const oldText = ['# Doc', '', '- one', '- two', '', '| a | b |', '|---|---|', '| 1 | 2 |'].join('\n');
+  const newText = ['# Doc', '', '- one', '- THREE', '- four', '', '| a | b |', '|---|---|', '| 1 | 2 |'].join('\n');
+  const ops = lineDiff(oldText, newText);
+  assert.equal(ops.filter((o) => o.type !== 'add').map((o) => o.text).join('\n'), oldText);
+  assert.equal(ops.filter((o) => o.type !== 'del').map((o) => o.text).join('\n'), newText);
+  assert.ok(ops.some((o) => o.type === 'del' && o.text === '- two'));
+  assert.ok(ops.some((o) => o.type === 'add' && o.text === '- THREE'));
 });

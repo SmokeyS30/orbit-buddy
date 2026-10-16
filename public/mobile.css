@@ -36,4 +36,8 @@
 @media(max-width:760px){
   .message.assistant.canvas-doc{padding:20px 18px;border-radius:16px}
   .canvas-head h3{font-size:18px}
+  /* L1: revisions sheet — diff stacks vertically, sheet goes nearly full-height */
+  .rev-sheet{max-height:92vh;border-radius:16px 16px 0 0}
+  .rev-diff-cols{grid-template-columns:1fr}
+  .rev-sheet-backdrop{padding:0}
 }

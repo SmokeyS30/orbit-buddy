@@ -91,6 +91,50 @@ function markdownToHtml(md,autoPrint,printUrl,toolbarOverride=null,docTitle=''){
 // Shared by the artifact print flow and R2 Canvas: fetch the page as ?format=pdf
 // and share it via the Web Share API.
 const PRINT_SHARE_JS=`async function sharePrint(){try{const res=await fetch(location.pathname+'?format=pdf');if(!res.ok)throw new Error('pdf');const blob=await res.blob();const file=new File([blob],'orbit-result.pdf',{type:'application/pdf'});if(navigator.canShare&&navigator.canShare({files:[file]})){await navigator.share({files:[file],title:document.title});}else{alert('Sharing is not supported here.');}}catch(e){alert('Could not prepare the file.');}}`;
+// L1 Canvas v2: server-side mirror of public/canvas.js isCanvasWorthy.
+// The revision-capture hook runs here (chat turn storage), not in the client,
+// so the thresholds must stay in sync with the client module. Pure.
+function serverCanvasScore(content){
+  const s=String(content||'');
+  const headings=(s.match(/^#{1,3}\s+\S/gm)||[]).length;
+  const tableLines=(s.match(/^\s*\|.*\|\s*$/gm)||[]).length;
+  const tables=tableLines>=2?1:0;
+  const lists=(s.match(/^\s*(?:[-*+]|\d+[.)])\s+\S/gm)||[]).length;
+  const fences=Math.floor(((s.match(/^```/gm)||[]).length)/2);
+  return {length:s.length,headings,tables,lists,fences};
+}
+function isCanvasWorthyServer(content){
+  const c=serverCanvasScore(content);
+  if(c.length<1200)return false;
+  const structure=c.headings+c.tables*2+Math.min(c.lists/4,2)+c.fences;
+  return structure>=3;
+}
+// L1 Canvas v2: revision capture. Whenever a canvas-worthy assistant message
+// is saved and the conversation already had a canvas document, the previous
+// document is snapshotted as a revision (version = max+1) before the new one
+// becomes "current". The previous message's revision chain is carried onto the
+// new message id so GET /api/canvas/:id/revisions always returns the full
+// history. Revisions are insert-only (immutable); failures never break the
+// chat turn. Exported for tests.
+export function captureCanvasRevision(db,userId,conversationId,stored){
+  try{
+    if(!stored||stored.role!=='assistant'||!isCanvasWorthyServer(stored.content))return;
+    const ordered=db.listConversationMessages(userId,conversationId,200);
+    let prev=null;
+    for(const m of ordered){
+      if(m.id===stored.id)continue;
+      if(m.role==='assistant'&&isCanvasWorthyServer(m.content))prev=m; // newest wins
+    }
+    if(!prev||prev.content===stored.content)return;
+    const carried=db.listCanvasRevisions(userId,prev.id);
+    let maxV=0;
+    for(const r of [...carried].reverse()){ // oldest first; version numbers carry over
+      db.addCanvasRevision(userId,stored.id,r.version,r.content);
+      if(r.version>maxV)maxV=r.version;
+    }
+    db.addCanvasRevision(userId,stored.id,maxV+1,prev.content);
+  }catch(error){console.error('[canvas] revision capture failed',error&&error.message);}
+}
 // R2 Canvas: short-lived printable renders. Tokens are unguessable, bound to
 // the user, and expire after 10 minutes; the markdown lives in memory only.
 const canvasRenders=new Map();
@@ -398,7 +442,7 @@ export function createOrbitServer(options={}) {
     if(!db.getConversation(userId,conversation.id))return null;
     const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
     let answer=null;
-    const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);return stored;};
+    const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
     try{
       const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
       const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
@@ -2449,6 +2493,49 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
           res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});
           return res.end(html);
+        }
+        // L1 Canvas v2: revision history. db.getMessage is user-scoped, so a
+        // foreign message id 404s exactly like an unknown one.
+        const canvasRevListMatch=url.pathname.match(/^\/api\/canvas\/([0-9a-f-]{36})\/revisions$/);
+        if(req.method==='GET'&&canvasRevListMatch){
+          if(userRateLimited(userId,'canvas',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const messageId=canvasRevListMatch[1];
+          const msg=db.getMessage(userId,messageId);
+          if(!msg)throw Object.assign(new Error('Message not found.'),{status:404});
+          const revs=db.listCanvasRevisions(userId,messageId);
+          return json(res,200,{messageId,current:{content:msg.content,created_at:msg.created_at},
+            revisions:revs.map((r)=>({version:r.version,created_at:r.created_at,preview:String(r.content).slice(0,240)}))});
+        }
+        const canvasRevOneMatch=url.pathname.match(/^\/api\/canvas\/([0-9a-f-]{36})\/revisions\/(\d+)$/);
+        if(req.method==='GET'&&canvasRevOneMatch){
+          if(userRateLimited(userId,'canvas',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const messageId=canvasRevOneMatch[1],version=Number(canvasRevOneMatch[2]);
+          const msg=db.getMessage(userId,messageId);
+          if(!msg)throw Object.assign(new Error('Message not found.'),{status:404});
+          const rev=db.getCanvasRevision(userId,messageId,version);
+          if(!rev)throw Object.assign(new Error('Revision not found.'),{status:404});
+          return json(res,200,{messageId,version:rev.version,content:rev.content,created_at:rev.created_at});
+        }
+        const canvasRevRestoreMatch=url.pathname.match(/^\/api\/canvas\/([0-9a-f-]{36})\/revisions\/(\d+)\/restore$/);
+        if(req.method==='POST'&&canvasRevRestoreMatch){
+          if(userRateLimited(userId,'canvas',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const messageId=canvasRevRestoreMatch[1],version=Number(canvasRevRestoreMatch[2]);
+          const msg=db.getMessage(userId,messageId);
+          if(!msg)throw Object.assign(new Error('Message not found.'),{status:404});
+          const rev=db.getCanvasRevision(userId,messageId,version);
+          if(!rev)throw Object.assign(new Error('Revision not found.'),{status:404});
+          const existing=db.listCanvasRevisions(userId,messageId);
+          const maxV=existing.reduce((m,r)=>Math.max(m,Number(r.version)||0),0);
+          // Restore is itself versioned: the pre-restore content is kept as a
+          // new revision first, so nothing is ever lost.
+          let keptAsVersion=null;
+          if(rev.content!==msg.content){
+            keptAsVersion=maxV+1;
+            db.addCanvasRevision(userId,messageId,keptAsVersion,msg.content);
+            db.setMessageContent(userId,messageId,rev.content);
+            db.touchConversation(userId,msg.conversation_id);
+          }
+          return json(res,200,{messageId,version:rev.version,keptAsVersion,content:rev.content});
         }
         // WhatsApp phone linking (authenticated; the code is texted to Orbit's WhatsApp number)
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){

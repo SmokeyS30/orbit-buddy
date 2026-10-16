@@ -307,6 +307,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     );
     CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam);
     CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC);
+    CREATE TABLE IF NOT EXISTS canvas_revisions (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      message_id TEXT NOT NULL, version INTEGER NOT NULL, content TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(message_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC);
     CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
     CREATE TABLE IF NOT EXISTS waitlist (
@@ -448,6 +455,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMessage: db.prepare('SELECT * FROM messages WHERE id=? AND user_id=?'),
     getMessageAny: db.prepare('SELECT * FROM messages WHERE id=?'),
     deleteMessageRow: db.prepare('DELETE FROM messages WHERE id=? AND user_id=?'),
+    setMessageContentRow: db.prepare('UPDATE messages SET content=? WHERE id=? AND user_id=?'),
+    // L1 Canvas v2: revision history (immutable rows).
+    addCanvasRevision: db.prepare('INSERT INTO canvas_revisions(id,user_id,message_id,version,content,created_at) VALUES (?,?,?,?,?,?)'),
+    listCanvasRevisions: db.prepare('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? ORDER BY version DESC LIMIT 50'),
+    getCanvasRevision: db.prepare('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? AND version=?'),
     retimeMessageRow: db.prepare('UPDATE messages SET created_at=? WHERE id=? AND user_id=?'),
     addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL, ?)`),
@@ -768,6 +780,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     // W1: move a message to an explicit position in conversation order
     // (regenerate re-inserts the new answer where the old one was).
     retimeMessage(userId,id,createdAt){return s.retimeMessageRow.run(createdAt,id,userId).changes>0;},
+    // L1 Canvas v2: revision history (immutable — rows are only ever inserted).
+    addCanvasRevision(userId,messageId,version,content){const row={id:randomUUID(),user_id:userId,message_id:messageId,version,content,created_at:timestamp()};s.addCanvasRevision.run(row.id,row.user_id,row.message_id,row.version,row.content,row.created_at);return row;},
+    listCanvasRevisions:(userId,messageId)=>s.listCanvasRevisions.all(userId,messageId),
+    getCanvasRevision:(userId,messageId,version)=>s.getCanvasRevision.get(userId,messageId,version),
+    setMessageContent(userId,id,content){return s.setMessageContentRow.run(content,id,userId).changes>0;},
     // Deletes a whole turn: the target message plus the adjacent partner that
     // completes it. Deleting an assistant reply also removes the user message
     // it answered; deleting a user message also removes the assistant reply
