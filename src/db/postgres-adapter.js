@@ -200,6 +200,19 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         dismissed_at TEXT,
         PRIMARY KEY (user_id, item_key)
       )`,
+      // L1 Canvas v2: revision history for canvas documents. Additive table;
+      // this migrations array is the ONLY schema path production runs
+      // (tables added solely to the SQLite layer never reach prod).
+      // Revisions are insert-only (immutable).
+      `CREATE TABLE IF NOT EXISTS canvas_revisions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(message_id, version)
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -211,6 +224,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam)',
       'CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -389,6 +403,18 @@ const indexMigrations = [
     async listMessages(userId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
+    // W1 parity: user-scoped single-message fetch (mirrors SQLite getMessage).
+    getMessage: async (userId, id) => get('SELECT * FROM messages WHERE id=? AND user_id=?', id, userId),
+    // L1 Canvas v2: replace a message's content in place (used by restore).
+    setMessageContent: async (userId, id, content) => (await run('UPDATE messages SET content=? WHERE id=? AND user_id=?', content, id, userId)).changes > 0,
+    // L1 Canvas v2: revision history (immutable — rows are only ever inserted).
+    async addCanvasRevision(userId, messageId, version, content) {
+      const row = { id: randomUUID(), user_id: userId, message_id: messageId, version, content, created_at: timestamp() };
+      await run('INSERT INTO canvas_revisions(id,user_id,message_id,version,content,created_at) VALUES (?,?,?,?,?,?)', row.id, row.user_id, row.message_id, row.version, row.content, row.created_at);
+      return row;
+    },
+    listCanvasRevisions: async (userId, messageId) => all('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? ORDER BY version DESC LIMIT 50', userId, messageId),
+    getCanvasRevision: async (userId, messageId, version) => get('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? AND version=?', userId, messageId, version),
 
     // --- Memories ---
     async addMemory(userId, content, options={}) {

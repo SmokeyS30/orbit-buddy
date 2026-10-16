@@ -68,3 +68,35 @@ export function findLatestCanvasMessage(messages) {
   }
   return null;
 }
+
+/**
+ * Line-based diff of two texts. Pure. Returns an ordered op list:
+ * {type:'same'|'del'|'add', text}. Simple LCS over lines; inputs whose
+ * line-count product exceeds the cap degrade to whole-document replace.
+ */
+export function lineDiff(oldText, newText) {
+  const a = String(oldText ?? '').split('\n');
+  const b = String(newText ?? '').split('\n');
+  const finish = (ops) => ops;
+  if (a.length * b.length > 250000) {
+    if (String(oldText ?? '') === String(newText ?? '')) return finish(a.map((text) => ({ type: 'same', text })));
+    return finish([...a.map((text) => ({ type: 'del', text })), ...b.map((text) => ({ type: 'add', text }))]);
+  }
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { ops.push({ type: 'same', text: a[i] }); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { ops.push({ type: 'del', text: a[i] }); i++; }
+    else { ops.push({ type: 'add', text: b[j] }); j++; }
+  }
+  while (i < n) { ops.push({ type: 'del', text: a[i] }); i++; }
+  while (j < m) { ops.push({ type: 'add', text: b[j] }); j++; }
+  return ops;
+}
