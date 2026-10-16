@@ -101,8 +101,14 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     const refetched_reply = db.getMessage(userId, reply.id);
     assert.equal(new Date(refetched_reply.created_at).toISOString().slice(0, 10), '2026-01-02', 'retimed created_at persisted');
     // Fresh user+assistant pair in natural order for the turn-delete check.
+    // Explicit distinct timestamps: same-millisecond inserts would make the
+    // created_at ASC, id ASC tiebreak fall back to random UUID order and the
+    // turn pairing would be nondeterministic.
+    const t1 = new Date('2026-03-04T10:00:00.000Z').toISOString();
+    const t2 = new Date('2026-03-04T10:00:01.000Z').toISOString();
     const u2 = db.addMessage(userId, conversationId, 'user', 'Second question');
     const a2 = db.addMessage(userId, conversationId, 'assistant', 'Second answer');
+    assert.ok(db.retimeMessage(userId, u2.id, t1) && db.retimeMessage(userId, a2.id, t2), 'retimed pair into deterministic order');
     const deletedIds = db.deleteMessageTurn(userId, a2.id);
     assert.ok(Array.isArray(deletedIds) && deletedIds.includes(a2.id) && deletedIds.includes(u2.id), 'deleteMessageTurn removes the whole turn');
     assert.equal(db.messageExists(a2.id), false, 'assistant reply gone after turn delete');

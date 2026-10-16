@@ -127,9 +127,11 @@ test('media tokens round-trip; tampered/expired/malformed tokens fail', () => {
   const token = signWhatsAppMediaToken(mediaId, secret);
   const verified = verifyWhatsAppMediaToken(token, secret);
   assert.equal(verified.mediaId, mediaId);
-  // Tampered signature.
+  // Tampered signature. Flip the FIRST char: all 6 of its bits are significant
+  // in the decoded digest (the last base64url char's low 2 bits are padding,
+  // so flipping it is a no-op ~1/16 of the time and the tamper wouldn't land).
   const [id, exp, sig] = token.split('.');
-  const flipped = sig.slice(0, -1) + (sig.endsWith('A') ? 'B' : 'A');
+  const flipped = (sig[0] === 'A' ? 'B' : 'A') + sig.slice(1);
   assert.equal(verifyWhatsAppMediaToken(`${id}.${exp}.${flipped}`, secret), null);
   // Tampered media id or expiry.
   assert.equal(verifyWhatsAppMediaToken(`${'00000000-0000-0000-0000-000000000000'}.${exp}.${sig}`, secret), null);
@@ -179,9 +181,11 @@ test('GET /api/whatsapp/media/:token serves staged bytes; invalid/expired -> 404
   assert.match(res.headers.get('cache-control') || '', /no-store/);
   assert.deepEqual(Buffer.from(await res.arrayBuffer()), bytes);
 
-  // Tampered signature -> 404 (never 403).
+  // Tampered signature -> 404 (never 403). Flip the FIRST char: all 6 bits
+  // are significant there (the last base64url char's low 2 bits are padding,
+  // so flipping it is a no-op some of the time).
   const [id, exp, sig] = token.split('.');
-  const bad = await fetch(`${base}/api/whatsapp/media/${id}.${exp}.${sig.slice(0, -1)}X`);
+  const bad = await fetch(`${base}/api/whatsapp/media/${id}.${exp}.${(sig[0] === 'A' ? 'B' : 'A') + sig.slice(1)}`);
   assert.equal(bad.status, 404);
   // Garbage token -> 404.
   assert.equal((await fetch(`${base}/api/whatsapp/media/nope`)).status, 404);
