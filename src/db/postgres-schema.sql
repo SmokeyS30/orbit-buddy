@@ -495,6 +495,24 @@ CREATE TABLE IF NOT EXISTS soul_history (
   UNIQUE(user_id, version)
 );
 
+-- Proactive memory: tracks which memories were volunteered unprompted (in
+-- chat or via a proactive push) so nothing repeats. content_snapshot +
+-- memory_created_at keep the "why are you telling me this?" answer exact
+-- even if the memory is later edited or deleted.
+CREATE TABLE IF NOT EXISTS memory_surfacing (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL,
+  occurrence_key TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  via TEXT NOT NULL,
+  reason TEXT,
+  content_snapshot TEXT,
+  memory_created_at TEXT,
+  surfaced_at TEXT NOT NULL,
+  UNIQUE(user_id, occurrence_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
 
@@ -521,3 +539,4 @@ CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id);
 CREATE INDEX IF NOT EXISTS idx_study_questions_exam ON study_questions(exam);
 CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC);
