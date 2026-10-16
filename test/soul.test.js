@@ -44,7 +44,7 @@ test('soul: default is warm, direct, and a little playful', () => {
 
 test('soul: record holds personality only — no personal facts', () => {
   const record = normalizeSoulRecord(DEFAULT_SOUL_RECORD);
-  assert.deepEqual(Object.keys(record).sort(), ['directness', 'formality', 'name', 'playfulness', 'warmth', 'will', 'wont']);
+  assert.deepEqual(Object.keys(record).sort(), ['directness', 'formality', 'learnings', 'name', 'playfulness', 'warmth', 'will', 'wont']);
   const directive = buildSoulDirective(record, { userName: 'Edward' });
   assert.ok(!directive.includes('Edward') || directive.includes('tuned this in chat'), 'directive names only the tuner, never stored facts');
 });

@@ -23,7 +23,7 @@ import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MES
 import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
-import { handleSoulCommand, resolveSoulDirective } from './src/soul.js';
+import { handleSoulCommand, handleAdaptationCommand, resolveAdaptiveSoulDirective } from './src/soul.js';
 import { buildSurfacingHint, chooseChatSurfacing, handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
@@ -641,17 +641,25 @@ export function createOrbitServer(options={}) {
       // gets a neutral default. Works identically on web and WhatsApp because
       // both flow through runChatReplyJob.
       const soulCommand=handleSoulCommand({db,userId,message,isDemo:isDemoUser(user)});
+      // Adaptive soul (2026-10-16): "why are you being so direct?", "stop
+      // adapting", "forget what you've learned" — answered directly, instant
+      // and exact, no model call, no UI. Per-user; demo mode gets neutral
+      // answers. Also flows through runChatReplyJob, so web and WhatsApp
+      // share the behavior.
+      const adaptationCommand=soulCommand?null:handleAdaptationCommand({db,userId,message,isDemo:isDemoUser(user)});
       // Memory v2 (chat-native, 2026-10-16): memory review/delete lives in chat.
       // "what do you know about me?" / "forget X" are answered directly — instant,
       // exact, no model call, no UI. Works identically on web and WhatsApp.
-      const memoryCommand=soulCommand?null:handleMemoryCommand({db,userId,message});
-      if(soulCommand||memoryCommand){
-        answer=soulCommand||memoryCommand;
+      const memoryCommand=(soulCommand||adaptationCommand)?null:handleMemoryCommand({db,userId,message});
+      if(soulCommand||adaptationCommand||memoryCommand){
+        answer=soulCommand||adaptationCommand||memoryCommand;
         storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       }else{
       // Soul directive renders the user's tuned personality (or the demo
-      // neutral default) into the system-prompt layer for this turn.
-      const soulDirective=resolveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name});
+      // neutral default) into the system-prompt layer for this turn, plus the
+      // adaptive soul layer: context-driven tone shifts around the tuned
+      // anchor, with learnings accumulated from conversation signals.
+      const soulDirective=resolveAdaptiveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name,message,timeZone:preferences.time_zone});
       const recalledMemories=db.listRelevantMemories(userId,message);
       // Proactive memory (2026-10-16): volunteer at most ONE timely memory
       // (a due date from memories, or an open loop the topic calls for) as a

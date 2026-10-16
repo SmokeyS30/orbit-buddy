@@ -41,6 +41,21 @@ const AXIS_LABELS = {
   formality: ['very casual', 'casual', 'neutral', 'polite', 'formal'],
 };
 
+// Time-of-day buckets for adaptation learnings ("mornings: prefers direct").
+const TIME_BUCKET_LABELS = {
+  morning: 'mornings',
+  midday: 'midday hours',
+  afternoon: 'afternoons',
+  evening: 'evenings',
+  night: 'late nights',
+};
+
+// Adaptive soul bounds: shifts stay within ±1 of the tuned anchor and move
+// one step per turn, so adaptation modulates — never overrides — the anchor.
+const ADAPT_MAX_SHIFT = 1;
+const ADAPT_MAX_LEARNINGS = 8;
+const ADAPT_EVIDENCE_THRESHOLD = 3;
+
 // Default soul: warm, direct, a little playful. Ships without asking — the
 // invisible-complexity rule means no first-run configuration.
 export const DEFAULT_SOUL_RECORD = Object.freeze({
@@ -99,7 +114,28 @@ export function normalizeSoulRecord(raw) {
   };
   record.will = cleanList(base.will, DEFAULT_SOUL_RECORD.will);
   record.wont = cleanList(base.wont, DEFAULT_SOUL_RECORD.wont);
+  // Adaptation learnings (soft, user-revertable): [{label, bucket, axis, delta}].
+  // Survive normalization so "go back to how you were" can revert them too.
+  record.learnings = cleanLearnings(base.learnings);
   return record;
+}
+
+/** Normalize the adaptation learnings list. Pure. */
+function cleanLearnings(value) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const label = String(item.label || '').trim().slice(0, 120);
+    const bucket = String(item.bucket || '').trim();
+    const axis = String(item.axis || '').trim();
+    const delta = Number(item.delta) > 0 ? 1 : -1;
+    if (!label || !TIME_BUCKET_LABELS[bucket] || !AXIS_LABELS[axis]) continue;
+    if (out.some((l) => l.bucket === bucket && l.axis === axis)) continue;
+    out.push({ label, bucket, axis, delta });
+    if (out.length >= ADAPT_MAX_LEARNINGS) break;
+  }
+  return out;
 }
 
 /** One-line human description of a soul record, e.g. "warm, direct, and a little playful". Pure. */
@@ -186,22 +222,42 @@ export function buildHonestSoulSection(record, { demo = false } = {}) {
  * Render a soul record into the system-prompt layer. Pure. This is the only
  * thing that reaches the model — the raw record (and its history) never does.
  */
-export function buildSoulDirective(record, { userName = '', demo = false } = {}) {
+export function buildSoulDirective(record, { userName = '', demo = false, adaptation = null } = {}) {
   const r = normalizeSoulRecord(record);
+  // Adaptation shifts the effective axes within ±1 of the tuned anchor —
+  // the anchor is never overridden, only modulated around.
+  const eff = { ...r };
+  const shifts = (adaptation && adaptation.shifts) || {};
+  for (const axis of Object.keys(AXIS_LABELS)) {
+    const shift = Number(shifts[axis]) || 0;
+    eff[axis] = Math.max(AXIS_MIN, Math.min(AXIS_MAX, r[axis] + shift));
+  }
   const who = String(userName || '').trim() || 'the user';
   const header = demo
     ? `Personality (demo default — neutral; the full app lets each user tune this in chat):`
     : `Personality — ${who} tuned this in chat, so honor it. It refines the tone guidance above; it never overrides safety or tool rules:`;
-  return [
+  const lines = [
     header,
-    `- ${warmthLine(r.warmth)}`,
-    `- ${directnessLine(r.directness)}`,
-    `- ${playfulnessLine(r.playfulness)}`,
-    `- ${formalityLine(r.formality)}`,
+    `- ${warmthLine(eff.warmth)}`,
+    `- ${directnessLine(eff.directness)}`,
+    `- ${playfulnessLine(eff.playfulness)}`,
+    `- ${formalityLine(eff.formality)}`,
     `- Style commitments: ${r.will.join('; ')}.`,
     `- Never: ${r.wont.join('; ')}.`,
-    buildHonestSoulSection(r, { demo }),
-  ].join('\n');
+  ];
+  if (!demo && adaptation) {
+    const reason = String(adaptation.reason || '').trim();
+    const anyShift = Object.keys(AXIS_LABELS).some((axis) => Number(shifts[axis]) !== 0);
+    if (anyShift && reason) {
+      lines.push(`- Current read on the conversation: ${reason}. This is temporary mood-matching, not a personality change — never announce or explain it unless asked.`);
+    }
+    const learnings = Array.isArray(r.learnings) ? r.learnings : [];
+    if (learnings.length) {
+      lines.push(`- Read-the-room notes (learned over weeks of conversation — gentle defaults, the user can change or clear them anytime): ${learnings.map((l) => l.label).join('; ')}.`);
+    }
+  }
+  lines.push(buildHonestSoulSection(eff, { demo }));
+  return lines.join('\n');
 }
 
 /**
@@ -289,6 +345,13 @@ function historySourceLabel(source) {
     if (intent) return intent.reply;
   }
   if (source === 'revert') return 'reverted one step';
+  const lm = /^learn:([a-z]+):([a-z]+)([+-])$/.exec(String(source || ''));
+  if (lm) {
+    const bucketLabel = TIME_BUCKET_LABELS[lm[1]] || lm[1];
+    const desc = learnDescription(lm[2], lm[3] === '+' ? 1 : -1);
+    return `learned: ${bucketLabel}: ${desc}`;
+  }
+  if (source === 'learn-clear') return 'cleared learned adaptations';
   return String(source || 'tuned').slice(0, 40) || 'tuned';
 }
 
@@ -330,6 +393,15 @@ export function handleSoulCommand({ db, userId, message, isDemo }) {
     record[tune.axis] = after;
     db.saveSoulRecord(userId, record, `tune:${tune.axis}${tune.delta > 0 ? '+' : '-'}1`);
     db.addEvent(userId, 'soul_tuned', `Tuned personality: ${tune.axis} ${before}\u2192${after} (“${text.slice(0, 80)}”).`);
+    // Explicit tuning is the anchor — adaptation modulates around it, so
+    // clear any active adaptation shift on the tuned axis.
+    try {
+      const adaptState = loadAdaptationState(db, userId);
+      if (adaptState && adaptState.shifts && adaptState.shifts[tune.axis]) {
+        adaptState.shifts[tune.axis] = 0;
+        saveAdaptationState(db, userId, adaptState);
+      }
+    } catch {}
     return `Got it \u2014 I\u2019ll be ${tune.reply} from here on.`;
   }
 
@@ -359,4 +431,478 @@ export function handleSoulCommand({ db, userId, message, isDemo }) {
   // status
   const record = normalizeSoulRecord(db.getSoulRecord(userId));
   return `Me in a nutshell: ${shortSoulDescription(record)}. Shape me anytime \u2014 \u201cbe more playful\u201d, \u201cbe more direct\u201d, \u201cbe more casual\u201d.`;
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive soul — read the room (2026-10-16).
+//
+// Orbit adapts its tone to the moment: crisp when they seem rushed, warm when
+// they're venting, playful when they're joking, focused when they're working.
+// Adaptation shifts the existing axes (warmth/directness/playfulness/formality)
+// dynamically per conversation context, within ±1 of the user's tuned anchor
+// — the anchor always wins ("be more playful" stays the anchor; adaptation
+// only modulates around it). Changes are gradual: at most one step per turn,
+// never wild swings.
+//
+// Continuous learning, not one-time calibration: conversation signals (NOT
+// ratings or popups) accumulate as evidence — short replies or pushback after
+// a playful turn ease off playfulness; warm engagement leans into warmth;
+// "just give me the answer" shifts toward directness. Repeated signals in the
+// same time-of-day bucket promote to a soft learning stored on the soul
+// record ("evenings: warmer works"), which shows in "soul history" and can be
+// reverted or cleared like any soul edit.
+//
+// Explainability: the current adaptation state (shifts + reason) is kept in a
+// lightweight record, so Orbit can say why it's acting a certain way when
+// asked ("I'm being direct because you seemed rushed earlier").
+//
+// Chat-native per the invisible-complexity rule: no settings, no dashboards,
+// no adaptation meter. It just reads the room. Works on web/app and WhatsApp
+// (both flow through runChatReplyJob). Demo mode: static neutral soul, no
+// adaptation, no learning. Everything is per-user isolated.
+// ---------------------------------------------------------------------------
+
+const ADAPT_STATE_KEY = (userId) => `soul_adapt_${userId}`;
+const ADAPT_STATE_VERSION = 1;
+
+// Conversation moods, checked in priority order (venting beats rushed: "just
+// need to vent" is venting, not rushing). Each mood names its target axis
+// shifts (-1/0/1) and the human reason stored for explainability.
+const MOODS = [
+  {
+    id: 'venting',
+    match: /\b(ugh|argh|rant|vent(ing)?)\b|\bi('m|m| am) so (tired|done|over it|frustrated|stressed)\b|\bi feel (like|so|really)\b/i,
+    shifts: { warmth: 1, directness: -1 },
+    reason: 'you seem like you could use some space — leaning warmer and gentler',
+    whyPast: 'you seemed like you needed space to vent',
+  },
+  {
+    id: 'rushed',
+    match: /\b(quick|hurry|running late|in a rush|asap|quickly)\b|\bjust (need|want|tell me|give me|say)\b|tl;dr|\bshort version\b/i,
+    shifts: { directness: 1, playfulness: -1 },
+    reason: 'you seem rushed — keeping it tight and skipping the fluff',
+    whyPast: 'you seemed rushed earlier',
+  },
+  {
+    id: 'celebrating',
+    match: /\bi did it\b|\bi passed\b|\bit worked\b|\bcelebrat/i,
+    shifts: { warmth: 1, playfulness: 1 },
+    reason: 'something went well — celebrating with you',
+    whyPast: 'you had something worth celebrating',
+  },
+  {
+    id: 'joking',
+    match: /\b(lol|lmao|haha|rofl|banter)\b|\broast me\b/i,
+    shifts: { playfulness: 1 },
+    reason: 'you\u2019re in a playful mood — matching your energy',
+    whyPast: 'you were in a playful mood',
+  },
+  {
+    id: 'focused',
+    match: /\b(focus(ed)?|let'?s (get (to )?work|do this)|deadline|heads? down|deep work|study session|need to (finish|ship|get this done))\b/i,
+    shifts: { directness: 1 },
+    reason: 'you seem heads-down — staying focused and direct',
+    whyPast: 'you seemed heads-down',
+  },
+];
+
+/** Detect the conversation mood of a user message. Pure. */
+export function detectConversationMood(text) {
+  const t = String(text || '');
+  for (const mood of MOODS) {
+    if (mood.match.test(t)) return mood.id;
+  }
+  return 'neutral';
+}
+
+function moodById(id) {
+  return MOODS.find((m) => m.id === id) || null;
+}
+
+// Human descriptions for learning labels, per axis and direction.
+const LEARN_DESCRIPTIONS = {
+  'warmth|1': 'warmer works',
+  'warmth|-1': 'gentler works',
+  'directness|1': 'prefers direct',
+  'directness|-1': 'prefers gentle',
+  'playfulness|1': 'humor lands',
+  'playfulness|-1': 'less humor',
+  'formality|1': 'prefers polish',
+  'formality|-1': 'prefers casual',
+};
+
+/** Human description for a learned adaptation, e.g. "prefers direct". Pure. */
+export function learnDescription(axis, delta) {
+  return LEARN_DESCRIPTIONS[`${axis}|${delta > 0 ? 1 : -1}`] || `${axis} ${delta > 0 ? '+' : '-'}`;
+}
+
+/**
+ * Detect conversation signals from the user's message — the continuous,
+ * rating-free learning loop. Signals are always interpreted against the
+ * previous adaptation state (what Orbit was doing when the user replied).
+ * Pure given state.
+ */
+export function detectAdaptationSignals(text, state) {
+  const t = String(text || '');
+  const signals = [];
+  if (/\bjust give me the answer\b|\bcut to the chase\b|\bskip the (fluff|small talk)\b/i.test(t)) {
+    signals.push({ kind: 'explicit_direct', weight: 2 });
+  }
+  if (/\bnot (the )?(time|moment)\b|\bbe serious\b|\bseriously[?!]*\s*$|\bstop (joking|kidding|playing)\b|\bthis is(n't| not) (a )?(joke|game)\b/i.test(t)) {
+    signals.push({ kind: 'playful_pushback', weight: 1 });
+  }
+  if (/\b(lol|haha|lmao|rofl|love (that|this|it)|that'?s (great|awesome|perfect|amazing)|thanks (so much|a ton))\b/i.test(t)) {
+    signals.push({ kind: 'warm_engagement', weight: 1 });
+  }
+  // Reply got much shorter right after Orbit leaned playful — ease off.
+  const lens = (state && Array.isArray(state.userLens) && state.userLens) || [];
+  const avg = lens.length ? lens.reduce((a, b) => a + b, 0) / lens.length : 0;
+  const len = t.trim().length;
+  const wasPlayful = state && state.shifts && Number(state.shifts.playfulness) > 0;
+  if (avg > 0 && len < 60 && len < 0.35 * avg && wasPlayful) {
+    signals.push({ kind: 'short_after_playful', weight: 1 });
+  }
+  return signals;
+}
+
+// Signals map to evidence keys: which axis, which direction.
+const SIGNAL_EVIDENCE = {
+  explicit_direct: { axis: 'directness', delta: 1 },
+  playful_pushback: { axis: 'playfulness', delta: -1 },
+  short_after_playful: { axis: 'playfulness', delta: -1 },
+  warm_engagement: { axis: 'warmth', delta: 1 },
+};
+
+// Strong signals also nudge the current turn's targets immediately (e.g.
+// pushback after a playful turn eases off playfulness right away), while the
+// durable learning only promotes after repeated evidence.
+const SIGNAL_TARGETS = {
+  explicit_direct: { directness: 1 },
+  playful_pushback: { playfulness: -1 },
+  short_after_playful: { playfulness: -1 },
+  warm_engagement: { warmth: 1 },
+};
+
+/**
+ * Time-of-day bucket in the user's timezone. Pure. Midnight hourCycle edge
+ * ("24") is normalized to 0.
+ */
+export function timeBucketFor(date, timeZone) {
+  try {
+    let h = Number(
+      new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: timeZone || 'America/New_York' }).format(date)
+    );
+    if (!Number.isFinite(h)) return 'evening';
+    h = h % 24;
+    if (h >= 5 && h < 11) return 'morning';
+    if (h >= 11 && h < 15) return 'midday';
+    if (h >= 15 && h < 18) return 'afternoon';
+    if (h >= 18 && h < 23) return 'evening';
+    return 'night';
+  } catch {
+    return 'evening';
+  }
+}
+
+function defaultAdaptState() {
+  return {
+    version: ADAPT_STATE_VERSION,
+    disabled: false,
+    shifts: { warmth: 0, directness: 0, playfulness: 0, formality: 0 },
+    mood: 'neutral',
+    reason: '',
+    whyPast: '',
+    evidence: {},
+    userLens: [],
+    updatedAt: Date.now(),
+  };
+}
+
+/** Load the current adaptation state (lightweight; lives in settings). Pure read. */
+export function loadAdaptationState(db, userId) {
+  const base = defaultAdaptState();
+  try {
+    const raw = db.getSetting(ADAPT_STATE_KEY(userId));
+    if (!raw) return base;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || parsed.version !== ADAPT_STATE_VERSION) return base;
+    for (const axis of Object.keys(AXIS_LABELS)) {
+      const v = Number(parsed.shifts && parsed.shifts[axis]);
+      base.shifts[axis] = Number.isFinite(v) ? Math.max(-ADAPT_MAX_SHIFT, Math.min(ADAPT_MAX_SHIFT, Math.round(v))) : 0;
+    }
+    base.disabled = parsed.disabled === true;
+    base.mood = typeof parsed.mood === 'string' ? parsed.mood : 'neutral';
+    base.reason = typeof parsed.reason === 'string' ? parsed.reason.slice(0, 160) : '';
+    base.whyPast = typeof parsed.whyPast === 'string' ? parsed.whyPast.slice(0, 160) : '';
+    base.evidence = parsed.evidence && typeof parsed.evidence === 'object' ? parsed.evidence : {};
+    base.userLens = Array.isArray(parsed.userLens) ? parsed.userLens.filter((n) => Number.isFinite(n)).slice(-6) : [];
+    base.updatedAt = Number(parsed.updatedAt) || base.updatedAt;
+    return base;
+  } catch {
+    return base;
+  }
+}
+
+/** Persist the adaptation state. */
+export function saveAdaptationState(db, userId, state) {
+  db.setSetting(ADAPT_STATE_KEY(userId), JSON.stringify(state));
+}
+
+/**
+ * Promote repeated signal evidence to a soft learning on the soul record.
+ * Shows in "soul history", revertable with "go back to how you were", and
+ * clearable with "forget what you've learned". Returns the learning label
+ * (or null when skipped as a duplicate).
+ */
+export function promoteAdaptationLearning(db, userId, bucket, axis, delta) {
+  const record = normalizeSoulRecord(db.getSoulRecord(userId));
+  const learnings = record.learnings || [];
+  if (learnings.some((l) => l.bucket === bucket && l.axis === axis && l.delta === delta)) return null;
+  const label = `${TIME_BUCKET_LABELS[bucket]}: ${learnDescription(axis, delta)}`;
+  const next = learnings.filter((l) => !(l.bucket === bucket && l.axis === axis));
+  next.push({ label, bucket, axis, delta });
+  record.learnings = next.slice(-ADAPT_MAX_LEARNINGS);
+  db.saveSoulRecord(userId, record, `learn:${bucket}:${axis}${delta > 0 ? '+' : '-'}`);
+  db.addEvent(userId, 'soul_learned', `Learned adaptation: “${label}”.`);
+  return label;
+}
+
+const SHIFT_DESCRIPTIONS = {
+  'warmth|1': 'extra warm',
+  'warmth|-1': 'more reserved',
+  'directness|1': 'extra direct',
+  'directness|-1': 'extra gentle',
+  'playfulness|1': 'more playful',
+  'playfulness|-1': 'more serious',
+  'formality|1': 'more formal',
+  'formality|-1': 'more casual',
+};
+
+function shiftDescription(axis, shift) {
+  return SHIFT_DESCRIPTIONS[`${axis}|${shift > 0 ? 1 : -1}`] || axis;
+}
+
+/**
+ * Run one adaptation turn: detect mood, collect signals, accumulate
+ * evidence, promote learnings, and move shifts gradually toward their
+ * targets. Saves state. Returns { shifts, reason, whyPast, learnings }.
+ * Demo mode is never adapted — callers must skip this for demo users.
+ */
+export function applyAdaptation({ db, userId, message, timeZone, nowMs }) {
+  const state = loadAdaptationState(db, userId);
+  const record = normalizeSoulRecord(db.getSoulRecord(userId));
+  if (state.disabled) {
+    return { shifts: { ...state.shifts }, reason: '', whyPast: '', learnings: record.learnings || [] };
+  }
+
+  const now = nowMs || Date.now();
+  const bucket = timeBucketFor(new Date(now), timeZone);
+
+  // 1. Signals first — they describe how the user is responding to us.
+  const signals = detectAdaptationSignals(message, state);
+  for (const signal of signals) {
+    const ev = SIGNAL_EVIDENCE[signal.kind];
+    if (!ev) continue;
+    const key = `${bucket}|${ev.axis}|${ev.delta > 0 ? '+' : '-'}`;
+    state.evidence[key] = (Number(state.evidence[key]) || 0) + signal.weight;
+    if (state.evidence[key] >= ADAPT_EVIDENCE_THRESHOLD) {
+      promoteAdaptationLearning(db, userId, bucket, ev.axis, ev.delta);
+      state.evidence[key] = 0;
+    }
+  }
+  const explicitDirect = signals.some((s) => s.kind === 'explicit_direct');
+
+  // 2. Mood-driven targets. An explicit "just give me the answer" always
+  //    wins for this turn — directness +1, no debate. Other strong signals
+  //    bias their axis target too (pushback eases off playfulness now, while
+  //    the durable learning only lands after repeated evidence).
+  let targets = {};
+  let reason = '';
+  let whyPast = '';
+  let mood = 'neutral';
+  if (explicitDirect) {
+    targets = { ...SIGNAL_TARGETS.explicit_direct };
+    mood = 'explicit_direct';
+    reason = 'you asked for just the answer — cutting straight to it';
+    whyPast = 'you asked me to just give you the answer';
+  } else {
+    const moodId = detectConversationMood(message);
+    const moodDef = moodById(moodId);
+    if (moodDef) {
+      targets = { ...moodDef.shifts };
+      reason = moodDef.reason;
+      whyPast = moodDef.whyPast;
+      mood = moodId;
+    }
+    for (const signal of signals) {
+      Object.assign(targets, SIGNAL_TARGETS[signal.kind] || {});
+    }
+    // Signals only get their own reason when nothing moodier was detected;
+    // a venting user who also pushes back is venting first.
+    if (!moodDef && signals.length) {
+      const first = SIGNAL_EVIDENCE[signals[0].kind];
+      if (first) {
+        const moodLabel = {
+          explicit_direct: 'you asked for just the answer — cutting straight to it',
+          playful_pushback: 'my humor didn\u2019t land — pulling back on it',
+          short_after_playful: 'you\u2019ve gone quiet — pulling back a little',
+          warm_engagement: 'you\u2019re enjoying this — leaning in warmly',
+        }[signals[0].kind];
+        reason = moodLabel || '';
+        whyPast = {
+          explicit_direct: 'you asked me to just give you the answer',
+          playful_pushback: 'my humor didn\u2019t land a moment ago',
+          short_after_playful: 'you went quiet after my last reply',
+          warm_engagement: 'you were enjoying the banter',
+        }[signals[0].kind] || '';
+        mood = `signal:${signals[0].kind}`;
+      }
+    }
+  }
+
+  // 3. Gradual movement: at most one step per turn toward each target,
+  //    clamped to ±1 of the tuned anchor. Neutral mood decays to 0.
+  for (const axis of Object.keys(AXIS_LABELS)) {
+    const target = Math.max(-ADAPT_MAX_SHIFT, Math.min(ADAPT_MAX_SHIFT, Number(targets[axis]) || 0));
+    const cur = state.shifts[axis] || 0;
+    state.shifts[axis] = cur < target ? cur + 1 : cur > target ? cur - 1 : cur;
+  }
+
+  // 4. Track recent user message lengths for the short-reply signal. The
+  //    current message joins AFTER signal detection, so it never judges
+  //    itself.
+  const len = String(message || '').trim().length;
+  state.userLens = [...state.userLens, len].slice(-6);
+
+  state.mood = mood;
+  state.reason = reason;
+  state.whyPast = whyPast;
+  state.updatedAt = now;
+  saveAdaptationState(db, userId, state);
+
+  const fresh = normalizeSoulRecord(db.getSoulRecord(userId));
+  return { shifts: { ...state.shifts }, reason, whyPast, learnings: fresh.learnings || [] };
+}
+
+/**
+ * Resolve the full soul directive for a chat turn, including the adaptation
+ * layer. Demo users get the static neutral soul — no adaptation, no state.
+ */
+export function resolveAdaptiveSoulDirective({ db, userId, isDemo, userName, message, timeZone, nowMs }) {
+  if (isDemo) return buildSoulDirective(NEUTRAL_SOUL_RECORD, { userName, demo: true });
+  const stored = db.getSoulRecord(userId);
+  const adaptation = applyAdaptation({ db, userId, message, timeZone, nowMs });
+  return buildSoulDirective(stored, { userName, adaptation });
+}
+
+// ---------------------------------------------------------------------------
+// Chat-native adaptation controls. Instant, exact, no model call — same
+// pattern as handleSoulCommand. Handles: stop/start adapting, forget what
+// was learned, and "why are you being so X?" explainability.
+// ---------------------------------------------------------------------------
+
+const ADAPT_COMMAND_MAX_LEN = 200;
+
+export function isAdaptationDisable(text) {
+  return /^(stop|turn off|disable|pause) (adapting|adaptation|reading the room)\.?$/i.test(String(text || '').trim());
+}
+
+export function isAdaptationEnable(text) {
+  return /^(start|turn on|enable|resume) (adapting|adaptation|reading the room)\.?$/i.test(String(text || '').trim());
+}
+
+export function isAdaptationClear(text) {
+  return /^forget (what|everything) you('ve| have)? learned( about (me|my (personality|mood|tone)))?\.?$/i.test(String(text || '').trim());
+}
+
+/**
+ * Detect "why are you being so X?" style explainability questions. Returns
+ * the axis being asked about, or 'general' for "why are you acting like
+ * this?", else null. Pure.
+ */
+export function detectAdaptationWhy(text) {
+  const t = String(text || '').trim();
+  if (/\bwhy are you acting like this\??$/i.test(t) || /\bwhy (the|this) (tone|attitude)\??$/i.test(t)) return 'general';
+  const m = /\bwhy (are you|so|did you|have you) (being |acting |getting |become |sound |gotten )?(so |too )?(direct|blunt|playful|joky|warm|serious|cold|distant|formal|casual|gentle|terse|short)\b/i.exec(t);
+  if (!m) return null;
+  const word = m[4].toLowerCase();
+  const axisFor = {
+    direct: 'directness', blunt: 'directness', terse: 'directness', short: 'directness',
+    gentle: 'directness',
+    playful: 'playfulness', joky: 'playfulness',
+    warm: 'warmth', cold: 'warmth', distant: 'warmth',
+    formal: 'formality', casual: 'formality',
+    serious: 'playfulness',
+  };
+  return axisFor[word] || 'general';
+}
+
+function adaptationWhyReply(state, axis) {
+  const shifts = state.shifts || {};
+  const active = Object.keys(AXIS_LABELS)
+    .filter((a) => Number(shifts[a]) !== 0)
+    .map((a) => ({ axis: a, shift: Number(shifts[a]) }));
+  const whyPast = String(state.whyPast || '').trim();
+  if (!active.length || !whyPast) {
+    return 'I\u2019m not really adjusting anything right now \u2014 this is just me. If you want me different, say \u201cbe more direct\u201d or \u201cbe more playful\u201d and I\u2019ll shift for real.';
+  }
+  if (axis && axis !== 'general') {
+    const hit = active.find((a) => a.axis === axis);
+    if (!hit) {
+      return 'Honestly, I don\u2019t think I\u2019m adjusting that right now \u2014 probably just how I am. Say \u201cbe more direct\u201d or similar if you want me to actually shift.';
+    }
+    return `I\u2019m being ${shiftDescription(axis, hit.shift)} because ${whyPast}. That\u2019s me matching the moment, not a personality change \u2014 say \u201cstop adapting\u201d if you\u2019d rather I didn\u2019t.`;
+  }
+  const parts = active.map((a) => shiftDescription(a.axis, a.shift));
+  return `Right now I\u2019m ${parts.join(' and ')} because ${whyPast}. That\u2019s me matching the moment, not a personality change \u2014 say \u201cstop adapting\u201d if you\u2019d rather I didn\u2019t.`;
+}
+
+/**
+ * Returns a reply string when the message is an adaptation command, else
+ * null. Synchronous — runs before the model call. Demo users get neutral
+ * answers; no state is ever created for them.
+ */
+export function handleAdaptationCommand({ db, userId, message, isDemo }) {
+  const text = String(message || '').trim();
+  if (!text || text.length > ADAPT_COMMAND_MAX_LEN) return null;
+
+  const disable = isAdaptationDisable(text);
+  const enable = !disable && isAdaptationEnable(text);
+  const clear = !disable && !enable && isAdaptationClear(text);
+  const why = !disable && !enable && !clear && detectAdaptationWhy(text);
+  if (!disable && !enable && !clear && !why) return null;
+
+  if (isDemo) {
+    if (why) return 'I keep things neutral and steady in demo mode \u2014 no mood-matching here.';
+    return 'Demo mode runs a fixed neutral personality \u2014 adaptation is a full-account thing.';
+  }
+
+  if (disable) {
+    const state = loadAdaptationState(db, userId);
+    state.disabled = true;
+    state.shifts = { warmth: 0, directness: 0, playfulness: 0, formality: 0 };
+    state.reason = '';
+    state.whyPast = '';
+    saveAdaptationState(db, userId, state);
+    return 'Got it \u2014 I\u2019ll stop adapting to your mood and just be the me you tuned. Say \u201cstart adapting\u201d anytime.';
+  }
+
+  if (enable) {
+    const state = loadAdaptationState(db, userId);
+    state.disabled = false;
+    saveAdaptationState(db, userId, state);
+    return 'Back to reading the room \u2014 I\u2019ll match the moment again. Say \u201cstop adapting\u201d anytime.';
+  }
+
+  if (clear) {
+    const record = normalizeSoulRecord(db.getSoulRecord(userId));
+    record.learnings = [];
+    db.saveSoulRecord(userId, record, 'learn-clear');
+    const state = loadAdaptationState(db, userId);
+    state.evidence = {};
+    saveAdaptationState(db, userId, state);
+    return 'Cleared what I\u2019d learned about your moods \u2014 I\u2019m back to reading the room fresh.';
+  }
+
+  return adaptationWhyReply(loadAdaptationState(db, userId), why);
 }
