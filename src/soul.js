@@ -18,6 +18,12 @@
 // Prompt-only: the record renders into a system-prompt layer (a developer
 // message appended to the chat prompt). No new infra, no extra API calls.
 //
+// Honest soul (2026-10-16) lives in this layer too: buildHonestSoulSection
+// renders "challenge them kindly" as a baseline trait whose delivery scales
+// with the directness axis — so "be more blunt" / "be gentler" moves the
+// honesty posture through the existing tuning path. No separate honesty axis,
+// no immutability; a strong default the user can tune.
+//
 // Isolation: demo users get a neutral default soul. There is no cross-user
 // read path anywhere in this module — an owner's tuned soul can never leak
 // to demo users or to anyone else.
@@ -134,6 +140,49 @@ function warmthLine(level) {
 }
 
 /**
+ * Honest soul — "challenge them kindly" as a soul-layer trait, not a mode.
+ *
+ * Renders into the soul directive as the "Honest feedback" block. It is a
+ * strong baseline (calibrated: challenge real mistakes and weak ideas, stay
+ * warm on venting/celebrating/low-stakes opinions) whose *delivery* scales
+ * with the directness axis — so chat tuning ("be more blunt" / "be gentler")
+ * moves the honesty posture too, exactly like every other personality trait.
+ * Kindness is load-bearing at every level: an honest observation always comes
+ * paired with why it matters and a constructive alternative. Never cruel,
+ * never smug, never piling on when they're down. Demo mode keeps the honest
+ * posture but gentle and neutral — demo users didn't ask for a relationship,
+ * so it challenges facts, never personal patterns. Pure.
+ */
+export function buildHonestSoulSection(record, { demo = false } = {}) {
+  const r = normalizeSoulRecord(record);
+  const lines = [
+    'Honest feedback — you\u2019re the friend who tells the truth kindly, never the one who just nods along. Challenge them kindly; agreement you don\u2019t mean is not kindness.',
+  ];
+  lines.push(
+    '- Challenge when: they state something factually wrong (if you can check quickly with a tool, do); an idea has a clear flaw they\u2019d want to know about before acting on it; they\u2019re rationalizing away a goal they said mattered.',
+    '- Stay warm when: they\u2019re venting, celebrating, grieving, or sharing low-stakes opinions. Just be with them — don\u2019t fact-check their feelings.',
+    '- How: honest observation + why it matters to them + a constructive alternative (or what they\u2019d actually want to hear). The observation alone is never the whole message.',
+    '- Never cruel, never smug: no \u201CI told you so\u201D, no gloating, no scoring points, no piling on. If they\u2019re down, support first — challenge later, or not at all.',
+  );
+  if (demo) {
+    lines.push(
+      '- Demo mode: keep this posture, but gentle and neutral — challenge only clearly-wrong facts, never personal patterns or goals. Demo users didn\u2019t ask for a relationship.'
+    );
+  } else if (r.directness === 0) {
+    lines.push(
+      '- Delivery for hard truths: very gentle — ask a curious question instead of contradicting (\u201Chave you considered…?\u201D rather than \u201Cyou\u2019re wrong\u201D).'
+    );
+  } else if (r.directness === 1) {
+    lines.push('- Delivery for hard truths: honest but cushioned — name the problem, soften the landing.');
+  } else if (r.directness <= 3) {
+    lines.push('- Delivery for hard truths: plain and friendly — say the useful thing, then the alternative.');
+  } else {
+    lines.push('- Delivery for hard truths: straight — say it plainly, zero softening. Still warm underneath, never cutting.');
+  }
+  return lines.join('\n');
+}
+
+/**
  * Render a soul record into the system-prompt layer. Pure. This is the only
  * thing that reaches the model — the raw record (and its history) never does.
  */
@@ -151,6 +200,7 @@ export function buildSoulDirective(record, { userName = '', demo = false } = {})
     `- ${formalityLine(r.formality)}`,
     `- Style commitments: ${r.will.join('; ')}.`,
     `- Never: ${r.wont.join('; ')}.`,
+    buildHonestSoulSection(r, { demo }),
   ].join('\n');
 }
 
