@@ -60,8 +60,8 @@ test('maintenance mode UP: bypass header or query param serves the site normally
   assert.equal(wrong.status, 503);
 });
 
-test('maintenance mode DOWN (default): site serves normally, no maintenance page', async (t) => {
-  const { app, base } = await fixture(); t.after(() => app.close());
+test('maintenance mode DOWN (forced via env): site serves normally, no maintenance page', async (t) => {
+  const { app, base } = await fixture({ MAINTENANCE_MODE: '0' }); t.after(() => app.close());
   const home = await fetch(base);
   assert.equal(home.status, 200);
   const html = await home.text();

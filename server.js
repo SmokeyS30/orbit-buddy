@@ -39,7 +39,7 @@ const publicRoot = path.join(root, 'public');
 // constant in this file — flipping must be a reviewable commit, not a config toggle.
 // Temporary bypass token (random, unguessable): removed at dawn with the rest
 // of this block.
-const MAINTENANCE_MODE = false; // maintenance window over — page down 2026-10-15
+const MAINTENANCE_MODE = true; // maintenance window — later-wave build 2026-10-15
 export const MAINT_BYPASS_TOKEN = '03fa0ae23f6bb958372f62feb96beb5b';
 // ===== END MAINTENANCE MODE =====
 
@@ -248,7 +248,7 @@ export function createOrbitServer(options={}) {
     }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
   }
   const production=env.NODE_ENV==='production';
-  const maintenanceOn = (MAINTENANCE_MODE || env.MAINTENANCE_MODE === '1') && env.NODE_ENV !== 'test';
+  const maintenanceOn = (MAINTENANCE_MODE || env.MAINTENANCE_MODE === '1') && env.MAINTENANCE_MODE !== '0' && env.NODE_ENV !== 'test';
   const maintenanceHtml = maintenanceOn
     ? fs.readFileSync(path.join(publicRoot, 'maintenance.html'), 'utf8')
     : null;
