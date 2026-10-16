@@ -406,7 +406,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null, emotionContext = null }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -441,6 +441,11 @@ export function createModelClient(env = process.env) {
         // neutral default in demo mode). Prompt-only layer: no extra API calls.
         // Stays separate from writingVoice ("how the user writes" — drafting only).
         ...(soulDirective ? [String(soulDirective)] : []),
+        // Memory connections / emotional-intelligence layer: the model's own
+        // reading of the conversation, grounded by tracked emotional
+        // patterns. States the honesty contract verbatim: Orbit MODELS
+        // emotions — it never feels them, never claims to.
+        ...(emotionContext ? [String(emotionContext)] : []),
         // Proactive memory ("what Orbit volunteers"): at most one timely
         // memory the model may weave in as a natural aside — or skip silently.
         // Deterministically chosen + deduped by the caller; the model only

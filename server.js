@@ -24,7 +24,8 @@ import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
 import { handleSoulCommand, handleAdaptationCommand, resolveAdaptiveSoulDirective } from './src/soul.js';
-import { buildSurfacingHint, chooseChatSurfacing, handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
+import { handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
+import { buildUnifiedHint, chooseChatSurfacingWithPatterns, detectEmotionalTone, trackEmotionalTone, loadEmotionalTrack, summarizeEmotionalPattern, buildEmotionalContext, handleEmotionHonesty, recordConnectionSurfacing, runMemoryConnectionPush } from './src/memory-connections.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
@@ -647,19 +648,40 @@ export function createOrbitServer(options={}) {
       // answers. Also flows through runChatReplyJob, so web and WhatsApp
       // share the behavior.
       const adaptationCommand=soulCommand?null:handleAdaptationCommand({db,userId,message,isDemo:isDemoUser(user)});
+      // Memory connections + emotional-intelligence layer (2026-10-16):
+      // per-message emotional tone. Tracked for non-demo users (feeds
+      // emotional patterns over time); demo users are never tracked. "Are
+      // you sad?" gets the honest no — Orbit MODELS emotions, it doesn't
+      // feel them; never performs distress, never claims a feeling.
+      const emotionTone=isDemoUser(user)?'neutral':detectEmotionalTone(message);
+      if(!isDemoUser(user)&&message&&message.trim()){try{trackEmotionalTone(db,userId,emotionTone,Date.now());}catch(error){console.error('emotional track failed',error&&error.message);}}
+      const emotionCommand=(soulCommand||adaptationCommand)?null:handleEmotionHonesty({message,tone:emotionTone});
       // Memory v2 (chat-native, 2026-10-16): memory review/delete lives in chat.
       // "what do you know about me?" / "forget X" are answered directly — instant,
       // exact, no model call, no UI. Works identically on web and WhatsApp.
-      const memoryCommand=(soulCommand||adaptationCommand)?null:handleMemoryCommand({db,userId,message});
-      if(soulCommand||adaptationCommand||memoryCommand){
-        answer=soulCommand||adaptationCommand||memoryCommand;
+      const memoryCommand=(soulCommand||adaptationCommand||emotionCommand)?null:handleMemoryCommand({db,userId,message});
+      if(soulCommand||adaptationCommand||emotionCommand||memoryCommand){
+        answer=soulCommand||adaptationCommand||emotionCommand||memoryCommand;
         storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       }else{
       // Soul directive renders the user's tuned personality (or the demo
       // neutral default) into the system-prompt layer for this turn, plus the
       // adaptive soul layer: context-driven tone shifts around the tuned
-      // anchor, with learnings accumulated from conversation signals.
+      // anchor, with learnings accumulated from conversation signals. The
+      // adaptive layer is emotionally grounded via the detected tone.
       const soulDirective=resolveAdaptiveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name,message,timeZone:preferences.time_zone});
+      // Emotional context: grounds the LLM's own reading of the
+      // conversation in tracked emotional patterns. States the honesty
+      // contract verbatim — Orbit MODELS emotions, never feels them. Demo:
+      // skipped entirely.
+      let emotionContext=null;let emotionTrack=[];
+      if(!isDemoUser(user)){
+        try{
+          emotionTrack=loadEmotionalTrack(db,userId);
+          const emotionPattern=summarizeEmotionalPattern({track:emotionTrack,nowMs:Date.now(),timeZone:preferences.time_zone});
+          emotionContext=buildEmotionalContext({userName:user?.display_name,tone:emotionTone,emotionPhrase:emotionPattern&&emotionPattern.phrase});
+        }catch(error){console.error('emotional context failed',error&&error.message);emotionContext=null;}
+      }
       const recalledMemories=db.listRelevantMemories(userId,message);
       // Proactive memory (2026-10-16): volunteer at most ONE timely memory
       // (a due date from memories, or an open loop the topic calls for) as a
@@ -669,7 +691,10 @@ export function createOrbitServer(options={}) {
       if(!isDemoUser(user)){
         try{
           const surfacedRows=db.listMemorySurfacings(userId,200);
-          proactiveSurfacing=chooseChatSurfacing({
+          // Memory connections (2026-10-16): unified chooser — date triggers
+          // first (time-sensitive), then memory patterns / emotional
+          // patterns, then open loops. At most one aside per turn.
+          proactiveSurfacing=chooseChatSurfacingWithPatterns({
             allMemories:db.listMemories(userId),
             recalledMemories,
             personalDates:db.listPersonalDates(userId),
@@ -677,13 +702,14 @@ export function createOrbitServer(options={}) {
             userMessage:message,
             surfacedKeys:new Set(surfacedRows.map((r)=>r.occurrence_key)),
             surfacedRows,
+            toneTrack:emotionTrack,
             nowMs:Date.now(),
             timeZone:preferences.time_zone,
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,
-        proactiveMemory:proactiveSurfacing?buildSurfacingHint(proactiveSurfacing):null,
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,
+        proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
@@ -704,10 +730,19 @@ export function createOrbitServer(options={}) {
       // occurrence — it waits for a better moment.
       if(proactiveSurfacing&&toolCalls.length===0){
         try{
-          db.recordMemorySurfacing(userId,{memoryId:proactiveSurfacing.memory.id,occurrenceKey:proactiveSurfacing.occurrenceKey,
-            kind:proactiveSurfacing.kind,via:'chat',reason:proactiveSurfacing.reason,
-            contentSnapshot:proactiveSurfacing.memory.content,memoryCreatedAt:proactiveSurfacing.memory.created_at});
-          db.addEvent(userId,'memory_surfaced_chat',`Volunteered a timely memory in chat (${proactiveSurfacing.reason}).`);
+          // Memory connections: pattern/emotion insights record through the
+          // connection path (stable occurrence keys get surfaced_at
+          // refreshed after their cooldown; emotion rows use the 'emotion'
+          // memory_id sentinel). Dates/open loops keep the existing path.
+          if(proactiveSurfacing.kind==='pattern'||proactiveSurfacing.kind==='emotion'){
+            recordConnectionSurfacing(db,userId,{...proactiveSurfacing,via:'chat'});
+            db.addEvent(userId,'memory_connection_chat',`Shared a pattern insight in chat (${proactiveSurfacing.reason}).`);
+          }else{
+            db.recordMemorySurfacing(userId,{memoryId:proactiveSurfacing.memory.id,occurrenceKey:proactiveSurfacing.occurrenceKey,
+              kind:proactiveSurfacing.kind,via:'chat',reason:proactiveSurfacing.reason,
+              contentSnapshot:proactiveSurfacing.memory.content,memoryCreatedAt:proactiveSurfacing.memory.created_at});
+            db.addEvent(userId,'memory_surfaced_chat',`Volunteered a timely memory in chat (${proactiveSurfacing.reason}).`);
+          }
         }catch(error){console.error('proactive memory record failed',error&&error.message);}
       }
       }
@@ -1924,7 +1959,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
@@ -1973,6 +2008,34 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }catch(error){console.error('proactive memory user failed',user.id,error&&error.message);}
       }
     }catch(error){console.error('proactive memory failed',error&&error.message);}
+  }
+  // Memory connections (2026-10-16): established memory patterns (3+) and
+  // established emotional patterns surface as a gentle proactive message —
+  // at most one per user per day — through the same shared pipeline (quiet
+  // hours, claimProactiveSlot 3/day cap, deliverProactive web/app +
+  // WhatsApp). Emerging patterns stay as chat asides only. Never in demo
+  // mode. Never throws.
+  async function runMemoryConnections(nowMs){
+    try{
+      for(const user of db.listUsers()){
+        if(user.disabled||isDemoUser(user))continue;
+        const preferences=db.getPreferences(user.id);
+        if(isQuietHours(preferences,nowMs))continue;
+        const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
+        const today=todayInZone(timeZone,nowMs);
+        if(db.getSetting(`memory_connections_pushed_${user.id}`)===today)continue;
+        try{
+          const sent=await runMemoryConnectionPush({
+            db,model,user,timeZone,nowMs,
+            buddyName:buddyNameFor(user.id),
+            claimSlot:()=>db.claimProactiveSlot(user.id,today),
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
+            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage),
+          });
+          if(sent>0)db.setSetting(`memory_connections_pushed_${user.id}`,today);
+        }catch(error){console.error('memory connections user failed',user.id,error&&error.message);}
+      }
+    }catch(error){console.error('memory connections failed',error&&error.message);}
   }
   // Study coach (proactive): nudges tied to study sessions on the user's
   // calendar (warm-up before, review offer after), weekly study-slot
