@@ -14,6 +14,7 @@ import {
   NEUTRAL_SOUL_RECORD,
   normalizeSoulRecord,
   shortSoulDescription,
+  buildHonestSoulSection,
   buildSoulDirective,
   resolveSoulDirective,
   parseSoulTune,
@@ -206,4 +207,98 @@ test('soul: normalizeSoulRecord clamps and fills defaults', () => {
   assert.equal(record.playfulness, 2, 'missing axis falls back to default');
   assert.ok(!('bogus' in record), 'unknown fields dropped');
   assert.equal(shortSoulDescription(NEUTRAL_SOUL_RECORD), 'friendly, straightforward, and restrained');
+});
+
+// ---------------------------------------------------------------------------
+// Honest soul: "challenge them kindly" as a soul-layer trait whose delivery
+// scales with the directness axis. Prompt-only, no new infra, no new commands.
+// ---------------------------------------------------------------------------
+
+test('soul: honest feedback block is in every directive', () => {
+  const directive = buildSoulDirective(DEFAULT_SOUL_RECORD, { userName: 'Owner' });
+  assert.ok(directive.includes('Honest feedback'), 'honest section header present');
+  assert.ok(directive.includes('Challenge them kindly'), 'kind challenge posture named');
+  assert.ok(directive.includes('agreement you don\u2019t mean is not kindness'), 'anti-sycophancy baseline');
+});
+
+test('soul: honest calibration — challenge when it matters, stay warm when it doesn\u2019t', () => {
+  const section = buildHonestSoulSection(DEFAULT_SOUL_RECORD, {});
+  assert.ok(section.includes('factually wrong'), 'challenge factual errors');
+  assert.ok(section.includes('clear flaw'), 'challenge weak ideas');
+  assert.ok(section.includes('rationalizing away a goal'), 'challenge goal avoidance');
+  assert.ok(section.includes('venting'), 'stay warm when venting');
+  assert.ok(section.includes('celebrating'), 'stay warm when celebrating');
+  assert.ok(section.includes('low-stakes opinions'), 'stay warm on low-stakes opinions');
+  assert.ok(section.includes('don\u2019t fact-check their feelings'), 'feelings are not for fact-checking');
+});
+
+test('soul: kindness is load-bearing — observation alone is never the whole message', () => {
+  const section = buildHonestSoulSection(DEFAULT_SOUL_RECORD, {});
+  assert.ok(section.includes('honest observation + why it matters'), 'observation+matters+alternative pattern');
+  assert.ok(section.includes('constructive alternative'), 'alternative required');
+  assert.ok(section.includes('The observation alone is never the whole message'), 'never just "that\'s a bad idea"');
+});
+
+test('soul: never cruel, never smug, never piling on', () => {
+  const section = buildHonestSoulSection(DEFAULT_SOUL_RECORD, {});
+  assert.ok(section.includes('Never cruel, never smug'), 'anti-cruelty named');
+  assert.ok(section.includes('I told you so'), 'no told-you-so energy');
+  assert.ok(section.includes('no piling on'), 'no pile-on when down');
+  assert.ok(section.includes('support first'), 'support first, challenge later');
+});
+
+test('soul: honesty delivery scales with directness — gentle to blunt, kind at every level', () => {
+  const gentle = buildHonestSoulSection({ directness: 0 }, {});
+  assert.ok(gentle.includes('ask a curious question instead of contradicting'), 'directness 0: question, not contradiction');
+  const diplomatic = buildHonestSoulSection({ directness: 1 }, {});
+  assert.ok(diplomatic.includes('honest but cushioned'), 'directness 1: cushion');
+  const plain = buildHonestSoulSection({ directness: 3 }, {});
+  assert.ok(plain.includes('plain and friendly'), 'directness 3: plain and friendly');
+  const blunt = buildHonestSoulSection({ directness: 4 }, {});
+  assert.ok(blunt.includes('zero softening'), 'directness 4: blunt');
+  assert.ok(blunt.includes('never cutting'), 'directness 4: still kind, never cutting');
+});
+
+test('soul: "be more blunt" moves the honesty posture up; "be gentler" moves it down', () => {
+  const { db, user } = fixture();
+  const before = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  assert.ok(before.includes('plain and friendly'), 'default directness 3 delivery');
+  const reply = handleSoulCommand({ db, userId: user.id, message: 'be more blunt' });
+  assert.ok(reply.includes('more direct'), 'tune command acknowledged');
+  const blunt = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  assert.ok(blunt.includes('zero softening'), 'honesty posture stronger after "be more blunt"');
+  assert.ok(!blunt.includes('ask a curious question'), 'gentle delivery gone');
+  handleSoulCommand({ db, userId: user.id, message: 'be gentler' });
+  handleSoulCommand({ db, userId: user.id, message: 'be gentler' });
+  handleSoulCommand({ db, userId: user.id, message: 'be gentler' });
+  const soft = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  assert.ok(soft.includes('honest but cushioned'), 'honesty posture softer after three "be gentler"');
+});
+
+test('soul: honest section is per-user — tuned soul only affects its owner', () => {
+  const { db, user } = fixture();
+  const other = db.createUser({ email: 'other@example.com', displayName: 'Other', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+  handleSoulCommand({ db, userId: user.id, message: 'be more blunt' });
+  const mine = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  const theirs = resolveSoulDirective({ db, userId: other.id, userName: 'Other' });
+  assert.ok(mine.includes('zero softening'), 'my tuned soul applies to me');
+  assert.ok(!theirs.includes('zero softening'), 'my tuned soul does not leak to another user');
+  assert.ok(theirs.includes('plain and friendly'), 'other user keeps the default honesty delivery');
+});
+
+test('soul: demo keeps the honest posture but gentle and neutral', () => {
+  const { db, user } = fixture();
+  const directive = resolveSoulDirective({ db, userId: user.id, isDemo: true, userName: 'Demo' });
+  assert.ok(directive.includes('Honest feedback'), 'honest posture still present in demo');
+  assert.ok(directive.includes('challenge only clearly-wrong facts'), 'demo challenges facts only');
+  assert.ok(directive.includes('never personal patterns or goals'), 'demo never challenges personal patterns');
+  assert.ok(directive.includes('didn\u2019t ask for a relationship'), 'demo framing named');
+  const nonDemo = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  assert.ok(!nonDemo.includes('didn\u2019t ask for a relationship'), 'demo framing absent for real users');
+});
+
+test('soul: honest feedback flows through the shared prompt pipeline (web + WhatsApp)', () => {
+  const { db, user } = fixture();
+  const directive = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
+  assert.ok(directive.includes('Honest feedback'), 'soul directive carries the honest section into the prompt');
 });
