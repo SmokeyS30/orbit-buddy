@@ -7,9 +7,10 @@
 // Speech recognition: Web Speech API when available (free, on-device, low
 // latency); otherwise the server-side Whisper fallback via deps.transcribeAudio.
 // Speech synthesis: speechSynthesis with a picked natural voice.
-// Barge-in: pressing the orb while Orbit is speaking cancels the speech and
-// starts listening immediately. True acoustic barge-in (detecting the user's
-// voice over the speaker output) is deferred — the orb is the interrupt.
+// Barge-in: true acoustic barge-in — while Orbit is speaking, a mic analyser
+// watches for sustained user speech over the speaker output and cancels the
+// utterance so Orbit stops talking when Edward starts. Orb-tap stays as the
+// fallback for devices where the analyser can't run.
 //
 // Pure helpers (isVoiceModeCommand, speechText, pickVoice) are exported for
 // unit tests. The VoiceMode controller is DOM-dependent and wired from app.js.
@@ -93,6 +94,95 @@ export function pickVoice(voices) {
 }
 
 /**
+ * Acoustic barge-in detector (pure logic — no DOM or audio, unit-testable).
+ *
+ * Feed it smoothed mic RMS-energy samples (linear amplitude, 0..1) while Orbit
+ * is speaking. sample() returns true only when energy stays above the trigger
+ * threshold for `framesRequired` consecutive frames — sustained user speech,
+ * not spikes (a door slam never cancels speech).
+ *
+ * Trigger rule: smoothed RMS must exceed
+ *   max(floorRms, relativeFactor × rollingBaseline).
+ * The floor is a conservative absolute starting point (~-30 dBFS); the
+ * relative rule (2.5× Orbit's own voice level through the speaker, measured
+ * over a ~2s rolling baseline) adapts to device volume. Pass the grace-period
+ * baseline seed to arm() so the relative rule protects from the first frame —
+ * otherwise Orbit's own voice could false-trigger before the baseline adapts.
+ *
+ * Anti-false-trigger design (the whole point of this function):
+ *  - Only armed while Orbit is speaking: arm()/disarm() are called from the
+ *    controller's utterance lifecycle. Samples while disarmed are ignored.
+ *  - Sustained, not spiky: requires `framesRequired` consecutive above-
+ *    threshold frames (~300ms at the default 50ms cadence).
+ *  - Cooldown: after a trigger, arming within `cooldownMs` can't re-trigger
+ *    (avoids chopping on the tail of the user's own interruption).
+ *  - Baseline only adapts from below-threshold samples, so a loud user never
+ *    drags the baseline up and masks themselves.
+ *
+ * Tuning starting points (empirical, per device): floor -30 dBFS,
+ * factor 2.5×, 6 frames (~300ms), grace ~800ms before arming,
+ * cooldown 1500ms. If false triggers appear on a device, raise the floor or
+ * the factor; if it never fires, lower them. Orb-tap interrupt always works.
+ */
+export function createBargeInDetector(opts = {}) {
+  const {
+    floorDb = -30,        // absolute energy floor (dBFS) — conservative start
+    relativeFactor = 2.5, // must jump this far above the speaking baseline
+    framesRequired = 6,   // consecutive frames above threshold (~300ms @ 50ms)
+    cooldownMs = 1500,    // after a trigger, don't re-fire this soon
+    baselineTauMs = 2000, // rolling baseline time constant during speech
+    frameMs = 50,         // expected sampling cadence
+  } = opts;
+  const floorRms = Math.pow(10, floorDb / 20);
+  let armed = false;
+  let aboveCount = 0;
+  let baseline = 0;
+  let lastTriggerAt = -Infinity;
+
+  return {
+    /**
+     * Arm for a new utterance. baselineSeed is linear-RMS energy measured
+     * during the grace period (Orbit's own voice level); defaults to 0.
+     */
+    arm(nowMs = 0, baselineSeed = 0) {
+      armed = true;
+      aboveCount = 0;
+      baseline = Math.max(0, baselineSeed || 0);
+    },
+    /** Disarm; cooldown memory survives so a fresh arm can't re-fire instantly. */
+    disarm() {
+      armed = false;
+      aboveCount = 0;
+    },
+    isArmed() { return armed; },
+    /**
+     * Feed one smoothed RMS sample (linear amplitude). Returns true exactly
+     * once per barge-in (auto-disarms and starts cooldown).
+     */
+    sample(rms, nowMs = 0) {
+      if (!armed) return false;
+      if (nowMs - lastTriggerAt < cooldownMs) { aboveCount = 0; return false; }
+      const threshold = Math.max(floorRms, baseline * relativeFactor);
+      if (rms > threshold) {
+        aboveCount += 1;
+        if (aboveCount >= framesRequired) {
+          armed = false;
+          aboveCount = 0;
+          lastTriggerAt = nowMs;
+          return true;
+        }
+      } else {
+        aboveCount = 0;
+        // Adapt to Orbit's voice level, but only from below-threshold samples
+        // so the user's own interruption never poisons the baseline.
+        baseline += (rms - baseline) * (frameMs / baselineTauMs);
+      }
+      return false;
+    },
+  };
+}
+
+/**
  * Create the voice-mode controller.
  *
  * deps:
@@ -166,6 +256,126 @@ export function createVoiceMode(deps) {
     stopRecognition();
     stopRecording();
     stopSpeaking();
+    stopBargeSampling();
+  }
+
+  // ---- Acoustic barge-in wiring ----
+  // One persistent mic stream per voice session; an AnalyserNode on it feeds
+  // smoothed RMS energy to the detector only while Orbit is speaking. No new
+  // buttons or settings: it just works, orb-tap remains the fallback.
+  let bargeAudio = null;     // { ctx, stream, analyser, data } — one session stream
+  let bargeGrace = null;     // grace-period seeding timer (~800ms)
+  let bargeTimer = null;      // armed sampling interval (50ms)
+  let bargeDetector = null;  // createBargeInDetector instance (keeps cooldown across utterances)
+  let bargeSmoothed = 0;     // ~200ms EMA of RMS while armed
+
+  function stopBargeSampling() {
+    if (bargeTimer) { clearInterval(bargeTimer); bargeTimer = null; }
+    if (bargeGrace) { clearTimeout(bargeGrace); bargeGrace = null; }
+    if (bargeDetector) { try { bargeDetector.disarm(); } catch (_) {} }
+  }
+
+  function teardownBargeAudio() {
+    stopBargeSampling();
+    if (bargeAudio) {
+      try {
+        if (bargeAudio.stream) bargeAudio.stream.getTracks().forEach((t) => { try { t.stop(); } catch (_) {} });
+        if (bargeAudio.ctx && typeof bargeAudio.ctx.close === 'function') { try { bargeAudio.ctx.close(); } catch (_) {} }
+      } catch (_) {}
+      bargeAudio = null;
+    }
+    bargeDetector = null;
+  }
+
+  /** One mic stream for the session; null-safe, never throws. */
+  async function ensureBargeAudio() {
+    if (bargeAudio && bargeAudio.analyser) return true;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
+      if (!bargeAudio) bargeAudio = {};
+      if (!bargeAudio.ctx) bargeAudio.ctx = new AC();
+      if (bargeAudio.ctx.state === 'suspended') {
+        try { await bargeAudio.ctx.resume(); } catch (_) {}
+      }
+      if (!bargeAudio.stream || bargeAudio.stream.getTracks().every((t) => t.readyState === 'ended')) {
+        // One stream per session, opened lazily on the first utterance (mic
+        // permission is already granted by then — the user has spoken).
+        bargeAudio.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      const src = bargeAudio.ctx.createMediaStreamSource(bargeAudio.stream);
+      bargeAudio.analyser = bargeAudio.ctx.createAnalyser();
+      bargeAudio.analyser.fftSize = 2048;
+      src.connect(bargeAudio.analyser);
+      bargeAudio.data = new Float32Array(bargeAudio.analyser.fftSize);
+      return true;
+    } catch (_) {
+      return false; // mic unavailable — orb-tap interrupt stays the fallback
+    }
+  }
+
+  function micRmsNow() {
+    try {
+      if (!bargeAudio || !bargeAudio.analyser) return null;
+      bargeAudio.analyser.getFloatTimeDomainData(bargeAudio.data);
+      let sum = 0;
+      const d = bargeAudio.data;
+      for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
+      return Math.sqrt(sum / d.length);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function sampleBargeIn() {
+    if (state !== 'speaking' || !bargeDetector) { stopBargeSampling(); return; }
+    const rms = micRmsNow();
+    if (rms == null) return;
+    // ~200ms exponential moving average, then the detector's sustained-frame rule.
+    bargeSmoothed += (rms - bargeSmoothed) * (50 / 200);
+    let trigger = false;
+    try { trigger = bargeDetector.sample(bargeSmoothed, performance.now()); } catch (_) {}
+    if (trigger) {
+      // Acoustic barge-in: Orbit stops mid-sentence, listening resumes.
+      // interrupt() calls speechSynthesis.cancel() exactly once via stopAll().
+      stopBargeSampling();
+      setStatus('Interrupted — listening…');
+      interrupt();
+    }
+  }
+
+  /**
+   * Arm the detector for the current utterance: ~800ms grace period (never
+   * armed during TTS onset / mic unmute pops), measuring Orbit's own voice
+   * level as the baseline seed so the relative trigger is safe immediately.
+   */
+  function armBargeIn() {
+    stopBargeSampling();
+    if (!('speechSynthesis' in window)) return;
+    if (!bargeDetector) bargeDetector = createBargeInDetector();
+    const detector = bargeDetector;
+    (async () => {
+      const ready = await ensureBargeAudio();
+      if (!ready || state !== 'speaking') { stopBargeSampling(); return; }
+      let seed = 0;
+      let frames = 0;
+      const tickSeed = () => {
+        bargeGrace = null;
+        if (state !== 'speaking') { stopBargeSampling(); return; }
+        const rms = micRmsNow();
+        // Fast EMA (~250ms tau) — ~96% converged after the grace period.
+        if (rms != null) seed += (rms - seed) * 0.2;
+        frames += 1;
+        if (frames >= 16) { // ~800ms at 50ms/frame: grace over, arm it
+          detector.arm(performance.now(), seed);
+          bargeSmoothed = 0;
+          bargeTimer = setInterval(sampleBargeIn, 50);
+        } else {
+          bargeGrace = setTimeout(tickSeed, 50);
+        }
+      };
+      bargeGrace = setTimeout(tickSeed, 50);
+    })().catch(() => { stopBargeSampling(); });
   }
 
   const SR = () => window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -296,7 +506,7 @@ export function createVoiceMode(deps) {
     stopSpeaking();
     state = 'speaking';
     setOrb('speaking');
-    setStatus('Speaking… tap the mic to interrupt.');
+    setStatus('Speaking… start talking to interrupt.');
     synth = window.speechSynthesis;
     if (!pickedVoice) {
       try { pickedVoice = pickVoice(synth.getVoices()); } catch (_) { pickedVoice = null; }
@@ -309,6 +519,10 @@ export function createVoiceMode(deps) {
     utter.onend = done;
     utter.onerror = done;
     synth.speak(utter);
+    // Acoustic barge-in: after an ~800ms grace period the mic analyser arms
+    // and Orbit stops mid-sentence when Edward starts talking. Orb-tap stays
+    // as the interrupt fallback.
+    armBargeIn();
   }
 
   /** Barge-in: interrupt Orbit and take the floor. */
@@ -363,6 +577,22 @@ export function createVoiceMode(deps) {
           pickedVoice = pickVoice(window.speechSynthesis.getVoices());
         };
       }
+      // Warm up the barge-in AudioContext inside this opening tap gesture so
+      // it isn't left suspended on strict platforms (iOS Safari); the mic
+      // stream itself is opened lazily on the first utterance.
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          if (!bargeAudio) bargeAudio = {};
+          if (!bargeAudio.ctx) {
+            bargeAudio.ctx = new AC();
+            if (bargeAudio.ctx.state === 'suspended') {
+              const p = bargeAudio.ctx.resume();
+              if (p && typeof p.catch === 'function') p.catch(() => {});
+            }
+          }
+        }
+      } catch (_) {}
     } catch (_) {}
     startListen();
   }
@@ -370,6 +600,7 @@ export function createVoiceMode(deps) {
   function close() {
     state = 'closed';
     stopAll();
+    teardownBargeAudio();
     if (els.overlay) els.overlay.classList.add('hidden');
     document.body.classList.remove('voice-open');
   }
