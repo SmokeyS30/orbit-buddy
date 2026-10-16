@@ -232,6 +232,23 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         created_at TEXT NOT NULL,
         UNIQUE(user_id, version)
       )`,
+      // Proactive memory: tracks which memories were volunteered unprompted
+      // (in chat or via a proactive push) so nothing repeats. content_snapshot
+      // + memory_created_at keep the "why are you telling me this?" answer
+      // exact even if the memory is later edited or deleted.
+      `CREATE TABLE IF NOT EXISTS memory_surfacing (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        memory_id TEXT NOT NULL,
+        occurrence_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        via TEXT NOT NULL,
+        reason TEXT,
+        content_snapshot TEXT,
+        memory_created_at TEXT,
+        surfaced_at TEXT NOT NULL,
+        UNIQUE(user_id, occurrence_key)
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -245,6 +262,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -906,6 +924,28 @@ const indexMigrations = [
       try { record = JSON.parse(row.record_json); } catch {}
       return { ...row, record };
     },
+    // Proactive memory: which memories were volunteered unprompted, and why.
+    // Dedup key is (user_id, occurrence_key); repeats are ignored.
+    async recordMemorySurfacing(userId, { memoryId, occurrenceKey, kind, via, reason = null, contentSnapshot = null, memoryCreatedAt = null } = {}) {
+      if (!userId || !memoryId || !occurrenceKey || !kind || !via) return false;
+      const result = await run(`INSERT INTO memory_surfacing(id,user_id,memory_id,occurrence_key,kind,via,reason,content_snapshot,memory_created_at,surfaced_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id, occurrence_key) DO NOTHING`,
+        randomUUID(), userId, memoryId, String(occurrenceKey).slice(0, 200),
+        String(kind).slice(0, 20), String(via).slice(0, 20),
+        reason == null ? null : String(reason).slice(0, 300),
+        contentSnapshot == null ? null : String(contentSnapshot).slice(0, 500),
+        memoryCreatedAt == null ? null : String(memoryCreatedAt).slice(0, 32),
+        timestamp());
+      return result.changes > 0;
+    },
+    getMemorySurfacing: async (userId, occurrenceKey) =>
+      (await get('SELECT * FROM memory_surfacing WHERE user_id=? AND occurrence_key=?', userId, occurrenceKey)) || null,
+    async listMemorySurfacings(userId, limit = 100) {
+      const n = Math.max(1, Math.min(500, Number(limit) || 100));
+      return all('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT ?', userId, n);
+    },
+    getLastMemorySurfacing: async (userId) =>
+      (await get('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT 1', userId)) || null,
 
     // --- People ---
     trackPersonMention: async (userId, personName) => {

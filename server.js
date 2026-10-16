@@ -24,6 +24,7 @@ import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
 import { handleSoulCommand, resolveSoulDirective } from './src/soul.js';
+import { buildSurfacingHint, chooseChatSurfacing, handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
@@ -314,6 +315,10 @@ function formatMemoryLine(memory,index){
 export function handleMemoryCommand({db,userId,message}){
   const text=String(message||'').trim();
   if(!text||text.length>300)return null;
+  // Proactive memory explainability: "why are you telling me this?" gets an
+  // exact answer naming the memory, when it was saved, and why it was timely.
+  const whyAnswer=handleProactiveMemoryWhy({db,userId,message:text});
+  if(whyAnswer)return whyAnswer;
   const pending=getMemoryPending(db,userId);
   // --- pending multi-step flows (confirm / cancel / numbered pick / more) ---
   if(pending){
@@ -647,8 +652,31 @@ export function createOrbitServer(options={}) {
       // Soul directive renders the user's tuned personality (or the demo
       // neutral default) into the system-prompt layer for this turn.
       const soulDirective=resolveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name});
+      const recalledMemories=db.listRelevantMemories(userId,message);
+      // Proactive memory (2026-10-16): volunteer at most ONE timely memory
+      // (a due date from memories, or an open loop the topic calls for) as a
+      // natural aside — graceful by design: the model gets a hint it may use
+      // or skip silently, never more than one per turn, never in demo mode.
+      let proactiveSurfacing=null;
+      if(!isDemoUser(user)){
+        try{
+          const surfacedRows=db.listMemorySurfacings(userId,200);
+          proactiveSurfacing=chooseChatSurfacing({
+            allMemories:db.listMemories(userId),
+            recalledMemories,
+            personalDates:db.listPersonalDates(userId),
+            historyMessages:history,
+            userMessage:message,
+            surfacedKeys:new Set(surfacedRows.map((r)=>r.occurrence_key)),
+            surfacedRows,
+            nowMs:Date.now(),
+            timeZone:preferences.time_zone,
+          });
+        }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
+      }
       const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,
-        memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+        proactiveMemory:proactiveSurfacing?buildSurfacingHint(proactiveSurfacing):null,
+        memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
         onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
@@ -662,6 +690,18 @@ export function createOrbitServer(options={}) {
       try{const autoSaved=db.autoApproveMemorySuggestions(userId,MEMORY_AUTO_SAVE_MINUTES);if(autoSaved>0)db.addEvent(userId,'memory_added',`Auto-saved ${autoSaved} suggested ${autoSaved===1?'memory':'memories'} after the review window.`);}catch(e){}
       answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
       storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      // Proactive memory bookkeeping: if a memory was volunteered this turn
+      // and the model wasn't mid-task (no tool calls), record it so it's
+      // never repeated for this occurrence. Mid-task turns don't burn the
+      // occurrence — it waits for a better moment.
+      if(proactiveSurfacing&&toolCalls.length===0){
+        try{
+          db.recordMemorySurfacing(userId,{memoryId:proactiveSurfacing.memory.id,occurrenceKey:proactiveSurfacing.occurrenceKey,
+            kind:proactiveSurfacing.kind,via:'chat',reason:proactiveSurfacing.reason,
+            contentSnapshot:proactiveSurfacing.memory.content,memoryCreatedAt:proactiveSurfacing.memory.created_at});
+          db.addEvent(userId,'memory_surfaced_chat',`Volunteered a timely memory in chat (${proactiveSurfacing.reason}).`);
+        }catch(error){console.error('proactive memory record failed',error&&error.message);}
+      }
       }
       if(db.getSetting(`ambient_context_${userId}`)==='granted'){
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
@@ -1876,7 +1916,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);}
+    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
@@ -1897,6 +1937,34 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         });
       }
     }catch(error){console.error('project radar failed',error&&error.message);}
+  }
+  // Proactive memory (2026-10-16): volunteers timely memories — upcoming
+  // dates embedded in memories ("Mom's birthday is October 23") — through
+  // the shared proactive pipeline: quiet hours, claimProactiveSlot (the 3/day
+  // cap shared by all proactive features), deliverProactive (web/app +
+  // WhatsApp). At most one proactive memory push per user per day — gentle,
+  // never a burst. Never in demo mode. Never throws.
+  async function runProactiveMemory(nowMs){
+    try{
+      for(const user of db.listUsers()){
+        if(user.disabled||isDemoUser(user))continue;
+        const preferences=db.getPreferences(user.id);
+        if(isQuietHours(preferences,nowMs))continue;
+        const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
+        const today=todayInZone(timeZone,nowMs);
+        if(db.getSetting(`proactive_memory_pushed_${user.id}`)===today)continue;
+        try{
+          const sent=await runProactiveMemoryPush({
+            db,model,user,timeZone,nowMs,
+            buddyName:buddyNameFor(user.id),
+            claimSlot:()=>db.claimProactiveSlot(user.id,today),
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
+            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage),
+          });
+          if(sent>0)db.setSetting(`proactive_memory_pushed_${user.id}`,today);
+        }catch(error){console.error('proactive memory user failed',user.id,error&&error.message);}
+      }
+    }catch(error){console.error('proactive memory failed',error&&error.message);}
   }
   // Study coach (proactive): nudges tied to study sessions on the user's
   // calendar (warm-up before, review offer after), weekly study-slot

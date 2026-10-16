@@ -229,3 +229,46 @@ test('PostgreSQL: Soul core parity (migrations + versioned record + history)', a
     }
   }
 });
+
+test('PostgreSQL: proactive memory surfacing parity (migrations + dedup)', async () => {
+  assert.ok(DATABASE_URL, 'TEST_DATABASE_URL must be set (CI provides PostgreSQL 16 service)');
+  await ensureSchema();
+  const email = `pgtest-pmem-${Date.now()}@example.com`;
+  let db = null;
+  let userId = null;
+  try {
+    db = createSyncPgAdapter(DATABASE_URL);
+    const user = db.createUser({ email, displayName: 'PG Proactive Memory', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    userId = user.id;
+    // Table must exist via the PROD migrations path (not just postgres-schema.sql).
+    assert.equal(db.getMemorySurfacing(userId, 'date:m1:2026-10-23'), null, 'no surfacing initially');
+    assert.equal(db.getLastMemorySurfacing(userId), null);
+    const row = {
+      memoryId: 'm1', occurrenceKey: 'date:m1:2026-10-23', kind: 'date', via: 'proactive',
+      reason: 'birthday is in 7 days (October 23)', contentSnapshot: "Mom's birthday is October 23",
+      memoryCreatedAt: '2026-10-01T12:00:00.000Z',
+    };
+    assert.equal(db.recordMemorySurfacing(userId, row), true, 'first record stored');
+    assert.equal(db.recordMemorySurfacing(userId, row), false, 'duplicate occurrence ignored');
+    const got = db.getMemorySurfacing(userId, 'date:m1:2026-10-23');
+    assert.ok(got, 'surfacing retrievable');
+    assert.equal(got.kind, 'date');
+    assert.equal(got.via, 'proactive');
+    assert.equal(got.content_snapshot, "Mom's birthday is October 23");
+    assert.equal(got.memory_created_at, '2026-10-01T12:00:00.000Z');
+    assert.equal(db.listMemorySurfacings(userId, 10).length, 1);
+    assert.equal(db.getLastMemorySurfacing(userId).occurrence_key, 'date:m1:2026-10-23');
+    // Per-user isolation: another user sees nothing.
+    const user2 = db.createUser({ email: `pgtest-pmem2-${Date.now()}@example.com`, displayName: 'PG PM 2', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    assert.equal(db.getLastMemorySurfacing(user2.id), null, 'surfacings are per-user');
+    try { db.deleteDemoUser(user2.id); } catch {}
+  } finally {
+    try {
+      if (db && userId) {
+        try { db.deleteDemoUser(userId); } catch {}
+      }
+    } finally {
+      if (db) { try { db.close(); } catch {} }
+    }
+  }
+});

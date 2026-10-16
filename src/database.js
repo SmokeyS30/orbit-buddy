@@ -312,6 +312,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       UNIQUE(user_id, version)
     );
     CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC);
+    -- Proactive memory (2026-10-16): tracks which memories were volunteered
+    -- unprompted (in chat or via a proactive push) so nothing repeats.
+    -- content_snapshot + memory_created_at keep the "why are you telling me
+    -- this?" answer exact even if the memory is later edited or deleted.
+    CREATE TABLE IF NOT EXISTS memory_surfacing (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      memory_id TEXT NOT NULL,
+      occurrence_key TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      via TEXT NOT NULL,
+      reason TEXT,
+      content_snapshot TEXT,
+      memory_created_at TEXT,
+      surfaced_at TEXT NOT NULL,
+      UNIQUE(user_id, occurrence_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC);
     CREATE TABLE IF NOT EXISTS study_questions (
       id TEXT PRIMARY KEY, exam TEXT NOT NULL, topic TEXT NOT NULL,
       question TEXT NOT NULL, choices TEXT NOT NULL, correct_index INTEGER NOT NULL,
@@ -566,6 +584,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     insertSoulHistory: db.prepare('INSERT INTO soul_history(id, user_id, version, record_json, source, created_at) VALUES(?,?,?,?,?,?)'),
     listSoulHistory: db.prepare('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? ORDER BY version DESC LIMIT ?'),
     getSoulHistoryVersion: db.prepare('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? AND version=?'),
+    // Proactive memory: surfacing dedup + explainability. INSERT OR IGNORE
+    // keeps recording idempotent on (user_id, occurrence_key).
+    recordMemorySurfacing: db.prepare(`INSERT OR IGNORE INTO memory_surfacing(id,user_id,memory_id,occurrence_key,kind,via,reason,content_snapshot,memory_created_at,surfaced_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`),
+    getMemorySurfacing: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? AND occurrence_key=?'),
+    listMemorySurfacings: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT ?'),
+    getLastMemorySurfacing: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT 1'),
     trackPersonMention: db.prepare(`INSERT INTO people_mentions(user_id,person_name,last_mentioned_at,last_nudged_at,dismissed,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,person_name) DO UPDATE SET last_mentioned_at=excluded.last_mentioned_at,
       dismissed=0,updated_at=excluded.updated_at`),
@@ -1009,6 +1034,21 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getSoulRecord(userId){const row=s.getSoulRecord.get(userId);if(!row)return null;let record=null;try{record=JSON.parse(row.record_json);}catch{}if(!record||typeof record!=='object')return null;return {...record,version:row.version,updatedAt:row.updated_at};},
     saveSoulRecord(userId,record,source){const current=this.getSoulRecord(userId);const version=(current?.version||0)+1;const clean={...record};delete clean.version;delete clean.updatedAt;const json=JSON.stringify(clean);const now=timestamp();s.upsertSoulRecord.run(userId,json,version,now);s.insertSoulHistory.run(randomUUID(),userId,version,json,String(source||'').slice(0,80),now);return {...clean,version,updatedAt:now};},
     listSoulHistory(userId,limit=10){return s.listSoulHistory.all(userId,Math.max(1,Math.min(50,limit||10)));},
+    // Proactive memory: which memories were volunteered unprompted, and why.
+    // Dedup key is (user_id, occurrence_key); repeats are ignored.
+    recordMemorySurfacing(userId,{memoryId,occurrenceKey,kind,via,reason=null,contentSnapshot=null,memoryCreatedAt=null}={}){
+      if(!userId||!memoryId||!occurrenceKey||!kind||!via)return false;
+      const now=timestamp();
+      const changes=s.recordMemorySurfacing.run(randomUUID(),userId,memoryId,String(occurrenceKey).slice(0,200),
+        String(kind).slice(0,20),String(via).slice(0,20),
+        reason==null?null:String(reason).slice(0,300),
+        contentSnapshot==null?null:String(contentSnapshot).slice(0,500),
+        memoryCreatedAt==null?null:String(memoryCreatedAt).slice(0,32),now).changes;
+      return changes>0;
+    },
+    getMemorySurfacing:(userId,occurrenceKey)=>s.getMemorySurfacing.get(userId,occurrenceKey)||null,
+    listMemorySurfacings:(userId,limit=100)=>s.listMemorySurfacings.all(userId,Math.max(1,Math.min(500,limit||100))),
+    getLastMemorySurfacing:(userId)=>s.getLastMemorySurfacing.get(userId)||null,
     getSoulHistoryVersion(userId,version){const row=s.getSoulHistoryVersion.get(userId,version);if(!row)return null;let record=null;try{record=JSON.parse(row.record_json);}catch{}return {...row,record};},
     trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},
