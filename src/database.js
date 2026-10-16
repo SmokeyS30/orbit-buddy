@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
+import { TEACH_MAX_STORED_CHARS } from './teach.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -92,6 +93,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS memory_suggestions (
       id TEXT PRIMARY KEY, user_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    -- Teach Orbit (X3): explicit knowledge base. SEPARATE from memories
+    -- (observed). Additive only; per-user isolated via user_id.
+    CREATE TABLE IF NOT EXISTS taught_knowledge (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      content TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'chat',
+      filename TEXT, mime_type TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_taught_knowledge_user ON taught_knowledge(user_id, updated_at DESC);
     CREATE TABLE IF NOT EXISTS import_jobs (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
       filename TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'processing',
@@ -471,6 +480,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMemorySuggestion: db.prepare('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?'),
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
+    // Teach Orbit (X3): explicit knowledge — stored separately from memories.
+    addTaughtKnowledge: db.prepare('INSERT INTO taught_knowledge(id,user_id,content,title,source,filename,mime_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'),
+    listTaughtKnowledge: db.prepare('SELECT * FROM taught_knowledge WHERE user_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 200'),
+    deleteTaughtKnowledge: db.prepare('DELETE FROM taught_knowledge WHERE id=? AND user_id=?'),
     addImportJob: db.prepare('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'),
     getImportJob: db.prepare('SELECT * FROM import_jobs WHERE id=? AND user_id=?'),
     listImportJobs: db.prepare('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5'),
@@ -850,6 +863,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return updated;
     },
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
+    // Teach Orbit (X3): explicit knowledge base. Taught items are NEVER
+    // suggestions — a direct "remember that…" instruction saves immediately.
+    // Stored in its own table; independent of memories (list/delete separate).
+    addTaughtKnowledge(userId,content,options={}){
+      const clean=String(content||'').trim();
+      if(!clean)return null;
+      const now=timestamp();
+      const row={id:randomUUID(),user_id:userId,content:clean.slice(0,TEACH_MAX_STORED_CHARS),
+        title:String(options.title||'').slice(0,200),source:String(options.source||'chat').slice(0,20),
+        filename:options.filename?String(options.filename).slice(0,300):null,
+        mime_type:options.mimeType?String(options.mimeType).slice(0,120):null,
+        created_at:now,updated_at:now};
+      s.addTaughtKnowledge.run(row.id,row.user_id,row.content,row.title,row.source,row.filename,row.mime_type,row.created_at,row.updated_at);
+      return row;
+    },
+    listTaughtKnowledge: (userId) => s.listTaughtKnowledge.all(userId),
+    listRelevantTaughtKnowledge(userId,query,limit=5){
+      return rankMemories(s.listTaughtKnowledge.all(userId),query,limit);
+    },
+    deleteTaughtKnowledge: (userId,id) => s.deleteTaughtKnowledge.run(id,userId).changes>0,
     addMemorySuggestion(userId,content,options={}){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
     dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
@@ -1141,7 +1174,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     markPasswordResetTokenUsed(tokenHash) { return s.usePwResetToken.run(tokenHash).changes>0; },
     cleanExpiredPasswordResetTokens() { s.cleanPwResetTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),taughtKnowledge:s.listTaughtKnowledge.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {
       if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {

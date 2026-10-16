@@ -21,6 +21,7 @@
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
+import { TEACH_MAX_STORED_CHARS } from '../teach.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 
 const { Pool } = pg;
@@ -214,6 +215,20 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         created_at TEXT NOT NULL,
         UNIQUE(message_id, version)
       )`,
+      // Teach Orbit (X3): explicit knowledge base — separate from observed
+      // memories. Lesson re-learned: production only runs THIS migrations
+      // array, so the table MUST be declared here (not just in SQLite).
+      `CREATE TABLE IF NOT EXISTS taught_knowledge (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        source TEXT NOT NULL DEFAULT 'chat',
+        filename TEXT,
+        mime_type TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -226,6 +241,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_taught_knowledge_user ON taught_knowledge(user_id, updated_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -487,6 +503,27 @@ const indexMigrations = [
       return updated;
     },
     deleteMemory: async (userId, id) => (await run('DELETE FROM memories WHERE id=? AND user_id=?', id, userId)).changes > 0,
+    // Teach Orbit (X3): explicit knowledge base, separate from memories.
+    async addTaughtKnowledge(userId, content, options={}) {
+      const clean = String(content || '').trim();
+      if (!clean) return null;
+      const now = timestamp();
+      const row = {
+        id: randomUUID(), user_id: userId, content: clean.slice(0, TEACH_MAX_STORED_CHARS),
+        title: String(options.title || '').slice(0, 200), source: String(options.source || 'chat').slice(0, 20),
+        filename: options.filename ? String(options.filename).slice(0, 300) : null,
+        mime_type: options.mimeType ? String(options.mimeType).slice(0, 120) : null,
+        created_at: now, updated_at: now,
+      };
+      await run('INSERT INTO taught_knowledge(id,user_id,content,title,source,filename,mime_type,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)',
+        row.id, row.user_id, row.content, row.title, row.source, row.filename, row.mime_type, row.created_at, row.updated_at);
+      return row;
+    },
+    listTaughtKnowledge: async (userId) => all('SELECT * FROM taught_knowledge WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT 200', userId),
+    async listRelevantTaughtKnowledge(userId, query, limit=5) {
+      return rankMemories(await all('SELECT * FROM taught_knowledge WHERE user_id=? ORDER BY updated_at DESC,id DESC LIMIT 200', userId), query, limit);
+    },
+    deleteTaughtKnowledge: async (userId, id) => (await run('DELETE FROM taught_knowledge WHERE id=? AND user_id=?', id, userId)).changes > 0,
     async addMemorySuggestion(userId, content, options={}) {
       const now = timestamp();
       const row = { id: randomUUID(), user_id: userId, content, created_at: now, kind: normalizeMemoryKind(options.kind), confidence: Math.max(0, Math.min(Number(options.confidence ?? 0.7), 1)) };

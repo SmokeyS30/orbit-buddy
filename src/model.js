@@ -180,6 +180,23 @@ function validateBaseUrl(value, allowInsecure) {
 const CITATION_START = '\uE200';
 const CITATION_END = '\uE201';
 
+// Teach Orbit (X3): format taught knowledge for the prompt. Pure — unit tested.
+// Taught items are the user's own explicit knowledge base ("remember that…",
+// uploaded documents); the cite instruction keeps Orbit honest about the source.
+export function formatTaughtKnowledge(taught) {
+  const items = (taught || []).slice(0, 5);
+  if (!items.length) return '';
+  const lines = items.map((entry, index) => {
+    const label = entry.title ? `"${entry.title}": ` : '';
+    return `${index + 1}. ${label}${entry.content}`;
+  });
+  return `Things the user has explicitly taught you (their own knowledge base — treat as authoritative for them):\n${lines.join('\n')}`;
+}
+
+export function taughtCiteInstruction() {
+  return 'When your answer draws on something from what the user taught you, briefly note it (e.g. "from what you taught me"). Keep it to a short natural aside — no formal citation format, no item numbers.';
+}
+
 export function stripCitationMarkers(value) {
   return String(value || '')
     // OpenAI search citations use private-use delimiters, for example:
@@ -406,7 +423,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], taught = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -420,6 +437,7 @@ export function createModelClient(env = process.env) {
           }).join('\n')
         : 'No user-approved memories are stored.';
       const recentHistory = history.slice(-16).map((entry) => ({ role: entry.role, content: entry.content }));
+      const taughtText = formatTaughtKnowledge(taught);
       const goalText = goals.length
         ? goals.slice(0, 8).map((goal) => `- ID ${goal.id}: ${goal.title} (${goal.progress}% complete, ${goal.status}, priority ${goal.priority}${goal.target_date ? `, target ${goal.target_date}` : ''}${goal.next_step ? `, next: ${goal.next_step}` : ''})`).join('\n')
         : 'No active goals are being tracked.';
@@ -443,6 +461,9 @@ export function createModelClient(env = process.env) {
         ...(writingVoice ? [`Personal writing voice for drafted writing only:\n${writingVoice}`] : []),
         ...(offerWritingVoice ? [`The user is asking you to draft or write something, and they haven't enabled "Writes like you" yet. Offer it once, briefly and naturally, as part of your reply: you can learn how they write from their sent emails so drafts sound like them, and they can delete it anytime with "forget how I write". If they say yes (or "learn how I write"), call learn_writing_voice right away. If they decline or ignore the offer, never mention it again.`] : []),
         `Relevant user-approved memory:\n${memoryText}`,
+        // Teach Orbit (X3): taught knowledge rides along like memory, but the
+        // model must briefly cite it when used ("from what you taught me").
+        ...(taughtText ? [taughtText, taughtCiteInstruction()] : []),
         `User-controlled goals:\n${goalText}`,
         `User-controlled projects:\n${projectText}`,
         ...(conversationSummary ? [`Earlier conversation summary:\n${conversationSummary}`] : [])

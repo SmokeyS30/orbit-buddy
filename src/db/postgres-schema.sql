@@ -475,6 +475,21 @@ CREATE TABLE IF NOT EXISTS study_attempts (
   correct INTEGER NOT NULL, attempted_at TEXT NOT NULL
 );
 
+-- Teach Orbit (X3): explicit knowledge base, separate from observed memories.
+CREATE TABLE IF NOT EXISTS taught_knowledge (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  source TEXT NOT NULL DEFAULT 'chat',
+  filename TEXT,
+  mime_type TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_taught_knowledge_user ON taught_knowledge(user_id, updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC);
 

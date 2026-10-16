@@ -637,7 +637,44 @@ test('webhook: failed image download gets the retry reply and no pipeline run', 
   }
 });
 
-test('webhook: non-image media gets the unsupported-type reply', async (t) => {
+test('webhook: document media is ingested as taught knowledge (Teach Orbit)', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base, 'owner-doc@example.com');
+  const sent = [];
+  const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< >>\nendobj\ntrailer\n<< >>\nBT (Teach me this PDF) Tj ET\n%%EOF', 'latin1');
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes('/Media/')) {
+      return {
+        ok: true, status: 200,
+        headers: { get: (h) => (String(h).toLowerCase() === 'content-length' ? String(pdfBytes.length) : (String(h).toLowerCase() === 'content-type' ? 'application/pdf' : null)) },
+        body: (async function* () { yield pdfBytes; })(),
+      };
+    }
+    try { if (new URL(u).hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; } } catch {}
+    return origFetch(url, opts);
+  };
+  try {
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'application/pdf',
+      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv3/Media/MEv3',
+      Body: '', MessageSid: 'SMdoc',
+    });
+    assert.equal(hook.status, 200);
+    assert.deepEqual(await hook.json(), { ok: true, teachFile: true });
+    const taught = app.db.listTaughtKnowledge(userId);
+    assert.equal(taught.length, 1, 'document ingested as taught knowledge');
+    assert.ok(taught[0].content.includes('Teach me this PDF'), 'PDF text extracted');
+    assert.equal(taught[0].source, 'upload');
+    assert.ok(taught[0].title.includes('shared-document.pdf'), 'filename recorded');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: failed document download gets the polite retry reply', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   await linkOwnerDirectly(app, base, 'owner-vid@example.com');
   const sent = [];
@@ -654,8 +691,8 @@ test('webhook: non-image media gets the unsupported-type reply', async (t) => {
       Body: '', MessageSid: 'SMvid',
     });
     assert.equal(hook.status, 200);
-    assert.deepEqual(await hook.json(), { ok: true });
-    assert.ok(sent.some((b) => decodeForm(b).includes('aren’t supported yet')), 'expected the unsupported-type reply');
+    assert.deepEqual(await hook.json(), { ok: true, teachFile: false });
+    assert.ok(sent.some((b) => decodeForm(b).includes('couldn’t quite grab that file')), 'expected the polite retry reply');
   } finally {
     globalThis.fetch = origFetch;
   }

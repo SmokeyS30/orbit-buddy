@@ -23,6 +23,7 @@ import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MES
 import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
+import { parseTeachCommand, extractTeachText, teachMetadataNote, teachFilenameForMime, TEACH_MAX_UPLOAD_BYTES, TEACH_MAX_STORED_CHARS } from './src/teach.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
@@ -250,6 +251,27 @@ export function stripSuggestMarkers(text){
 }
 export function stripModelMarkers(text){return stripCitationMarkers(stripSuggestMarkers(stripFollowUpMarkers(text)));}
 //
+// Teach Orbit (X3) — explicit teaching in chat (2026-10-16, invisible complexity).
+// "remember that my mom's birthday is June 12" / "teach Orbit that…" / "note that…"
+// saves IMMEDIATELY into the taught_knowledge table — a direct instruction needs
+// no tap, no review window. Synchronous, runs before handleMemoryCommand and the
+// model call, so it works identically on web and WhatsApp. Taught knowledge is
+// EXPLICIT (he gave it); memories are OBSERVED (Orbit noticed) — separate tables,
+// listed separately, deletable independently.
+// Returns a reply string when the message is a teach command, else null.
+export function handleTeachCommand({db,userId,message}){
+  const teach=parseTeachCommand(message);
+  if(!teach)return null;
+  // A new explicit instruction abandons any pending forget/list flow, same as
+  // any other fresh message would via handleMemoryCommand.
+  clearMemoryPending(db,userId);
+  let row=null;
+  try{row=db.addTaughtKnowledge(userId,teach.content,{source:'chat'});}catch(e){console.error('teach save failed',e&&e.message);}
+  if(!row)return `Hmm — I had trouble saving that. Mind trying again?`;
+  db.addEvent(userId,'taught_added',`Taught via chat: “${teach.content.slice(0,120)}”.`);
+  return `Noted — I've added that to what you've taught me.`;
+}
+//
 // Memory v2 — chat-native review/delete (2026-10-16, invisible complexity).
 // No settings UI, no toggles, no dashboard for memory. The owner reviews and
 // deletes what Orbit knows in plain chat:
@@ -308,6 +330,27 @@ function formatMemoryLine(memory,index){
   const kind=memory.kind&&memory.kind!=='fact'?` (${memory.kind})`:'';
   return `${index}. ${memory.content}${kind}`;
 }
+// Teach Orbit (X3): taught items are listed with their own T-numbers and a
+// title prefix when they came from a file upload. Never mixed into the memory
+// numbering — the two stores stay visibly distinct.
+function formatTaughtLine(taught){
+  const content=String(taught.content||'');
+  const short=content.length>160?content.slice(0,160)+'…':content;
+  return taught.title?`"${taught.title}": ${short}`:short;
+}
+function formatForgetLine(match,index){
+  const kind=match.kind&&match.kind!=='fact'?` (${match.kind})`:'';
+  const taught=match.store==='taught'?' (taught)':'';
+  return `${index}. ${match.content}${kind}${taught}`;
+}
+// Defensive: every db path (SQLite, Postgres sync wrapper) exposes these, but a
+// missing method must degrade to "no taught items", never crash the chat turn.
+function listTaughtSafe(db,userId){
+  try{return (db.listTaughtKnowledge&&db.listTaughtKnowledge(userId))||[];}catch{return [];}
+}
+function deleteTaughtSafe(db,userId,id){
+  try{return db.deleteTaughtKnowledge&&db.deleteTaughtKnowledge(userId,id);}catch{return false;}
+}
 // Returns a reply string when the message is a memory-review command, else null.
 // Synchronous — runs before the model call so review/delete is instant and exact.
 export function handleMemoryCommand({db,userId,message}){
@@ -318,28 +361,39 @@ export function handleMemoryCommand({db,userId,message}){
   if(pending){
     if(isMemoryCancel(text)){clearMemoryPending(db,userId);return 'Kept everything — nothing deleted.';}
     if(isMemoryConfirm(text)){
-      if(pending.type==='forget'&&pending.ids&&pending.ids.length){
-        let deleted=0;
-        for(const id of pending.ids){try{if(db.deleteMemory(userId,id))deleted++;}catch{}}
+      // Teach Orbit (X3): pending items carry their store — taught items delete
+      // from taught_knowledge, memories from memories. Old pendings (ids only)
+      // are treated as memories (backward compatible across the deploy).
+      const items=pending.items||(pending.ids||[]).map((id)=>({id,store:'memory'}));
+      if(pending.type==='forget'&&items.length){
+        let deleted=0,deletedTaught=0;
+        for(const item of items){
+          try{
+            if(item.store==='taught'){if(deleteTaughtSafe(db,userId,item.id)){deleted++;deletedTaught++;}}
+            else if(db.deleteMemory(userId,item.id))deleted++;
+          }catch{}
+        }
         clearMemoryPending(db,userId);
-        db.addEvent(userId,'memory_deleted',`Deleted ${deleted} ${deleted===1?'memory':'memories'} via chat.`);
-        return deleted===1
-          ? `Done — forgot “${pending.label}”.`
-          : `Done — forgot ${deleted} memories${pending.label?` about “${pending.label}”`:''}.`;
+        const allTaught=deleted>0&&deletedTaught===deleted;
+        db.addEvent(userId,allTaught?'taught_deleted':'memory_deleted',`Deleted ${deleted} ${deleted===1?'item':'items'} via chat.`);
+        if(deleted===1)return `Done — forgot “${pending.label}”${allTaught?' (from what you taught me)':''}.`;
+        return `Done — forgot ${deleted} ${allTaught?'things you taught me':(deletedTaught?'saved items':'memories')}${pending.label?` about “${pending.label}”`:''}.`;
       }
       clearMemoryPending(db,userId);
       return null; // stale pending shape; fall through to normal chat
     }
     const pick=parseForgetRequest(text);
-    if(/^forget\s+all\.?$/i.test(text)&&pending.type==='forget-list'&&pending.ids&&pending.ids.length){
-      setMemoryPending(db,userId,{type:'forget',ids:pending.ids,label:pending.label});
-      return `Delete all ${pending.ids.length} memories about “${pending.label}”? Say yes to confirm, or no to keep them.`;
+    if(/^forget\s+all\.?$/i.test(text)&&pending.type==='forget-list'&&pending.items&&pending.items.length){
+      setMemoryPending(db,userId,{type:'forget',items:pending.items,label:pending.label});
+      return `Delete all ${pending.items.length} saved items about “${pending.label}”? Say yes to confirm, or no to keep them.`;
     }
     if(pick&&pick.kind==='pick'&&pending.type==='forget-list'&&pending.matches){
       const chosen=pending.matches[pick.index-1];
       if(chosen){
-        setMemoryPending(db,userId,{type:'forget',ids:[chosen.id],label:chosen.content});
-        return `Forget this one?\n\n“${chosen.content}”\n\nSay yes to confirm, or no to keep it.`;
+        const store=chosen.store||'memory';
+        setMemoryPending(db,userId,{type:'forget',items:[{id:chosen.id,store}],label:chosen.content});
+        const taughtNote=store==='taught'?' (from what you taught me)':'';
+        return `Forget this one?${taughtNote}\n\n“${chosen.content}”\n\nSay yes to confirm, or no to keep it.`;
       }
     }
     if(isMemoryMoreRequest(text)&&pending.type==='list'){
@@ -350,28 +404,52 @@ export function handleMemoryCommand({db,userId,message}){
   }
   // --- fresh commands ---
   if(isMemoryListRequest(text))return memoryListReply(db,userId,0);
+  // Teach Orbit (X3): "forget everything I taught you" / "forget all taught
+  // knowledge" clears ONLY taught knowledge — memories stay. Checked before
+  // parseForgetRequest, which would otherwise swallow these as fuzzy queries.
+  if(/^forget\s+(?:everything|all)\s+(?:that\s+|what\s+)?i\s+taught\s+you\.?$/i.test(text)||/^forget\s+all\s+taught(\s+knowledge)?\.?$/i.test(text)){
+    const taught=listTaughtSafe(db,userId);
+    if(!taught.length)return `You haven't taught me anything yet — nothing to forget.`;
+    setMemoryPending(db,userId,{type:'forget',items:taught.map((t)=>({id:t.id,store:'taught'})),label:'everything you taught me'});
+    return `This would delete all ${taught.length} things you've taught me (what I remember about you stays). Say yes to confirm, or no to keep everything.`;
+  }
   const forget=parseForgetRequest(text);
   if(forget&&forget.kind!=='pick'){
     const memories=db.listMemories(userId);
-    // Bare "forget all" / "forget everything": delete every memory, with explicit confirm.
+    const taught=listTaughtSafe(db,userId);
+    // Bare "forget all" / "forget everything": deletes every MEMORY, with explicit
+    // confirm. Taught knowledge is independent — it stays unless asked for by name.
     if(forget.kind==='single'&&/^(all|everything)$/i.test(forget.query)){
       const live=memories.filter((m)=>!m.superseded_by);
       if(!live.length)return `I don't have anything saved about you yet — nothing to forget.`;
-      setMemoryPending(db,userId,{type:'forget',ids:live.map((m)=>m.id),label:'everything'});
-      return `This would delete all ${live.length} things I remember about you. Say yes to confirm, or no to keep everything.`;
+      setMemoryPending(db,userId,{type:'forget',items:live.map((m)=>({id:m.id,store:'memory'})),label:'everything'});
+      const taughtNote=taught.length?` (What you've taught me stays — say “forget everything I taught you” to clear that too.)`:'';
+      return `This would delete all ${live.length} things I remember about you. Say yes to confirm, or no to keep everything.${taughtNote}`;
     }
-    const matches=rankMemories(memories,forget.query,forget.kind==='bulk'?100:8)
-      .filter((m)=>!m.superseded_by&&memoryQueryHits(m,forget.query));
+    // Teach Orbit (X3): forget searches BOTH stores. Matches carry their store
+    // so the confirm step deletes from the right table. Listed separately so
+    // the taught/memory distinction stays visible.
+    const memMatches=rankMemories(memories,forget.query,forget.kind==='bulk'?100:8)
+      .filter((m)=>!m.superseded_by&&memoryQueryHits(m,forget.query))
+      .map((m)=>({id:m.id,content:m.content,kind:m.kind,store:'memory'}));
+    const taughtMatches=rankMemories(taught,forget.query,forget.kind==='bulk'?100:8)
+      .filter((t)=>memoryQueryHits(t,forget.query))
+      .map((t)=>({id:t.id,content:formatTaughtLine(t),kind:null,store:'taught'}));
+    const matches=[...memMatches,...taughtMatches].slice(0,forget.kind==='bulk'?100:8);
     if(!matches.length)return `I don't have anything about “${forget.query}” saved.`;
+    const memOnly=matches.every((m)=>m.store==='memory');
+    const noun=memOnly?(matches.length===1?'memory':'memories'):(matches.length===1?'saved item':'saved items');
     if(matches.length===1){
-      setMemoryPending(db,userId,{type:'forget',ids:[matches[0].id],label:matches[0].content});
-      return `Forget this?\n\n“${matches[0].content}”\n\nSay yes to confirm, or no to keep it.`;
+      const store=matches[0].store;
+      const taughtNote=store==='taught'?' (from what you taught me)':'';
+      setMemoryPending(db,userId,{type:'forget',items:[{id:matches[0].id,store}],label:matches[0].content});
+      return `Forget this?${taughtNote}\n\n“${matches[0].content}”\n\nSay yes to confirm, or no to keep it.`;
     }
     const shown=matches.slice(0,5);
-    setMemoryPending(db,userId,{type:'forget-list',ids:matches.map((m)=>m.id),label:forget.query,matches:matches.map((m)=>({id:m.id,content:m.content}))});
-    const lines=shown.map((m,i)=>formatMemoryLine(m,i+1)).join('\n');
+    setMemoryPending(db,userId,{type:'forget-list',items:matches.map((m)=>({id:m.id,store:m.store})),label:forget.query,matches:matches.map((m)=>({id:m.id,content:m.content,store:m.store}))});
+    const lines=shown.map((m,i)=>formatForgetLine(m,i+1)).join('\n');
     const more=matches.length>5?`\n…and ${matches.length-5} more.`:'';
-    return `I found ${matches.length} memories about “${forget.query}”:\n\n${lines}${more}\n\nSay “forget all” to delete them all, “forget 2” for just one, or no to keep everything.`;
+    return `I found ${matches.length} ${noun} about “${forget.query}”:\n\n${lines}${more}\n\nSay “forget all” to delete them all, “forget 2” for just one, or no to keep everything.`;
   }
   if(isMemoryMoreRequest(text)){
     // "more" with no pending list -> gentle nudge, not an error
@@ -381,17 +459,27 @@ export function handleMemoryCommand({db,userId,message}){
 }
 function memoryListReply(db,userId,offset){
   const memories=(db.listMemories(userId)||[]).filter((m)=>!m.superseded_by);
-  if(!memories.length){clearMemoryPending(db,userId);return `I don't have anything saved about you yet. Tell me things you'd like me to remember — “remember that…” — and I'll keep them.`;}
+  // Teach Orbit (X3): "what do you know about me?" covers taught knowledge too —
+  // its own clearly-labeled section, never mingled with the memory numbering.
+  const taught=listTaughtSafe(db,userId);
+  const taughtLines=taught.map((t,i)=>`T${i+1}. ${formatTaughtLine(t)}`).join('\n');
+  if(!memories.length&&!taught.length){clearMemoryPending(db,userId);return `I don't have anything saved about you yet. Tell me things you'd like me to remember — “remember that…” — and I'll keep them.`;}
+  if(!memories.length){
+    clearMemoryPending(db,userId);
+    return `What you've taught me (${taught.length} total):\n\n${taughtLines}\n\nSay “forget <thing>” to remove anything, anytime.`;
+  }
   const total=memories.length;
   const page=memories.slice(offset,offset+MEMORY_PAGE_SIZE);
   const lines=page.map((m,i)=>formatMemoryLine(m,offset+i+1)).join('\n');
+  // Taught section rides on the first page only; "more" pages stay memories-only.
+  const taughtSection=(offset===0&&taught.length)?`\n\nWhat you've taught me (${taught.length} total):\n\n${taughtLines}`:'';
   if(offset+MEMORY_PAGE_SIZE<total){
     setMemoryPending(db,userId,{type:'list',offset:offset+MEMORY_PAGE_SIZE});
-    return `Here's what I remember about you (${total} total):\n\n${lines}\n\nSay “more” for the next ${Math.min(MEMORY_PAGE_SIZE,total-offset-MEMORY_PAGE_SIZE)}, or “forget <thing>” to remove anything.`;
+    return `Here's what I remember about you (${total} total):\n\n${lines}${taughtSection}\n\nSay “more” for the next ${Math.min(MEMORY_PAGE_SIZE,total-offset-MEMORY_PAGE_SIZE)}, or “forget <thing>” to remove anything.`;
   }
   clearMemoryPending(db,userId);
   const tail=offset>0?`\n\nThat's everything (${total}).`:` (${total} total)`;
-  return `Here's what I remember about you${tail}:\n\n${lines}\n\nSay “forget <thing>” to remove anything, anytime.`;
+  return `Here's what I remember about you${tail}:\n\n${lines}${taughtSection}\n\nSay “forget <thing>” to remove anything, anytime.`;
 }
 function sanitizeAssistantMessages(messages){return messages.map((message)=>message.role==='assistant'?{...message,content:stripModelMarkers(message.content)}:message);}
 // W3: conversation share/export — clean markdown for a whole thread:
@@ -629,16 +717,20 @@ export function createOrbitServer(options={}) {
         offerWritingVoice=true;
         try{db.markWritingVoiceOffered(userId);}catch(_){}
       }
-      // Memory v2 (chat-native, 2026-10-16): memory review/delete lives in chat.
-      // "what do you know about me?" / "forget X" are answered directly — instant,
-      // exact, no model call, no UI. Works identically on web and WhatsApp.
-      const memoryCommand=handleMemoryCommand({db,userId,message});
-      if(memoryCommand){
-        answer=memoryCommand;
+      // Teach Orbit (X3, 2026-10-16): explicit teaching ("remember that…",
+      // "teach Orbit that…") auto-saves immediately — checked BEFORE memory
+      // commands and the model call. Memory v2: "what do you know about me?" /
+      // "forget X" are answered directly — instant, exact, no model call, no UI.
+      // All three work identically on web and WhatsApp.
+      const teachCommand=handleTeachCommand({db,userId,message});
+      const memoryCommand=teachCommand?null:handleMemoryCommand({db,userId,message});
+      const directCommand=teachCommand||memoryCommand;
+      if(directCommand){
+        answer=directCommand;
         storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       }else{
       const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,
-        memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+        memories:db.listRelevantMemories(userId,message),taught:db.listRelevantTaughtKnowledge(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
         onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
@@ -2355,9 +2447,38 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             });
             return json(res,200,{ok:true,image:true});
           }
-          // Other media types (video, documents) are not supported yet.
+          // Other media types (documents, video, misc files): Teach Orbit accepts
+          // ALL file types (owner decision 2026-10-16). Download, extract text
+          // best-effort, store as taught knowledge, confirm in chat. Nothing is
+          // rejected by type; unreadable files become an honest metadata note.
+          if(mediaUrl){
+            let dl=null;
+            try{dl=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});}
+            catch(e){
+              console.error('whatsapp document download failed',e.code||e.message);
+              const tooLong=e.code==='MEDIA_TOO_LARGE';
+              try{await twilioSend(from,tooLong?'That file is a bit large for me — try one under 10MB and I’ll take it.':'I couldn’t quite grab that file — mind sending it again?');}catch(e2){console.error('whatsapp file reply failed',e2.message);}
+              return json(res,200,{ok:true,teachFile:false});
+            }
+            const waFilename=teachFilenameForMime(dl.contentType||mediaContentType);
+            const extracted=extractTeachText({bytes:dl.bytes,filename:waFilename,mimeType:dl.contentType||mediaContentType});
+            let content=extracted.text;
+            if(extracted.needsVision)content=teachMetadataNote({filename:waFilename,mimeType:dl.contentType||mediaContentType,bytes:dl.bytes,reason:'I could not read this file'});
+            const row=db.addTaughtKnowledge(waUserId,content,{source:'upload',title:`WhatsApp: ${waFilename}`,filename:waFilename,mimeType:dl.contentType||mediaContentType});
+            if(row)db.addEvent(waUserId,'taught_added',`Taught via WhatsApp file: “${waFilename}” (${extracted.extraction}).`);
+            const userMsg=db.addMessage(waUserId,conversation.id,'user',`[Shared a file via WhatsApp: ${waFilename}]`);db.touchConversation(waUserId,conversation.id);
+            enqueueChatReply(conversation.id,async()=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,userMsg,images:[],
+                message:`[The user just taught you the file "${waFilename}" over WhatsApp — ${String(content).length} characters were saved to what they've taught you. Briefly confirm in one or two sentences what it covers, based on this excerpt: """${String(content).slice(0,1500)}"""]`});
+              if(answer&&from){
+                try{await twilioSend(from,answer);}
+                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
+              }
+            });
+            return json(res,200,{ok:true,teachFile:true});
+          }
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
-          try{await twilioSend(from,'I can read text, listen to voice notes, and look at photos — other file types aren’t supported yet.');}catch(e){console.error('whatsapp media reply failed',e.message);}
+          try{await twilioSend(from,'I got that, but there was no file attached I could read.');}catch(e){console.error('whatsapp media reply failed',e.message);}
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
@@ -2444,7 +2565,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}// "Catch me up": capture the previous app-open before stamping this one,
 // so the Today-tab card can tell a genuine 6h+ absence from a refresh.
-let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
+let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),taughtKnowledge:db.listTaughtKnowledge(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
         const userId=user.user_id||user.id;
         // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
         // the 15s frontend refresh doesn't refetch weather/calendar each time.
@@ -2550,6 +2671,49 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType}); // validates size too
           db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
           return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/chat/teach-file'){
+          // Teach Orbit (X3): document upload — ALL file types accepted, nothing
+          // rejected by type (owner decision 2026-10-16). Text is extracted
+          // best-effort (text/PDF/DOCX/vision for images); anything unreadable
+          // is stored as an honest metadata note. The extracted text becomes a
+          // taught_knowledge row immediately, then Orbit acknowledges in chat
+          // through the normal reply pipeline (no fake history, no new UI).
+          if(userRateLimited(userId,'chat-teach-file',20,60*60_000))throw Object.assign(new Error('Too many uploads. Try again shortly.'),{status:429});
+          const uploadType=req.headers['content-type']||'';
+          if(!uploadType.includes('multipart/form-data'))throw Object.assign(new Error('Send the file as multipart form data.'),{status:400});
+          const chunks=[];let size=0;
+          for await(const chunk of req){size+=chunk.length;if(size>TEACH_MAX_UPLOAD_BYTES)throw Object.assign(new Error('File is too large (10MB max).'),{status:413});chunks.push(chunk);}
+          const raw=Buffer.concat(chunks);
+          if(!raw.length)throw Object.assign(new Error('No file uploaded.'),{status:400});
+          const file=parseMultipartImage(raw,uploadType); // generic first-file-part parser
+          if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded file.'),{status:400});
+          const filename=String(file.filename||'file').slice(0,200);
+          const extracted=extractTeachText({bytes:file.bytes,filename,mimeType:file.mimeType});
+          let content=extracted.text;
+          if(extracted.needsVision){
+            // Images: describe through the existing vision pipeline (best-effort).
+            try{
+              const imageBlock=processImageInput({bytes:file.bytes,mimeType:file.mimeType});
+              const {text:desc}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,
+                message:`The user shared this image for you to learn from (Teach Orbit). Describe everything in it that is worth remembering: text, people, places, objects, diagrams, key details. Be thorough but factual.`,
+                images:[imageBlock],memories:[],goals:[],projects:[],history:[],taskMode:true});
+              const clean=stripModelMarkers(desc).trim().slice(0,TEACH_MAX_STORED_CHARS);
+              content=clean||teachMetadataNote({filename,mimeType:file.mimeType,bytes:file.bytes,reason:'I could not make out anything in this image'});
+            }catch(e){content=teachMetadataNote({filename,mimeType:file.mimeType,bytes:file.bytes,reason:'I could not read this image'});}
+          }
+          const row=db.addTaughtKnowledge(userId,content,{source:'upload',title:filename,filename,mimeType:file.mimeType});
+          if(!row)throw Object.assign(new Error('Could not save what you taught me.'),{status:500});
+          db.addEvent(userId,'taught_added',`Taught via file upload: “${filename}” (${extracted.extraction}).`);
+          // Acknowledge in chat via the normal pipeline so the reply streams like
+          // any other turn. The excerpt grounds Orbit's confirmation.
+          const qcid=url.searchParams.get('conversationId');
+          let conversation=(qcid&&db.getConversation(userId,String(qcid)))||db.ensureDefaultConversation(userId);
+          const userMsg=db.addMessage(userId,conversation.id,'user',`[Shared a file: ${filename}]`);db.touchConversation(userId,conversation.id);
+          const excerpt=String(content).slice(0,1500);
+          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,userMsg,images:[],
+            message:`[The user just taught you the file "${filename}" — ${content.length} characters were saved to what they've taught you. Briefly confirm in one or two sentences what it covers, based on this excerpt: """${excerpt}"""]`}));
+          return json(res,202,{ok:true,id:row.id,messageId:userMsg.id,conversationId:conversation.id,extraction:extracted.extraction});
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
@@ -2797,6 +2961,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         }
         if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
         const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
+        // Teach Orbit (X3): taught knowledge is deleted independently of memories.
+        const taughtMatch=url.pathname.match(/^\/api\/taught\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&taughtMatch){if(!db.deleteTaughtKnowledge(userId,taughtMatch[1]))throw Object.assign(new Error('Taught item not found.'),{status:404});db.addEvent(userId,'taught_deleted','Deleted something you taught Orbit.');return json(res,200,{ok:true});}
         // L4: search filters apply before scoring. Note: db.listMessages clamps to
         // the 200 most recent messages, so filtered search covers the recent corpus.
         if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const filters=parseSearchFilterParams(url.searchParams,{conversationExists:(id)=>!!db.getConversation(userId,id)});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20,Object.keys(filters).length?filters:null);return json(res,200,{results:formatSearchResults(results),items:formatSearchItems(results)});}

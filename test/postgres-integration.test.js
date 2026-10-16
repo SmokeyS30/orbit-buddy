@@ -192,3 +192,40 @@ test('PostgreSQL: Memory v2 auto-recall parity (auto-save + contradiction guard)
     }
   }
 });
+
+test('PostgreSQL: Teach Orbit taught_knowledge parity (table + CRUD + isolation)', async () => {
+  assert.ok(DATABASE_URL, 'TEST_DATABASE_URL must be set (CI provides PostgreSQL 16 service)');
+  await ensureSchema();
+  const email = `pgtest-teach-${Date.now()}@example.com`;
+  const email2 = `pgtest-teach2-${Date.now()}@example.com`;
+  let db = null;
+  let userId = null;
+  let userId2 = null;
+  try {
+    db = createSyncPgAdapter(DATABASE_URL);
+    const user = db.createUser({ email, displayName: 'PG Teach', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    const user2 = db.createUser({ email: email2, displayName: 'PG Teach 2', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    userId = user.id; userId2 = user2.id;
+    // The taught_knowledge table must exist via the schema AND the adapter's
+    // self-migration array (production only runs the migrations array).
+    const row = db.addTaughtKnowledge(userId, 'The garage code is 4412.', { source: 'chat' });
+    assert.ok(row && row.id, 'taught item saved');
+    assert.equal(row.source, 'chat');
+    const up = db.addTaughtKnowledge(userId, 'Launch notes.', { source: 'upload', title: 'alpha.txt', filename: 'alpha.txt', mimeType: 'text/plain' });
+    assert.equal(up.title, 'alpha.txt', 'upload metadata preserved');
+    assert.equal(db.listTaughtKnowledge(userId).length, 2);
+    assert.equal(db.listTaughtKnowledge(userId2).length, 0, 'per-user isolation');
+    const relevant = db.listRelevantTaughtKnowledge(userId, 'garage code');
+    assert.ok(relevant.length >= 1 && relevant[0].content.includes('4412'), 'relevance ranking works');
+    assert.ok(db.deleteTaughtKnowledge(userId, row.id), 'delete works');
+    assert.equal(db.listTaughtKnowledge(userId).length, 1);
+    assert.equal(db.deleteTaughtKnowledge(userId2, up.id), false, 'cross-user delete refused');
+  } finally {
+    try {
+      if (db && userId) { for (const t of db.listTaughtKnowledge(userId)) { try { db.deleteTaughtKnowledge(userId, t.id); } catch {} } }
+    } catch {}
+    try { if (db && userId) { try { db.deleteDemoUser(userId); } catch {} } } catch {}
+    try { if (db && userId2) { try { db.deleteDemoUser(userId2); } catch {} } } catch {}
+    finally { if (db) { try { db.close(); } catch {} } }
+  }
+});
