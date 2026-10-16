@@ -23,6 +23,7 @@ import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MES
 import { sendEmail, trashEmail } from './src/gmail.js';
 import { sendEmail as sendResendEmail } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
+import { handleSoulCommand, resolveSoulDirective } from './src/soul.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
@@ -629,15 +630,24 @@ export function createOrbitServer(options={}) {
         offerWritingVoice=true;
         try{db.markWritingVoiceOffered(userId);}catch(_){}
       }
+      // Soul core (personality, 2026-10-16): chat-native tuning — "be more
+      // playful", "stop being so formal", "go back to how you were" — answered
+      // directly, instant and exact, no model call, no UI. Per-user; demo mode
+      // gets a neutral default. Works identically on web and WhatsApp because
+      // both flow through runChatReplyJob.
+      const soulCommand=handleSoulCommand({db,userId,message,isDemo:isDemoUser(user)});
       // Memory v2 (chat-native, 2026-10-16): memory review/delete lives in chat.
       // "what do you know about me?" / "forget X" are answered directly — instant,
       // exact, no model call, no UI. Works identically on web and WhatsApp.
-      const memoryCommand=handleMemoryCommand({db,userId,message});
-      if(memoryCommand){
-        answer=memoryCommand;
+      const memoryCommand=soulCommand?null:handleMemoryCommand({db,userId,message});
+      if(soulCommand||memoryCommand){
+        answer=soulCommand||memoryCommand;
         storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       }else{
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,
+      // Soul directive renders the user's tuned personality (or the demo
+      // neutral default) into the system-prompt layer for this turn.
+      const soulDirective=resolveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name});
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,
         memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},

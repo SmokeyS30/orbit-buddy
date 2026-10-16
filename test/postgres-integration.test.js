@@ -192,3 +192,40 @@ test('PostgreSQL: Memory v2 auto-recall parity (auto-save + contradiction guard)
     }
   }
 });
+
+test('PostgreSQL: Soul core parity (migrations + versioned record + history)', async () => {
+  assert.ok(DATABASE_URL, 'TEST_DATABASE_URL must be set (CI provides PostgreSQL 16 service)');
+  await ensureSchema();
+  const email = `pgtest-soul-${Date.now()}@example.com`;
+  let db = null;
+  let userId = null;
+  try {
+    db = createSyncPgAdapter(DATABASE_URL);
+    const user = db.createUser({ email, displayName: 'PG Soul', passwordHash: 'h', passwordSalt: 's', role: 'member' });
+    userId = user.id;
+    // Tables must exist via the PROD migrations path (not just postgres-schema.sql).
+    assert.equal(db.getSoulRecord(userId), null, 'no soul record initially');
+    const saved = db.saveSoulRecord(userId, { name: 'Orbit', warmth: 3, directness: 4, playfulness: 2, formality: 1 }, 'tune:directness+1');
+    assert.equal(saved.version, 1);
+    assert.equal(saved.directness, 4);
+    const saved2 = db.saveSoulRecord(userId, { ...saved, playfulness: 3 }, 'tune:playfulness+1');
+    assert.equal(saved2.version, 2);
+    const current = db.getSoulRecord(userId);
+    assert.equal(current.version, 2);
+    assert.equal(current.playfulness, 3);
+    const history = db.listSoulHistory(userId, 10);
+    assert.equal(history.length, 2, 'append-only history has both versions');
+    assert.equal(history[0].version, 2, 'newest first');
+    const v1 = db.getSoulHistoryVersion(userId, 1);
+    assert.ok(v1, 'specific version retrievable');
+    assert.equal(JSON.parse(v1.record_json).directness, 4);
+  } finally {
+    try {
+      if (db && userId) {
+        try { db.deleteDemoUser(userId); } catch {}
+      }
+    } finally {
+      if (db) { try { db.close(); } catch {} }
+    }
+  }
+});

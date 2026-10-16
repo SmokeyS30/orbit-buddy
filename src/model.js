@@ -406,7 +406,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -437,6 +437,10 @@ export function createModelClient(env = process.env) {
           ? [`One gentle ask, woven naturally into this conversation (never a formal setup question): may you note the setting of your chats — the time of day and any place labels the user mentions themselves, like "at the cabin" — so you can notice their rhythms (e.g. Sunday-morning hike planning)? Be explicit and honest: it's only with their permission; everything is stored as ordinary memories they can see and delete in the Memory tab; nothing leaves this server; you never track precise location, only labels they give you. If they say yes, call the set_ambient_context tool with "granted" right away. If they decline, call it with "declined". If they dodge or ignore the question, drop it completely and don't bring it up again.`]
           : []),
         `Today is ${today} (YYYY-MM-DD) in the user's timezone, ${timeZone}. Use it to resolve relative dates like "Thursday", "tomorrow", or "next week".`,
+        // Soul core ("how Orbit is" — the user's own tuned personality, or the
+        // neutral default in demo mode). Prompt-only layer: no extra API calls.
+        // Stays separate from writingVoice ("how the user writes" — drafting only).
+        ...(soulDirective ? [String(soulDirective)] : []),
         taskMode ? 'Complete the requested background thinking task and return a useful result.' : 'Answer the user directly.',
         // X5 "Writes like you": the learned voice applies ONLY when the user
         // asks Orbit to draft/write something — never in normal conversation.

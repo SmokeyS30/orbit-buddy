@@ -214,6 +214,24 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         created_at TEXT NOT NULL,
         UNIQUE(message_id, version)
       )`,
+      // Soul core: versioned personality record per user (personality only —
+      // no personal facts) + append-only edit history. Revisions are
+      // insert-only; the current record is always max(version).
+      `CREATE TABLE IF NOT EXISTS soul_records (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        record_json TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS soul_history (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        record_json TEXT NOT NULL,
+        source TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(user_id, version)
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -226,6 +244,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_study_attempts_user ON study_attempts(user_id, attempted_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_catchup_seen_user ON catchup_seen(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -849,6 +868,43 @@ const indexMigrations = [
       await this.getPreferences(userId);
       await run('UPDATE user_preferences SET writing_voice_opt_in=0, writing_voice_profile=NULL, writing_voice_updated_at=NULL, updated_at=? WHERE user_id=?', timestamp(), userId);
       return this.getWritingVoice(userId);
+    },
+
+    // Soul core: versioned personality record per user (personality only — no
+    // personal facts) + append-only edit history. Mirrors the SQLite methods.
+    async getSoulRecord(userId) {
+      const row = await get('SELECT user_id, record_json, version, updated_at FROM soul_records WHERE user_id=?', userId);
+      if (!row) return null;
+      let record = null;
+      try { record = JSON.parse(row.record_json); } catch {}
+      if (!record || typeof record !== 'object') return null;
+      return { ...record, version: Number(row.version), updatedAt: row.updated_at };
+    },
+    async saveSoulRecord(userId, record, source) {
+      const current = await this.getSoulRecord(userId);
+      const version = (current?.version || 0) + 1;
+      const clean = { ...record };
+      delete clean.version;
+      delete clean.updatedAt;
+      const json = JSON.stringify(clean);
+      const now = timestamp();
+      await run(`INSERT INTO soul_records(user_id, record_json, version, updated_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET record_json=excluded.record_json, version=excluded.version, updated_at=excluded.updated_at`,
+        userId, json, version, now);
+      await run('INSERT INTO soul_history(id, user_id, version, record_json, source, created_at) VALUES(?,?,?,?,?,?)',
+        randomUUID(), userId, version, json, String(source || '').slice(0, 80), now);
+      return { ...clean, version, updatedAt: now };
+    },
+    async listSoulHistory(userId, limit = 10) {
+      const n = Math.max(1, Math.min(50, Number(limit) || 10));
+      return all('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? ORDER BY version DESC LIMIT ?', userId, n);
+    },
+    async getSoulHistoryVersion(userId, version) {
+      const row = await get('SELECT id, user_id, version, record_json, source, created_at FROM soul_history WHERE user_id=? AND version=?', userId, version);
+      if (!row) return null;
+      let record = null;
+      try { record = JSON.parse(row.record_json); } catch {}
+      return { ...row, record };
     },
 
     // --- People ---
