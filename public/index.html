@@ -21,7 +21,7 @@
     />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261015a" />
+    <link rel="stylesheet" href="/styles.css?v=20261016a" />
     <link rel="stylesheet" href="/mobile.css" />
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
@@ -393,6 +393,11 @@
             ><button class="primary">Create project</button>
           </div>
         </form>
+        <div id="projects-view-toggle" class="view-toggle" role="tablist" aria-label="Project steps view">
+          <button type="button" role="tab" data-projects-view="list" aria-selected="true">List</button>
+          <button type="button" role="tab" data-projects-view="kanban" aria-selected="false">Kanban</button>
+          <button type="button" role="tab" data-projects-view="timeline" aria-selected="false">Timeline</button>
+        </div>
         <div id="projects-list" class="card-list"></div>
       </section>
 
