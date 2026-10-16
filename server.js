@@ -12,7 +12,7 @@ import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAg
 import { createPushService } from './src/push.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
+import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems, parseSearchFilterParams } from './src/conversation-search.js';
 import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone, detectActivityRhythms, activityRhythmSentence, activityRhythmKey } from './src/ambient.js';
@@ -249,6 +249,150 @@ export function stripSuggestMarkers(text){
   return text.replace(/\[SUGGEST_MEMORY:[^\]\n]*\]/gi,'').replace(/\n{3,}/g,'\n\n').trim();
 }
 export function stripModelMarkers(text){return stripCitationMarkers(stripSuggestMarkers(stripFollowUpMarkers(text)));}
+//
+// Memory v2 — chat-native review/delete (2026-10-16, invisible complexity).
+// No settings UI, no toggles, no dashboard for memory. The owner reviews and
+// deletes what Orbit knows in plain chat:
+//   "what do you know about me?" -> conversational list, paginated
+//   "forget X" / "forget everything about Y" -> match, confirm in chat, delete
+// Auto-recall is ON by default: suggestions persist after MEMORY_AUTO_SAVE_MINUTES
+// unless dismissed; contradictory ones stay pending for explicit approval.
+// Teaching ("remember that...") already flows through chat tools — nothing new here.
+const MEMORY_AUTO_SAVE_MINUTES=15;
+const MEMORY_PAGE_SIZE=10;
+const MEMORY_PENDING_TTL_MS=10*60_000;
+export function isMemoryListRequest(text){
+  return /^(what do you (know|remember) about me|what do you remember|show me (all |my )?memories|list (all |my )?memories|tell me everything you (know|remember) about me|what have you (remembered|learned) about me)\??$/i.test(String(text||'').trim());
+}
+export function isMemoryMoreRequest(text){
+  return /^(more|show more|next page|keep going|continue)$/i.test(String(text||'').trim());
+}
+export function isMemoryConfirm(text){
+  return /^(yes|yeah|yep|yup|confirm|sure|do it|go ahead|ok(ay)?|absolutely)\.?$/i.test(String(text||'').trim());
+}
+export function isMemoryCancel(text){
+  return /^(no|nope|cancel|never ?mind|stop|don'?t)\.?$/i.test(String(text||'').trim());
+}
+// "forget X" | "forget about X" | "forget everything about Y" | "forget all about Y" | "forget 2" (numbered pick)
+export function parseForgetRequest(text){
+  const t=String(text||'').trim();
+  let m=t.match(/^forget\s+(?:number\s+)?(\d{1,2})\.?$/i);
+  if(m)return {kind:'pick',index:Number(m[1])};
+  m=t.match(/^forget\s+(?:everything|all)\s+about\s+(.+?)[.!?]*$/i);
+  if(m&&m[1].trim())return {kind:'bulk',query:m[1].trim()};
+  m=t.match(/^forget\s+(?:about\s+)?(.+?)[.!?]*$/i);
+  if(m&&m[1].trim()&&!/^(it|that|this)$/i.test(m[1].trim()))return {kind:'single',query:m[1].trim()};
+  return null;
+}
+function memoryPendingKey(userId){return `memory_pending_${userId}`;}
+// Forget matching needs a genuine hit: the content must contain the query or one
+// of its significant words (rankMemories alone always returns up to `limit` rows).
+function memoryQueryHits(memory, query) {
+  const content = String(memory.content || '').toLowerCase();
+  const q = String(query || '').toLowerCase().trim();
+  if (!q) return false;
+  if (content.includes(q)) return true;
+  return q.split(/[^a-z0-9']+/).filter((w) => w.length > 2).some((w) => content.includes(w));
+}
+function getMemoryPending(db,userId){
+  let p=null;
+  try{p=JSON.parse(db.getSetting(memoryPendingKey(userId))||'null');}catch{}
+  if(p&&p.expiresAt&&Date.now()>p.expiresAt){db.setSetting(memoryPendingKey(userId),'');return null;}
+  return p;
+}
+function setMemoryPending(db,userId,pending){
+  db.setSetting(memoryPendingKey(userId),JSON.stringify({...pending,expiresAt:Date.now()+MEMORY_PENDING_TTL_MS}));
+}
+function clearMemoryPending(db,userId){db.setSetting(memoryPendingKey(userId),'');}
+function formatMemoryLine(memory,index){
+  const kind=memory.kind&&memory.kind!=='fact'?` (${memory.kind})`:'';
+  return `${index}. ${memory.content}${kind}`;
+}
+// Returns a reply string when the message is a memory-review command, else null.
+// Synchronous — runs before the model call so review/delete is instant and exact.
+export function handleMemoryCommand({db,userId,message}){
+  const text=String(message||'').trim();
+  if(!text||text.length>300)return null;
+  const pending=getMemoryPending(db,userId);
+  // --- pending multi-step flows (confirm / cancel / numbered pick / more) ---
+  if(pending){
+    if(isMemoryCancel(text)){clearMemoryPending(db,userId);return 'Kept everything — nothing deleted.';}
+    if(isMemoryConfirm(text)){
+      if(pending.type==='forget'&&pending.ids&&pending.ids.length){
+        let deleted=0;
+        for(const id of pending.ids){try{if(db.deleteMemory(userId,id))deleted++;}catch{}}
+        clearMemoryPending(db,userId);
+        db.addEvent(userId,'memory_deleted',`Deleted ${deleted} ${deleted===1?'memory':'memories'} via chat.`);
+        return deleted===1
+          ? `Done — forgot “${pending.label}”.`
+          : `Done — forgot ${deleted} memories${pending.label?` about “${pending.label}”`:''}.`;
+      }
+      clearMemoryPending(db,userId);
+      return null; // stale pending shape; fall through to normal chat
+    }
+    const pick=parseForgetRequest(text);
+    if(/^forget\s+all\.?$/i.test(text)&&pending.type==='forget-list'&&pending.ids&&pending.ids.length){
+      setMemoryPending(db,userId,{type:'forget',ids:pending.ids,label:pending.label});
+      return `Delete all ${pending.ids.length} memories about “${pending.label}”? Say yes to confirm, or no to keep them.`;
+    }
+    if(pick&&pick.kind==='pick'&&pending.type==='forget-list'&&pending.matches){
+      const chosen=pending.matches[pick.index-1];
+      if(chosen){
+        setMemoryPending(db,userId,{type:'forget',ids:[chosen.id],label:chosen.content});
+        return `Forget this one?\n\n“${chosen.content}”\n\nSay yes to confirm, or no to keep it.`;
+      }
+    }
+    if(isMemoryMoreRequest(text)&&pending.type==='list'){
+      return memoryListReply(db,userId,pending.offset);
+    }
+    // Any other message abandons the pending flow (don't swallow real chat).
+    clearMemoryPending(db,userId);
+  }
+  // --- fresh commands ---
+  if(isMemoryListRequest(text))return memoryListReply(db,userId,0);
+  const forget=parseForgetRequest(text);
+  if(forget&&forget.kind!=='pick'){
+    const memories=db.listMemories(userId);
+    // Bare "forget all" / "forget everything": delete every memory, with explicit confirm.
+    if(forget.kind==='single'&&/^(all|everything)$/i.test(forget.query)){
+      const live=memories.filter((m)=>!m.superseded_by);
+      if(!live.length)return `I don't have anything saved about you yet — nothing to forget.`;
+      setMemoryPending(db,userId,{type:'forget',ids:live.map((m)=>m.id),label:'everything'});
+      return `This would delete all ${live.length} things I remember about you. Say yes to confirm, or no to keep everything.`;
+    }
+    const matches=rankMemories(memories,forget.query,forget.kind==='bulk'?100:8)
+      .filter((m)=>!m.superseded_by&&memoryQueryHits(m,forget.query));
+    if(!matches.length)return `I don't have anything about “${forget.query}” saved.`;
+    if(matches.length===1){
+      setMemoryPending(db,userId,{type:'forget',ids:[matches[0].id],label:matches[0].content});
+      return `Forget this?\n\n“${matches[0].content}”\n\nSay yes to confirm, or no to keep it.`;
+    }
+    const shown=matches.slice(0,5);
+    setMemoryPending(db,userId,{type:'forget-list',ids:matches.map((m)=>m.id),label:forget.query,matches:matches.map((m)=>({id:m.id,content:m.content}))});
+    const lines=shown.map((m,i)=>formatMemoryLine(m,i+1)).join('\n');
+    const more=matches.length>5?`\n…and ${matches.length-5} more.`:'';
+    return `I found ${matches.length} memories about “${forget.query}”:\n\n${lines}${more}\n\nSay “forget all” to delete them all, “forget 2” for just one, or no to keep everything.`;
+  }
+  if(isMemoryMoreRequest(text)){
+    // "more" with no pending list -> gentle nudge, not an error
+    return null;
+  }
+  return null;
+}
+function memoryListReply(db,userId,offset){
+  const memories=(db.listMemories(userId)||[]).filter((m)=>!m.superseded_by);
+  if(!memories.length){clearMemoryPending(db,userId);return `I don't have anything saved about you yet. Tell me things you'd like me to remember — “remember that…” — and I'll keep them.`;}
+  const total=memories.length;
+  const page=memories.slice(offset,offset+MEMORY_PAGE_SIZE);
+  const lines=page.map((m,i)=>formatMemoryLine(m,offset+i+1)).join('\n');
+  if(offset+MEMORY_PAGE_SIZE<total){
+    setMemoryPending(db,userId,{type:'list',offset:offset+MEMORY_PAGE_SIZE});
+    return `Here's what I remember about you (${total} total):\n\n${lines}\n\nSay “more” for the next ${Math.min(MEMORY_PAGE_SIZE,total-offset-MEMORY_PAGE_SIZE)}, or “forget <thing>” to remove anything.`;
+  }
+  clearMemoryPending(db,userId);
+  const tail=offset>0?`\n\nThat's everything (${total}).`:` (${total} total)`;
+  return `Here's what I remember about you${tail}:\n\n${lines}\n\nSay “forget <thing>” to remove anything, anytime.`;
+}
 function sanitizeAssistantMessages(messages){return messages.map((message)=>message.role==='assistant'?{...message,content:stripModelMarkers(message.content)}:message);}
 // W3: conversation share/export — clean markdown for a whole thread:
 // title, roles with timestamps, code blocks preserved, no internal
@@ -485,6 +629,14 @@ export function createOrbitServer(options={}) {
         offerWritingVoice=true;
         try{db.markWritingVoiceOffered(userId);}catch(_){}
       }
+      // Memory v2 (chat-native, 2026-10-16): memory review/delete lives in chat.
+      // "what do you know about me?" / "forget X" are answered directly — instant,
+      // exact, no model call, no UI. Works identically on web and WhatsApp.
+      const memoryCommand=handleMemoryCommand({db,userId,message});
+      if(memoryCommand){
+        answer=memoryCommand;
+        storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      }else{
       const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,
         memories:db.listRelevantMemories(userId,message),goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
@@ -494,8 +646,13 @@ export function createOrbitServer(options={}) {
       // Backward compatibility for replies from older/custom models that still emit legacy markers.
       for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
       for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
+      // Memory v2: auto-recall ON by default — suggestions older than the review
+      // window persist automatically (contradictory ones stay pending; the owner
+      // reviews/deletes anything in chat). The 2/reply suggestion cap is unchanged.
+      try{const autoSaved=db.autoApproveMemorySuggestions(userId,MEMORY_AUTO_SAVE_MINUTES);if(autoSaved>0)db.addEvent(userId,'memory_added',`Auto-saved ${autoSaved} suggested ${autoSaved===1?'memory':'memories'} after the review window.`);}catch(e){}
       answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
       storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+      }
       if(db.getSetting(`ambient_context_${userId}`)==='granted'){
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
@@ -680,6 +837,9 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
 
       // Memory decay: fade relevance of unused memories (runs once daily per user)
       try{db.applyMemoryDecay(user.id);}catch(e){}
+      // Memory v2 backstop: auto-save suggestions past the review window even for
+      // quiet users (runs once daily per user alongside decay).
+      try{const n=db.autoApproveMemorySuggestions(user.id,MEMORY_AUTO_SAVE_MINUTES);if(n>0)db.addEvent(user.id,'memory_added',`Auto-saved ${n} suggested ${n===1?'memory':'memories'} after the review window.`);}catch(e){}
       // Get recent messages (last 24h, up to 40)
       const messages=db.listMessages(user.id,40);
       const cutoff=nowMs-24*3600_000;

@@ -495,12 +495,29 @@ const indexMigrations = [
     },
     listMemorySuggestions: async (userId) => all('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 50', userId),
     dismissMemorySuggestion: async (userId, id) => (await run('DELETE FROM memory_suggestions WHERE id=? AND user_id=?', id, userId)).changes > 0,
-    async approveMemorySuggestion(userId, id) {
+    async approveMemorySuggestion(userId, id, options={}) {
       const row = await get('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?', id, userId);
       if (!row) return null;
-      const saved = await this.addMemory(userId, row.content, { kind: row.kind, source: 'suggestion', confidence: row.confidence });
+      const saved = await this.addMemory(userId, row.content, { kind: row.kind, source: options.source || 'suggestion', confidence: row.confidence });
       await run('DELETE FROM memory_suggestions WHERE id=? AND user_id=?', id, userId);
       return { ...row, memory_id: saved.id };
+    },
+    // Memory v2: auto-recall ON by default (SQLite twin above has the full comment).
+    // Contradictory suggestions are never auto-saved — flagged, never overwritten.
+    async autoApproveMemorySuggestions(userId, windowMinutes=15) {
+      const cutoff = new Date(Date.now() - windowMinutes * 60_000).toISOString();
+      const stale = (await this.listMemorySuggestions(userId)).filter((r) => r.created_at <= cutoff);
+      if (!stale.length) return 0;
+      const existing = await all("SELECT * FROM memories WHERE user_id=? AND status='approved'", userId);
+      let saved = 0;
+      for (const row of stale) {
+        let contradicted = false;
+        try { const c = detectContradiction(row.content, existing); contradicted = !!(c && c.contradicted && c.contradicted.id); } catch {}
+        if (contradicted) continue;
+        const approved = await this.approveMemorySuggestion(userId, row.id, { source: 'auto-suggestion' });
+        if (approved) { saved++; existing.push({ id: approved.memory_id, content: row.content, status: 'approved', superseded_by: null, kind: row.kind }); }
+      }
+      return saved;
     },
 
     // --- Import jobs ---

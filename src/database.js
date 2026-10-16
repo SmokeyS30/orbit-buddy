@@ -853,7 +853,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addMemorySuggestion(userId,content,options={}){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
     dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
-    approveMemorySuggestion(userId,id){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const saved=this.addMemory(userId,row.content,{kind:row.kind,source:'suggestion',confidence:row.confidence});s.deleteMemorySuggestion.run(id,userId);return {...row,memory_id:saved.id};},
+    approveMemorySuggestion(userId,id,options={}){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const saved=this.addMemory(userId,row.content,{kind:row.kind,source:options.source||'suggestion',confidence:row.confidence});s.deleteMemorySuggestion.run(id,userId);return {...row,memory_id:saved.id};},
+    // Memory v2 (chat-native, 2026-10-16): auto-recall is ON by default — suggestions older
+    // than the review window persist automatically. A suggestion that contradicts an
+    // existing memory is NEVER auto-saved: it stays pending for explicit approval
+    // (verified behavior 2026-10-10 — conflicts are flagged, never silently overwritten).
+    autoApproveMemorySuggestions(userId,windowMinutes=15){
+      const cutoff=new Date(Date.now()-windowMinutes*60_000).toISOString();
+      const stale=s.listMemorySuggestions.all(userId).filter((r)=>r.created_at<=cutoff);
+      if(!stale.length)return 0;
+      const existing=s.listMemories.all(userId);
+      let saved=0;
+      for(const row of stale){
+        let contradicted=false;
+        try{const c=detectContradiction(row.content,existing);contradicted=!!(c&&c.contradicted&&c.contradicted.id);}catch{}
+        if(contradicted)continue;
+        const approved=this.approveMemorySuggestion(userId,row.id,{source:'auto-suggestion'});
+        if(approved){saved++;existing.push({id:approved.memory_id,content:row.content,status:'approved',superseded_by:null,kind:row.kind});}
+      }
+      return saved;
+    },
     createImportJob(userId,filename){const now=timestamp();const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;},
     getImportJob:(userId,id)=>s.getImportJob.get(id,userId)||null,
     listImportJobs:(userId)=>s.listImportJobs.all(userId),
