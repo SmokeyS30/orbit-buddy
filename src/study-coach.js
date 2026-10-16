@@ -201,22 +201,25 @@ export function getStudyWeakSpots(db, userId, days = WEAK_SPOT_DAYS) {
 }
 
 // Consecutive local days with at least one recorded quiz answer, ending today
-// (or yesterday — today's session may not have happened yet). Pure read of
-// study_attempts; nothing to write or migrate.
-export function getStudyStreak(db, userId, timeZone) {
-  const days = db.getStudyActiveDates(userId) || [];
-  const set = new Set(days);
+// (or yesterday — today's session may not have happened yet). Bucketed from
+// raw attempt timestamps in the user's timezone: bucketing the stored UTC
+// date directly breaks near midnight (UTC day != local day 00:00–04:59 UTC
+// for America/New_York), so we convert each timestamp to the local day here.
+// `nowMs` is injectable for tests; defaults to the current time.
+export function getStudyStreak(db, userId, timeZone, nowMs = Date.now()) {
+  const times = db.getStudyAttemptTimes(userId) || [];
   const dayMs = 86400_000;
   const toKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone });
-  const todayKey = toKey(Date.now());
-  let cursor = Date.now();
+  const set = new Set(times.map((t) => toKey(new Date(t).valueOf())));
+  const todayKey = toKey(nowMs);
+  let cursor = nowMs;
   if (!set.has(todayKey)) cursor -= dayMs;
   let streak = 0;
   while (set.has(toKey(cursor))) {
     streak += 1;
     cursor -= dayMs;
   }
-  return { days: streak, lastActiveDate: days[0] || null };
+  return { days: streak, lastActiveDate: times.length ? toKey(new Date(times[0]).valueOf()) : null };
 }
 
 export function getLastStudyActivity(db, userId) {

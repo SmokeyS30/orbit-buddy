@@ -1048,7 +1048,7 @@ const indexMigrations = [
         SUM(CASE WHEN a.correct=0 THEN 1 ELSE 0 END) AS wrong
       FROM study_attempts a JOIN study_questions q ON q.id=a.question_id
       WHERE a.user_id=? AND a.attempted_at>=? GROUP BY q.exam,q.topic`, userId, cutoff),
-    getStudyActiveDates: async (userId) => (await all('SELECT DISTINCT SUBSTR(attempted_at,1,10) AS day FROM study_attempts WHERE user_id=? ORDER BY day DESC LIMIT 400', userId)).map((r) => r.day),
+    getStudyAttemptTimes: async (userId) => (await all('SELECT attempted_at AS at FROM study_attempts WHERE user_id=? ORDER BY at DESC LIMIT 2000', userId)).map((r) => r.at),
     getLastStudyActivity: async (userId) => (await get('SELECT MAX(attempted_at) AS last_at FROM study_attempts WHERE user_id=?', userId))?.last_at || null,
     isRadarMuted: async (userId, repo) => Boolean(await get('SELECT 1 FROM radar_mutes WHERE user_id=? AND repo=?', userId, String(repo).toLowerCase())),
 
