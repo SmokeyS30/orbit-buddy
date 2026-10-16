@@ -28,6 +28,12 @@
 // read path anywhere in this module — an owner's tuned soul can never leak
 // to demo users or to anyone else.
 
+// Emotional grounding (memory connections, 2026-10-16): the adaptive layer
+// consumes the detected emotional tone so its shifts track how the user is
+// actually feeling, not just surface keywords. Orbit MODELS the emotion —
+// it does not feel it (see src/memory-connections.js).
+import { detectEmotionalTone, EMOTION_SHIFTS } from './memory-connections.js';
+
 // Personality axes, each an integer 0..4. The record stores only these axes
 // (plus a name) — everything descriptive is derived at render time, so the
 // stored shape stays small and forward-compatible.
@@ -756,6 +762,20 @@ export function applyAdaptation({ db, userId, message, timeZone, nowMs }) {
           warm_engagement: 'you were enjoying the banter',
         }[signals[0].kind] || '';
         mood = `signal:${signals[0].kind}`;
+      }
+    }
+    // Emotional grounding (memory connections): when no explicit signal or
+    // conversation mood matched, a detected emotional tone still shapes the
+    // targets — tone-shifting tracks how he's actually feeling. Explicit
+    // signals and moods keep priority (they're more specific).
+    if (!moodDef && signals.length === 0) {
+      const tone = detectEmotionalTone(message);
+      const mapping = EMOTION_SHIFTS[tone];
+      if (mapping) {
+        targets = { ...mapping.targets };
+        reason = mapping.reason;
+        whyPast = mapping.whyPast;
+        mood = `emotion:${tone}`;
       }
     }
   }

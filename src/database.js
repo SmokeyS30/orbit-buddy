@@ -591,6 +591,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMemorySurfacing: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? AND occurrence_key=?'),
     listMemorySurfacings: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT ?'),
     getLastMemorySurfacing: db.prepare('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT 1'),
+    // Memory connections (2026-10-16): stable occurrence keys (pattern kind+theme)
+    // are re-surfaced after their cooldown — refresh surfaced_at on re-record
+    // since recordMemorySurfacing is INSERT OR IGNORE.
+    touchMemorySurfacing: db.prepare('UPDATE memory_surfacing SET surfaced_at=? WHERE user_id=? AND occurrence_key=?'),
     trackPersonMention: db.prepare(`INSERT INTO people_mentions(user_id,person_name,last_mentioned_at,last_nudged_at,dismissed,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,person_name) DO UPDATE SET last_mentioned_at=excluded.last_mentioned_at,
       dismissed=0,updated_at=excluded.updated_at`),
@@ -1049,6 +1053,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getMemorySurfacing:(userId,occurrenceKey)=>s.getMemorySurfacing.get(userId,occurrenceKey)||null,
     listMemorySurfacings:(userId,limit=100)=>s.listMemorySurfacings.all(userId,Math.max(1,Math.min(500,limit||100))),
     getLastMemorySurfacing:(userId)=>s.getLastMemorySurfacing.get(userId)||null,
+    // Memory connections: refresh surfaced_at when a stable-occurrence-key
+    // insight is re-surfaced after its cooldown (INSERT OR IGNORE won't).
+    touchMemorySurfacing(userId,occurrenceKey){
+      if(!userId||!occurrenceKey)return false;
+      return s.touchMemorySurfacing.run(timestamp(),userId,occurrenceKey).changes>0;
+    },
     getSoulHistoryVersion(userId,version){const row=s.getSoulHistoryVersion.get(userId,version);if(!row)return null;let record=null;try{record=JSON.parse(row.record_json);}catch{}return {...row,record};},
     trackPersonMention(userId,personName){const name=String(personName||'').trim().slice(0,80);if(!name)return null;const now=timestamp();s.trackPersonMention.run(userId,name,now,null,0,now,now);return name;},
     getStalePeople(userId,daysThreshold=14){const nowMs=Date.now();const mentionedCutoff=new Date(nowMs-daysThreshold*86400_000).toISOString();const nudgeCutoff=new Date(nowMs-30*86400_000).toISOString();return s.getStalePeople.all(userId,mentionedCutoff,nudgeCutoff);},

@@ -946,6 +946,14 @@ const indexMigrations = [
     },
     getLastMemorySurfacing: async (userId) =>
       (await get('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT 1', userId)) || null,
+    // Memory connections: refresh surfaced_at when a stable-occurrence-key
+    // insight is re-surfaced after its cooldown (ON CONFLICT DO NOTHING won't).
+    async touchMemorySurfacing(userId, occurrenceKey) {
+      if (!userId || !occurrenceKey) return false;
+      const result = await run('UPDATE memory_surfacing SET surfaced_at=? WHERE user_id=? AND occurrence_key=?',
+        timestamp(), userId, occurrenceKey);
+      return result.changes > 0;
+    },
 
     // --- People ---
     trackPersonMention: async (userId, personName) => {
