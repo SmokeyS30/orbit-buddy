@@ -11,13 +11,17 @@
 // Bump CACHE + STATIC_VERSION together whenever shipped static assets change,
 // so existing clients drop the old cache cleanly on next visit.
 
-const CACHE = 'orbit-buddy-v52';
+const CACHE = 'orbit-buddy-v53';
 const STATIC_VERSION = '20261015a'; // keep in sync with the ?v= in public/index.html
 
 // Every static asset the app shell needs on first paint / offline.
 // The list is generated from these entries (see buildPrecacheManifest) so it
 // can't go stale the way the old hardcoded list did — v50 missed the
 // versioned ?v= CSS, voice-mode.js, canvas.js and desktop.css.
+// W7: voice-mode.js and canvas.js are NOT precached anymore — they are
+// code-split chunks fetched on first use. The fetch handler below serves them
+// via stale-while-revalidate on demand (network, then cached), so removing
+// them from the precache list is safe.
 const STATIC_ASSETS = [
   { url: '/', versioned: false },
   { url: '/styles.css', versioned: true },
@@ -26,8 +30,6 @@ const STATIC_ASSETS = [
   { url: '/smooth.css', versioned: false },
   { url: '/app.js', versioned: false },
   { url: '/briefing-layout.js', versioned: false },
-  { url: '/voice-mode.js', versioned: false },
-  { url: '/canvas.js', versioned: false },
   { url: '/chat-scroll.js', versioned: false },
   { url: '/chat-markdown.js', versioned: false },
   { url: '/deep-link.js', versioned: false },
