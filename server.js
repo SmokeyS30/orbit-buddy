@@ -1912,6 +1912,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       res.setHeader('Content-Type','text/html; charset=utf-8');
       res.setHeader('Cache-Control','no-store');
+      // Maintenance page uses an inline <style> block; relax style-src for this
+      // response only so it renders styled. Other routes keep the strict CSP.
+      res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
       res.writeHead(503);res.end(maintenanceHtml);return;
     }
     // ===== END MAINTENANCE MODE =====
