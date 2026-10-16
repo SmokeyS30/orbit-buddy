@@ -14,7 +14,7 @@ import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems } from './src/conversation-search.js';
-import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone } from './src/ambient.js';
+import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone, detectActivityRhythms, activityRhythmSentence, activityRhythmKey } from './src/ambient.js';
 import { buildTimeline, formatTimeline } from './src/memory-timeline.js';
 import { buildTodayBriefing, resolveBriefingCoords } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
@@ -221,6 +221,50 @@ export function quietNudgeDue(lastActivityAt,lastNudgeAt,nowMs){
   if(!(idleMs>48*3600_000))return false;
   if(!lastNudgeAt)return true;
   return (nowMs-new Date(lastNudgeAt).valueOf())>7*24*3600_000;
+}
+
+/**
+ * D4 — passive rhythm detection: conversation starts + task creations clustered
+ * by (day-of-week × time bucket). Called from runLearningCycle with the SAME
+ * permission gate as R3: the `ambient_context_<user.id>` setting must be
+ * 'granted'. When not granted, NOTHING is written — no memories, no events.
+ *
+ * Signals: each conversation row's created_at (when that chat session began)
+ * and each task's created_at, over the last ~30 days. Results are stored as
+ * ordinary visible, deletable memories (kind 'fact', source 'ambient-rhythm')
+ * — they never silently change suggestions, nudges, or briefing content, and
+ * deleting the memory removes the rhythm entirely. Max 2 new rhythm memories
+ * per run. Exported for tests.
+ */
+export function applyActivityRhythmDetection(db,user,{nowMs,timeZone}={}){
+  const userId=user&&(user.id||user.user_id);
+  if(!userId)return {gated:true,added:0};
+  if(db.getSetting(`ambient_context_${userId}`)!=='granted')return {gated:true,added:0};
+  const tz=timeZone||'America/New_York';
+  const asMs=(v)=>{const ms=v==null?NaN:new Date(v).valueOf();return Number.isFinite(ms)?ms:null;};
+  const chatStarts=[];
+  for(const c of db.listConversations(userId)||[]){const ms=asMs(c&&c.created_at);if(ms!=null)chatStarts.push({atMs:ms});}
+  const taskStarts=[];
+  for(const t of db.listTasks(userId)||[]){const ms=asMs(t&&t.created_at);if(ms!=null)taskStarts.push({atMs:ms});}
+  const candidates=[];
+  for(const [type,starts] of [['chat',chatStarts],['task',taskStarts]]){
+    for(const r of detectActivityRhythms(starts,{nowMs,timeZone:tz}))candidates.push({type,rhythm:r});
+  }
+  candidates.sort((a,b)=>b.rhythm.distinctDays-a.rhythm.distinctDays||b.rhythm.share-a.rhythm.share);
+  // listMemoriesBySource caps at 50 (db-side); share the dedup namespace with R3.
+  const known=new Set((db.listMemoriesBySource(userId,'ambient-rhythm',50)||[]).map((m)=>String(m.content||'').split(' ')[0]));
+  const who=user.display_name||'The user';
+  let added=0;
+  for(const {type,rhythm} of candidates){
+    if(added>=2)break;
+    const marker=activityRhythmKey(type,rhythm);
+    if(known.has(marker))continue;
+    known.add(marker);
+    db.addMemory(userId,`${marker} ${who} ${activityRhythmSentence(type,rhythm)}. Noticed from when new chats and tasks begin — an observation only; nothing about Orbit changes because of it.`,{kind:'fact',source:'ambient-rhythm',confidence:0.7});
+    added+=1;
+  }
+  if(added>0)db.addEvent(userId,'ambient_rhythm',`Noticed ${added} activity rhythm${added>1?'s':''} from chat and task times.`);
+  return {gated:false,added};
 }
 
 export function createOrbitServer(options={}) {
@@ -654,6 +698,14 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
           if(rhythmsAdded>0)db.addEvent(user.id,'ambient_rhythm',`Noticed ${rhythmsAdded} chat rhythm${rhythmsAdded>1?'s':''}.`);
         }
       }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
+
+      // --- D4 passive rhythm detection: conversation starts and task
+      // creations clustered by (day-of-week × time bucket). Same permission
+      // gate and memory-only output as R3 — these rhythms are never read by
+      // any suggestion/nudge/briefing code path.
+      try{
+        applyActivityRhythmDetection(db,user,{nowMs,timeZone});
+      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect activity rhythms.',error.message);}
 
       // --- Monthly deep dive: mine full history for long arcs ---
       try{
