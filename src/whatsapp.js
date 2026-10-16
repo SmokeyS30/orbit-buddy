@@ -94,6 +94,42 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
   return data.sid || null;
 }
 
+/**
+ * Send a WhatsApp media message via Twilio's Messages API (D5: outbound).
+ * Same credential pattern as sendWhatsAppText (Basic auth, form-encoded —
+ * never logged). `mediaUrl` is a public HTTPS URL Twilio fetches server-side
+ * (see GET /api/whatsapp/media/:token). An optional caption `body` may
+ * accompany the media.
+ * Twilio supports up to 10 media items per message via MediaUrl0..MediaUrl9,
+ * but this app sends a single media attachment per message.
+ * Returns the Twilio message SID. Throws on non-2xx.
+ */
+export async function sendWhatsAppMedia({ accountSid, authToken, fromNumber, toPhone, mediaUrl, body }) {
+  if (!mediaUrl) throw new Error('A media URL is required.');
+  const endpoint = `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(accountSid)}/Messages.json`;
+  const form = new URLSearchParams({
+    From: `whatsapp:${fromNumber}`,
+    To: `whatsapp:${toPhone}`,
+    MediaUrl: String(mediaUrl),
+  });
+  if (body) form.set('Body', String(body).slice(0, 1600));
+  const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: form.toString(),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Twilio media send failed (${response.status}): ${text.slice(0, 200)}`);
+  }
+  const data = await response.json().catch(() => ({}));
+  return data.sid || null;
+}
+
 /** Mask a phone for display: +15085551234 -> +1 ••• ••• 1234 */
 export function maskPhone(e164) {
   const digits = String(e164 || '').replace(/\D/g, '');

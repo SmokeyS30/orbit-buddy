@@ -2,7 +2,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
-import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
+import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE } from './src/model.js';
@@ -352,6 +353,10 @@ export function createOrbitServer(options={}) {
   }
 
   function originFor(req){if(publicBase)return publicBase;const protocol=req.headers['x-forwarded-proto']==='https'?'https':production?'https':'http';return `${protocol}://${req.headers.host}`;}
+  // D5: WhatsApp outbound media — absolute signed URL Twilio fetches with its
+  // MediaUrl param. Signed with a sub-key of the existing DATA_ENCRYPTION_KEY
+  // server secret (no new credential); requires PUBLIC_BASE_URL in production.
+  function whatsappMediaUrlFor(mediaId){return buildWhatsAppMediaUrl(publicBase,mediaId,deriveMediaSigningKey(encryptionKey));}
   function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session;if(!token)return null;return db.getSession(hashToken(token));}
   function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
@@ -1996,6 +2001,22 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(hourlyLimited(req,60,'public-usage'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
         const now=new Date();const monthStart=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),1)).toISOString();
         return json(res,200,{month:monthStart.slice(0,7),braveConfigured:!!env.BRAVE_SEARCH_API_KEY?.trim(),webSearches:db.countToolUseSince('web_search',monthStart)});
+      }
+      // D5: Twilio fetches outbound media here server-side. Public by necessity
+      // (Twilio has no session); the signed 15-minute token is the auth, and
+      // WhatsApp itself stays owner-only (linking enforces the owner role, so
+      // only the owner can ever stage media). Invalid and expired tokens both
+      // answer 404 — never 403 — so a token leaks nothing about its validity.
+      // Cache-Control: no-store; bytes are staged in memory and never logged.
+      if(req.method==='GET'&&url.pathname.startsWith('/api/whatsapp/media/')){
+        const token=url.pathname.slice('/api/whatsapp/media/'.length);
+        const verified=verifyWhatsAppMediaToken(token,deriveMediaSigningKey(encryptionKey));
+        const media=verified?peekWhatsAppMedia(verified.mediaId):null;
+        if(!media)return json(res,404,{error:'Not found.'});
+        res.setHeader('Content-Type',media.mimeType);
+        res.setHeader('Content-Length',media.bytes.length);
+        res.setHeader('Cache-Control','private, no-store');
+        res.writeHead(200);res.end(media.bytes);return;
       }
       // WhatsApp webhook (Twilio). Public: Twilio authenticates via X-Twilio-Signature.
       if(req.method==='POST'&&url.pathname==='/api/whatsapp/webhook'){
