@@ -697,7 +697,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         SUM(CASE WHEN a.correct=0 THEN 1 ELSE 0 END) AS wrong
       FROM study_attempts a JOIN study_questions q ON q.id=a.question_id
       WHERE a.user_id=? AND a.attempted_at>=? GROUP BY q.exam,q.topic`),
-    getStudyActiveDates: db.prepare('SELECT DISTINCT SUBSTR(attempted_at,1,10) AS day FROM study_attempts WHERE user_id=? ORDER BY day DESC LIMIT 400'),
+    getStudyAttemptTimes: db.prepare('SELECT attempted_at AS at FROM study_attempts WHERE user_id=? ORDER BY at DESC LIMIT 2000'),
     getLastStudyActivity: db.prepare('SELECT MAX(attempted_at) AS last_at FROM study_attempts WHERE user_id=?'),
   };
 
@@ -1060,7 +1060,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     countStudyQuestions: () => s.countStudyQuestions.get().c,
     recordStudyAttempt({id,userId,questionId,correct}) { s.recordStudyAttempt.run(id,userId,questionId,correct?1:0,timestamp()); },
     getStudyAttemptsByTopic: (userId,cutoff) => s.getStudyAttemptsByTopic.all(userId,cutoff),
-    getStudyActiveDates: (userId) => s.getStudyActiveDates.all(userId).map((r)=>r.day),
+    getStudyAttemptTimes: (userId) => s.getStudyAttemptTimes.all(userId).map((r)=>r.at),
     getLastStudyActivity: (userId) => s.getLastStudyActivity.get(userId)?.last_at || null,
     // "Catch me up" digest: last app-open tracking + seen/dismissed item keys.
     getLastAppOpen: (userId) => s.getLastAppOpen.get(userId)?.last_app_open_at || null,

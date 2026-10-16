@@ -156,18 +156,28 @@ test('streak: consecutive days counted from study_attempts', () => {
   const toKey = (ms) => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/New_York' });
   const today = Date.now();
   const fake = {
-    getStudyActiveDates: () => [0, 1, 2].map((d) => toKey(today - d * 86400_000)),
+    getStudyAttemptTimes: () => [0, 1, 2].map((d) => new Date(today - d * 86400_000).toISOString()),
   };
   assert.equal(getStudyStreak(fake, 'u1', 'America/New_York').days, 3);
   const broken = {
-    getStudyActiveDates: () => [0, 2].map((d) => toKey(today - d * 86400_000)),
+    getStudyAttemptTimes: () => [0, 2].map((d) => new Date(today - d * 86400_000).toISOString()),
   };
   assert.equal(getStudyStreak(broken, 'u1', 'America/New_York').days, 1);
-  const empty = { getStudyActiveDates: () => [] };
+  const empty = { getStudyAttemptTimes: () => [] };
   assert.equal(getStudyStreak(empty, 'u1', 'America/New_York').days, 0);
   // Real DB: one attempt today -> streak of 1.
   db.recordStudyAttempt({ id: 's1', userId: 'u2', questionId: 'a1-ram-ddr5', correct: 1 });
   assert.equal(getStudyStreak(db, 'u2', 'America/New_York').days, 1);
+});
+
+test('streak: attempt near midnight buckets in the user timezone', () => {
+  // Regression: attempts are stored as UTC ISO timestamps. Bucketing the UTC
+  // date broke the streak between 00:00 and 04:59 UTC (23:xx EDT previous day).
+  const db = { getStudyAttemptTimes: () => ['2026-10-16T03:30:00.000Z'] }; // 23:30 EDT Oct 15
+  const nowMs = new Date('2026-10-16T03:35:00.000Z').valueOf(); // 23:35 EDT Oct 15
+  const streak = getStudyStreak(db, 'u1', 'America/New_York', nowMs);
+  assert.equal(streak.days, 1);
+  assert.equal(streak.lastActiveDate, '2026-10-15');
 });
 
 test('buildStudyNudgeLine: empty when no weak spots, counts when present', () => {
