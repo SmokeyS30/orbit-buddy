@@ -91,6 +91,24 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     const messages = db.listMessages(userId, 100);
     assert.ok(messages.some(m => m.id === messageId), 'message found');
 
+    // 7b. W1 parity: messageExists / retimeMessage / deleteMessageTurn must
+    // exist on the Postgres adapter (they were missing; regenerate and
+    // per-message delete threw in production while working on SQLite).
+    assert.equal(db.messageExists(messageId), true, 'messageExists true for a real message');
+    assert.equal(db.messageExists('00000000-0000-0000-0000-000000000000'), false, 'messageExists false for unknown id');
+    const reply = db.addMessage(userId, conversationId, 'assistant', 'Hello back');
+    assert.ok(db.retimeMessage(userId, reply.id, new Date('2026-01-02T03:04:05.000Z').toISOString()), 'retimeMessage updates created_at');
+    const refetched_reply = db.getMessage(userId, reply.id);
+    assert.equal(new Date(refetched_reply.created_at).toISOString().slice(0, 10), '2026-01-02', 'retimed created_at persisted');
+    // Fresh user+assistant pair in natural order for the turn-delete check.
+    const u2 = db.addMessage(userId, conversationId, 'user', 'Second question');
+    const a2 = db.addMessage(userId, conversationId, 'assistant', 'Second answer');
+    const deletedIds = db.deleteMessageTurn(userId, a2.id);
+    assert.ok(Array.isArray(deletedIds) && deletedIds.includes(a2.id) && deletedIds.includes(u2.id), 'deleteMessageTurn removes the whole turn');
+    assert.equal(db.messageExists(a2.id), false, 'assistant reply gone after turn delete');
+    assert.equal(db.messageExists(u2.id), false, 'user message gone after turn delete');
+    assert.equal(db.deleteMessageTurn(userId, '00000000-0000-0000-0000-000000000000'), null, 'deleteMessageTurn null for unknown id');
+
     // 8. Persistence: close and reopen, data must survive.
     db.close(); db = null;
     db2 = createSyncPgAdapter(DATABASE_URL);

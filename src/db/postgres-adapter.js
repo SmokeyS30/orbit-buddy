@@ -405,6 +405,29 @@ const indexMigrations = [
     },
     // W1 parity: user-scoped single-message fetch (mirrors SQLite getMessage).
     getMessage: async (userId, id) => get('SELECT * FROM messages WHERE id=? AND user_id=?', id, userId),
+    // W1 parity: these three mirror their SQLite counterparts. They were
+    // missing here, so regenerate (retimeMessage) and per-message delete
+    // (messageExists/deleteMessageTurn) threw on production Postgres while
+    // working on SQLite — found during the later-wave build sweep.
+    messageExists: async (id) => !!(await get('SELECT 1 FROM messages WHERE id=?', id)),
+    retimeMessage: async (userId, id, createdAt) => (await run('UPDATE messages SET created_at=? WHERE id=? AND user_id=?', createdAt, id, userId)).changes > 0,
+    // Deletes a whole turn: the target message plus the adjacent partner that
+    // completes it (same semantics as SQLite deleteMessageTurn).
+    async deleteMessageTurn(userId, messageId) {
+      const target = await get('SELECT * FROM messages WHERE id=? AND user_id=?', messageId, userId);
+      if (!target) return null;
+      const ordered = await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at ASC, id ASC LIMIT 200', userId, target.conversation_id);
+      const idx = ordered.findIndex((m) => m.id === messageId);
+      const ids = [messageId];
+      const prev = idx > 0 ? ordered[idx - 1] : null;
+      const next = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
+      if (target.role === 'assistant' && prev && prev.role === 'user') ids.push(prev.id);
+      if (target.role === 'user' && next && next.role === 'assistant') ids.push(next.id);
+      await withTransaction(async ({ run: tRun }) => {
+        for (const id of ids) await tRun('DELETE FROM messages WHERE id=? AND user_id=?', id, userId);
+      });
+      return ids;
+    },
     // L1 Canvas v2: replace a message's content in place (used by restore).
     setMessageContent: async (userId, id, content) => (await run('UPDATE messages SET content=? WHERE id=? AND user_id=?', content, id, userId)).changes > 0,
     // L1 Canvas v2: revision history (immutable — rows are only ever inserted).
