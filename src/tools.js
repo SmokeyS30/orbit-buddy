@@ -1383,7 +1383,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'schedule_followup',
-    description: 'Schedule a warm follow-up after the user mentions a meaningful upcoming event with a clear date. Do not use for vague dates or routine calendar items.',
+    description: 'Schedule a warm follow-up after the user mentions a meaningful upcoming event with a clear date. Do not use for vague dates or routine calendar items. When confirming, tell the user: "You\'ll find it under the Memory tab, in the Scheduled follow-ups section at the top."',
     parameters: {
       type: 'object',
       properties: {
