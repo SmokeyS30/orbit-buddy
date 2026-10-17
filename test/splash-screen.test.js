@@ -30,6 +30,14 @@ test('splash CSS uses the welcome-page palette', () => {
   assert.ok(html.includes('#8b5cf6'), 'violet accent present');
 });
 
+test('splash signals completion for the welcome redirect', () => {
+  const html = readPublic('index.html');
+  assert.ok(html.includes("__orbitSplashComplete=true"), 'splash sets completion flag');
+  assert.ok(html.includes("orbit-splash-done"), 'splash dispatches done event');
+  const appJs = readPublic('app.js');
+  assert.ok(appJs.includes("orbit-splash-done"), 'app waits for splash before welcome redirect');
+});
+
 test('splash hides on a timer with a hard cap', () => {
   const html = readPublic('index.html');
   // 5s display timer
