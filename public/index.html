@@ -88,8 +88,8 @@
             splash.classList.add('splash-hide');
             setTimeout(function(){if(splash&&splash.parentNode)splash.parentNode.removeChild(splash);},900);
           }
-          // Show for ~5s, then fade. Hard cap ensures it never sticks.
-          setTimeout(hide,5000);
+          // Show for ~10s, then fade. Hard cap ensures it never sticks.
+          setTimeout(hide,10000);
           // Allow the app to dismiss early once fully ready (optional hook).
           window.__orbitSplashDone=hide;
         }catch(e){/* splash must never break the app */}
