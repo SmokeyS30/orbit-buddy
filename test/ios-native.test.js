@@ -86,3 +86,66 @@ test('logout clears the session cookie with the matching SameSite value', async 
   assert.match(cleared, /SameSite=None/);
   assert.match(cleared, /Secure/);
 });
+
+test('X-Orbit-Native header alone (no Origin) gets SameSite=None;Secure — the WKWebView case', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+    body: JSON.stringify({ email: `hdr${Date.now()}@example.com`, displayName: 'Test', password: 'correct horse battery staple' }),
+  });
+  assert.equal(res.status, 201);
+  const cookie = res.headers.get('set-cookie');
+  assert.match(cookie, /SameSite=None/);
+  assert.match(cookie, /Secure/);
+});
+
+test('no header and no Origin stays SameSite=Strict — web behavior unchanged', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: `web${Date.now()}@example.com`, displayName: 'Test', password: 'correct horse battery staple' }),
+  });
+  assert.equal(res.status, 201);
+  assert.match(res.headers.get('set-cookie'), /SameSite=Strict/);
+});
+
+test('logout with only the native header clears the cookie as SameSite=None', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const reg = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+    body: JSON.stringify({ email: `lo${Date.now()}@example.com`, displayName: 'Test', password: 'correct horse battery staple' }),
+  });
+  assert.equal(reg.status, 201);
+  const cookie = reg.headers.get('set-cookie').split(';')[0];
+  const body = await reg.json();
+  const out = await fetch(`${base}/api/auth/logout`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-Orbit-Native': '1', 'X-Orbit-CSRF': body.csrf },
+  });
+  assert.equal(out.status, 200);
+  const cleared = out.headers.get('set-cookie');
+  assert.match(cleared, /Max-Age=0/);
+  assert.match(cleared, /SameSite=None/);
+});
+
+test('preflight allow-headers includes X-Orbit-Native for the native origin', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const pre = await fetch(`${base}/api/chat`, {
+    method: 'OPTIONS',
+    headers: { Origin: NATIVE, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'X-Orbit-Native, X-Orbit-CSRF' },
+  });
+  assert.equal(pre.status, 204);
+  assert.match(pre.headers.get('access-control-allow-headers') || '', /X-Orbit-Native/);
+});
+
+test('the native header alone never grants a CORS origin echo', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const res = await fetch(`${base}/api/auth/setup-status`, {
+    headers: { Origin: 'https://evil.example', 'X-Orbit-Native': '1' },
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('access-control-allow-origin'), null);
+});

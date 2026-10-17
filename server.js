@@ -55,6 +55,11 @@ export const MAINT_BYPASS_TOKEN = '03fa0ae23f6bb958372f62feb96beb5b';
 // allowance plus SameSite=None cookies. Nothing here changes web behavior.
 const NATIVE_ORIGINS = new Set(['capacitor://localhost', 'ionic://localhost']);
 function isNativeOrigin(origin) { return typeof origin === 'string' && NATIVE_ORIGINS.has(origin); }
+// The WKWebView doesn't reliably send an Origin header on fetch(), so the
+// native client also sends X-Orbit-Native: 1 on every API request. Either
+// signal marks the request as native for cookie purposes. The header alone
+// NEVER grants a CORS origin echo — that stays on the strict allowlist above.
+function isNativeRequest(req) { const h = req.headers || {}; return isNativeOrigin(h.origin) || h['x-orbit-native'] === '1'; }
 const mime = { '.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.webmanifest':'application/manifest+json' };
 const now = () => new Date().toISOString();
 
@@ -567,7 +572,7 @@ export function createOrbitServer(options={}) {
   function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
-  function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeOrigin(req.headers.origin)?'None':'Strict'}));return csrf;}
+  function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return csrf;}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
@@ -2202,7 +2207,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       res.setHeader('Vary','Origin');
       if(req.method==='OPTIONS'){
         res.setHeader('Access-Control-Allow-Methods','GET, POST, PUT, PATCH, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers','Content-Type, X-Orbit-CSRF, Authorization');
+        res.setHeader('Access-Control-Allow-Headers','Content-Type, X-Orbit-CSRF, X-Orbit-Native, Authorization');
         res.setHeader('Access-Control-Max-Age','86400');
         res.writeHead(204);res.end();return;
       }
@@ -2600,7 +2605,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(url.pathname.startsWith('/api/')){
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
         if(req.method==='GET'&&url.pathname==='/api/auth/me')return json(res,200,{user:publicUser(user),csrf:user.csrf_token||null});
-        if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeOrigin(req.headers.origin)?'None':'Strict'}));return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session;if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName:buddyNameFor(user.user_id||user.id),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}// "Catch me up": capture the previous app-open before stamping this one,
