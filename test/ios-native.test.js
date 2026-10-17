@@ -149,3 +149,114 @@ test('the native header alone never grants a CORS origin echo', async (t) => {
   assert.equal(res.status, 200);
   assert.equal(res.headers.get('access-control-allow-origin'), null);
 });
+
+test('native login response includes sessionToken in body; web login does not', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  // Native login (X-Orbit-Native header) → sessionToken present.
+  const email = `bl${Date.now()}@example.com`;
+  const password = 'correct horse battery staple';
+  await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, displayName: 'Test', password }),
+  });
+  const nativeLogin = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(nativeLogin.status, 200);
+  const nativeBody = await nativeLogin.json();
+  assert.ok(nativeBody.sessionToken, 'native login body must include sessionToken');
+  assert.equal(typeof nativeBody.sessionToken, 'string');
+  // Web login (no native header) → sessionToken absent.
+  const webLogin = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(webLogin.status, 200);
+  const webBody = await webLogin.json();
+  assert.equal(webBody.sessionToken, undefined, 'web login body must NOT include sessionToken');
+});
+
+test('Bearer token authenticates requests without a cookie', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const email = `bt${Date.now()}@example.com`;
+  const password = 'correct horse battery staple';
+  await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, displayName: 'Test', password }),
+  });
+  const login = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+    body: JSON.stringify({ email, password }),
+  });
+  const { sessionToken, csrf } = await login.json();
+  // No cookie sent — only the Bearer header. Must authenticate.
+  const me = await fetch(`${base}/api/auth/me`, {
+    headers: { Authorization: `Bearer ${sessionToken}`, 'X-Orbit-Native': '1' },
+  });
+  assert.equal(me.status, 200);
+  const meBody = await me.json();
+  assert.equal(meBody.user.email, email);
+  // And CSRF-protected writes work with Bearer + CSRF header.
+  const snap = await fetch(`${base}/api/snapshot`, {
+    headers: { Authorization: `Bearer ${sessionToken}`, 'X-Orbit-Native': '1', 'X-Orbit-CSRF': csrf },
+  });
+  assert.equal(snap.status, 200);
+});
+
+test('wrong or missing Bearer token → 401', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const bad = await fetch(`${base}/api/auth/me`, {
+    headers: { Authorization: 'Bearer definitely-not-a-real-token', 'X-Orbit-Native': '1' },
+  });
+  assert.equal(bad.status, 401);
+  const none = await fetch(`${base}/api/auth/me`, {
+    headers: { 'X-Orbit-Native': '1' },
+  });
+  assert.equal(none.status, 401);
+  const malformed = await fetch(`${base}/api/auth/me`, {
+    headers: { Authorization: 'Token abc123', 'X-Orbit-Native': '1' },
+  });
+  assert.equal(malformed.status, 401);
+});
+
+test('cookie auth still works — Bearer is additive, not a replacement', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const reg = await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: `ck${Date.now()}@example.com`, displayName: 'Test', password: 'correct horse battery staple' }),
+  });
+  assert.equal(reg.status, 201);
+  const cookie = reg.headers.get('set-cookie').split(';')[0];
+  const me = await fetch(`${base}/api/auth/me`, { headers: { Cookie: cookie } });
+  assert.equal(me.status, 200);
+});
+
+test('logout via Bearer token deletes the session', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const email = `lbo${Date.now()}@example.com`;
+  const password = 'correct horse battery staple';
+  await fetch(`${base}/api/auth/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, displayName: 'Test', password }),
+  });
+  const login = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+    body: JSON.stringify({ email, password }),
+  });
+  const { sessionToken, csrf } = await login.json();
+  const authHeaders = { Authorization: `Bearer ${sessionToken}`, 'X-Orbit-Native': '1', 'X-Orbit-CSRF': csrf };
+  const out = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: authHeaders });
+  assert.equal(out.status, 200);
+  // Session is gone — Bearer no longer authenticates.
+  const me = await fetch(`${base}/api/auth/me`, { headers: { Authorization: `Bearer ${sessionToken}`, 'X-Orbit-Native': '1' } });
+  assert.equal(me.status, 401);
+});
