@@ -16,8 +16,12 @@ function connectBody() {
   return appJs.slice(start, end);
 }
 
-test('welcome page has a prominent Sign in button', () => {
-  assert.match(welcomeHtml, /<a class="btn btn-primary" href="index\.html#signin">Sign in<\/a>/);
+test('welcome page has Join the Waitlist as the primary button', () => {
+  assert.match(welcomeHtml, /<a class="btn btn-primary" href="#waitlist">Join the Waitlist<\/a>/);
+});
+
+test('welcome page has Sign in as a ghost button', () => {
+  assert.match(welcomeHtml, /<a class="btn btn-ghost" href="index\.html#signin">Sign in<\/a>/);
 });
 
 test('welcome page keeps the waitlist option', () => {
