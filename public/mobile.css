@@ -67,3 +67,12 @@
   .tabs{margin-bottom:18px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scroll-padding-inline-start:6px}
   .tabs .tab{flex:0 0 auto;min-width:0;padding:10px 12px;font-size:14px}
 }
+
+/* --- Prevent iOS auto-zoom on input focus (<=760px) --- */
+@media(max-width:760px){
+  /* iOS/WKWebView zooms the page when focusing a form field under 16px.
+     Keep every form field at 16px on mobile so focus never triggers a zoom. */
+  input,textarea,select{font-size:16px}
+  /* Belt and braces: never inflate text anywhere on mobile, not just the header */
+  html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+}
