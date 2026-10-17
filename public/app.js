@@ -1193,7 +1193,7 @@ async function openVoiceMode(){
   // runs synchronously after the await, so the controller is built exactly once.
   let voiceModeApi;try{voiceModeApi=await loadVoiceMode();}catch(_){toast('Voice mode needs a connection to load.');return;}
   if(!voiceMode){
-    voiceMode=voiceModeApi.createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio});
+    voiceMode=voiceModeApi.createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio,isNative:IS_NATIVE});
     voiceMode.wire();
   }
   if(!voiceMode.isOpen())voiceMode.open();

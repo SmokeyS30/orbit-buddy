@@ -383,7 +383,10 @@ export function createVoiceMode(deps) {
   function startListen() {
     if (state === 'closed') return;
     stopAll();
-    if (SR()) {
+    // Web Speech API is broken in iOS WKWebView (service-not-allowed) —
+    // use tap-to-record + Whisper on native instead.
+    const useWebSpeech = SR() && !deps.isNative;
+    if (useWebSpeech) {
       state = 'listening';
       setOrb('listening');
       setStatus('Listening…');
@@ -432,7 +435,7 @@ export function createVoiceMode(deps) {
         setStatus('Could not start listening.');
       }
     } else {
-      // No Web Speech API (e.g. Firefox): tap-to-record via Whisper fallback.
+      // No Web Speech API (e.g. Firefox, iOS native): tap-to-record via Whisper fallback.
       state = 'idle-tap';
       setOrb('idle');
       setStatus('Tap the mic, say your piece, tap again to send.');
