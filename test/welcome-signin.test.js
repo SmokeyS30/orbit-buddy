@@ -37,7 +37,13 @@ test('connect() does NOT auto-open the auth dialog on plain launch', () => {
 
 test('native first launch (signed out) redirects to the welcome page', () => {
   const body = connectBody();
-  assert.match(body, /if\(IS_NATIVE&&!state\.launchSignin\)\{location\.href='welcome\.html';return;\}/);
+  assert.ok(body.includes("location.href='welcome.html'"), 'redirects to welcome.html');
+});
+
+test('welcome redirect waits for the splash screen', () => {
+  const body = connectBody();
+  assert.ok(body.includes('orbit-splash-done'), 'waits for splash-done event before redirect');
+  assert.ok(body.includes('__orbitSplashComplete'), 'checks splash completion flag');
 });
 
 test('#signin launch flag opens the auth dialog instead of redirecting', () => {
