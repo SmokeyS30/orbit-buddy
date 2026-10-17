@@ -49,3 +49,21 @@
   .goal-arc{gap:10px}
   .view-toggle{max-width:100%;overflow-x:auto}
 }
+
+/* --- Mobile header compaction (<=760px): tight header, no clipped tabs --- */
+@media(max-width:760px){
+  /* Stop iOS/WKWebView from inflating header text (Dynamic Type / text-size-adjust) */
+  .topbar,.tabs{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+  /* Compact header: less vertical padding, smaller brand lockup */
+  .topbar{padding-top:calc(6px + env(safe-area-inset-top));padding-bottom:12px;gap:10px}
+  .brand{gap:10px;min-width:0;flex-shrink:1}
+  .brand-mark{width:30px;height:30px;flex:none}
+  .brand-mark span{width:10px;height:10px;border-width:2px}
+  .brand strong{font-size:15px;line-height:1.25}
+  .brand small{font-size:11px;margin-top:1px}
+  .top-actions{gap:8px;flex:none}
+  #account-button{padding:6px 10px;font-size:12px;max-width:38vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Tab bar: size tabs to content, scroll cleanly inside the viewport, never clip */
+  .tabs{margin-bottom:18px;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;scroll-padding-inline-start:6px}
+  .tabs .tab{flex:0 0 auto;min-width:0;padding:10px 12px;font-size:14px}
+}
