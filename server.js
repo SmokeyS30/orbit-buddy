@@ -26,6 +26,7 @@ import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from 
 import { handleSoulCommand, handleAdaptationCommand, resolveAdaptiveSoulDirective } from './src/soul.js';
 import { handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
 import { buildUnifiedHint, chooseChatSurfacingWithPatterns, detectEmotionalTone, trackEmotionalTone, loadEmotionalTrack, summarizeEmotionalPattern, buildEmotionalContext, handleEmotionHonesty, recordConnectionSurfacing, runMemoryConnectionPush } from './src/memory-connections.js';
+import { enforceSchedulingHonesty } from './src/scheduling-honesty.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
@@ -722,7 +723,18 @@ export function createOrbitServer(options={}) {
       // window persist automatically (contradictory ones stay pending; the owner
       // reviews/deletes anything in chat). The 2/reply suggestion cap is unchanged.
       try{const autoSaved=db.autoApproveMemorySuggestions(userId,MEMORY_AUTO_SAVE_MINUTES);if(autoSaved>0)db.addEvent(userId,'memory_added',`Auto-saved ${autoSaved} suggested ${autoSaved===1?'memory':'memories'} after the review window.`);}catch(e){}
-      answer=stripModelMarkers(rawAnswer)||'Noted — I’ll check in about that afterwards.';
+      // Scheduling honesty guardrail (2026-10-17): if the model claimed to
+      // schedule something ("I've scheduled a check-in for November 6") but
+      // called no scheduling tool, make it true — parse the intent and create
+      // the follow-up for real. If the intent can't be parsed, the reply is
+      // rewritten to drop the false claim instead of letting Orbit lie.
+      let schedulingResult=null;
+      try{
+        schedulingResult=enforceSchedulingHonesty({answer:rawAnswer,toolCalls,db,userId,timeZone:preferences.time_zone||'America/New_York',sourceMessageId:userMsg.id,userMessage:message});
+        if(schedulingResult.created)db.addEvent(userId,'scheduling_honesty',`Auto-created follow-up the model promised: "${schedulingResult.created.description}" on ${schedulingResult.created.due_date||schedulingResult.created.dueDate}.`);
+        if(schedulingResult.corrected)db.addEvent(userId,'scheduling_honesty',`Rewrote an unparseable scheduling claim instead of letting it through.`);
+      }catch(e){console.error('scheduling honesty failed',e&&e.message);}
+      answer=stripModelMarkers(schedulingResult?schedulingResult.answer:rawAnswer)||'Noted — I’ll check in about that afterwards.';
       storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       // Proactive memory bookkeeping: if a memory was volunteered this turn
       // and the model wasn't mid-task (no tool calls), record it so it's
