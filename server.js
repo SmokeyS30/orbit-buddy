@@ -43,7 +43,7 @@ const publicRoot = path.join(root, 'public');
 // constant in this file — flipping must be a reviewable commit, not a config toggle.
 // Temporary bypass token (random, unguessable): removed at dawn with the rest
 // of this block.
-const MAINTENANCE_MODE = true; // maintenance window open — memory+soul 8-item build 2026-10-16; stays up until the final sweep verifies everything green
+const MAINTENANCE_MODE = false; // maintenance window over — memory+soul build complete 2026-10-16; final sweep green on both platforms
 export const MAINT_BYPASS_TOKEN = '03fa0ae23f6bb958372f62feb96beb5b';
 // ===== END MAINTENANCE MODE =====
 
