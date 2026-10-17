@@ -6,6 +6,12 @@
 // own drafting voice. Soul and voice compose — Orbit with its soul, drafting
 // in the user's voice when asked — and are never merged or entangled.
 //
+// Deepening soul (2026-10-16): soul_history actively shapes responses — a
+// compact "how we've evolved" digest (recent tunings, key learnings,
+// promises made, rare milestone warmth) renders into the prompt layer so the
+// personality speaks from a continuous relationship. The current record stays
+// authoritative: history is context, never the present.
+//
 // Storage: one versioned soul record per user (soul_records) plus an
 // append-only edit history (soul_history). Tuning happens in chat:
 // "be more playful", "stop being so formal", "be more direct with me".
@@ -228,7 +234,7 @@ export function buildHonestSoulSection(record, { demo = false } = {}) {
  * Render a soul record into the system-prompt layer. Pure. This is the only
  * thing that reaches the model — the raw record (and its history) never does.
  */
-export function buildSoulDirective(record, { userName = '', demo = false, adaptation = null } = {}) {
+export function buildSoulDirective(record, { userName = '', demo = false, adaptation = null, historyDigest = null } = {}) {
   const r = normalizeSoulRecord(record);
   // Adaptation shifts the effective axes within ±1 of the tuned anchor —
   // the anchor is never overridden, only modulated around.
@@ -261,6 +267,13 @@ export function buildSoulDirective(record, { userName = '', demo = false, adapta
     if (learnings.length) {
       lines.push(`- Read-the-room notes (learned over weeks of conversation — gentle defaults, the user can change or clear them anytime): ${learnings.map((l) => l.label).join('; ')}.`);
     }
+  }
+  // Deepening soul (2026-10-16): the "how we've evolved" digest — recent
+  // tunings, key learnings, promises made — so the personality speaks from
+  // a continuous relationship, never a reset. Derived from soul_history plus
+  // the CURRENT record (always authoritative); demo mode never gets one.
+  if (!demo && historyDigest && Array.isArray(historyDigest.lines) && historyDigest.lines.length) {
+    for (const line of historyDigest.lines) lines.push(String(line));
   }
   lines.push(buildHonestSoulSection(eff, { demo }));
   return lines.join('\n');
@@ -804,17 +817,6 @@ export function applyAdaptation({ db, userId, message, timeZone, nowMs }) {
   return { shifts: { ...state.shifts }, reason, whyPast, learnings: fresh.learnings || [] };
 }
 
-/**
- * Resolve the full soul directive for a chat turn, including the adaptation
- * layer. Demo users get the static neutral soul — no adaptation, no state.
- */
-export function resolveAdaptiveSoulDirective({ db, userId, isDemo, userName, message, timeZone, nowMs }) {
-  if (isDemo) return buildSoulDirective(NEUTRAL_SOUL_RECORD, { userName, demo: true });
-  const stored = db.getSoulRecord(userId);
-  const adaptation = applyAdaptation({ db, userId, message, timeZone, nowMs });
-  return buildSoulDirective(stored, { userName, adaptation });
-}
-
 // ---------------------------------------------------------------------------
 // Chat-native adaptation controls. Instant, exact, no model call — same
 // pattern as handleSoulCommand. Handles: stop/start adapting, forget what
@@ -925,4 +927,223 @@ export function handleAdaptationCommand({ db, userId, message, isDemo }) {
   }
 
   return adaptationWhyReply(loadAdaptationState(db, userId), why);
+}
+
+// ---------------------------------------------------------------------------
+// Deepening soul — history awareness (2026-10-16).
+//
+// The soul RECORD and its append-only soul_history actively shape responses:
+// the system-prompt layer carries a compact "how we've evolved" digest —
+// recent tunings, key learnings, promises made — so Orbit speaks from a
+// continuous relationship, not a static preset.
+//
+// Three behaviors, all prompt-layer, all per-user, demo mode excluded:
+//
+// 1. Continuity digest — built from soul_history (newest first) plus the
+//    CURRENT record. The current record is authoritative: the digest's "where
+//    things stand" line always reflects the present, so a revert ("go back
+//    to how you were") is followed without clinging to the undone past.
+//
+// 2. Promise callbacks — every chat tune ("be more direct") is a style
+//    promise, and its reply says so ("I'll be more direct from here on").
+//    The digest names the most recent unreverted tune as the promise in
+//    force, with strict rarity guidance (very rarely, never forced, never
+//    mid-task). If they change direction again, the newest direction wins —
+//    no guilt-tripping about the old one.
+//
+// 3. Milestone warmth — a single warm line about how long they've been at
+//    this is offered to the model at most once per 30 days (a settings
+//    marker records when the line was last offered; the model uses it at
+//    its own discretion, so the marker refills even if it skipped it).
+//
+// No new tables: history comes from soul_history, the milestone marker from
+// the existing settings table. Prompt-only, no extra API calls. Chat-native
+// per the invisible-complexity rule — no timeline UI, no settings. Web/app
+// and WhatsApp share it automatically (both flow through
+// resolveAdaptiveSoulDirective). Demo mode: no history awareness at all —
+// each demo session starts fresh.
+// ---------------------------------------------------------------------------
+
+// The promise in force must be fresh enough to feel like an ongoing promise
+// but old enough that the tune itself isn't still the news: older than 3
+// days, younger than 60.
+const PROMISE_MIN_AGE_MS = 3 * 24 * 3600 * 1000;
+const PROMISE_MAX_AGE_MS = 60 * 24 * 3600 * 1000;
+
+// Milestone line offered at most once per 30 days.
+const MILESTONE_PROMPT_MIN_GAP_MS = 30 * 24 * 3600 * 1000;
+
+const MILESTONE_KEY = (userId) => `soul_milestone_${userId}`;
+
+// Relationship milestones by age of the earliest soul-history entry.
+const RELATIONSHIP_MILESTONES = [
+  [365, 'a year'],
+  [180, 'about half a year'],
+  [90, 'a few months'],
+  [30, 'about a month'],
+];
+
+/**
+ * Find the active style promise in history rows (newest first). The first
+ * tune found scanning newest→oldest is the promise in force — unless a
+ * revert comes first, which cancels it (they asked to go back; don't
+ * callback about the undone promise). Learnings don't change direction, so
+ * they never cancel a promise. Pure.
+ */
+export function activeStylePromise(historyRows) {
+  const rows = Array.isArray(historyRows) ? historyRows : [];
+  for (const row of rows) {
+    const source = String(row && row.source || '');
+    if (/^tune:/.test(source)) {
+      const createdAt = row.created_at ? Date.parse(row.created_at) : NaN;
+      return {
+        phrase: historySourceLabel(source),
+        dateLabel: row.created_at ? formatSoulDate(row.created_at) : '',
+        createdAt: Number.isFinite(createdAt) ? createdAt : null,
+      };
+    }
+    if (source === 'revert') return null;
+  }
+  return null;
+}
+
+/**
+ * Relationship milestone for a first-change timestamp. Returns
+ * { days, label } for the highest milestone reached, or null under 30 days.
+ * Pure.
+ */
+export function relationshipMilestone({ firstChangeAt, nowMs }) {
+  const first = Number(firstChangeAt);
+  const now = Number(nowMs);
+  if (!Number.isFinite(first) || !Number.isFinite(now) || now < first) return null;
+  const days = Math.floor((now - first) / (24 * 3600 * 1000));
+  for (const [threshold, label] of RELATIONSHIP_MILESTONES) {
+    if (days >= threshold) return { days, label };
+  }
+  return null;
+}
+
+/**
+ * Chronological shaping trail: the most recent tunings/reverts as a
+ * readable journey, oldest→newest, e.g.
+ * "more direct" (Oct 2) → "reverted one step" (Oct 9). Pure.
+ */
+export function shapingTrail(historyRows, limit = 4) {
+  const rows = (Array.isArray(historyRows) ? historyRows : [])
+    .filter((row) => /^(tune:|revert$)/.test(String(row && row.source || '')))
+    .slice(0, Math.max(1, limit))
+    .reverse();
+  return rows.map((row) => {
+    const date = row.created_at ? formatSoulDate(row.created_at) : '';
+    return `\u201C${historySourceLabel(row.source)}\u201D${date ? ` (${date})` : ''}`;
+  });
+}
+
+/** Labels of recent read-the-room learnings (newest first). Pure. */
+export function learnedLabels(historyRows, limit = 4) {
+  return (Array.isArray(historyRows) ? historyRows : [])
+    .filter((row) => /^learn:/.test(String(row && row.source || '')))
+    .slice(0, Math.max(1, limit))
+    .map((row) => historySourceLabel(row.source));
+}
+
+export function getMilestonePromptedAt(db, userId) {
+  try {
+    const raw = db.getSetting(MILESTONE_KEY(userId));
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+export function markMilestonePrompted(db, userId, nowMs) {
+  try {
+    db.setSetting(MILESTONE_KEY(userId), String(Number(nowMs) || Date.now()));
+  } catch {}
+}
+
+/**
+ * Build the "how we've evolved" digest. Returns
+ * { lines, milestoneOffered } or null when there's no history to speak from.
+ * Pure given its inputs (historyRows newest first, as listSoulHistory
+ * returns; record = the CURRENT record — always authoritative).
+ */
+export function buildSoulHistoryDigest({ userName, historyRows, record, nowMs, milestoneLastPromptedAt }) {
+  const rows = Array.isArray(historyRows) ? historyRows : [];
+  if (!rows.length) return null;
+  const now = Number(nowMs) || Date.now();
+  const who = String(userName || '').trim() || 'the user';
+  const current = shortSoulDescription(normalizeSoulRecord(record));
+
+  const lines = [
+    `- Continuity \u2014 you have a history with ${who}; speak from it, never from a blank slate:`,
+    `  - Where things stand (their most recent choice \u2014 authoritative; the past is context, never the present): ${current}.`,
+  ];
+
+  const trail = shapingTrail(rows);
+  if (trail.length) {
+    lines.push(`  - The road here: ${trail.join(' \u2192 ')}. You followed each turn of it.`);
+  }
+
+  const labels = learnedLabels(rows);
+  if (labels.length) {
+    lines.push(`  - Read-the-room learnings (still in force unless they contradict the present): ${labels.join('; ')}.`);
+  }
+
+  // Promise callbacks: the most recent unreverted tune, within the freshness
+  // window. Rare by instruction — the model drops it in only when it fits.
+  const promise = activeStylePromise(rows);
+  if (promise && promise.createdAt !== null) {
+    const age = now - promise.createdAt;
+    if (age >= PROMISE_MIN_AGE_MS && age <= PROMISE_MAX_AGE_MS) {
+      const when = promise.dateLabel ? ` (${promise.dateLabel})` : '';
+      lines.push(
+        `  - Style promise in force: \u201C${promise.phrase}\u201D${when} \u2014 you said you\u2019d be ${promise.phrase} from here on. If the moment genuinely fits, a light, natural nod to keeping it is welcome (e.g. leading with the blunt version) \u2014 very rarely, never forced, never mid-task, never robotic. If they change direction again, follow the newest one without dwelling on the old.`
+      );
+    }
+  }
+
+  // Milestone warmth: one warm line at most, and only when the 30-day
+  // budget allows. Callers record the offer via markMilestonePrompted.
+  let milestoneOffered = false;
+  const oldest = rows[rows.length - 1];
+  const firstChangeAt = oldest && oldest.created_at ? Date.parse(oldest.created_at) : NaN;
+  const milestone = Number.isFinite(firstChangeAt) ? relationshipMilestone({ firstChangeAt, nowMs: now }) : null;
+  const lastPrompted = Number(milestoneLastPromptedAt);
+  if (milestone && (!Number.isFinite(lastPrompted) || now - lastPrompted >= MILESTONE_PROMPT_MIN_GAP_MS)) {
+    lines.push(
+      `  - Milestone (rare \u2014 one warm line at most, never saccharine, only if it fits the conversation): you\u2019ve been at this ${milestone.label} now.`
+    );
+    milestoneOffered = true;
+  }
+
+  return { lines, milestoneOffered };
+}
+
+/**
+ * Resolve the full soul directive for a chat turn, including adaptation and
+ * the deepening layer (history digest). Demo users get the static neutral
+ * soul — no history awareness, no adaptation, no state.
+ */
+export function resolveAdaptiveSoulDirective({ db, userId, isDemo, userName, message, timeZone, nowMs }) {
+  if (isDemo) return buildSoulDirective(NEUTRAL_SOUL_RECORD, { userName, demo: true });
+  const stored = db.getSoulRecord(userId);
+  const adaptation = applyAdaptation({ db, userId, message, timeZone, nowMs });
+  let historyDigest = null;
+  try {
+    const rows = db.listSoulHistory(userId, 12);
+    if (rows && rows.length) {
+      const now = nowMs || Date.now();
+      historyDigest = buildSoulHistoryDigest({
+        userName,
+        historyRows: rows,
+        record: stored,
+        nowMs: now,
+        milestoneLastPromptedAt: getMilestonePromptedAt(db, userId),
+      });
+      if (historyDigest && historyDigest.milestoneOffered) markMilestonePrompted(db, userId, now);
+    }
+  } catch {}
+  return buildSoulDirective(stored, { userName, adaptation, historyDigest });
 }
