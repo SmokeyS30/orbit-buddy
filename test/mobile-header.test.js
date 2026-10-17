@@ -58,3 +58,19 @@ test('in-app hash navigation still works after launch', () => {
     /addEventListener\('hashchange',\(\)=>activateView\(location\.hash\.slice\(1\),\{updateHash:false\}\)\)/
   );
 });
+
+test('mobile form fields stay at 16px to prevent iOS focus zoom', () => {
+  const zoomBlock = mobileCss.match(/\/\* --- Prevent iOS auto-zoom[\s\S]*?\n\}/);
+  assert.ok(zoomBlock, 'mobile.css must contain the anti-zoom block');
+  const css = zoomBlock[0];
+  assert.match(css, /@media\s*\(\s*max-width:\s*760px\s*\)/);
+  assert.match(css, /input,textarea,select\{[^}]*font-size:\s*16px/);
+});
+
+test('mobile text-size-adjust is applied page-wide', () => {
+  const zoomBlock = mobileCss.match(/\/\* --- Prevent iOS auto-zoom[\s\S]*?\n\}/);
+  assert.ok(zoomBlock, 'mobile.css must contain the anti-zoom block');
+  const css = zoomBlock[0];
+  assert.match(css, /html\{[^}]*-webkit-text-size-adjust:\s*100%/);
+  assert.match(css, /html\{[^}]*text-size-adjust:\s*100%/);
+});
