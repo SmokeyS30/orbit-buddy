@@ -1615,7 +1615,10 @@ async function pollAccessStatus(email){
 }
 $('#registration-toggle').addEventListener('click',async()=>{try{const open=!state.setup?.registrationOpen;await api('/api/admin/registration',{method:'POST',body:JSON.stringify({open})});await refresh();toast(open?'Registration is open.':'Registration is closed.');}catch(error){toast(error.message);}});$('#resume-button').addEventListener('click',async()=>{if(prompt('Type RESUME to restart Orbit work:')!=='RESUME')return;try{await api('/api/admin/resume',{method:'POST',body:JSON.stringify({confirm:'RESUME'})});await refresh();toast('Orbit resumed.');}catch(error){toast(error.message);}});
 $('#auth-dialog')?.addEventListener('close',()=>{if(accessPollTimer){clearInterval(accessPollTimer);accessPollTimer=null;}});
-activateView(location.hash.slice(1)||'today',{updateHash:false});
+// Launch always lands on the welcome screen (Today view with the Orbit hero),
+// ignoring any stale hash from a previous session. In-app hash navigation still works.
+if(location.hash)history.replaceState(null,'',location.pathname+location.search);
+activateView('today',{updateHash:false});
 if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});
   // Auto-reload when a new app version activates
   navigator.serviceWorker.addEventListener('message',(event)=>{
