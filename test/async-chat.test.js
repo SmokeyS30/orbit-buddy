@@ -82,7 +82,7 @@ test('a failing model call saves a graceful reply instead of a 500', async (t) =
   const landed = await waitFor(() => {
     const convo = app.db.ensureDefaultConversation(auth.userId);
     return chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).some((m) => m.role === 'assistant' && m.content.includes('connection needs attention'));
-  });
+  }, 30000); // model calls now retry transient failures with backoff before failing
   assert.ok(landed, 'a reply was saved even though the model failed');
   const convo = app.db.ensureDefaultConversation(auth.userId);
   const reply = chatOnly(app.db.listConversationMessages(auth.userId, convo.id, 10)).find((m) => m.role === 'assistant');
