@@ -384,8 +384,10 @@ export function createVoiceMode(deps) {
     if (state === 'closed') return;
     stopAll();
     // Web Speech API is broken in iOS WKWebView (service-not-allowed) —
-    // use tap-to-record + Whisper on native instead.
-    const useWebSpeech = SR() && !deps.isNative;
+    // use tap-to-record + Whisper on native instead. Check live because the
+    // Capacitor bridge may not be ready when the app module first loads.
+    const isNativeNow = deps.isNative || (typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.() === true);
+    const useWebSpeech = SR() && !isNativeNow;
     if (useWebSpeech) {
       state = 'listening';
       setOrb('listening');
