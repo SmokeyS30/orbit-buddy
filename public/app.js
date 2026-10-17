@@ -20,6 +20,7 @@ function loadCanvas(){
 }
 import { briefingLayoutFor } from './briefing-layout.js';
 import { parseConversationDeepLink } from './deep-link.js';
+import { geoAttemptPlan, markGeoAsked, clearGeoAsked } from './geo-prompt.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
@@ -169,32 +170,36 @@ function renderTasks(items){const root=$('#tasks-list');root.replaceChildren();$
 // Data comes from GET /api/today-briefing; cached client-side for 10 minutes
 // so the 15s refresh loop doesn't refetch it.
 const briefingState={data:null,at:0,coordsKey:''};
-// Location-aware weather: one-time browser Geolocation request (works on web
-// and in the iOS webview) so briefing weather follows the user. Coords are
-// sent with the briefing request only — never stored server-side. A stored
-// denial is respected quietly (never nag); denial/unavailability/timeout
-// silently falls back to home weather.
-const GEO_DENIED_KEY='orbit-geo-denied';
+// Location-aware weather: browser Geolocation request so briefing weather
+// follows the user (works on web and in the iOS webview). Coords are sent
+// with the briefing request only — never stored server-side. The prompt gate
+// (./geo-prompt.js) asks ONCE per device and remembers while signed in:
+// granted -> call freely (no dialog), denied -> never call (home weather),
+// prompt -> call only if this device was never asked. Sign-out clears it.
+function safeStorage(){try{return localStorage;}catch(_){return null;}}
 let geoCoordsPromise=null;
 function requestBriefingCoords(){
   if(geoCoordsPromise)return geoCoordsPromise;
-  geoCoordsPromise=new Promise((resolve)=>{
-    const done=(v)=>resolve(v);
-    let denied=false;
-    try{denied=localStorage.getItem(GEO_DENIED_KEY)==='1';}catch(_){}
-    if(denied||typeof navigator==='undefined'||!navigator.geolocation)return done(null);
-    const timer=setTimeout(()=>done(null),10000);
-    try{
-      navigator.geolocation.getCurrentPosition(
-        (pos)=>{clearTimeout(timer);const c=pos&&pos.coords;
-          done(c&&Number.isFinite(c.latitude)&&Number.isFinite(c.longitude)&&Math.abs(c.latitude)<=90&&Math.abs(c.longitude)<=180
-            ?{lat:c.latitude,lon:c.longitude}:null);},
-        (err)=>{clearTimeout(timer);
-          try{if(err&&err.code===1)localStorage.setItem(GEO_DENIED_KEY,'1');}catch(_){}
-          done(null);},
-        {enableHighAccuracy:false,timeout:9000,maximumAge:600000});
-    }catch(_){clearTimeout(timer);done(null);}
-  });
+  geoCoordsPromise=(async()=>{
+    if(typeof navigator==='undefined'||!navigator.geolocation)return null;
+    let plan;
+    try{plan=await geoAttemptPlan(safeStorage(),navigator);}
+    catch(_){plan={attempt:false,countsAsAsk:false};}
+    if(!plan.attempt)return null;
+    if(plan.countsAsAsk)markGeoAsked(safeStorage());
+    return new Promise((resolve)=>{
+      const done=(v)=>resolve(v);
+      const timer=setTimeout(()=>done(null),10000);
+      try{
+        navigator.geolocation.getCurrentPosition(
+          (pos)=>{clearTimeout(timer);const c=pos&&pos.coords;
+            done(c&&Number.isFinite(c.latitude)&&Number.isFinite(c.longitude)&&Math.abs(c.latitude)<=90&&Math.abs(c.longitude)<=180
+              ?{lat:c.latitude,lon:c.longitude}:null);},
+          ()=>{clearTimeout(timer);done(null);},
+          {enableHighAccuracy:false,timeout:9000,maximumAge:600000});
+      }catch(_){clearTimeout(timer);done(null);}
+    });
+  })();
   return geoCoordsPromise;
 }
 function fetchBriefingData(coords){
@@ -902,7 +907,7 @@ $('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-reg
 $('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await fetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;await connect();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
-$('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{await api('/api/auth/logout',{method:'POST'});location.reload();});
+$('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{try{clearGeoAsked(safeStorage());}catch(_){}await api('/api/auth/logout',{method:'POST'});location.reload();});
 // --- Offline message queue (Q5) ---
 // Typed messages queue locally when the network drops and send automatically
 // when connectivity returns — no error, no lost message, no extra UI.
