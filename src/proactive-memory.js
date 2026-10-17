@@ -238,7 +238,7 @@ function distinctiveWords(text) {
 export function alreadyOnTopic(userMessage, memoryContent) {
   const words = distinctiveWords(memoryContent);
   if (words.length < 2) return false;
-  const msg = String(userMessage || '');
+  const msg = String(userMessage || '').trim();
   const msgWords = new Set(msg.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/));
   const hits = words.filter((w) => msgWords.has(w)).length;
   if (hits === 0) return false;
@@ -379,10 +379,14 @@ export function handleProactiveMemoryWhy({ db, userId, message }) {
   const ageMs = Date.now() - new Date(last.surfaced_at).valueOf();
   if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > PROACTIVE_MEMORY.whyLookbackDays * 86400_000) return null;
   // Memory connections (2026-10-16): emotional patterns aren't "in my notes" —
-  // they're modeled from how he's been talking. Say so, honestly.
+  // they're modeled from how they've been talking. Say so, honestly.
   if (last.kind === 'emotion') {
-    const observed = last.content_snapshot || 'a pattern in how you\u2019ve been talking lately';
-    return `I mentioned it because I\u2019ve noticed ${observed} — that\u2019s a pattern I\u2019m modeling from your messages, not something I feel. Tell me if I\u2019m reading it wrong.`;
+    const observed = String(last.content_snapshot || 'a pattern in how you\u2019ve been talking lately');
+    // Lowercase a leading "You've…"/"They've…" so it reads after "because"
+    // ("I mentioned it because you've seemed drained…"); keep "I'm starting
+    // to notice…" as-is.
+    const said = /^(I'?m|I’m)\b/.test(observed) ? observed : observed.charAt(0).toLowerCase() + observed.slice(1);
+    return `I mentioned it because ${said} — that\u2019s a pattern I\u2019m modeling from your messages, not something I feel. Tell me if I\u2019m reading it wrong.`;
   }
   const content = last.content_snapshot || 'something you asked me to remember';
   const saved = String(last.memory_created_at || '').slice(0, 10);

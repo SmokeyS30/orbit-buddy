@@ -471,3 +471,20 @@ test('background push shares the 3/day proactive cap', async (t) => {
   await app.runProactiveChecks(runAt);
   assert.equal(app.db.listMemorySurfacings(userId, 10).length, 0, 'no push when the shared cap is exhausted');
 });
+
+// --- Polish (2026-10-16): emotion "why" reads naturally, no double-subject ---
+
+test('handleProactiveMemoryWhy emotion branch reads like a person', () => {
+  const db = {
+    getLastMemorySurfacing: () => ({
+      kind: 'emotion',
+      content_snapshot: "You've seemed drained the last three evenings.",
+      surfaced_at: new Date(Date.now() - 3600_000).toISOString(),
+    }),
+  };
+  const answer = handleProactiveMemoryWhy({ db, userId: 'u1', message: 'why did you mention that?' });
+  assert.ok(answer);
+  assert.match(answer, /because you've seemed drained/i);
+  assert.ok(!/noticed You/i.test(answer), 'no doubled "I\'ve noticed You\'ve"');
+  assert.match(answer, /not something I feel/i);
+});

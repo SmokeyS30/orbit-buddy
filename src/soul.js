@@ -184,7 +184,7 @@ function warmthLine(level) {
   if (level === 1) return 'Warmth: reserved but kind.';
   if (level === 2) return 'Warmth: friendly and easygoing.';
   if (level === 3) return 'Warmth: warm — genuinely interested in how they\u2019re doing.';
-  return 'Warmth: very warm — full enthusiasm, celebrate everything.';
+  return 'Warmth: very warm — deep, genuine care; be fully present.';
 }
 
 /**
@@ -234,7 +234,7 @@ export function buildHonestSoulSection(record, { demo = false } = {}) {
  * Render a soul record into the system-prompt layer. Pure. This is the only
  * thing that reaches the model — the raw record (and its history) never does.
  */
-export function buildSoulDirective(record, { userName = '', demo = false, adaptation = null, historyDigest = null } = {}) {
+export function buildSoulDirective(record, { userName = '', demo = false, adaptation = null, historyDigest = null, hasHistory = false } = {}) {
   const r = normalizeSoulRecord(record);
   // Adaptation shifts the effective axes within ±1 of the tuned anchor —
   // the anchor is never overridden, only modulated around.
@@ -245,9 +245,14 @@ export function buildSoulDirective(record, { userName = '', demo = false, adapta
     eff[axis] = Math.max(AXIS_MIN, Math.min(AXIS_MAX, r[axis] + shift));
   }
   const who = String(userName || '').trim() || 'the user';
+  // Say who shaped it: a tuned soul names the tuner; the default soul is
+  // honest that it hasn't been tuned yet (don't claim "you tuned this"
+  // when the user never touched it).
   const header = demo
     ? `Personality (demo default — neutral; the full app lets each user tune this in chat):`
-    : `Personality — ${who} tuned this in chat, so honor it. It refines the tone guidance above; it never overrides safety or tool rules:`;
+    : hasHistory
+      ? `Personality — ${who} tuned this in chat, so honor it. It refines the tone guidance above; it never overrides safety or tool rules:`
+      : `Personality — the default soul (untuned; honor it as-is). It refines the tone guidance above; it never overrides safety or tool rules:`;
   const lines = [
     header,
     `- ${warmthLine(eff.warmth)}`,
@@ -336,7 +341,7 @@ const AT_MAX_WORD = { playfulness: 'playful', formality: 'formal', directness: '
 const AT_MIN_WORD = { playfulness: 'serious', formality: 'casual', directness: 'gentle', warmth: 'reserved' };
 
 export function isSoulRevert(text) {
-  return /^(go back to (how|the way) you were|revert( your personality)?|undo that|soul revert|back to how (you|it) was|restore your personality|change (it )?back)\.?$/i.test(
+  return /^(go back to (how|the way) (you were|it was)|revert( your personality)?|undo that|soul revert|back to how (you|it) was|restore your personality|change (it )?back)\.?$/i.test(
     String(text || '').trim()
   );
 }
@@ -1099,7 +1104,7 @@ export function buildSoulHistoryDigest({ userName, historyRows, record, nowMs, m
     if (age >= PROMISE_MIN_AGE_MS && age <= PROMISE_MAX_AGE_MS) {
       const when = promise.dateLabel ? ` (${promise.dateLabel})` : '';
       lines.push(
-        `  - Style promise in force: \u201C${promise.phrase}\u201D${when} \u2014 you said you\u2019d be ${promise.phrase} from here on. If the moment genuinely fits, a light, natural nod to keeping it is welcome (e.g. leading with the blunt version) \u2014 very rarely, never forced, never mid-task, never robotic. If they change direction again, follow the newest one without dwelling on the old.`
+        `  - Style promise in force: \u201C${promise.phrase}\u201D${when} \u2014 you said you\u2019d be ${promise.phrase} from here on. If the moment genuinely fits, a light, natural nod to keeping it is welcome \u2014 very rarely, never forced, never mid-task, never robotic. If they change direction again, follow the newest one without dwelling on the old.`
       );
     }
   }
@@ -1131,13 +1136,16 @@ export function resolveAdaptiveSoulDirective({ db, userId, isDemo, userName, mes
   const stored = db.getSoulRecord(userId);
   const adaptation = applyAdaptation({ db, userId, message, timeZone, nowMs });
   let historyDigest = null;
+  let historyRows = null;
   try {
-    const rows = db.listSoulHistory(userId, 12);
-    if (rows && rows.length) {
+    historyRows = db.listSoulHistory(userId, 12);
+  } catch {}
+  try {
+    if (historyRows && historyRows.length) {
       const now = nowMs || Date.now();
       historyDigest = buildSoulHistoryDigest({
         userName,
-        historyRows: rows,
+        historyRows,
         record: stored,
         nowMs: now,
         milestoneLastPromptedAt: getMilestonePromptedAt(db, userId),
@@ -1145,5 +1153,5 @@ export function resolveAdaptiveSoulDirective({ db, userId, isDemo, userName, mes
       if (historyDigest && historyDigest.milestoneOffered) markMilestonePrompted(db, userId, now);
     }
   } catch {}
-  return buildSoulDirective(stored, { userName, adaptation, historyDigest });
+  return buildSoulDirective(stored, { userName, adaptation, historyDigest, hasHistory: !!(historyRows && historyRows.length) });
 }

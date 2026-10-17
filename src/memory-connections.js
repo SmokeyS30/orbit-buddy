@@ -431,18 +431,21 @@ export function chooseChatSurfacingWithPatterns({ allMemories, recalledMemories,
 
 /** Developer-prompt emotional context: grounds the LLM's own reading of the conversation. */
 export function buildEmotionalContext({ userName, tone, emotionPhrase }) {
+  const who = String(userName || '').trim();
+  const whose = who ? `${who}\u2019s` : 'the user\u2019s';
+  const subject = who || 'the user';
   const lines = [
-    'Emotional read (a MODEL, not a feeling): you MODEL Edward\u2019s emotional patterns — you do NOT feel emotions yourself. Never claim to feel anything (sad, worried, excited, proud); never perform distress or concern. Say what you NOTICE, never what you FEEL.',
+    `Emotional read (a MODEL, not a feeling): you MODEL ${whose} emotional patterns — you do NOT feel emotions yourself. Never claim to feel anything (sad, worried, excited, proud); never perform distress or concern. Say what you NOTICE, never what you FEEL.`,
   ];
   if (emotionPhrase) lines.push(`Recent emotional pattern you\u2019ve noticed: ${emotionPhrase}`);
-  if (tone && tone !== 'neutral') lines.push(`This turn he seems ${toneLabel(tone)}.`);
-  lines.push('Let that quietly inform your tone and patience — a little warmer when he\u2019s heavy, matching his energy when he\u2019s up. Never announce it as a diagnosis, never moralize, never bring it up unless there\u2019s a genuine opening.');
+  if (tone && tone !== 'neutral') lines.push(`This turn ${subject} seems ${toneLabel(tone)}.`);
+  lines.push('Let that quietly inform your tone and patience — a little warmer when they\u2019re heavy, matching their energy when they\u2019re up. Never announce it as a diagnosis, never moralize, never bring it up unless there\u2019s a genuine opening.');
   return lines.join('\n');
 }
 
 function kindGuidance(kind) {
   if (kind === 'drain') return 'This is about his energy — be curious about what\u2019s draining him, not prescriptive. Ask, don\u2019t lecture.';
-  if (kind === 'avoidance') return 'This is uncomfortable by nature — use the honest-kindness pattern: plain observation + why it matters to him + ONE constructive path forward. Never judgment, never shaming, never a lecture.';
+  if (kind === 'avoidance') return 'This is uncomfortable by nature — use the honest-kindness pattern: plain observation + why it matters to them + ONE constructive path forward. Never judgment, never shaming, never a lecture.';
   if (kind === 'aspiration') return 'This is something he wants — be encouraging and concrete. Offer one small next step, not a plan.';
   return 'Keep it light and observational — a genuine connection you noticed, not a revelation.';
 }
@@ -455,7 +458,7 @@ export function buildPatternHint({ kind, pattern, emotion, memory }) {
   const p = pattern;
   const samples = p.memories.slice(-3).map((m) => `\u201c${String(m.content).slice(0, 160)}\u201d (saved ${String(m.created_at || '').slice(0, 10)})`).join('; ');
   const stance = p.maturity === 'established' ? 'This keeps coming up — name it plainly.' : 'This is early — lead with \u201cI\u2019m starting to notice\u2026\u201d, tentative, not a verdict.';
-  return `Pattern insight — you MAY share this ONE observation as a brief, natural aside near the end of your reply, but only if the conversation has a genuine opening for it; otherwise skip it silently and never force it. Never volunteer more than one insight per reply. Observation (a MODEL, not a feeling — you do not feel concern, you notice patterns): ${p.occurrences.length} related memories, theme \u201c${p.theme}\u201d: ${samples}. ${stance} ${kindGuidance(p.kind)} Compose the insight in your own words from the evidence — genuine and specific, never a fortune-cookie generality. If the user asks why you mentioned it, say you noticed these memories connecting — and he can ask you to forget any of them anytime.`;
+  return `Pattern insight — you MAY share this ONE observation as a brief, natural aside near the end of your reply, but only if the conversation has a genuine opening for it; otherwise skip it silently and never force it. Never volunteer more than one insight per reply. Observation (a MODEL, not a feeling — you do not feel concern, you notice patterns): ${p.occurrences.length} related memories, theme \u201c${p.theme}\u201d: ${samples}. ${stance} ${kindGuidance(p.kind)} Compose the insight in your own words from the evidence — genuine and specific, never a fortune-cookie generality. If the user asks why you mentioned it, say you noticed these memories connecting — and they can ask you to forget any of them anytime.`;
 }
 
 /** Dispatch to the right hint builder for any unified surfacing candidate. */
