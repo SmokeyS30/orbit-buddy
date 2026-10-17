@@ -26,8 +26,75 @@
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
     <title>Orbit Buddy</title>
+    <style>
+      /* Splash screen — inline for instant paint, no external assets */
+      #orbit-splash{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;background:radial-gradient(1200px 600px at 50% -10%,#232a5e 0%,#0b0d17 60%);overflow:hidden;transition:opacity .8s ease}
+      #orbit-splash.splash-hide{opacity:0;pointer-events:none}
+      #orbit-splash .splash-stars{position:absolute;inset:0}
+      #orbit-splash .splash-star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:0;animation:splash-twinkle 4s ease-in-out infinite}
+      @keyframes splash-twinkle{0%,100%{opacity:0}50%{opacity:.7}}
+      #orbit-splash .splash-rings{position:absolute;width:min(340px,88vw);height:min(340px,88vw);top:50%;left:50%;transform:translate(-50%,-58%);pointer-events:none}
+      #orbit-splash .splash-ring{position:absolute;inset:0;border:1px solid rgba(108,140,255,.18);border-radius:50%;animation:splash-spin 24s linear infinite}
+      #orbit-splash .splash-ring:nth-child(2){inset:12%;border-color:rgba(139,92,246,.14);animation-duration:36s;animation-direction:reverse}
+      #orbit-splash .splash-ring:nth-child(3){inset:24%;border-color:rgba(108,140,255,.08);animation-duration:48s}
+      #orbit-splash .splash-ring::after{content:'';position:absolute;top:-3px;left:50%;width:6px;height:6px;background:#6c8cff;border-radius:50%;box-shadow:0 0 12px #6c8cff}
+      #orbit-splash .splash-ring:nth-child(2)::after{background:#8b5cf6;box-shadow:0 0 12px #8b5cf6}
+      #orbit-splash .splash-ring:nth-child(3)::after{background:transparent;box-shadow:none}
+      @keyframes splash-spin{to{transform:rotate(360deg)}}
+      #orbit-splash .splash-orb{width:150px;height:150px;border-radius:50%;background:radial-gradient(circle at 35% 35%,#3b4480,#171b33 70%);border:1px solid rgba(108,140,255,.25);position:relative;z-index:2;box-shadow:0 0 80px rgba(108,140,255,.25),inset 0 0 60px rgba(108,140,255,.1);animation:splash-float 6s ease-in-out infinite;display:flex;align-items:center;justify-content:center}
+      #orbit-splash .splash-orb::before{content:'';position:absolute;inset:24px;border-radius:50%;border:1px solid rgba(108,140,255,.15)}
+      #orbit-splash .splash-core{font-size:3.2em;color:rgba(108,140,255,.6);animation:splash-pulse 3s ease-in-out infinite;line-height:1}
+      @keyframes splash-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-12px)}}
+      @keyframes splash-pulse{0%,100%{opacity:.6;transform:scale(1)}50%{opacity:1;transform:scale(1.08)}}
+      #orbit-splash .splash-brand{margin-top:48px;text-align:center;z-index:2;animation:splash-fadeUp 1.2s ease-out both;animation-delay:.3s}
+      #orbit-splash .splash-brand h1{font-size:42px;font-weight:800;letter-spacing:-.5px;background:linear-gradient(120deg,#fff,#b9c6ff);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;margin:0}
+      #orbit-splash .splash-brand p{color:#a7aecf;font-size:13px;letter-spacing:4px;text-transform:uppercase;margin:10px 0 0;font-weight:500}
+      @keyframes splash-fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+      #orbit-splash .splash-loader{position:absolute;bottom:90px;width:120px;height:3px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;z-index:2}
+      #orbit-splash .splash-loader::after{content:'';display:block;height:100%;width:40%;background:linear-gradient(90deg,#6c8cff,#8b5cf6);border-radius:2px;animation:splash-load 2.5s ease-in-out infinite}
+      @keyframes splash-load{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+      #orbit-splash .splash-tagline{position:absolute;bottom:48px;color:rgba(167,174,207,.5);font-size:12px;letter-spacing:1px;z-index:2;animation:splash-fadeUp 1.2s ease-out both;animation-delay:.8s;margin:0}
+      @media (prefers-reduced-motion:reduce){#orbit-splash *{animation:none!important}}
+    </style>
   </head>
   <body>
+    <div id="orbit-splash" aria-hidden="true">
+      <div class="splash-stars" id="splash-stars"></div>
+      <div class="splash-rings"><div class="splash-ring"></div><div class="splash-ring"></div><div class="splash-ring"></div></div>
+      <div class="splash-orb"><div class="splash-core">◉</div></div>
+      <div class="splash-brand"><h1>Orbit Buddy</h1><p>Your steady copilot</p></div>
+      <div class="splash-loader"></div>
+      <p class="splash-tagline">warming up your universe…</p>
+    </div>
+    <script>
+      // Splash screen: stars + timed fade-out. Inline so it runs during initial parse.
+      (function(){
+        try{
+          var container=document.getElementById('splash-stars');
+          if(container){
+            for(var i=0;i<60;i++){
+              var s=document.createElement('div');
+              s.className='splash-star';
+              s.style.left=(Math.random()*100)+'%';
+              s.style.top=(Math.random()*100)+'%';
+              s.style.animationDelay=(Math.random()*4)+'s';
+              container.appendChild(s);
+            }
+          }
+          var splash=document.getElementById('orbit-splash');
+          var done=false;
+          function hide(){
+            if(done||!splash)return;done=true;
+            splash.classList.add('splash-hide');
+            setTimeout(function(){if(splash&&splash.parentNode)splash.parentNode.removeChild(splash);},900);
+          }
+          // Show for ~5s, then fade. Hard cap ensures it never sticks.
+          setTimeout(hide,5000);
+          // Allow the app to dismiss early once fully ready (optional hook).
+          window.__orbitSplashDone=hide;
+        }catch(e){/* splash must never break the app */}
+      })();
+    </script>
 </div>
     <div class="ambient ambient-one"></div>
     <div class="ambient ambient-two"></div>
