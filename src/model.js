@@ -319,13 +319,39 @@ export function createModelClient(env = process.env) {
     ...(usingAzure ? [] : [DEFAULT_MODEL, ...COMPATIBILITY_MODELS])
   ]).filter((name) => name !== model);
   const fallbackModel = fallbackModels[0] || null;
-  const baseUrl = validateBaseUrl(
-    usingAzure ? `${azureEndpoint}/openai/v1` : env.OPENAI_BASE_URL,
-    env.ALLOW_INSECURE_MODEL_URL === 'true'
-  );
-  const authHeaders = usingAzure ? { 'api-key': apiKey } : { Authorization: `Bearer ${apiKey}` };
+  const allowInsecureModelUrl = env.ALLOW_INSECURE_MODEL_URL === 'true';
+  // Multi-region Azure failover: an optional secondary endpoint (West US 3)
+  // takes over on 5xx/network failures. Health probes and every request start
+  // at the primary, so traffic returns to East US automatically on recovery.
+  const azureSecondaryEndpoint = usingAzure ? env.AZURE_OPENAI_SECONDARY_ENDPOINT?.trim().replace(/\/+$/, '') : '';
+  const azureSecondaryApiKey = usingAzure ? env.AZURE_OPENAI_SECONDARY_KEY?.trim() : '';
+  const azureSecondaryDeployment = usingAzure ? (env.AZURE_OPENAI_SECONDARY_DEPLOYMENT?.trim() || azureDeployment) : '';
+  const requestEndpoints = [];
+  if (usingAzure) {
+    requestEndpoints.push({
+      name: 'primary',
+      baseUrl: validateBaseUrl(`${azureEndpoint}/openai/v1`, allowInsecureModelUrl),
+      authHeaders: { 'api-key': azureApiKey },
+      deployment: azureDeployment
+    });
+    if (azureSecondaryEndpoint && azureSecondaryApiKey) {
+      requestEndpoints.push({
+        name: 'secondary',
+        baseUrl: validateBaseUrl(`${azureSecondaryEndpoint}/openai/v1`, allowInsecureModelUrl),
+        authHeaders: { 'api-key': azureSecondaryApiKey },
+        deployment: azureSecondaryDeployment
+      });
+    }
+  } else {
+    requestEndpoints.push({
+      name: 'primary',
+      baseUrl: validateBaseUrl(env.OPENAI_BASE_URL, allowInsecureModelUrl),
+      authHeaders: { Authorization: `Bearer ${apiKey}` },
+      deployment: null
+    });
+  }
   const provider = usingAzure ? 'azure-openai' : 'openai';
-  const health = { provider, state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, fallbackModel, fallbackModels, availableTextModelCount: null, connectionLatencyMs: null, lastFirstTokenMs: null, lastResponseMs: null, lastError: null, checkedAt: null };
+  const health = { provider, state: apiKey ? 'unverified' : 'demo', primaryModel: model, activeModel: apiKey ? null : model, activeEndpoint: null, fallbackModel, fallbackModels, availableTextModelCount: null, connectionLatencyMs: null, lastFirstTokenMs: null, lastResponseMs: null, lastError: null, checkedAt: null };
   const configuredConnectionTtl = Number(env.OPENAI_CONNECTION_CHECK_TTL_MS);
   const connectionCheckTtlMs = Number.isFinite(configuredConnectionTtl)
     ? Math.max(5_000, Math.min(configuredConnectionTtl, 5 * 60_000))
@@ -339,13 +365,24 @@ export function createModelClient(env = process.env) {
     ? Math.max(30_000, Math.min(configuredResponseTimeout, 180_000))
     : 90_000;
   let preferredModel = model;
+  let activeEndpointName = 'primary';
   let discoveredModels = [];
   let connectionCheckInFlight = null;
+
+  // Exponential backoff with jitter for transient failures: 3 retries, ~1s
+  // base delay doubling, capped ~10s. Shared by the request path and the
+  // health probe's failover decision below.
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const FAILOVER_TRANSIENT_CLASSES = new Set(['service', 'network']);
+  const MAX_MODEL_REQUEST_RETRIES = 3;
+  const RETRY_BASE_DELAY_MS = 1000;
+  const RETRY_MAX_DELAY_MS = 10000;
 
   const recordFailure = (error) => {
     const classification = error?.classification || classifyModelError(error);
     health.state = classification;
     health.activeModel = null;
+    health.activeEndpoint = null;
     health.lastError = String(error?.message || error).slice(0, 300);
     health.checkedAt = new Date().toISOString();
     return classification;
@@ -357,31 +394,61 @@ export function createModelClient(env = process.env) {
     if (Number.isFinite(checkedAtMs) && Date.now() - checkedAtMs < connectionCheckTtlMs) return { ...health };
     if (connectionCheckInFlight) return connectionCheckInFlight;
 
+  const probeEndpointModels = async (endpoint) => {
+    const response = await fetch(`${endpoint.baseUrl}/models`, {
+      headers: endpoint.authHeaders,
+      signal: AbortSignal.timeout(5_000)
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw modelRequestError(response, payload, endpoint.deployment || model);
+    return new Set((payload.data || []).map((entry) => entry?.id).filter(Boolean));
+  };
+
     connectionCheckInFlight = (async () => {
       const startedAt = Date.now();
       try {
-        const response = await fetch(`${baseUrl}/models`, {
-          headers: authHeaders,
-          signal: AbortSignal.timeout(5_000)
-        });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok) throw modelRequestError(response, payload, model);
-        const available = new Set((payload.data || []).map((entry) => entry?.id).filter(Boolean));
+        // Prefer the primary region: probe it first and fail over to the
+        // secondary only on 5xx/network errors, so traffic returns to East US
+        // automatically when it recovers.
+        let servingEndpoint = null;
+        let available = null;
+        let probeError = null;
+        for (const endpoint of requestEndpoints) {
+          try {
+            available = await probeEndpointModels(endpoint);
+            servingEndpoint = endpoint;
+            probeError = null;
+            break;
+          } catch (error) {
+            error.classification = error?.classification || classifyModelError(error);
+            probeError = error;
+            if (!FAILOVER_TRANSIENT_CLASSES.has(error.classification)) throw error;
+          }
+        }
+        if (!available) throw probeError;
+        activeEndpointName = servingEndpoint.name;
+        health.activeEndpoint = servingEndpoint.name;
         discoveredModels = rankAvailableTextModels([...available]);
         health.availableTextModelCount = discoveredModels.length;
-        const selected = uniqueModels([model, ...fallbackModels, ...(usingAzure ? [] : discoveredModels)]).find((name) => available.has(name));
+        const viaPrimaryModel = servingEndpoint.deployment || model;
+        const selected = uniqueModels([viaPrimaryModel, ...fallbackModels, ...(usingAzure ? [] : discoveredModels)]).find((name) => available.has(name));
         health.checkedAt = new Date().toISOString();
         if (!selected) {
-          preferredModel = model;
+          preferredModel = viaPrimaryModel;
           health.state = 'model_access';
           health.activeModel = null;
-          health.lastError = `The ${usingAzure ? 'Azure OpenAI resource' : 'OpenAI project'} does not list ${model} or Orbit's configured fallback models.`;
+          health.lastError = `The ${usingAzure ? 'Azure OpenAI resource' : 'OpenAI project'} does not list ${viaPrimaryModel} or Orbit's configured fallback models.`;
           return { ...health };
         }
         preferredModel = selected;
         health.activeModel = selected;
-        health.state = selected === model ? 'ready' : 'fallback';
-        health.lastError = selected === model ? null : `${model} is not available to this OpenAI project; using ${selected}.`;
+        const onPrimaryReady = servingEndpoint.name === 'primary' && selected === model;
+        health.state = onPrimaryReady ? 'ready' : 'fallback';
+        health.lastError = onPrimaryReady
+          ? null
+          : (servingEndpoint.name === 'primary'
+            ? `${model} is not available to this OpenAI project; using ${selected}.`
+            : `${model} is not reachable in the primary region; serving via ${servingEndpoint.name}${selected === model ? '' : ` (${selected})`}.`);
         return { ...health };
       } catch (error) {
         error.classification = error?.classification || classifyModelError(error);
@@ -475,15 +542,47 @@ export function createModelClient(env = process.env) {
         };
       };
 
-      const startModelRequest = async (modelInput, modelName, extra = {}) => {
+      // Cross-region failover + exponential backoff with jitter for the model
+      // request path. Transient 5xx/503s and dropped connections are retried
+      // on the same endpoint first (3 retries, ~1s base delay doubling, capped
+      // ~10s); when an endpoint keeps failing transiently, the request fails
+      // over to the next configured endpoint instead of surfacing the error.
+      // Non-transient errors (auth, quota, model access, bad request) throw
+      // immediately: a secondary region cannot fix those.
+      const requestWithResilience = async (singleRequest, modelInput, modelName) => {
+        let lastError = null;
+        for (const endpoint of requestEndpoints) {
+          const endpointModel = endpoint.deployment || modelName;
+          let delayMs = RETRY_BASE_DELAY_MS;
+          for (let attempt = 0; ; attempt += 1) {
+            try {
+              const output = await singleRequest(endpoint, modelInput, endpointModel);
+              activeEndpointName = endpoint.name;
+              return output;
+            } catch (error) {
+              error.classification = error?.classification || classifyModelError(error);
+              lastError = error;
+              const transient = FAILOVER_TRANSIENT_CLASSES.has(error.classification);
+              if (!transient || attempt >= MAX_MODEL_REQUEST_RETRIES) break;
+              const jittered = delayMs * (0.5 + Math.random());
+              await sleep(Math.min(jittered, RETRY_MAX_DELAY_MS));
+              delayMs = Math.min(delayMs * 2, RETRY_MAX_DELAY_MS);
+            }
+          }
+          if (!FAILOVER_TRANSIENT_CLASSES.has(lastError?.classification)) throw lastError;
+        }
+        throw lastError;
+      };
+
+      const startModelRequest = async (endpoint, modelInput, modelName, extra = {}) => {
         const controller = new AbortController();
         const firstResponseTimer = setTimeout(() => controller.abort(), firstResponseTimeoutMs);
         let responseTimer = null;
         try {
-          const response = await fetch(`${baseUrl}/responses`, {
+          const response = await fetch(`${endpoint.baseUrl}/responses`, {
             method: 'POST',
             headers: {
-              ...authHeaders,
+              ...endpoint.authHeaders,
               'Content-Type': 'application/json',
               ...(extra.stream ? { Accept: 'text/event-stream' } : {})
             },
@@ -500,9 +599,9 @@ export function createModelClient(env = process.env) {
         }
       };
 
-      const requestModel = async (modelInput, modelName) => {
+      const requestModelOnce = async (endpoint, modelInput, modelName) => {
         const startedAt = Date.now();
-        const request = await startModelRequest(modelInput, modelName);
+        const request = await startModelRequest(endpoint, modelInput, modelName);
         try {
           const payload = await request.response.json().catch(() => ({}));
           if (!request.response.ok) {
@@ -516,13 +615,13 @@ export function createModelClient(env = process.env) {
         }
       };
 
-      // Streaming variant of requestModel: parses the Responses API SSE stream,
-      // rebuilding output items in the same shape as the non-streaming response
+      // Streaming variant of requestModelOnce: parses the Responses API SSE stream,
+      // rebuilding output items in the same shape as a non-streaming response
       // and calling onToken for each text delta as it arrives.
-      const requestModelStream = async (modelInput, modelName) => {
+      const requestModelStreamOnce = async (endpoint, modelInput, modelName) => {
         const startedAt = Date.now();
         let firstTokenMs = null;
-        const request = await startModelRequest(modelInput, modelName, { stream: true });
+        const request = await startModelRequest(endpoint, modelInput, modelName, { stream: true });
         try {
           const { response } = request;
           if (!response.ok) {
@@ -548,6 +647,11 @@ export function createModelClient(env = process.env) {
           request.stop();
         }
       };
+
+      // Public request entry points: every model call retries transient
+      // failures with backoff and fails over across regions automatically.
+      const requestModel = (modelInput, modelName) => requestWithResilience(requestModelOnce, modelInput, modelName);
+      const requestModelStream = (modelInput, modelName) => requestWithResilience(requestModelStreamOnce, modelInput, modelName);
 
       const parseArgs = (raw) => {
         try {
@@ -593,11 +697,13 @@ export function createModelClient(env = process.env) {
           try {
             const output = await request(input, selectedModel);
             if (!useComplexModel || selectedModel !== complexModel) preferredModel = selectedModel;
-            const routeSucceeded = selectedModel === routeTargetModel;
+            const viaSecondary = activeEndpointName !== 'primary';
+            const routeSucceeded = selectedModel === routeTargetModel && !viaSecondary;
             health.state = routeSucceeded ? 'ready' : 'fallback';
             health.activeModel = selectedModel;
+            health.activeEndpoint = activeEndpointName;
             health.checkedAt = new Date().toISOString();
-            health.lastError = routeSucceeded ? null : `${unavailable.join(', ') || routeTargetModel} unavailable; using ${selectedModel}.`;
+            health.lastError = routeSucceeded ? null : `${unavailable.join(', ') || routeTargetModel} unavailable; using ${selectedModel}${viaSecondary ? ` via the ${activeEndpointName} region` : ''}.`;
             return output;
           } catch (error) {
             error.classification = error?.classification || classifyModelError(error);

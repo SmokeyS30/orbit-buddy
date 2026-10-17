@@ -327,7 +327,7 @@ test('model access failure falls back to the configured starter model', async (t
   assert.equal(model.diagnostics().activeModel, 'gpt-6-luna');
 });
 
-test('temporary primary-model overload falls back immediately to the next configured model', async (t) => {
+test('temporary primary-model overload retries with backoff, then falls back to the next configured model', async (t) => {
   const attempted = [];
   const stub = http.createServer((req, res) => {
     let body = '';
@@ -355,7 +355,9 @@ test('temporary primary-model overload falls back immediately to the next config
   const response = await model.respond({ buddyName: 'Orbit', message: 'Hello', tools: true });
 
   assert.equal(response.text, 'Sol fallback worked.');
-  assert.deepEqual(attempted, ['gpt-6-astra', 'gpt-6.1-sol']);
+  // Transient 503s are retried with backoff (1 initial + 3 retries) before
+  // the model-level fallback chain moves to the next configured model.
+  assert.deepEqual(attempted, ['gpt-6-astra', 'gpt-6-astra', 'gpt-6-astra', 'gpt-6-astra', 'gpt-6.1-sol']);
   assert.equal(model.diagnostics().state, 'fallback');
   assert.equal(model.diagnostics().activeModel, 'gpt-6.1-sol');
 });
