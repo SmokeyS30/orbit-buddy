@@ -33,7 +33,7 @@ test('splash CSS uses the welcome-page palette', () => {
 test('splash hides on a timer with a hard cap', () => {
   const html = readPublic('index.html');
   // 5s display timer
-  assert.ok(html.includes('setTimeout(hide,5000)'), 'splash hides after ~5s');
+  assert.ok(html.includes('setTimeout(hide,10000)'), 'splash hides after ~10s');
   // Fade-out class + DOM removal
   assert.ok(html.includes('splash-hide'), 'fade-out class exists');
   assert.ok(html.includes('removeChild(splash)'), 'splash removed from DOM after fade');
