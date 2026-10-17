@@ -302,3 +302,25 @@ test('soul: honest feedback flows through the shared prompt pipeline (web + What
   const directive = resolveSoulDirective({ db, userId: user.id, userName: 'Owner' });
   assert.ok(directive.includes('Honest feedback'), 'soul directive carries the honest section into the prompt');
 });
+
+// ---------------------------------------------------------------------------
+// Polish pass (2026-10-16): feel-level fixes — untuned default header,
+// revert phrasing, venting-safe max-warmth line.
+// ---------------------------------------------------------------------------
+
+test('soul: untuned default does not claim the user tuned it', () => {
+  const directive = buildSoulDirective(DEFAULT_SOUL_RECORD, { userName: 'Owner' });
+  assert.ok(!directive.includes('tuned this in chat'), 'default header is honest about being untuned');
+  const tuned = buildSoulDirective(DEFAULT_SOUL_RECORD, { userName: 'Owner', hasHistory: true });
+  assert.ok(tuned.includes('Owner tuned this in chat'), 'tuned header names the tuner');
+});
+
+test('soul: max warmth reads caring, not celebratory (venting-safe)', () => {
+  const venting = buildSoulDirective({ ...DEFAULT_SOUL_RECORD, warmth: 4 }, { userName: 'Owner', hasHistory: true });
+  assert.ok(!venting.includes('celebrate everything'), 'max warmth is not a party line');
+  assert.match(venting, /fully present/i);
+});
+
+test('soul: "go back to how it was" reverts too', () => {
+  assert.ok(isSoulRevert('go back to how it was'));
+});

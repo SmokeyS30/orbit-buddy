@@ -581,3 +581,22 @@ test('server: memory-connection push stays silent in quiet hours', async (t) => 
   await app.runProactiveChecks(runAt);
   assert.equal(app.db.listMemorySurfacings(userId, 10).length, 0, 'no surfacing in quiet hours');
 });
+
+// --- Polish (2026-10-16): emotional context uses the user's name, never a hardcoded one ---
+
+test('emotional context names the user instead of hardcoding Edward', () => {
+  const ctx = buildEmotionalContext({ userName: 'Jordan', tone: 'stressed', emotionPhrase: null });
+  assert.match(ctx, /Jordan’s emotional patterns/);
+  assert.match(ctx, /Jordan seems stressed/);
+  const anon = buildEmotionalContext({ userName: '', tone: 'stressed', emotionPhrase: null });
+  assert.match(anon, /the user’s emotional patterns/);
+  assert.match(anon, /the user seems stressed/);
+  assert.ok(!anon.includes('Edward'));
+});
+
+test('pattern hint never hardcodes gender', () => {
+  const pattern = detectMemoryPatterns({ memories: DRAIN_MEMORIES, nowMs: NOW })[0];
+  const hint = buildUnifiedHint({ kind: 'pattern', pattern, memory: pattern.memories[0] });
+  assert.ok(!/\bhe can\b/i.test(hint), 'no hardcoded "he"');
+  assert.ok(!/matters to him/i.test(hint), 'no hardcoded "him"');
+});
