@@ -87,6 +87,8 @@
             if(done||!splash)return;done=true;
             splash.classList.add('splash-hide');
             setTimeout(function(){if(splash&&splash.parentNode)splash.parentNode.removeChild(splash);},900);
+            window.__orbitSplashComplete=true;
+            try{window.dispatchEvent(new CustomEvent('orbit-splash-done'));}catch(e){}
           }
           // Show for ~10s, then fade. Hard cap ensures it never sticks.
           setTimeout(hide,10000);
