@@ -1535,6 +1535,10 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
   const input=$('#chat-input');
   if(!voiceBtn||!input)return;
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  // Live native check at tap time: newer iOS exposes a SpeechRecognition
+  // constructor in WKWebView whose service is blocked (service-not-allowed),
+  // so native must take precedence over SR existing. Never Web Speech on native.
+  const isNative=()=>typeof window!=='undefined'&&window.Capacitor?.isNativePlatform?.()===true;
   let longPressTimer=null,longPressFired=false;
   voiceBtn.addEventListener('pointerdown',()=>{
     longPressFired=false;
@@ -1556,6 +1560,7 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
   let recognition=null;
   voiceBtn.addEventListener('click',()=>{
     if(longPressFired){longPressFired=false;return;} // long-press already opened voice mode
+    if(isNative()){openVoiceMode();return;} // native: tap-to-record + server Whisper, never Web Speech
     if(recognizing&&recognition){recognition.stop();return;}
     recognition=new SR();
     recognition.lang='en-US';
