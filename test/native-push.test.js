@@ -101,3 +101,13 @@ test('push registration has a timeout when Apple never responds', () => {
   assert.match(appJs, /pushRegistrationPending=true;/);
   assert.match(appJs, /setTimeout\(\(\)=>\{if\(pushRegistrationPending\)\{pushRegistrationPending=false;toast\('Push setup timed out/);
 });
+
+test('AppDelegate forwards Apple push callbacks to Capacitor', () => {
+  // Without these, iOS delivers the APNs token/error to the AppDelegate and
+  // it goes nowhere: the JS registration events never fire (silent timeout).
+  const delegate = fs.readFileSync(path.join(root, 'ios', 'App', 'App', 'AppDelegate.swift'), 'utf8');
+  assert.match(delegate, /func application\(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data\)/);
+  assert.match(delegate, /NotificationCenter\.default\.post\(name: \.capacitorDidRegisterForRemoteNotifications, object: deviceToken\)/);
+  assert.match(delegate, /func application\(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error\)/);
+  assert.match(delegate, /NotificationCenter\.default\.post\(name: \.capacitorDidFailToRegisterForRemoteNotifications, object: error\)/);
+});
