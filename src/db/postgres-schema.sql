@@ -256,6 +256,32 @@ CREATE TABLE IF NOT EXISTS apns_device_tokens (
   UNIQUE(user_id, device_token)
 );
 
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  product_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  expires_at TEXT,
+  app_account_token TEXT,
+  environment TEXT NOT NULL DEFAULT 'production',
+  original_transaction_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_usage (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day_ny TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, day_ny)
+);
+
+CREATE TABLE IF NOT EXISTS processed_notifications (
+  notification_id TEXT PRIMARY KEY,
+  received_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS connectors (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

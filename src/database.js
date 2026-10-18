@@ -171,6 +171,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE(user_id, device_token)
     );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      expires_at TEXT, app_account_token TEXT, environment TEXT NOT NULL DEFAULT 'production',
+      original_transaction_id TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS daily_usage (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      day_ny TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, day_ny)
+    );
+    CREATE TABLE IF NOT EXISTS processed_notifications (
+      notification_id TEXT PRIMARY KEY,
+      received_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS connectors (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, access_encrypted TEXT NOT NULL, refresh_encrypted TEXT,
@@ -686,6 +704,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`),
     listApnsTokens: db.prepare('SELECT * FROM apns_device_tokens WHERE user_id=?'),
     deleteApnsToken: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=?'),
+    upsertSubscription: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+      expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+      original_transaction_id=excluded.original_transaction_id,updated_at=excluded.updated_at`),
+    getSubscription: db.prepare('SELECT * FROM subscriptions WHERE user_id=?'),
+    getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
+    incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+      ON CONFLICT(user_id,day_ny) DO UPDATE SET count=count+1,updated_at=excluded.updated_at`),
+    resetDailyUsage: db.prepare('DELETE FROM daily_usage WHERE day_ny<?'),
+    insertNotification: db.prepare('INSERT OR IGNORE INTO processed_notifications(notification_id,received_at) VALUES(?,?)'),
+    pruneNotifications: db.prepare("DELETE FROM processed_notifications WHERE received_at < datetime('now','-30 days')"),
+    findUserByAppAccountToken: db.prepare('SELECT user_id FROM subscriptions WHERE app_account_token=?'),
     upsertConnector: db.prepare(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
       refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
@@ -1165,6 +1195,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
     listApnsTokens: (userId) => s.listApnsTokens.all(userId),
     deleteApnsToken: (token) => s.deleteApnsToken.run(token),
+    saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId}) {
+      const now=timestamp();
+      s.upsertSubscription.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken||null,environment||'production',originalTransactionId||null,now,now);
+    },
+    getSubscription: (userId) => s.getSubscription.get(userId)||null,
+    getDailyUsageCount(userId,dayNy) { const row=s.getDailyUsage.get(userId,dayNy); return row?row.count:0; },
+    incrementDailyUsage(userId,dayNy) { s.incrementDailyUsage.run(userId,dayNy,timestamp()); },
+    pruneDailyUsage(beforeDayNy) { s.resetDailyUsage.run(beforeDayNy); },
+    markNotificationProcessed(notificationId) { return s.insertNotification.run(notificationId,timestamp()).changes>0; },
+    pruneNotifications() { s.pruneNotifications.run(); },
+    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken); return row?row.user_id:null; },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
     getConnector: (userId,provider) => s.connector.get(userId,provider),

@@ -259,6 +259,29 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         updated_at TEXT NOT NULL,
         UNIQUE(user_id, device_token)
       )`,
+      `CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        expires_at TEXT,
+        app_account_token TEXT,
+        environment TEXT NOT NULL DEFAULT 'production',
+        original_transaction_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS daily_usage (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day_ny TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, day_ny)
+      )`,
+      `CREATE TABLE IF NOT EXISTS processed_notifications (
+        notification_id TEXT PRIMARY KEY,
+        received_at TEXT NOT NULL
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -274,6 +297,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_apns_tokens_user ON apns_device_tokens(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_daily_usage_day ON daily_usage(day_ny)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -1183,6 +1207,37 @@ const indexMigrations = [
     },
     listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
     deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
+
+    // --- Subscriptions (StoreKit 2) ---
+    saveSubscription: async (userId, { productId, status, expiresAt, appAccountToken, environment, originalTransactionId }) => {
+      const now = timestamp();
+      await run(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+        expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+        original_transaction_id=excluded.original_transaction_id,updated_at=excluded.updated_at`,
+        randomUUID(), userId, productId, status, expiresAt || null, appAccountToken || null,
+        environment || 'production', originalTransactionId || null, now, now);
+    },
+    getSubscription: async (userId) => (await get('SELECT * FROM subscriptions WHERE user_id=?', userId)) || null,
+    getDailyUsageCount: async (userId, dayNy) => {
+      const row = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
+      return row ? row.count : 0;
+    },
+    incrementDailyUsage: async (userId, dayNy) => {
+      await run(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+        ON CONFLICT(user_id,day_ny) DO UPDATE SET count=daily_usage.count+1,updated_at=excluded.updated_at`,
+        userId, dayNy, timestamp());
+    },
+    pruneDailyUsage: async (beforeDayNy) => { await run('DELETE FROM daily_usage WHERE day_ny<?', beforeDayNy); },
+    markNotificationProcessed: async (notificationId) => {
+      const r = await run('INSERT INTO processed_notifications(notification_id,received_at) VALUES(?,?) ON CONFLICT DO NOTHING', notificationId, timestamp());
+      return (r.rowCount || 0) > 0;
+    },
+    pruneNotifications: async () => { await run("DELETE FROM processed_notifications WHERE received_at < NOW() - INTERVAL '30 days'"); },
+    findUserByAppAccountToken: async (appAccountToken) => {
+      const row = await get('SELECT user_id FROM subscriptions WHERE app_account_token=?', appAccountToken);
+      return row ? row.user_id : null;
+    },
 
     // --- Connectors ---
     saveConnector: async (userId, provider, data) => {
