@@ -252,6 +252,13 @@ body.voice-open{overflow:hidden}
 .camera-video{max-width:min(920px,94vw);max-height:68vh;border-radius:14px;background:#000}
 .camera-actions{display:flex;gap:10px}
 .camera-hint{color:var(--muted);font-size:14px;line-height:1.5;max-width:440px;text-align:center;margin:0}
+/* Files-tab document viewer: in-app overlay, no top-level navigation (which
+   breaks native auth on iOS). Matches the camera overlay aesthetic. */
+.doc-overlay{position:fixed;inset:0;z-index:70;display:flex;flex-direction:column;background:var(--bg)}
+.doc-bar{display:flex;align-items:center;gap:10px;padding:calc(10px + env(safe-area-inset-top)) 16px 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+.doc-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
+.doc-bar .primary,.doc-bar .ghost{padding:9px 14px;font-size:13px}
+.doc-frame{flex:1;border:0;width:100%;background:#fff}
 /* W1: per-message actions — hidden until hover (desktop) or long-press (touch). No persistent chrome. */
 .message{position:relative}
 .msg-actions{display:none;gap:6px;margin-top:10px;flex-wrap:wrap;align-items:center}

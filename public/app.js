@@ -585,7 +585,61 @@ async function renderTimeline(){
 }
 function renderActivity(items){const root=$('#activity-list');root.replaceChildren();if(!items.length)return empty(root,'This is a running log of everything Orbit does for you, so you can always see what happened. Nothing has happened yet.');for(const event of items){const el=document.createElement('div');el.className='timeline-item';const p=document.createElement('p');p.textContent=event.message;const time=document.createElement('time');time.dateTime=event.created_at;time.textContent=formatDate(event.created_at);el.append(p,time);if(event.detail){const detail=document.createElement('p');detail.className='muted small';detail.textContent=event.detail;el.append(detail);}root.append(el);}}
 async function deleteFile(id,name){if(!confirm(`Delete "${name}"?`))return;try{await api(`/api/artifacts/${id}`,{method:'DELETE'});state.snapshot.artifacts=(state.snapshot.artifacts||[]).filter(f=>f.id!==id);renderFiles(state.snapshot.artifacts);toast('File deleted.');}catch(e){toast('Could not delete file: '+e.message);}}
-function renderFiles(items){const root=$('#files-list');root.replaceChildren();if(!items.length)return empty(root,'Files Orbit makes for you — documents, lists, calendars — show up here.','Make me a packing list for a beach weekend');for(const file of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=file.name;const p=document.createElement('p');p.textContent=`${Math.max(1,Math.round(file.size_bytes/1024))} KB · ${formatDate(file.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='card-actions';const link=document.createElement('a');link.className='primary link-button';link.href=`/api/artifacts/${file.id}`;link.textContent='Download';const del=document.createElement('button');del.className='danger link-button';del.textContent='Delete';del.onclick=()=>deleteFile(file.id,file.name);actions.append(link,del);head.append(wrap,actions);card.append(head);root.append(card);}}
+// Files-tab document viewer. The old bare <a href> Download link did a top-level
+// navigation with no auth headers — on iOS native (Bearer-token auth, no usable
+// cookie in WKWebView) the request 401'd and the app page was destroyed (splash
+// screen, back to the Today tab). Now everything goes through the authenticated
+// api() helper and no navigation happens at all: markdown docs open in an
+// in-app viewer with Print, other files go to the share sheet / download.
+async function openArtifact(file){
+  let res;
+  try{res=await api(`/api/artifacts/${file.id}`);}
+  catch(e){toast(e&&e.auth?'Please sign in again, then try once more.':'Could not open "'+file.name+'": '+(e&&e.message||e));return;}
+  try{
+    const type=res.headers.get('content-type')||'';
+    if(type.includes('text/html')){openDocViewer(file.name,await res.text(),file.id);return;}
+    await shareOrDownloadBlob(await res.blob(),file.name||'orbit-file',type);
+  }catch(e){toast('Could not open "'+file.name+'": '+(e&&e.message||e));}
+}
+async function shareOrDownloadBlob(blob,name,type){
+  const f=new File([blob],name,{type:type||blob.type||'application/octet-stream'});
+  if(navigator.canShare&&navigator.canShare({files:[f]})){
+    try{await navigator.share({files:[f],title:name});return;}
+    catch(e){if(e&&e.name==='AbortError')return;} // user dismissed the sheet — done
+  }
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
+}
+function openDocViewer(name,html,artifactId){
+  closeDocViewer();
+  const overlay=document.createElement('div');
+  overlay.className='doc-overlay';overlay.id='doc-overlay';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-label',name);
+  const bar=document.createElement('div');bar.className='doc-bar';
+  const title=document.createElement('strong');title.className='doc-title';title.textContent=name;
+  const printBtn=document.createElement('button');printBtn.type='button';printBtn.className='primary';printBtn.textContent='Print';
+  printBtn.onclick=()=>printArtifact(artifactId,name);
+  const closeBtn=document.createElement('button');closeBtn.type='button';closeBtn.className='ghost';closeBtn.textContent='Close';
+  closeBtn.onclick=closeDocViewer;
+  bar.append(title,printBtn,closeBtn);
+  const frame=document.createElement('iframe');frame.className='doc-frame';frame.title=name;
+  // The server HTML ships its own toolbar wired for top-level navigation
+  // (Done link + Print via relative fetch) — hide it; the viewer bar above
+  // is authoritative while the doc lives inside the app.
+  frame.srcdoc=String(html).replace('<div class="toolbar">','<div class="toolbar" style="display:none">');
+  overlay.append(bar,frame);document.body.append(overlay);
+  document.addEventListener('keydown',docViewerKey);
+}
+function docViewerKey(event){if(event.key==='Escape')closeDocViewer();}
+function closeDocViewer(){document.removeEventListener('keydown',docViewerKey);const el=document.getElementById('doc-overlay');if(el)el.remove();}
+async function printArtifact(artifactId,name){
+  try{
+    const res=await api(`/api/artifacts/${artifactId}?format=pdf`);
+    const pdfName=String(name||'orbit-result').replace(/\.md$/i,'')+'.pdf';
+    await shareOrDownloadBlob(await res.blob(),pdfName,'application/pdf');
+  }catch(e){toast('Could not prepare the print file: '+(e&&e.message||e));}
+}
+function renderFiles(items){const root=$('#files-list');root.replaceChildren();if(!items.length)return empty(root,'Files Orbit makes for you — documents, lists, calendars — show up here.','Make me a packing list for a beach weekend');for(const file of items){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=file.name;const p=document.createElement('p');p.textContent=`${Math.max(1,Math.round(file.size_bytes/1024))} KB · ${formatDate(file.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='card-actions';const link=document.createElement('button');link.type='button';link.className='primary link-button';link.textContent='Open';link.onclick=()=>openArtifact(file);const del=document.createElement('button');del.className='danger link-button';del.textContent='Delete';del.onclick=()=>deleteFile(file.id,file.name);actions.append(link,del);head.append(wrap,actions);card.append(head);root.append(card);}}
 const whatsappUi={status:null,code:null,expiresAt:null,deepLink:null,codeRefreshed:null,loading:false};
 async function loadWhatsAppStatus(force){
   if(whatsappUi.loading)return;
