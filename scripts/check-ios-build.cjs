@@ -3,12 +3,13 @@
  * pre-archive check for Orbit Buddy iOS builds.
  *
  * Run this on your Mac BEFORE archiving for TestFlight:
- *   node scripts/check-ios-build.js
+ *   node scripts/check-ios-build.cjs
  *
- * It verifies three things that have bitten us before:
+ * It verifies four things that have bitten us before:
  *   1. Web assets are synced — ios/App/App/public matches public/
  *   2. Native API base is absolute — the app talks to https://orbitbuddy.app, not relative URLs
- *   3. Sign-in is wired — the auth form has a submit handler and the button actually submits
+ *   3. Native voice routing cannot enter Web Speech on iOS
+ *   4. Sign-in is wired — the auth form has a submit handler and the button actually submits
  *
  * Fails fast with the exact problem. Exit 0 = safe to archive.
  */
@@ -20,6 +21,8 @@ const ROOT = path.resolve(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const SYNCED_DIR = path.join(ROOT, 'ios', 'App', 'App', 'public');
 const APP_JS = path.join(PUBLIC_DIR, 'app.js');
+const VOICE_JS = path.join(PUBLIC_DIR, 'voice-mode.js');
+const NATIVE_RUNTIME_JS = path.join(PUBLIC_DIR, 'native-runtime.js');
 const INDEX_HTML = path.join(PUBLIC_DIR, 'index.html');
 
 let failures = 0;
@@ -91,8 +94,31 @@ if (!fs.existsSync(APP_JS)) {
   }
 }
 
-// --- 3. Sign-in wiring -------------------------------------------------------
-section('3. Sign-in wiring (tap reaches a real handler)');
+// --- 3. Native voice routing -------------------------------------------------
+section('3. Native voice routing (never Web Speech on iOS)');
+if (!fs.existsSync(VOICE_JS) || !fs.existsSync(NATIVE_RUNTIME_JS)) {
+  fail('voice-mode.js or native-runtime.js is missing.');
+} else {
+  const appJs = fs.readFileSync(APP_JS, 'utf8');
+  const voiceJs = fs.readFileSync(VOICE_JS, 'utf8');
+  const runtimeJs = fs.readFileSync(NATIVE_RUNTIME_JS, 'utf8');
+  const appUsesClassifier = /shouldUseWebSpeech\(window\)/.test(appJs);
+  const voiceUsesClassifier = /shouldUseWebSpeech\(window\)/.test(voiceJs);
+  const hasSchemeFallback = /protocol === 'capacitor:'/.test(runtimeJs);
+  const hasBridgeFallback = /messageHandlers\?\.bridge/.test(runtimeJs);
+  const hasIosFallback = /iPad\|iPhone\|iPod/.test(runtimeJs);
+  if (!appUsesClassifier) fail('app.js does not gate the mic through shouldUseWebSpeech().');
+  if (!voiceUsesClassifier) fail('voice-mode.js does not gate recognition through shouldUseWebSpeech().');
+  if (!hasSchemeFallback || !hasBridgeFallback || !hasIosFallback) {
+    fail('native-runtime.js is missing a required iOS native fallback signal.');
+  }
+  if (appUsesClassifier && voiceUsesClassifier && hasSchemeFallback && hasBridgeFallback && hasIosFallback) {
+    pass('native and iOS mic paths are forced to MediaRecorder transcription.');
+  }
+}
+
+// --- 4. Sign-in wiring -------------------------------------------------------
+section('4. Sign-in wiring (tap reaches a real handler)');
 if (!fs.existsSync(APP_JS) || !fs.existsSync(INDEX_HTML)) {
   fail('app.js or index.html not found.');
 } else {

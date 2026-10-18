@@ -21,6 +21,7 @@ function loadCanvas(){
 import { briefingLayoutFor } from './briefing-layout.js';
 import { parseConversationDeepLink } from './deep-link.js';
 import { geoAttemptPlan, markGeoAsked, clearGeoAsked } from './geo-prompt.js';
+import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null};
@@ -47,7 +48,7 @@ const $=(selector)=>document.querySelector(selector);const $$=(selector)=>[...do
 // the server — every API call is prefixed with API_BASE (absolute on native,
 // empty string on web, keeping web behavior byte-identical). Cookies on the
 // cross-origin native fetch must be sent explicitly ('include').
-const IS_NATIVE=typeof window!=='undefined'&&window.Capacitor?.isNativePlatform?.()===true;
+const IS_NATIVE=isNativeRuntime(window);
 const API_BASE=IS_NATIVE?'https://orbitbuddy.app':'';
 const NATIVE_CREDENTIALS=IS_NATIVE?'include':'same-origin';
 // The server can't rely on the Origin header from the WKWebView, so every
@@ -1247,7 +1248,7 @@ async function openVoiceMode(){
   // runs synchronously after the await, so the controller is built exactly once.
   let voiceModeApi;try{voiceModeApi=await loadVoiceMode();}catch(_){toast('Voice mode needs a connection to load.');return;}
   if(!voiceMode){
-    voiceMode=voiceModeApi.createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio,isNative:IS_NATIVE});
+    voiceMode=voiceModeApi.createVoiceMode({buddyName:()=>state.status?.buddyName||'Orbit',sendTurn:sendVoiceTurn,transcribeAudio,isNative:()=>isNativeRuntime(window)});
     voiceMode.wire();
   }
   if(!voiceMode.isOpen())voiceMode.open();
@@ -1535,10 +1536,9 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
   const input=$('#chat-input');
   if(!voiceBtn||!input)return;
   const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  // Live native check at tap time: newer iOS exposes a SpeechRecognition
-  // constructor in WKWebView whose service is blocked (service-not-allowed),
-  // so native must take precedence over SR existing. Never Web Speech on native.
-  const isNative=()=>typeof window!=='undefined'&&window.Capacitor?.isNativePlatform?.()===true;
+  // Resolve the runtime again at tap time. The classifier also recognizes the
+  // capacitor: scheme and iOS itself, so a missing/late bridge can never route
+  // a native iPhone into its blocked Web Speech implementation.
   let longPressTimer=null,longPressFired=false;
   voiceBtn.addEventListener('pointerdown',()=>{
     longPressFired=false;
@@ -1560,7 +1560,7 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
   let recognition=null;
   voiceBtn.addEventListener('click',()=>{
     if(longPressFired){longPressFired=false;return;} // long-press already opened voice mode
-    if(isNative()){openVoiceMode();return;} // native: tap-to-record + server Whisper, never Web Speech
+    if(!shouldUseWebSpeech(window)){openVoiceMode();return;} // native/iOS: MediaRecorder + server transcription
     if(recognizing&&recognition){recognition.stop();return;}
     recognition=new SR();
     recognition.lang='en-US';

@@ -33,6 +33,7 @@ const STATIC_ASSETS = [
   { url: '/chat-scroll.js', versioned: false },
   { url: '/chat-markdown.js', versioned: false },
   { url: '/deep-link.js', versioned: false },
+  { url: '/native-runtime.js', versioned: false },
   { url: '/smooth.js', versioned: false },
   { url: '/pwa-install.js', versioned: false },
   { url: '/vendor/marked.min.js', versioned: false },
