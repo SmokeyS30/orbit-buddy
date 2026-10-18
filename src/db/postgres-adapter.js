@@ -249,6 +249,16 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         surfaced_at TEXT NOT NULL,
         UNIQUE(user_id, occurrence_key)
       )`,
+      `CREATE TABLE IF NOT EXISTS apns_device_tokens (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        device_token TEXT NOT NULL,
+        platform TEXT NOT NULL DEFAULT 'ios',
+        apns_environment TEXT NOT NULL DEFAULT 'production',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(user_id, device_token)
+      )`,
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -263,6 +273,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_canvas_revisions_message ON canvas_revisions(message_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_apns_tokens_user ON apns_device_tokens(user_id)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
