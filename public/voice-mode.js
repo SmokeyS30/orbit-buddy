@@ -398,8 +398,26 @@ export function createVoiceMode(deps) {
       recognition.interimResults = true;
       recognition.maxAlternatives = 1;
       let finalTranscript = '';
+      // If the speech service is blocked or hangs without firing (iOS WKWebView
+      // exposes the constructor but the service is unavailable), fall back to
+      // tap-to-record + Whisper instead of stranding the user on "Listening…".
+      let webSpeechSettled = false;
+      const fallbackToTap = () => {
+        if (webSpeechSettled) return;
+        webSpeechSettled = true;
+        try { if (recognition) recognition.abort(); } catch (_) {}
+        recognition = null;
+        state = 'idle-tap';
+        setOrb('idle');
+        setStatus('Tap the mic, say your piece, tap again to send.');
+      };
+      const webSpeechHangTimer = setTimeout(() => {
+        if (state === 'listening') fallbackToTap();
+      }, 4000);
+      const settleWebSpeech = () => { webSpeechSettled = true; clearTimeout(webSpeechHangTimer); };
       recognition.onresult = (event) => {
         if (state !== 'listening') return;
+        settleWebSpeech();
         let interim = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const tr = event.results[i][0].transcript;
@@ -410,6 +428,7 @@ export function createVoiceMode(deps) {
         if (show) addLine('user', show, true);
       };
       recognition.onend = () => {
+        settleWebSpeech();
         recognition = null;
         if (state !== 'listening') return;
         const text = finalTranscript.trim();
@@ -418,13 +437,12 @@ export function createVoiceMode(deps) {
         else startListen(); // hands-free: keep the conversation going
       };
       recognition.onerror = (event) => {
+        settleWebSpeech();
         recognition = null;
         if (state !== 'listening') return;
         const err = event && event.error;
         if (err === 'not-allowed' || err === 'service-not-allowed') {
-          setStatus('Microphone is blocked — allow it to keep talking.');
-          state = 'idle-blocked';
-          setOrb('idle');
+          fallbackToTap();
           return;
         }
         // 'no-speech', 'aborted', 'network': just listen again
@@ -433,8 +451,7 @@ export function createVoiceMode(deps) {
       try {
         recognition.start();
       } catch (_) {
-        state = 'idle-blocked';
-        setStatus('Could not start listening.');
+        fallbackToTap();
       }
     } else {
       // No Web Speech API (e.g. Firefox, iOS native): tap-to-record via Whisper fallback.

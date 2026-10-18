@@ -38,3 +38,39 @@ test('mic block defines a live Capacitor native check, not eval-time only', () =
   // may be ready; the mic handler needs its own live check at tap time.
   assert.match(body, /const isNative=\(\)=>[^;]*isNativePlatform/);
 });
+
+test('mic button falls through to voice mode when the speech service is blocked', () => {
+  const body = micBlock();
+  // On iOS WKWebView the Web Speech constructor exists but the service is
+  // blocked: instead of stranding the user on an error toast, open voice
+  // mode, which falls back to tap-to-record + Whisper on its own.
+  assert.match(
+    body,
+    /if\(event\.error==='service-not-allowed'\|\|event\.error==='not-allowed'\)\{openVoiceMode\(\);return;\}/
+  );
+});
+
+test('voice mode falls back to tap-to-record when Web Speech hangs', () => {
+  const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const src = fs.readFileSync(path.join(rootDir, 'public', 'voice-mode.js'), 'utf8');
+  // A hang timer watches recognition.start(): if nothing fires (blocked
+  // service in WKWebView), the user lands on tap-to-record + Whisper.
+  assert.match(src, /const webSpeechHangTimer = setTimeout\(/);
+  assert.match(src, /if \(state === 'listening'\) fallbackToTap\(\);/);
+  assert.match(src, /const fallbackToTap = \(\) => \{[\s\S]{0,400}state = 'idle-tap'/);
+});
+
+test('voice mode service-not-allowed falls back instead of dead-ending', () => {
+  const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  const src = fs.readFileSync(path.join(rootDir, 'public', 'voice-mode.js'), 'utf8');
+  const errBlock = src.slice(src.indexOf('recognition.onerror = (event) => {'));
+  assert.ok(
+    errBlock.indexOf('fallbackToTap()') > -1 &&
+    errBlock.indexOf('fallbackToTap()') < errBlock.indexOf("if (err !== 'aborted')"),
+    'service-not-allowed must trigger fallbackToTap()'
+  );
+  assert.doesNotMatch(
+    errBlock.slice(0, errBlock.indexOf("if (err !== 'aborted')")),
+    /Microphone is blocked/
+  );
+});
