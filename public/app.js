@@ -1644,9 +1644,67 @@ $('#preferences-form').addEventListener('input',()=>{preferencesDirty=true;});$(
 $('#writing-voice-learn').addEventListener('click',async()=>{const btn=$('#writing-voice-learn');btn.disabled=true;btn.textContent='Learning…';try{const result=await api('/api/writing-voice/learn',{method:'POST'});await refresh();toast(`Learned your writing voice from ${result.sampleCount} sent emails.`);}catch(error){toast(error.message);}finally{btn.disabled=false;btn.textContent='Learn how I write';}});
 $('#writing-voice-optin').addEventListener('change',async(event)=>{try{await api('/api/writing-voice/opt-in',{method:'POST',body:JSON.stringify({optIn:event.target.checked})});await refresh();toast(event.target.checked?'Writing voice on for drafts.':'Writing voice off — your style is kept.');}catch(error){event.target.checked=!event.target.checked;toast(error.message);}});
 $('#writing-voice-forget').addEventListener('click',async()=>{if(!confirm('Delete your learned writing voice? This also turns the feature off.'))return;try{await api('/api/writing-voice',{method:'DELETE'});await refresh();toast('Forgot how you write. It’s gone.');}catch(error){toast(error.message);}});
-async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;try{if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
-$('#enable-push').addEventListener('click',async()=>{try{if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');updatePushButton();}catch(error){toast(error.message);}});
+// B1: native iOS push via the Capacitor PushNotifications plugin, driven
+// through the low-level window.Capacitor bridge APIs (no bundler needed):
+// nativePromise('PushNotifications', method) for calls and
+// addListener('PushNotifications', event, cb) for the registration event.
+const APNS_REGISTERED_KEY='orbit_apns_registered';
+let nativePushListenersAttached=false;
+function capPushPlugin(){
+  const cap=window.Capacitor;
+  if(!cap||typeof cap.isPluginAvailable!=='function')return null;
+  try{return cap.isPluginAvailable('PushNotifications')?cap:null;}catch(_){return null;}
+}
+function nativePushAvailable(){return isNativeRuntime(window)&&!!capPushPlugin();}
+function apnsRegistered(){try{return localStorage.getItem(APNS_REGISTERED_KEY)==='1';}catch(_){return false;}}
+async function postApnsToken(token){
+  await api('/api/push/token',{method:'POST',body:JSON.stringify({token})});
+  try{localStorage.setItem(APNS_REGISTERED_KEY,'1');}catch(_){}
+}
+function attachNativePushListeners(){
+  const cap=capPushPlugin();
+  if(!cap||nativePushListenersAttached)return;
+  nativePushListenersAttached=true;
+  cap.addListener('PushNotifications','registration',(info)=>{
+    const token=info&&info.value;
+    if(!token||typeof token!=='string')return;
+    postApnsToken(token).then(()=>updatePushButton()).catch((error)=>console.warn('[push] device token upload failed',error&&error.message||error));
+  });
+  cap.addListener('PushNotifications','registrationError',(info)=>{console.warn('[push] registration error',info&&info.error);});
+  cap.addListener('PushNotifications','pushNotificationReceived',(notification)=>{console.info('[push] notification received',notification&&notification.title);});
+}
+async function setupNativePush(){
+  const cap=capPushPlugin();
+  if(!cap)return;
+  attachNativePushListeners();
+  try{
+    const perm=await cap.nativePromise('PushNotifications','checkPermissions',{});
+    // Re-register on launch when already allowed: refreshes the APNs device
+    // token, and the registration listener uploads it to the server.
+    if(perm&&perm.receive==='granted')await cap.nativePromise('PushNotifications','register',{});
+  }catch(error){console.warn('[push] native push setup failed',error&&error.message||error);}
+}
+async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;try{
+if(nativePushAvailable()){
+let permission='prompt';
+try{const perm=await window.Capacitor.nativePromise('PushNotifications','checkPermissions',{});permission=(perm&&perm.receive)||'prompt';}catch(_){}
+if(permission==='granted'&&apnsRegistered()){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}
+else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}
+return;
+}
+if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
+$('#enable-push').addEventListener('click',async()=>{try{
+if(nativePushAvailable()){
+const cap=window.Capacitor;
+attachNativePushListeners();
+const perm=await cap.nativePromise('PushNotifications','requestPermissions',{});
+if(!perm||perm.receive!=='granted')throw new Error('Notification permission was not granted.');
+await cap.nativePromise('PushNotifications','register',{});
+toast('Push notifications enabled.');updatePushButton();return;
+}
+if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');updatePushButton();}catch(error){toast(error.message);}});
 updatePushButton();
+if(isNativeRuntime(window))setupNativePush();
 $('#export-backup').addEventListener('click',async()=>{try{const passphrase=$('#backup-passphrase').value;const response=await nativeFetch(API_BASE+'/api/backups/export',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json','X-Orbit-CSRF':state.csrf},body:JSON.stringify({passphrase})});if(!response.ok)throw new Error((await response.json()).error);const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`orbit-backup-${new Date().toISOString().slice(0,10)}.orbitbackup`;link.click();URL.revokeObjectURL(url);toast('Encrypted backup downloaded.');}catch(error){toast(error.message);}});
 $('#restore-backup').addEventListener('click',async()=>{try{const file=$('#restore-file').files[0];if(!file)throw new Error('Choose an Orbit backup first.');if(file.size>10*1024*1024)throw new Error('Backup is too large.');if(prompt('Restoring merges data and pauses Orbit. Type RESTORE to continue:')!=='RESTORE')return;const payload=await file.text();await api('/api/backups/restore',{method:'POST',body:JSON.stringify({payload,passphrase:$('#backup-passphrase').value,confirm:'RESTORE'})});await refresh();toast('Backup restored. Orbit remains paused for review.');}catch(error){toast(error.message);}});
 $('#rotate-recovery').addEventListener('click',async()=>{try{const result=await api('/api/recovery-codes/rotate',{method:'POST',body:JSON.stringify({password:$('#recovery-password').value})});showCodes(result.recoveryCodes);$('#recovery-password').value='';}catch(error){toast(error.message);}});

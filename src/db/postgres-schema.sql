@@ -245,6 +245,17 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS apns_device_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_token TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'ios',
+  apns_environment TEXT NOT NULL DEFAULT 'production',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(user_id, device_token)
+);
+
 CREATE TABLE IF NOT EXISTS connectors (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

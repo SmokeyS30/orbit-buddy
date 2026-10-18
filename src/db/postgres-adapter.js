@@ -1163,6 +1163,16 @@ const indexMigrations = [
     deletePush: async (userId, endpoint) => { await run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, userId); },
     deletePushById: async (id) => { await run('DELETE FROM push_subscriptions WHERE id=?', id); },
 
+    // --- APNs device tokens (native iOS push) ---
+    saveApnsToken: async (userId, token) => {
+      const now = timestamp();
+      await run(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,
+        randomUUID(), userId, token, 'ios', 'production', now, now);
+    },
+    listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
+    deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
+
     // --- Connectors ---
     saveConnector: async (userId, provider, data) => {
       const now = timestamp();

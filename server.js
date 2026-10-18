@@ -10,6 +10,7 @@ import { createModelClient, stripCitationMarkers, processImageInput, isImageCont
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
+import { createApnsService } from './src/apns.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
@@ -494,6 +495,7 @@ export function createOrbitServer(options={}) {
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=createModelClient(env);
   const push=createPushService(env,db);
+  const apns=createApnsService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
 
   // Send a password reset email via Resend. Returns true if sent, false otherwise (never throws).
@@ -565,6 +567,7 @@ export function createOrbitServer(options={}) {
     db.setSetting('registration_nudge_at',new Date().toISOString());
     db.addEvent(owner.id,'registration_nudge','Registration has been open for over an hour.');
     await push.notify(owner.id,'Registration still open','The Orbit registration door has been open for over an hour.',{view:'safety'});
+    await apns.notify(owner.id,'Registration still open','The Orbit registration door has been open for over an hour.',{view:'safety'});
   }
 
   function originFor(req){if(publicBase)return publicBase;const protocol=req.headers['x-forwarded-proto']==='https'?'https':production?'https':'http';return `${protocol}://${req.headers.host}`;}
@@ -3060,6 +3063,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='GET'&&url.pathname==='/api/push/public-key')return json(res,200,{configured:push.configured,publicKey:push.publicKey});
         if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/push/unsubscribe'){const body=await readJson(req);db.deletePush(userId,String(body.endpoint||''));return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/push/token'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(userRateLimited(userId,'push-token',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const body=await readJson(req);const token=String(body.token||'').trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(token))throw Object.assign(new Error('Device token is invalid.'),{status:400});db.saveApnsToken(userId,token);db.addEvent(userId,'push_enabled','Enabled native push notifications on iPhone.');return json(res,201,{ok:true});}
         const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}

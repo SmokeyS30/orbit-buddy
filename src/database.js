@@ -164,6 +164,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS apns_device_tokens (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      device_token TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'ios',
+      apns_environment TEXT NOT NULL DEFAULT 'production',
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      UNIQUE(user_id, device_token)
+    );
     CREATE TABLE IF NOT EXISTS connectors (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, access_encrypted TEXT NOT NULL, refresh_encrypted TEXT,
@@ -675,6 +682,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listPush: db.prepare('SELECT * FROM push_subscriptions WHERE user_id=?'),
     deletePush: db.prepare('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?'),
     deletePushById: db.prepare('DELETE FROM push_subscriptions WHERE id=?'),
+    upsertApnsToken: db.prepare(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`),
+    listApnsTokens: db.prepare('SELECT * FROM apns_device_tokens WHERE user_id=?'),
+    deleteApnsToken: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=?'),
     upsertConnector: db.prepare(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
       refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
@@ -1151,6 +1162,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listPush: (userId) => s.listPush.all(userId),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
     deletePushById: (id) => s.deletePushById.run(id),
+    saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
+    listApnsTokens: (userId) => s.listApnsTokens.all(userId),
+    deleteApnsToken: (token) => s.deleteApnsToken.run(token),
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
     getConnector: (userId,provider) => s.connector.get(userId,provider),
