@@ -259,6 +259,46 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         updated_at TEXT NOT NULL,
         UNIQUE(user_id, device_token)
       )`,
+      `CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        expires_at TEXT,
+        app_account_token TEXT,
+        environment TEXT NOT NULL DEFAULT 'production',
+        original_transaction_id TEXT,
+        last_event_signed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS subscription_purchase_intents (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        product_id TEXT NOT NULL,
+        app_account_token TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        transaction_id TEXT,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+      )`,
+      `CREATE TABLE IF NOT EXISTS daily_usage (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        day_ny TEXT NOT NULL,
+        count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, day_ny)
+      )`,
+      `CREATE TABLE IF NOT EXISTS processed_notifications (
+        notification_id TEXT PRIMARY KEY,
+        received_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'processing',
+        completed_at TEXT
+      )`,
+      'ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS last_event_signed_at TEXT',
+      "ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'processed'",
+      'ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS completed_at TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
     ];
 const indexMigrations = [
@@ -274,6 +314,11 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_apns_tokens_user ON apns_device_tokens(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_daily_usage_day ON daily_usage(day_ny)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL',
+      'CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -1183,6 +1228,59 @@ const indexMigrations = [
     },
     listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
     deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
+
+    // --- Subscriptions (StoreKit 2) ---
+    saveSubscription: async (userId, { productId, status, expiresAt, appAccountToken, environment, originalTransactionId, lastEventSignedAt = null }) => {
+      const now = timestamp();
+      await run(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+        expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+        original_transaction_id=excluded.original_transaction_id,last_event_signed_at=COALESCE(excluded.last_event_signed_at,subscriptions.last_event_signed_at),updated_at=excluded.updated_at`,
+        randomUUID(), userId, productId, status, expiresAt || null, appAccountToken || null,
+        environment || 'production', originalTransactionId || null, lastEventSignedAt, now, now);
+    },
+    getSubscription: async (userId) => (await get('SELECT * FROM subscriptions WHERE user_id=?', userId)) || null,
+    getDailyUsageCount: async (userId, dayNy) => {
+      const row = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
+      return row ? row.count : 0;
+    },
+    incrementDailyUsage: async (userId, dayNy) => {
+      await run(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+        ON CONFLICT(user_id,day_ny) DO UPDATE SET count=daily_usage.count+1,updated_at=excluded.updated_at`,
+        userId, dayNy, timestamp());
+    },
+    consumeDailyUsage: async (userId, dayNy, limit) => {
+      const row = await get(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+        ON CONFLICT(user_id,day_ny) DO UPDATE SET count=daily_usage.count+1,updated_at=excluded.updated_at
+        WHERE daily_usage.count<? RETURNING count`, userId, dayNy, timestamp(), limit);
+      if (row) return { allowed: true, count: Number(row.count) };
+      const current = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
+      return { allowed: false, count: Number(current?.count || limit) };
+    },
+    pruneDailyUsage: async (beforeDayNy) => { await run('DELETE FROM daily_usage WHERE day_ny<?', beforeDayNy); },
+    claimNotification: async (notificationId) => {
+      const now = timestamp(); const staleBefore = new Date(Date.now() - 5 * 60_000).toISOString();
+      const r = await run(`INSERT INTO processed_notifications(notification_id,received_at,state,completed_at) VALUES(?,?,'processing',NULL)
+        ON CONFLICT(notification_id) DO UPDATE SET received_at=excluded.received_at,state='processing',completed_at=NULL
+        WHERE processed_notifications.state='processing' AND processed_notifications.received_at<?`, notificationId, now, staleBefore);
+      return (r.changes || 0) > 0;
+    },
+    completeNotification: async (notificationId) => (await run("UPDATE processed_notifications SET state='processed',completed_at=? WHERE notification_id=? AND state='processing'", timestamp(), notificationId)).changes > 0,
+    releaseNotification: async (notificationId) => (await run("DELETE FROM processed_notifications WHERE notification_id=? AND state='processing'", notificationId)).changes > 0,
+    pruneNotifications: async () => { await run("DELETE FROM processed_notifications WHERE state='processed' AND received_at::timestamptz < NOW() - INTERVAL '30 days'"); },
+    findUserByAppAccountToken: async (appAccountToken) => {
+      const row = await get('SELECT user_id FROM subscriptions WHERE app_account_token=?', appAccountToken);
+      return row ? row.user_id : null;
+    },
+    createPurchaseIntent: async (userId, productId, appAccountToken, expiresAt) => {
+      const row = { id: randomUUID(), user_id: userId, product_id: productId, app_account_token: appAccountToken, status: 'pending', expires_at: expiresAt, created_at: timestamp() };
+      await run(`INSERT INTO subscription_purchase_intents(id,user_id,product_id,app_account_token,status,transaction_id,expires_at,created_at,completed_at)
+        VALUES(?,?,?,?,'pending',NULL,?,?,NULL)`, row.id, row.user_id, row.product_id, row.app_account_token, row.expires_at, row.created_at);
+      return row;
+    },
+    getPurchaseIntent: async (userId, appAccountToken, productId) => (await get("SELECT * FROM subscription_purchase_intents WHERE user_id=? AND app_account_token=? AND product_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1", userId, appAccountToken, productId, timestamp())) || null,
+    completePurchaseIntent: async (id, transactionId) => (await run("UPDATE subscription_purchase_intents SET status='verified',transaction_id=?,completed_at=? WHERE id=? AND status='pending'", transactionId, timestamp(), id)).changes > 0,
+    prunePurchaseIntents: async () => { await run("DELETE FROM subscription_purchase_intents WHERE (status='pending' AND expires_at::timestamptz<NOW()) OR (completed_at IS NOT NULL AND completed_at::timestamptz<NOW()-INTERVAL '30 days')"); },
 
     // --- Connectors ---
     saveConnector: async (userId, provider, data) => {

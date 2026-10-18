@@ -11,6 +11,7 @@ import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, M
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
+import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
@@ -513,6 +514,7 @@ export function createOrbitServer(options={}) {
   const model=createModelClient(env);
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
+  const subscriptions=createSubscriptionService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
 
   // Send a password reset email via Resend. Returns true if sent, false otherwise (never throws).
@@ -2470,6 +2472,21 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         res.setHeader('Cache-Control','private, no-store');
         res.writeHead(200);res.end(media.bytes);return;
       }
+      // App Store Server Notifications v2. Public: Apple authenticates via the
+      // JWS signedPayload itself (verified in the service; payload never logged).
+      if(req.method==='POST'&&url.pathname==='/api/subscriptions/apple-notifications'){
+        const body=await readJson(req);
+        const signedPayload=String(body.signedPayload||'');
+        if(!signedPayload)return json(res,400,{error:'Missing payload.'});
+        try{
+          const result=await subscriptions.handleNotification(signedPayload);
+          return json(res,200,{ok:true});
+        }catch(error){
+          // Log the error class only — never the payload.
+          console.error('[subscriptions] notification failed:',error&&error.message);
+          return json(res,error.status||500,{error:'Notification rejected.'});
+        }
+      }
       // WhatsApp webhook (Twilio). Public: Twilio authenticates via X-Twilio-Signature.
       if(req.method==='POST'&&url.pathname==='/api/whatsapp/webhook'){
         if(!whatsappConfigured(env))return json(res,200,{ok:true,configured:false});
@@ -2848,6 +2865,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const hasImages=imageBlocks.length>0;
           const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
+          // One atomic database operation both checks and consumes the free
+          // allowance, so simultaneous requests cannot send message 26.
+          const quota=subscriptions.consumeQuota(userId,user);
+          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true});
           const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
           enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
@@ -3164,6 +3185,47 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/push/unsubscribe'){const body=await readJson(req);db.deletePush(userId,String(body.endpoint||''));return json(res,200,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/push/token'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(userRateLimited(userId,'push-token',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const body=await readJson(req);const token=String(body.token||'').trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(token))throw Object.assign(new Error('Device token is invalid.'),{status:400});db.saveApnsToken(userId,token);db.addEvent(userId,'push_enabled','Enabled native push notifications on iPhone.');return json(res,201,{ok:true});}
+
+        // Subscriptions (StoreKit 2). Quota is only enforced when the service
+        // reports ready (enabled + Apple config complete); otherwise fail-open.
+        if(req.method==='GET'&&url.pathname==='/api/subscriptions/status')return json(res,200,subscriptions.status(userId,user));
+        if(req.method==='POST'&&url.pathname==='/api/subscriptions/purchase-intent'){
+          if(isDemoUser(user))throw Object.assign(new Error('Subscriptions are not available in demo mode.'),{status:403});
+          if(!subscriptions.ready)throw Object.assign(new Error('Subscriptions are not ready.'),{status:503});
+          if(userRateLimited(userId,'sub-intent',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const body=await readJson(req);const productId=String(body.productId||'');
+          if(!subscriptions.PRODUCTS[productId])throw Object.assign(new Error('Unknown subscription product.'),{status:400});
+          const existing=db.getSubscription(userId);const appAccountToken=existing?.app_account_token||randomUUID();
+          const owner=db.findUserByAppAccountToken(appAccountToken);if(owner&&owner!==userId)throw Object.assign(new Error('Purchase token is already assigned.'),{status:409});
+          // Ask-to-Buy approvals can take days, so keep the binding for one
+          // week while still expiring abandoned intents automatically.
+          const expiresAt=new Date(Date.now()+7*24*60*60_000).toISOString();db.createPurchaseIntent(userId,productId,appAccountToken,expiresAt);
+          return json(res,200,{ok:true,appAccountToken,expiresAt});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/subscriptions/verify'){
+          if(isDemoUser(user))throw Object.assign(new Error('Subscriptions are not available in demo mode.'),{status:403});
+          if(userRateLimited(userId,'sub-verify',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const body=await readJson(req);const signedTransaction=String(body.signedTransaction||'');const requestedToken=String(body.appAccountToken||'').trim();const requestedProduct=String(body.productId||'');
+          if(!signedTransaction)throw Object.assign(new Error('Missing transaction.'),{status:400});
+          if(requestedToken&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedToken))throw Object.assign(new Error('Invalid app account token.'),{status:400});
+          const current=db.getSubscription(userId);const intent=requestedToken?db.getPurchaseIntent(userId,requestedToken,requestedProduct):null;
+          if(requestedToken&&!intent)throw Object.assign(new Error('Purchase intent is missing or expired.'),{status:403});
+          const expectedToken=intent?.app_account_token||current?.app_account_token;
+          if(!expectedToken)throw Object.assign(new Error('Purchase is not bound to this Orbit account.'),{status:403});
+          const owner=db.findUserByAppAccountToken(expectedToken);if(owner&&owner!==userId)throw Object.assign(new Error('Purchase belongs to another Orbit account.'),{status:403});
+          const result=await subscriptions.verifyTransaction(signedTransaction,{expectedAppAccountToken:expectedToken,expectedProductId:intent?.product_id});
+          db.saveSubscription(userId,{...result,lastEventSignedAt:result.signedAt});
+          if(intent&&!db.completePurchaseIntent(intent.id,result.transactionId))throw Object.assign(new Error('Purchase intent was already consumed.'),{status:409});
+          db.addEvent(userId,'subscription_verified','Subscription verified.');
+          return json(res,200,{ok:true,transactionId:result.transactionId,product:result.productId,status:result.status,expiresAt:result.expiresAt});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/subscriptions/restore'){
+          if(isDemoUser(user))throw Object.assign(new Error('Subscriptions are not available in demo mode.'),{status:403});
+          if(userRateLimited(userId,'sub-restore',10))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const entitlements=await subscriptions.fetchEntitlements(userId);
+          for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
+          return json(res,200,{ok:true,entitlements});
+        }
         const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
@@ -3186,7 +3248,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,true);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessDeny[1]);db.addEvent(user.id,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
         return json(res,404,{error:'API route not found.'});
       }
-    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';return json(res,error.status||500,{error:message}); }
+    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag)); }
 
     if(url.pathname==='/reset-password'&&['GET','HEAD'].includes(req.method)){const resolved=path.resolve(publicRoot,'./index.html');res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);return;}
     if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});
@@ -3200,7 +3262,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
   return {server,db,push,pendingStreams,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }
