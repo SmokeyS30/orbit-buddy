@@ -6,6 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 
 import { createApnsService, createApnsProviderToken, APNS_PRODUCTION_HOST, APNS_PRODUCTION_PORT } from '../src/apns.js';
 
@@ -136,4 +137,35 @@ test('unconfigured service degrades gracefully (no env vars, no crash)', async (
   assert.equal(apns.configured, false);
   const result = await apns.notify('user-1', 'A', 'B');
   assert.deepEqual(result, { sent: 0, failed: 0, skipped: true });
+});
+
+test('apns_device_tokens has a Postgres startup migration', () => {
+  // Regression: apns_device_tokens had an INSERT in postgres-adapter.js and
+  // a CREATE TABLE in postgres-schema.sql (used only by tests/fresh DBs),
+  // but no CREATE TABLE in the migrations that openPostgres runs against
+  // the existing production database. Production Postgres threw
+  // "relation does not exist" and POST /api/push/token 500'd on every
+  // token upload.
+  // Rule: a new table needs BOTH postgres-schema.sql (fresh DBs) AND the
+  // migrations array in openPostgres (existing production DBs).
+  const pg = fs.readFileSync(new URL('../src/db/postgres-adapter.js', import.meta.url), 'utf8');
+  assert.match(pg, /CREATE TABLE IF NOT EXISTS apns_device_tokens \(/);
+});
+
+test('every table the Postgres adapter queries exists in postgres-schema.sql', () => {
+  // Guards the fresh-DB/test schema: any table the adapter touches must be
+  // defined in the full schema file.
+  const pg = fs.readFileSync(new URL('../src/db/postgres-adapter.js', import.meta.url), 'utf8');
+  const schema = fs.readFileSync(new URL('../src/db/postgres-schema.sql', import.meta.url), 'utf8');
+  const referenced = new Set();
+  for (const m of pg.matchAll(/(?:INSERT INTO|UPDATE|DELETE FROM|FROM)\s+(\w+)/gi)) {
+    referenced.add(m[1].toLowerCase());
+  }
+  const defined = new Set([
+    ...[...schema.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
+    ...[...pg.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
+  ]);
+  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'text', 'context', 'today', 'existing', 'values']);
+  const missing = [...referenced].filter((t) => !defined.has(t) && !keywords.has(t));
+  assert.deepEqual(missing, [], `adapter tables missing from postgres-schema.sql: ${missing.join(', ')}`);
 });
