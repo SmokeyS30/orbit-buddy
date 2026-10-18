@@ -1579,6 +1579,9 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
     recognition.onend=()=>{recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');};
     recognition.onerror=(event)=>{
       recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');
+      // Blocked speech service (iOS WKWebView): fall through to voice mode,
+      // which falls back to tap-to-record + Whisper on its own.
+      if(event.error==='service-not-allowed'||event.error==='not-allowed'){openVoiceMode();return;}
       if(event.error!=='aborted'&&event.error!=='no-speech')toast('Voice input: '+event.error);
     };
     recognition.start();
