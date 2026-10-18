@@ -1,4 +1,5 @@
 // Orbit Buddy voice conversation mode ("call Orbit").
+import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 //
 // A real spoken conversation: the user talks, Orbit talks back. The transcript
 // is an ordinary chat conversation (every turn goes through the normal chat
@@ -194,7 +195,7 @@ export function createBargeInDetector(opts = {}) {
  */
 export function createVoiceMode(deps) {
   const els = {};
-  let state = 'closed'; // closed|listening|thinking|speaking|recording
+  let state = 'closed'; // closed|opening|idle-tap|listening|thinking|speaking|recording
   let recognition = null;
   let recorder = null;
   let recordChunks = [];
@@ -386,8 +387,14 @@ export function createVoiceMode(deps) {
     // Web Speech API is broken in iOS WKWebView (service-not-allowed) —
     // use tap-to-record + Whisper on native instead. Check live because the
     // Capacitor bridge may not be ready when the app module first loads.
-    const isNativeNow = deps.isNative || (typeof window !== 'undefined' && window.Capacitor?.isNativePlatform?.() === true);
-    const useWebSpeech = SR() && !isNativeNow;
+    let nativeFromDependency = false;
+    try {
+      nativeFromDependency = typeof deps.isNative === 'function'
+        ? deps.isNative() === true
+        : deps.isNative === true;
+    } catch (_) {}
+    const isNativeNow = nativeFromDependency || isNativeRuntime(window);
+    const useWebSpeech = Boolean(SR()) && !isNativeNow && shouldUseWebSpeech(window);
     if (useWebSpeech) {
       state = 'listening';
       setOrb('listening');
@@ -401,23 +408,44 @@ export function createVoiceMode(deps) {
       // If the speech service is blocked or hangs without firing (iOS WKWebView
       // exposes the constructor but the service is unavailable), fall back to
       // tap-to-record + Whisper instead of stranding the user on "Listening…".
-      let webSpeechSettled = false;
+      let webSpeechFinished = false;
+      let webSpeechHangTimer = null;
+      const clearWebSpeechTimer = () => {
+        if (webSpeechHangTimer) clearTimeout(webSpeechHangTimer);
+        webSpeechHangTimer = null;
+      };
       const fallbackToTap = () => {
-        if (webSpeechSettled) return;
-        webSpeechSettled = true;
-        try { if (recognition) recognition.abort(); } catch (_) {}
+        if (webSpeechFinished || state !== 'listening') return;
+        webSpeechFinished = true;
+        clearWebSpeechTimer();
+        const activeRecognition = recognition;
         recognition = null;
+        try {
+          if (activeRecognition) {
+            activeRecognition.onresult = null;
+            activeRecognition.onend = null;
+            activeRecognition.onerror = null;
+            activeRecognition.abort();
+          }
+        } catch (_) {}
         state = 'idle-tap';
         setOrb('idle');
         setStatus('Tap the mic, say your piece, tap again to send.');
       };
-      const webSpeechHangTimer = setTimeout(() => {
-        if (state === 'listening') fallbackToTap();
-      }, 4000);
-      const settleWebSpeech = () => { webSpeechSettled = true; clearTimeout(webSpeechHangTimer); };
+      const armWebSpeechTimer = () => {
+        clearWebSpeechTimer();
+        webSpeechHangTimer = setTimeout(() => {
+          if (state === 'listening') fallbackToTap();
+        }, 4000);
+      };
+      armWebSpeechTimer();
+      const finishWebSpeech = () => {
+        webSpeechFinished = true;
+        clearWebSpeechTimer();
+      };
       recognition.onresult = (event) => {
         if (state !== 'listening') return;
-        settleWebSpeech();
+        armWebSpeechTimer();
         let interim = '';
         for (let i = event.resultIndex; i < event.results.length; i++) {
           const tr = event.results[i][0].transcript;
@@ -428,23 +456,23 @@ export function createVoiceMode(deps) {
         if (show) addLine('user', show, true);
       };
       recognition.onend = () => {
-        settleWebSpeech();
         recognition = null;
         if (state !== 'listening') return;
         const text = finalTranscript.trim();
         clearLiveLine();
+        finishWebSpeech();
         if (text) submitTurn(text);
-        else startListen(); // hands-free: keep the conversation going
+        else startListen(); // ordinary desktop web: keep listening hands-free
       };
       recognition.onerror = (event) => {
-        settleWebSpeech();
-        recognition = null;
         if (state !== 'listening') return;
         const err = event && event.error;
         if (err === 'not-allowed' || err === 'service-not-allowed') {
           fallbackToTap();
           return;
         }
+        finishWebSpeech();
+        recognition = null;
         // 'no-speech', 'aborted', 'network': just listen again
         if (err !== 'aborted') startListen();
       };
@@ -616,6 +644,10 @@ export function createVoiceMode(deps) {
         }
       } catch (_) {}
     } catch (_) {}
+    // Mark the controller open before startListen(). startListen() deliberately
+    // ignores calls while closed, so leaving this as "closed" reveals the
+    // overlay but strands it on the HTML's default "Listening…" text.
+    state = 'opening';
     startListen();
   }
 
