@@ -1661,16 +1661,18 @@ async function postApnsToken(token){
   await api('/api/push/token',{method:'POST',body:JSON.stringify({token})});
   try{localStorage.setItem(APNS_REGISTERED_KEY,'1');}catch(_){}
 }
+let pushRegistrationPending=false;
 function attachNativePushListeners(){
   const cap=capPushPlugin();
   if(!cap||nativePushListenersAttached)return;
   nativePushListenersAttached=true;
   cap.addListener('PushNotifications','registration',(info)=>{
+    pushRegistrationPending=false;
     const token=info&&info.value;
-    if(!token||typeof token!=='string')return;
-    postApnsToken(token).then(()=>updatePushButton()).catch((error)=>console.warn('[push] device token upload failed',error&&error.message||error));
+    if(!token||typeof token!=='string'){toast('Push setup failed: no device token from Apple.');return;}
+    postApnsToken(token).then(()=>{toast('Push notifications enabled.');updatePushButton();}).catch((error)=>toast('Push setup failed: '+(error&&error.message||error)));
   });
-  cap.addListener('PushNotifications','registrationError',(info)=>{console.warn('[push] registration error',info&&info.error);});
+  cap.addListener('PushNotifications','registrationError',(info)=>{pushRegistrationPending=false;toast('Push registration failed: '+((info&&info.error)||'unknown error'));});
   cap.addListener('PushNotifications','pushNotificationReceived',(notification)=>{console.info('[push] notification received',notification&&notification.title);});
 }
 async function setupNativePush(){
@@ -1700,7 +1702,9 @@ attachNativePushListeners();
 const perm=await cap.nativePromise('PushNotifications','requestPermissions',{});
 if(!perm||perm.receive!=='granted')throw new Error('Notification permission was not granted.');
 await cap.nativePromise('PushNotifications','register',{});
-toast('Push notifications enabled.');updatePushButton();return;
+pushRegistrationPending=true;
+setTimeout(()=>{if(pushRegistrationPending){pushRegistrationPending=false;toast('Push setup timed out: no response from Apple. Check the build includes the Push Notifications capability, then try again.');}},12000);
+updatePushButton();return;
 }
 if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');updatePushButton();}catch(error){toast(error.message);}});
 updatePushButton();

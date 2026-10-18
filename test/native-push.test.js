@@ -74,3 +74,30 @@ test('client never talks to APNs directly (server-side only)', () => {
 test('push listeners attach once (no duplicate registrations)', () => {
   assert.match(appJs, /nativePushListenersAttached/);
 });
+
+test('push failures surface as toasts, not silent console warnings', () => {
+  // Registration and upload failures must be visible on the phone: the
+  // iPhone's console is not accessible, so console.warn-only errors are
+  // undebuggable in the field.
+  const listeners = appJs.slice(appJs.indexOf('function attachNativePushListeners()'));
+  assert.match(listeners, /registrationError.*toast\('Push registration failed: '/);
+  assert.match(listeners, /\.catch\(\(error\)=>toast\('Push setup failed: '/);
+});
+
+test('push success toast fires only after the token upload completes', () => {
+  // The premature "enabled" toast in the click handler lied: it fired after
+  // register() but before the token reached the server. Success is now
+  // toasted from the registration listener after postApnsToken resolves.
+  const clickStart = appJs.indexOf("$('#enable-push').addEventListener('click'");
+  const clickBody = appJs.slice(clickStart, appJs.indexOf('updatePushButton();', clickStart) + 500);
+  assert.doesNotMatch(
+    clickBody.slice(0, clickBody.indexOf('pushRegistrationPending=true')),
+    /toast\('Push notifications enabled\.'\)/
+  );
+  assert.match(appJs, /postApnsToken\(token\)\.then\(\(\)=>\{toast\('Push notifications enabled\.'\);/);
+});
+
+test('push registration has a timeout when Apple never responds', () => {
+  assert.match(appJs, /pushRegistrationPending=true;/);
+  assert.match(appJs, /setTimeout\(\(\)=>\{if\(pushRegistrationPending\)\{pushRegistrationPending=false;toast\('Push setup timed out/);
+});
