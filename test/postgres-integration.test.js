@@ -115,6 +115,31 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.equal(db.messageExists(u2.id), false, 'user message gone after turn delete');
     assert.equal(db.deleteMessageTurn(userId, '00000000-0000-0000-0000-000000000000'), null, 'deleteMessageTurn null for unknown id');
 
+    // 7c. StoreKit subscription parity: binding uniqueness, purchase intents,
+    // atomic quota consumption, and retry-safe notification claims all run
+    // through the same sync worker used in production.
+    const appAccountToken = userId;
+    const originalTransactionId = `orig-${userId}`;
+    db.saveSubscription(userId, {
+      productId: 'com.smokeys30.orbitbuddy.standard.monthly', status: 'active',
+      expiresAt: new Date(Date.now() + 86400_000).toISOString(), appAccountToken,
+      environment: 'sandbox', originalTransactionId, lastEventSignedAt: new Date().toISOString(),
+    });
+    assert.equal(db.getSubscription(userId).app_account_token, appAccountToken, 'subscription binding persisted');
+    const intent = db.createPurchaseIntent(userId, 'com.smokeys30.orbitbuddy.pro.monthly', appAccountToken, new Date(Date.now() + 3600_000).toISOString());
+    assert.equal(db.getPurchaseIntent(userId, appAccountToken, 'com.smokeys30.orbitbuddy.pro.monthly').id, intent.id, 'pending purchase intent fetched');
+    assert.equal(db.completePurchaseIntent(intent.id, `txn-${userId}`), true, 'purchase intent consumed once');
+    assert.equal(db.completePurchaseIntent(intent.id, `txn-duplicate-${userId}`), false, 'purchase intent cannot be replayed');
+    for (let i = 1; i <= 25; i++) assert.deepEqual(db.consumeDailyUsage(userId, '2026-10-19', 25), { allowed: true, count: i });
+    assert.deepEqual(db.consumeDailyUsage(userId, '2026-10-19', 25), { allowed: false, count: 25 }, 'message 26 is atomically blocked');
+    const notificationId = `notification-${userId}`;
+    assert.equal(db.claimNotification(notificationId), true, 'notification claimed');
+    assert.equal(db.claimNotification(notificationId), false, 'concurrent duplicate rejected');
+    assert.equal(db.releaseNotification(notificationId), true, 'failed claim released for retry');
+    assert.equal(db.claimNotification(notificationId), true, 'released notification can retry');
+    assert.equal(db.completeNotification(notificationId), true, 'successful notification completed');
+    assert.equal(db.claimNotification(notificationId), false, 'completed notification remains deduped');
+
     // 8. Persistence: close and reopen, data must survive.
     db.close(); db = null;
     db2 = createSyncPgAdapter(DATABASE_URL);

@@ -171,6 +171,30 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE(user_id, device_token)
     );
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+      expires_at TEXT, app_account_token TEXT, environment TEXT NOT NULL DEFAULT 'production',
+      original_transaction_id TEXT, last_event_signed_at TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS subscription_purchase_intents (
+      id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL, app_account_token TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', transaction_id TEXT,
+      expires_at TEXT NOT NULL, created_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS daily_usage (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      day_ny TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, day_ny)
+    );
+    CREATE TABLE IF NOT EXISTS processed_notifications (
+      notification_id TEXT PRIMARY KEY,
+      received_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'processing', completed_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS connectors (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, access_encrypted TEXT NOT NULL, refresh_encrypted TEXT,
@@ -427,6 +451,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'writing_voice_updated_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'writing_voice_offered', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
+  ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
+  ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
+  ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
+  db.exec("UPDATE processed_notifications SET state='processed',completed_at=COALESCE(completed_at,received_at) WHERE state IS NULL OR state!='processing'");
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)');
@@ -686,6 +718,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`),
     listApnsTokens: db.prepare('SELECT * FROM apns_device_tokens WHERE user_id=?'),
     deleteApnsToken: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=?'),
+    upsertSubscription: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+      expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+      original_transaction_id=excluded.original_transaction_id,last_event_signed_at=COALESCE(excluded.last_event_signed_at,subscriptions.last_event_signed_at),updated_at=excluded.updated_at`),
+    getSubscription: db.prepare('SELECT * FROM subscriptions WHERE user_id=?'),
+    getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
+    incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+      ON CONFLICT(user_id,day_ny) DO UPDATE SET count=count+1,updated_at=excluded.updated_at`),
+    resetDailyUsage: db.prepare('DELETE FROM daily_usage WHERE day_ny<?'),
+    insertNotification: db.prepare(`INSERT INTO processed_notifications(notification_id,received_at,state,completed_at) VALUES(?,?,'processing',NULL)
+      ON CONFLICT(notification_id) DO UPDATE SET received_at=excluded.received_at,state='processing',completed_at=NULL
+      WHERE processed_notifications.state='processing' AND processed_notifications.received_at<?`),
+    completeNotification: db.prepare("UPDATE processed_notifications SET state='processed',completed_at=? WHERE notification_id=? AND state='processing'"),
+    releaseNotification: db.prepare("DELETE FROM processed_notifications WHERE notification_id=? AND state='processing'"),
+    pruneNotifications: db.prepare("DELETE FROM processed_notifications WHERE state='processed' AND received_at < datetime('now','-30 days')"),
+    findUserByAppAccountToken: db.prepare('SELECT user_id FROM subscriptions WHERE app_account_token=?'),
+    insertPurchaseIntent: db.prepare(`INSERT INTO subscription_purchase_intents(id,user_id,product_id,app_account_token,status,transaction_id,expires_at,created_at,completed_at)
+      VALUES(?,?,?,?,'pending',NULL,?,?,NULL)`),
+    getPurchaseIntent: db.prepare("SELECT * FROM subscription_purchase_intents WHERE user_id=? AND app_account_token=? AND product_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1"),
+    completePurchaseIntent: db.prepare("UPDATE subscription_purchase_intents SET status='verified',transaction_id=?,completed_at=? WHERE id=? AND status='pending'"),
+    prunePurchaseIntents: db.prepare("DELETE FROM subscription_purchase_intents WHERE (status='pending' AND expires_at<?) OR (completed_at IS NOT NULL AND completed_at<datetime('now','-30 days'))"),
     upsertConnector: db.prepare(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
       refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
@@ -1165,6 +1218,33 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
     listApnsTokens: (userId) => s.listApnsTokens.all(userId),
     deleteApnsToken: (token) => s.deleteApnsToken.run(token),
+    saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
+      const now=timestamp();
+      s.upsertSubscription.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken||null,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now);
+    },
+    getSubscription: (userId) => s.getSubscription.get(userId)||null,
+    getDailyUsageCount(userId,dayNy) { const row=s.getDailyUsage.get(userId,dayNy); return row?row.count:0; },
+    incrementDailyUsage(userId,dayNy) { s.incrementDailyUsage.run(userId,dayNy,timestamp()); },
+    consumeDailyUsage(userId,dayNy,limit) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row=s.getDailyUsage.get(userId,dayNy);
+        if(row&&row.count>=limit){db.exec('COMMIT');return {allowed:false,count:row.count};}
+        s.incrementDailyUsage.run(userId,dayNy,timestamp());
+        const count=s.getDailyUsage.get(userId,dayNy).count;
+        db.exec('COMMIT');return {allowed:true,count};
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
+    pruneDailyUsage(beforeDayNy) { s.resetDailyUsage.run(beforeDayNy); },
+    claimNotification(notificationId) { const now=timestamp();const staleBefore=new Date(Date.now()-5*60_000).toISOString();return s.insertNotification.run(notificationId,now,staleBefore).changes>0; },
+    completeNotification(notificationId) { return s.completeNotification.run(timestamp(),notificationId).changes>0; },
+    releaseNotification(notificationId) { return s.releaseNotification.run(notificationId).changes>0; },
+    pruneNotifications() { s.pruneNotifications.run(); },
+    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken); return row?row.user_id:null; },
+    createPurchaseIntent(userId,productId,appAccountToken,expiresAt) { const row={id:randomUUID(),user_id:userId,product_id:productId,app_account_token:appAccountToken,status:'pending',expires_at:expiresAt,created_at:timestamp()}; s.insertPurchaseIntent.run(row.id,row.user_id,row.product_id,row.app_account_token,row.expires_at,row.created_at); return row; },
+    getPurchaseIntent(userId,appAccountToken,productId) { return s.getPurchaseIntent.get(userId,appAccountToken,productId,timestamp())||null; },
+    completePurchaseIntent(id,transactionId) { return s.completePurchaseIntent.run(transactionId,timestamp(),id).changes>0; },
+    prunePurchaseIntents() { s.prunePurchaseIntents.run(timestamp()); },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
     getConnector: (userId,provider) => s.connector.get(userId,provider),

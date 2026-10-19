@@ -64,7 +64,7 @@ function nativeToken(){try{return IS_NATIVE?localStorage.getItem(NATIVE_TOKEN_KE
 function setNativeToken(t){try{if(t)localStorage.setItem(NATIVE_TOKEN_KEY,t);else localStorage.removeItem(NATIVE_TOKEN_KEY);}catch(_){}}
 function nativeAuthHeaders(){const t=nativeToken();return t?{Authorization:'Bearer '+t}:{};}
 function nativeFetch(url,options={}){return fetch(url,{...options,headers:{...NATIVE_API_HEADERS,...nativeAuthHeaders(),...(options.headers||{})}});}
-async function api(url,options={}){const isForm=options.body instanceof FormData;const headers={...NATIVE_API_HEADERS,...nativeAuthHeaders(),...(!isForm&&options.body?{'Content-Type':'application/json'}:{}),...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{}),...(options.headers||{})};const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),30000);try{const response=await fetch((String(url).startsWith('/')?API_BASE:'')+url,{credentials:NATIVE_CREDENTIALS,...options,headers,signal:ctrl.signal});const type=response.headers.get('content-type')||'';const body=type.includes('json')?await response.json().catch(()=>({})):null;if(response.status===401)throw Object.assign(new Error(body?.error||'Authentication required.'),{auth:true});if(!response.ok)throw new Error(body?.error||`Request failed (${response.status}).`);return body??response;}catch(e){if(e.name==='AbortError')throw new Error('Request timed out. Check your connection and try again.');throw e;}finally{clearTimeout(timer);}}
+async function api(url,options={}){const isForm=options.body instanceof FormData;const headers={...NATIVE_API_HEADERS,...nativeAuthHeaders(),...(!isForm&&options.body?{'Content-Type':'application/json'}:{}),...(state.csrf?{'X-Orbit-CSRF':state.csrf}:{}),...(options.headers||{})};const ctrl=new AbortController();const timer=setTimeout(()=>ctrl.abort(),30000);try{const response=await fetch((String(url).startsWith('/')?API_BASE:'')+url,{credentials:NATIVE_CREDENTIALS,...options,headers,signal:ctrl.signal});const type=response.headers.get('content-type')||'';const body=type.includes('json')?await response.json().catch(()=>({})):null;if(response.status===401)throw Object.assign(new Error(body?.error||'Authentication required.'),{auth:true,status:response.status,body});if(!response.ok)throw Object.assign(new Error(body?.error||`Request failed (${response.status}).`),{status:response.status,body});return body??response;}catch(e){if(e.name==='AbortError')throw new Error('Request timed out. Check your connection and try again.');throw e;}finally{clearTimeout(timer);}}
 function toast(message){const el=$('#toast');el.textContent=message;el.classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.classList.remove('show'),2800);}
 function formatDate(value){if(!value)return'Ready now';return new Intl.DateTimeFormat(undefined,{dateStyle:'medium',timeStyle:'short'}).format(new Date(value));}
 function empty(root,text,tryText){const p=document.createElement('p');p.className='empty';p.textContent=text;root.append(p);if(tryText){const chip=button('Try: '+tryText,'ghost empty-suggest',()=>suggestPrompt(tryText));root.append(chip);}}
@@ -1027,7 +1027,8 @@ async function flushChatQueue(){
         pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now());
       }catch(error){
         if(isNetworkError(error))break; // connection dropped mid-flush — retry later
-        toast(`A queued message failed: ${error.message}`); // non-network error — drop this one
+        if(isPaywallError(error))showInlinePaywall(); // daily limit: inline nudge, never a generic toast
+        else toast(`A queued message failed: ${error.message}`); // non-network error — drop this one
       }
       queue=queue.slice(1);saveChatQueue(queue);
     }
@@ -1541,6 +1542,10 @@ async function sendChatMessage(text){
       if(attachmentIds.length)toast('Connection lost — your image is staged and ready to resend.');
       else queueOfflineMessage(message,el);
     }
+    // Daily free limit hit: inline paywall nudge in the conversation, never
+    // the generic error toast. No refresh() here — it would re-render the
+    // message list and wipe the nudge.
+    else if(isPaywallError(error)){input.value=message;if(el)el.remove();showInlinePaywall();}
     else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
   }finally{if(submit)submit.disabled=false;}
   }finally{releaseSend();}
@@ -1731,6 +1736,198 @@ updatePushButton();return;
 if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');updatePushButton();}catch(error){toast(error.message);}});
 updatePushButton();
 if(isNativeRuntime(window))setupNativePush();
+// --- Subscriptions: StoreKit 2 via the native iOS plugin ---
+// Same bridge pattern as native push above: low-level window.Capacitor APIs,
+// nativePromise('StoreKit', method) for calls and addListener('StoreKit',
+// event, cb) for transaction updates. Everything here is gated behind
+// storeKitAvailable() so web/desktop never touch the plugin. Server
+// confirmation (POST /api/subscriptions/verify) is the purchase record —
+// the JWS (signedTransaction) is sent to the server and never logged.
+function capStoreKitPlugin(){
+  const cap=window.Capacitor;
+  if(!cap||typeof cap.isPluginAvailable!=='function')return null;
+  try{return cap.isPluginAvailable('StoreKit')?cap:null;}catch(_){return null;}
+}
+function storeKitAvailable(){return isNativeRuntime(window)&&!!capStoreKitPlugin();}
+// Static fallback catalog mirroring src/subscriptions.js PRODUCTS, used when
+// the native product lookup fails or returns nothing. Server truth lives in
+// /api/subscriptions/status; these are display-only fallbacks.
+const SUB_PRODUCT_FALLBACK=[
+  {id:'com.smokeys30.orbitbuddy.standard.monthly',title:'Standard Monthly',fallbackPrice:'$5.99/month'},
+  {id:'com.smokeys30.orbitbuddy.standard.yearly',title:'Standard Yearly',fallbackPrice:'$59.99/year'},
+  {id:'com.smokeys30.orbitbuddy.pro.monthly',title:'Pro Monthly',fallbackPrice:'$19.99/month'},
+];
+function formatStoreKitPrice(p){
+  const n=Number(p&&p.price);
+  if(Number.isFinite(n)){try{return new Intl.NumberFormat(undefined,{style:'currency',currency:p.currencyCode||'USD'}).format(n);}catch(_){}}
+  return String(p.price);
+}
+function productPriceLine(p){
+  const price=(p.price!=null)?formatStoreKitPrice(p):(p.fallbackPrice||null);
+  return price?(p.title+' — '+price):p.title;
+}
+let subProductsCache=null,subProductsPromise=null;
+const STOREKIT_PENDING_KEY='orbit_storekit_pending_v1';
+function setPendingStoreKitPurchase(value){try{if(value)localStorage.setItem(STOREKIT_PENDING_KEY,JSON.stringify(value));else localStorage.removeItem(STOREKIT_PENDING_KEY);}catch(_){}}
+function pendingStoreKitPurchase(){try{return JSON.parse(localStorage.getItem(STOREKIT_PENDING_KEY)||'null');}catch(_){return null;}}
+async function loadStoreKitProducts(){
+  if(!storeKitAvailable())throw new Error('Subscriptions are managed in the Orbit iOS app.');
+  if(subProductsCache)return subProductsCache;
+  if(subProductsPromise)return subProductsPromise;
+  subProductsPromise=(async()=>{
+    const status=await api('/api/subscriptions/status');
+    const ids=(status&&status.products)||[];
+    const nativeById={};
+    try{
+      const cap=capStoreKitPlugin();
+      const res=await cap.nativePromise('StoreKit','getProducts',{productIds:ids});
+      for(const p of((res&&res.products)||[]))nativeById[p.id]=p;
+    }catch(_){/* fall through to the static fallback catalog */}
+    const catalog=(ids.length?ids:SUB_PRODUCT_FALLBACK.map((f)=>f.id)).map((id)=>{
+      const n=nativeById[id]||{};
+      const fb=SUB_PRODUCT_FALLBACK.find((f)=>f.id===id)||{};
+      return {id,title:n.title||fb.title||id,description:n.description||'',
+        price:(n.price!=null?n.price:null),currencyCode:n.currencyCode||null,
+        fallbackPrice:fb.fallbackPrice||null};
+    });
+    subProductsCache=catalog;
+    return catalog;
+  })();
+  try{return await subProductsPromise;}catch(error){subProductsPromise=null;throw error;}
+}
+async function refreshSubscriptionState(){
+  try{const status=await api('/api/subscriptions/status');state.subscription=status&&status.entitlement||null;}catch(_){}
+  updateSubscriptionsButton();
+}
+async function purchaseProduct(productId){
+  if(!storeKitAvailable()){toast('Subscriptions are managed in the Orbit iOS app.');return;}
+  try{
+    const status=await api('/api/subscriptions/status');
+    if(!(status&&status.ready))throw new Error('Subscriptions aren’t ready yet — please try again in a moment.');
+    // The server creates (or reuses) the account UUID and records the exact
+    // product before StoreKit starts. The client cannot choose another user's
+    // binding token.
+    const intent=await api('/api/subscriptions/purchase-intent',{method:'POST',body:JSON.stringify({productId})});
+    const appAccountToken=intent&&intent.appAccountToken;
+    if(!appAccountToken)throw new Error('The server could not prepare this purchase.');
+    setPendingStoreKitPurchase({appAccountToken,productId,expiresAt:intent.expiresAt});
+    const cap=capStoreKitPlugin();
+    let result;
+    try{result=await cap.nativePromise('StoreKit','purchase',{productId,appAccountToken});}
+    catch(err){if(err&&err.code==='cancelled'){setPendingStoreKitPurchase(null);toast('Purchase cancelled.');return;}throw err;}
+    if(result&&result.pending){toast('Waiting for approval — finish the purchase in the App Store to unlock unlimited chat.');return;}
+    const signedTransaction=result&&result.signedTransaction;
+    if(!signedTransaction)throw new Error('The App Store didn’t return a transaction. Please try again.');
+    // Never log the signedTransaction or any JWS payload — only the outcome.
+    const verified=await api('/api/subscriptions/verify',{method:'POST',body:JSON.stringify({signedTransaction,appAccountToken,productId})});
+    if(!(verified&&verified.ok))throw new Error('The App Store couldn’t confirm that purchase. If you were charged, tap Restore purchases.');
+    // Acknowledge only after the server has cryptographically verified and
+    // persisted the entitlement. If this fails, StoreKit keeps it unfinished
+    // and the transaction listener retries later.
+    await cap.nativePromise('StoreKit','finish',{transactionId:verified.transactionId});
+    setPendingStoreKitPurchase(null);
+    await refreshSubscriptionState();
+    toast('Unlimited chat is on — enjoy.');
+  }catch(error){toast(error.message||'Purchase failed. Please try again.');}
+}
+async function restorePurchases(){
+  if(!storeKitAvailable()){toast('Subscriptions are managed in the Orbit iOS app.');return;}
+  try{
+    const cap=capStoreKitPlugin();
+    const restored=await cap.nativePromise('StoreKit','restore',{});
+    const txns=(restored&&restored.transactions)||[];
+    if(!txns.length){toast('No past purchases found on this Apple ID.');return;}
+    let confirmed=0;
+    for(const t of txns){
+      const signedTransaction=t&&t.signedTransaction;
+      if(!signedTransaction)continue; // never logged
+      try{const v=await api('/api/subscriptions/verify',{method:'POST',body:JSON.stringify({signedTransaction})});if(v&&v.ok){await cap.nativePromise('StoreKit','finish',{transactionId:v.transactionId});confirmed++;}}
+      catch(_){/* one unverifiable receipt must not kill the batch */}
+    }
+    if(confirmed){await refreshSubscriptionState();toast('Purchase restored — unlimited chat is back on.');}
+    else toast('Couldn’t restore any purchases. If you bought Orbit in the App Store, try again.');
+  }catch(error){toast(error.message||'Restore failed. Please try again.');}
+}
+let storeKitListenerAttached=false;
+function attachStoreKitListener(){
+  const cap=capStoreKitPlugin();
+  if(!cap||storeKitListenerAttached)return;
+  storeKitListenerAttached=true;
+  // Handles renewals: any transaction the App Store surfaces later is
+  // re-verified with the server, which keeps the entitlement current.
+  cap.addListener('StoreKit','transactionUpdated',async(info)=>{
+    const signedTransaction=info&&info.signedTransaction;
+    if(!signedTransaction)return; // never logged
+    const pending=pendingStoreKitPurchase();
+    const binding=pending&&pending.productId===info.productId?{appAccountToken:pending.appAccountToken,productId:pending.productId}:{};
+    try{const v=await api('/api/subscriptions/verify',{method:'POST',body:JSON.stringify({signedTransaction,...binding})});if(v&&v.ok){await cap.nativePromise('StoreKit','finish',{transactionId:v.transactionId});if(binding.appAccountToken)setPendingStoreKitPurchase(null);await refreshSubscriptionState();}}
+    catch(error){console.warn('[storekit] renewal verify failed',error&&error.message);}
+  });
+}
+// 402 + paywall:true from POST /api/chat: the daily free limit is hit.
+function isPaywallError(error){return !!(error&&error.status===402&&error.body&&error.body.paywall===true);}
+// Inline paywall nudge — a styled assistant message in the conversation.
+// Never a modal, dialog, or popup.
+function showInlinePaywall(){
+  const root=$('#messages');if(!root)return;
+  // One nudge at a time: scroll to the existing one instead of stacking.
+  if(root.querySelector('.message.paywall-nudge')){scrollToBottom(root);return;}
+  const el=document.createElement('div');el.className='message assistant paywall-nudge';
+  const title=document.createElement('p');title.className='paywall-title';title.textContent='You’ve hit today’s free limit';
+  const copy=document.createElement('p');copy.textContent='The free plan covers 25 messages a day and resets at midnight Eastern. Unlimited chat is a subscription through the App Store.';
+  el.append(title,copy);
+  if(storeKitAvailable()){
+    const actions=document.createElement('div');actions.className='mini-actions';el.append(actions);
+    const loading=document.createElement('p');loading.className='muted';loading.textContent='Loading plans…';actions.append(loading);
+    loadStoreKitProducts().then((products)=>{
+      loading.remove();
+      if(!products.length)throw new Error('no plans');
+      for(const p of products)actions.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
+      actions.append(button('Restore purchases','ghost',restorePurchases));
+    }).catch(()=>{loading.textContent='Plans are unavailable right now.';});
+  }else{
+    const note=document.createElement('p');note.className='muted';note.textContent='Subscriptions are managed in the Orbit iOS app — open it on your iPhone to upgrade or restore a purchase.';
+    el.append(note);
+  }
+  root.append(el);scrollToBottom(root);
+}
+// One subtle Settings entry point next to the push panel — no toggles.
+async function updateSubscriptionsButton(){
+  const btn=$('#subscriptions-button'),hint=$('#subscriptions-hint');
+  if(!btn)return;
+  if(!storeKitAvailable()){
+    if(hint)hint.textContent='Unlimited chat is a subscription managed in the Orbit iOS app.';
+    btn.classList.add('hidden');
+    return;
+  }
+  try{
+    const status=await api('/api/subscriptions/status');
+    const ent=status&&status.entitlement;
+    if(ent&&ent.unlimited){
+      if(hint)hint.textContent='Unlimited chat is active. Manage it in the App Store under your Apple ID.';
+      btn.classList.add('hidden');
+    }else{
+      if(hint)hint.textContent=(status&&status.ready)?'Three plans, unlimited chat, billed through the App Store.':'Subscriptions aren’t ready yet — check back shortly.';
+      btn.classList.remove('hidden');
+    }
+  }catch(_){if(hint)hint.textContent='Couldn’t check subscription status right now.';}
+}
+$('#subscriptions-button').addEventListener('click',async()=>{
+  const btn=$('#subscriptions-button');if(!btn)return;
+  let panel=$('#subscriptions-plans');
+  if(panel){panel.remove();btn.textContent='View plans';return;}
+  btn.disabled=true;btn.textContent='Loading…';
+  try{
+    const products=await loadStoreKitProducts();
+    panel=document.createElement('div');panel.id='subscriptions-plans';panel.className='mini-actions block-top';
+    for(const p of products)panel.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
+    panel.append(button('Restore purchases','ghost',restorePurchases));
+    btn.after(panel);btn.textContent='Hide plans';
+  }catch(error){toast(error.message||'Couldn’t load plans right now.');btn.textContent='View plans';}
+  finally{btn.disabled=false;}
+});
+updateSubscriptionsButton();
+if(isNativeRuntime(window))attachStoreKitListener();
 $('#export-backup').addEventListener('click',async()=>{try{const passphrase=$('#backup-passphrase').value;const response=await nativeFetch(API_BASE+'/api/backups/export',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json','X-Orbit-CSRF':state.csrf},body:JSON.stringify({passphrase})});if(!response.ok)throw new Error((await response.json()).error);const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`orbit-backup-${new Date().toISOString().slice(0,10)}.orbitbackup`;link.click();URL.revokeObjectURL(url);toast('Encrypted backup downloaded.');}catch(error){toast(error.message);}});
 $('#restore-backup').addEventListener('click',async()=>{try{const file=$('#restore-file').files[0];if(!file)throw new Error('Choose an Orbit backup first.');if(file.size>10*1024*1024)throw new Error('Backup is too large.');if(prompt('Restoring merges data and pauses Orbit. Type RESTORE to continue:')!=='RESTORE')return;const payload=await file.text();await api('/api/backups/restore',{method:'POST',body:JSON.stringify({payload,passphrase:$('#backup-passphrase').value,confirm:'RESTORE'})});await refresh();toast('Backup restored. Orbit remains paused for review.');}catch(error){toast(error.message);}});
 $('#rotate-recovery').addEventListener('click',async()=>{try{const result=await api('/api/recovery-codes/rotate',{method:'POST',body:JSON.stringify({password:$('#recovery-password').value})});showCodes(result.recoveryCodes);$('#recovery-password').value='';}catch(error){toast(error.message);}});

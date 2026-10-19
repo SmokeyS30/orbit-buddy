@@ -256,6 +256,53 @@ CREATE TABLE IF NOT EXISTS apns_device_tokens (
   UNIQUE(user_id, device_token)
 );
 
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+  product_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  expires_at TEXT,
+  app_account_token TEXT,
+  environment TEXT NOT NULL DEFAULT 'production',
+  original_transaction_id TEXT,
+  last_event_signed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS subscription_purchase_intents (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  product_id TEXT NOT NULL,
+  app_account_token TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  transaction_id TEXT,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at);
+
+CREATE TABLE IF NOT EXISTS daily_usage (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  day_ny TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, day_ny)
+);
+
+CREATE TABLE IF NOT EXISTS processed_notifications (
+  notification_id TEXT PRIMARY KEY,
+  received_at TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'processing',
+  completed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS connectors (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
