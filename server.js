@@ -891,7 +891,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           // is never silently dropped.
           if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+          await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
+        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
       }
     }finally{workerBusy=false;}
   }
@@ -927,6 +928,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     // W4: notification tap deep-linking — the check-in lives in this conversation,
     // so carry its id in the push payload; the SW routes the tap straight to it.
     await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
+    await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
   }
   // WhatsApp delivery for a completed scheduled task: only when the 24h window
   // is open. Outside the window (or if sending fails) we fall back to push so
@@ -2347,6 +2349,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           db.addDoorToken(hashToken(doorToken),new Date(Date.now()+24*60*60_000).toISOString());
           db.addEvent(owner.id,'access_request',`${name} (${email}) asked for Orbit access.`);
           await push.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety',doorAction:true,doorToken});
+          await apns.notify(owner.id,'Access request',`${name} asked for Orbit access.`,{view:'safety',doorAction:true,doorToken});
         }
         return json(res,201,{ok:true,id:saved.id});
       }
@@ -2384,7 +2387,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }catch{}
         // Notify owner
         const owner=db.listUsers().find((u)=>u.role==='owner');
-        if(owner)await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});
+        if(owner){await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});await apns.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});}
         return json(res,201,{ok:true});
       }
       if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
@@ -2643,7 +2646,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const emailed=await sendPasswordResetEmail({to:email,resetUrl});
             if(!emailed){
               const owner=db.listUsers().find((u)=>u.role==='owner');
-              if(owner) await push.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});
+              if(owner){await push.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});await apns.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});}
             }
           }
         }
@@ -3171,7 +3174,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           requireOwner(user);
           return json(res,200,{ok:true,backupDir:backupDir||null,...backupStatus()});
         }
-        if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});await apns.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
         if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.setSetting('registration_opened_at',open?new Date().toISOString():'');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
