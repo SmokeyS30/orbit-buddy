@@ -23,13 +23,14 @@ function updatePushButtonBody() {
   return appJs.slice(start, end);
 }
 
-test('updatePushButton has a native branch ahead of the web-push check', () => {
+test('updatePushButton waits for the native bridge ahead of the web-push check', () => {
   const body = updatePushButtonBody();
-  const nativeIdx = body.indexOf('nativePushAvailable()');
+  const nativeIdx = body.indexOf('isNativeRuntime(window)');
   const webIdx = body.indexOf('serviceWorker');
-  assert.ok(nativeIdx > -1, 'must consult nativePushAvailable()');
+  assert.ok(nativeIdx > -1, 'must consult the live native runtime');
   assert.ok(webIdx > -1, 'must keep the web-push path');
   assert.ok(nativeIdx < webIdx, 'native branch must come before the web check');
+  assert.match(body, /await waitForNativePushPlugin\(1500\)/);
   assert.match(body, /checkPermissions/);
 });
 
@@ -37,7 +38,7 @@ test('native branch never reports "not supported" before checking the plugin', (
   const body = updatePushButtonBody();
   const nativeSection = body.slice(0, body.indexOf("if(!('serviceWorker'in navigator)"));
   assert.doesNotMatch(nativeSection, /Not supported on this device/);
-  assert.match(nativeSection, /Notifications enabled/);
+  assert.match(nativeSection, /Send test notification/);
   assert.match(nativeSection, /Enable on this device/);
 });
 
@@ -53,7 +54,8 @@ test('APNs registration event uploads the token via the authenticated api() help
 test('native enable flow requests permission then registers via the bridge', () => {
   const clickIdx = appJs.indexOf("$('#enable-push').addEventListener");
   const region = appJs.slice(clickIdx, clickIdx + 1200);
-  assert.match(region, /nativePushAvailable\(\)/);
+  assert.match(region, /isNativeRuntime\(window\)/);
+  assert.match(region, /await waitForNativePushPlugin\(\)/);
   assert.match(region, /nativePromise\('PushNotifications','requestPermissions'/);
   assert.match(region, /nativePromise\('PushNotifications','register'/);
 });
@@ -81,7 +83,8 @@ test('push failures surface as toasts, not silent console warnings', () => {
   // undebuggable in the field.
   const listeners = appJs.slice(appJs.indexOf('function attachNativePushListeners()'));
   assert.match(listeners, /registrationError.*toast\('Push registration failed: '/);
-  assert.match(listeners, /\.catch\(\(error\)=>toast\('Push setup failed: '/);
+  assert.match(listeners, /\.catch\(\(error\)=>\{[\s\S]*?toast\('Push setup failed: '/);
+  assert.match(listeners, /Notification setup needs attention:/);
 });
 
 test('push success toast fires only after the token upload completes', () => {
@@ -109,6 +112,23 @@ test('explicit enable verifies delivery while launch refresh does not spam a tes
   const setupIdx = appJs.indexOf('async function setupNativePush()');
   const setupBody = appJs.slice(setupIdx, setupIdx + 800);
   assert.doesNotMatch(setupBody, /pushRegistrationPending=true/);
+});
+
+test('native setup waits for the bridge and starts only after authenticated connect', () => {
+  assert.match(appJs, /async function waitForNativePushPlugin\(timeoutMs=8000\)/);
+  const setupIdx = appJs.indexOf('async function setupNativePush()');
+  const setupBody = appJs.slice(setupIdx, setupIdx + 900);
+  assert.match(setupBody, /await waitForNativePushPlugin\(\)/);
+  const connectIdx = appJs.indexOf('async function connect()');
+  const connectBody = appJs.slice(connectIdx, connectIdx + 1400);
+  assert.match(connectBody, /await refresh\(\)[\s\S]*?setupNativePush\(\)/);
+  assert.doesNotMatch(appJs, /updatePushButton\(\);\s*if\(isNativeRuntime\(window\)\)setupNativePush\(\);/);
+});
+
+test('an enabled native device can always request a verified test push', () => {
+  const body = updatePushButtonBody();
+  assert.match(body, /permission==='granted'&&apnsRegistered\(\)[\s\S]*?btn\.disabled=false/);
+  assert.match(body, /Send test notification/);
 });
 
 test('foreground native pushes surface visibly instead of logging only', () => {

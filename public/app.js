@@ -769,7 +769,7 @@ async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{stat
 // this page load — later refreshes overwrite it with "just now", which would
 // erase the 6h+ absence the away card needs to detect.
 if(state.catchupSince===undefined)state.catchupSince=state.snapshot.lastAppOpenAt||null;try{state.writingVoice=await api('/api/writing-voice');}catch(_){state.writingVoice=null;}state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();if(state.user&&$('#today').classList.contains('active')){loadBriefing();loadCatchupCard();}}finally{refreshInFlight=false;}}
-async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');$('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);$('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');await refresh();maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(IS_NATIVE&&!state.launchSignin){
+async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');$('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);$('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');await refresh();maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();if(isNativeRuntime(window))setupNativePush();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(IS_NATIVE&&!state.launchSignin){
           const goWelcome=()=>{location.href='welcome.html';};
           if(window.__orbitSplashComplete){goWelcome();return;}
           let splashWaited=false;
@@ -1696,7 +1696,15 @@ function capPushPlugin(){
   if(!cap||typeof cap.isPluginAvailable!=='function')return null;
   try{return cap.isPluginAvailable('PushNotifications')?cap:null;}catch(_){return null;}
 }
-function nativePushAvailable(){return isNativeRuntime(window)&&!!capPushPlugin();}
+async function waitForNativePushPlugin(timeoutMs=8000){
+  const deadline=Date.now()+timeoutMs;
+  do{
+    const cap=capPushPlugin();
+    if(cap)return cap;
+    await new Promise((resolve)=>setTimeout(resolve,200));
+  }while(Date.now()<deadline);
+  return null;
+}
 function apnsRegistered(){try{return localStorage.getItem(APNS_REGISTERED_KEY)==='1';}catch(_){return false;}}
 async function postApnsToken(token,verifyDelivery=false){
   await api('/api/push/token',{method:'POST',body:JSON.stringify({token,verifyDelivery})});
@@ -1712,13 +1720,16 @@ function attachNativePushListeners(){
     pushRegistrationPending=false;
     const token=info&&info.value;
     if(!token||typeof token!=='string'){toast('Push setup failed: no device token from Apple.');return;}
-    postApnsToken(token,verifyDelivery).then(()=>{toast(verifyDelivery?'Push notifications enabled — test sent.':'Push notifications enabled.');updatePushButton();}).catch((error)=>toast('Push setup failed: '+(error&&error.message||error)));
+    postApnsToken(token,verifyDelivery).then(()=>{toast(verifyDelivery?'Push notifications enabled — test sent.':'Push notifications enabled.');updatePushButton();}).catch((error)=>{try{localStorage.removeItem(APNS_REGISTERED_KEY);}catch(_){}toast('Push setup failed: '+(error&&error.message||error));updatePushButton();});
   });
   cap.addListener('PushNotifications','registrationError',(info)=>{pushRegistrationPending=false;toast('Push registration failed: '+((info&&info.error)||'unknown error'));});
   cap.addListener('PushNotifications','pushNotificationReceived',(notification)=>{const title=notification&&notification.title;toast(title?`Notification received: ${title}`:'Notification received from Orbit.');});
 }
 async function setupNativePush(){
-  const cap=capPushPlugin();
+  // Physical iPhones can load app.js before Capacitor has finished exposing
+  // native plugins. Wait for the bridge, and only register after connect()
+  // has restored the authenticated bearer token used by postApnsToken().
+  const cap=await waitForNativePushPlugin();
   if(!cap)return;
   attachNativePushListeners();
   try{
@@ -1726,20 +1737,23 @@ async function setupNativePush(){
     // Re-register on launch when already allowed: refreshes the APNs device
     // token, and the registration listener uploads it to the server.
     if(perm&&perm.receive==='granted')await cap.nativePromise('PushNotifications','register',{});
-  }catch(error){console.warn('[push] native push setup failed',error&&error.message||error);}
+  }catch(error){toast('Notification setup needs attention: '+(error&&error.message||error));updatePushButton();}
 }
 async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;try{
-if(nativePushAvailable()){
+if(isNativeRuntime(window)){
+const cap=await waitForNativePushPlugin(1500);
+if(!cap){btn.disabled=false;btn.textContent='Retry notification setup';btn.classList.add('primary');return;}
 let permission='prompt';
-try{const perm=await window.Capacitor.nativePromise('PushNotifications','checkPermissions',{});permission=(perm&&perm.receive)||'prompt';}catch(_){}
-if(permission==='granted'&&apnsRegistered()){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}
+try{const perm=await cap.nativePromise('PushNotifications','checkPermissions',{});permission=(perm&&perm.receive)||'prompt';}catch(_){}
+if(permission==='granted'&&apnsRegistered()){btn.disabled=false;btn.textContent='Send test notification';btn.classList.add('primary');}
 else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}
 return;
 }
 if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
 $('#enable-push').addEventListener('click',async()=>{try{
-if(nativePushAvailable()){
-const cap=window.Capacitor;
+if(isNativeRuntime(window)){
+const cap=await waitForNativePushPlugin();
+if(!cap)throw new Error('The iPhone notification bridge did not load. Close and reopen Orbit, then try again.');
 attachNativePushListeners();
 const perm=await cap.nativePromise('PushNotifications','requestPermissions',{});
 if(!perm||perm.receive!=='granted')throw new Error('Notification permission was not granted.');
@@ -1750,7 +1764,6 @@ updatePushButton();return;
 }
 if(!('serviceWorker'in navigator)||!('PushManager'in window))throw new Error('Push is not supported on this browser.');const key=await api('/api/push/public-key');if(!key.configured)throw new Error('Push keys are not configured on the server.');const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Notification permission was not granted.');const registration=await navigator.serviceWorker.ready;const bytes=Uint8Array.from(atob(key.publicKey.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));const subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:bytes});await api('/api/push/subscribe',{method:'POST',body:JSON.stringify(subscription)});toast('Push notifications enabled.');updatePushButton();}catch(error){toast(error.message);}});
 updatePushButton();
-if(isNativeRuntime(window))setupNativePush();
 // --- Subscriptions: StoreKit 2 via the native iOS plugin ---
 // Same bridge pattern as native push above: low-level window.Capacitor APIs,
 // nativePromise('StoreKit', method) for calls and addListener('StoreKit',
