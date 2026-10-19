@@ -859,6 +859,45 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getUserById: (id) => s.userById.get(id),
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled(id, disabled) { s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id); },
+    deleteUserAccount(userId) {
+      const account = s.userById.get(userId);
+      if (!account) return { deleted: false, successorId: null };
+      let successorId = null;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if (account.role === 'owner') {
+          const successor = db.prepare(`SELECT id FROM users
+            WHERE id<>? AND is_demo=0 AND disabled=0
+            ORDER BY created_at,id LIMIT 1`).get(userId);
+          if (successor) {
+            db.prepare("UPDATE users SET role='owner',updated_at=? WHERE id=?").run(timestamp(), successor.id);
+            successorId = successor.id;
+          }
+        }
+
+        // Delete every table row carrying this user_id, including legacy
+        // tables that predate foreign-key cascades. Parent tables are last so
+        // dependent rows are always gone first.
+        const parentTables = new Set(['conversations', 'goals', 'projects', 'radar_findings']);
+        const userTables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all()
+          .map((row) => row.name)
+          .filter((name) => db.prepare(`PRAGMA table_info("${String(name).replaceAll('"', '""')}")`).all().some((column) => column.name === 'user_id'))
+          .sort((a, b) => Number(parentTables.has(a)) - Number(parentTables.has(b)) || a.localeCompare(b));
+        for (const table of userTables) {
+          const quoted = `"${String(table).replaceAll('"', '""')}"`;
+          db.prepare(`DELETE FROM ${quoted} WHERE user_id=?`).run(userId);
+        }
+        db.prepare('DELETE FROM settings WHERE instr(key, ?) > 0').run(userId);
+        db.prepare('DELETE FROM access_requests WHERE lower(email)=lower(?)').run(account.email);
+        db.prepare('DELETE FROM waitlist WHERE lower(email)=lower(?)').run(account.email);
+        s.deleteUser.run(userId);
+        db.exec('COMMIT');
+        return { deleted: true, successorId };
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+    },
     claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
     getSession: (tokenHash) => s.session.get(tokenHash, timestamp()),

@@ -297,3 +297,29 @@ test('PostgreSQL: proactive memory surfacing parity (migrations + dedup)', async
     }
   }
 });
+
+test('PostgreSQL: account deletion removes user-scoped rows', async () => {
+  assert.ok(DATABASE_URL, 'TEST_DATABASE_URL must be set (CI provides PostgreSQL 16 service)');
+  await ensureSchema();
+  let db = null;
+  let userId = null;
+  try {
+    db = createSyncPgAdapter(DATABASE_URL);
+    const user = db.createUser({
+      email: `pgtest-delete-${Date.now()}@example.com`, displayName: 'PG Delete',
+      passwordHash: 'h', passwordSalt: 's', role: 'member',
+    });
+    userId = user.id;
+    db.addMemory(userId, 'Delete this private memory', { kind: 'fact', source: 'test' });
+    db.setSetting(`delete_test_${userId}`, 'private');
+    const result = db.deleteUserAccount(userId);
+    assert.deepEqual(result, { deleted: true, successorId: null });
+    assert.equal(db.getUserById(userId), null);
+    assert.equal(db.listMemories(userId).length, 0);
+    assert.equal(db.getSetting(`delete_test_${userId}`), null);
+    userId = null;
+  } finally {
+    try { if (db && userId) db.deleteDemoUser(userId); } catch {}
+    if (db) { try { db.close(); } catch {} }
+  }
+});

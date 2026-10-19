@@ -861,6 +861,27 @@
             <p class="muted">Everyone with an Orbit account. Reset a password if someone can't sign in.</p>
             <div id="user-list" class="card-list"></div>
           </section>
+          <section class="panel danger-zone" id="delete-account-panel">
+            <h2>Delete account</h2>
+            <p class="muted">
+              Permanently delete your Orbit account, conversations, memories,
+              connected-service tokens, files, and other associated data. This
+              cannot be undone.
+            </p>
+            <p class="muted">
+              Deleting Orbit does not cancel billing through Apple. Cancel an
+              active plan first in
+              <a href="https://apps.apple.com/account/subscriptions/" target="_blank" rel="noopener">Apple subscription settings</a>.
+            </p>
+            <p class="hint hidden" id="owner-delete-warning">
+              If another active account exists, deleting the owner account
+              transfers ownership to the oldest active account.
+            </p>
+            <label>Current password
+              <input id="delete-account-password" type="password" autocomplete="current-password" />
+            </label>
+            <button id="delete-account-button" class="danger block-top">Delete my account</button>
+          </section>
           <section class="panel danger-zone">
             <h2>Emergency pause</h2>
             <p class="muted">

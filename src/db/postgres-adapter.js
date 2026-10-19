@@ -423,6 +423,37 @@ const indexMigrations = [
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
     updatePassword: async (id, passwordHash, passwordSalt) => { await run('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?', passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled: async (id, disabled) => { await run('UPDATE users SET disabled=?, updated_at=? WHERE id=?', disabled ? 1 : 0, timestamp(), id); },
+    async deleteUserAccount(userId) {
+      return withTransaction(async ({ get: tGet, all: tAll, run: tRun }) => {
+        const account = await tGet('SELECT * FROM users WHERE id=?', userId);
+        if (!account) return { deleted: false, successorId: null };
+        let successorId = null;
+        if (account.role === 'owner') {
+          const successor = await tGet(`SELECT id FROM users
+            WHERE id<>? AND is_demo=0 AND disabled=0
+            ORDER BY created_at,id LIMIT 1`, userId);
+          if (successor) {
+            await tRun("UPDATE users SET role='owner',updated_at=? WHERE id=?", timestamp(), successor.id);
+            successorId = successor.id;
+          }
+        }
+
+        const parentTables = new Set(['conversations', 'goals', 'projects', 'radar_findings']);
+        const userTables = (await tAll(`SELECT table_name FROM information_schema.columns
+          WHERE table_schema='public' AND column_name='user_id'`))
+          .map((row) => row.table_name)
+          .sort((a, b) => Number(parentTables.has(a)) - Number(parentTables.has(b)) || a.localeCompare(b));
+        for (const table of userTables) {
+          const quoted = `"${String(table).replaceAll('"', '""')}"`;
+          await tRun(`DELETE FROM ${quoted} WHERE user_id=?`, userId);
+        }
+        await tRun('DELETE FROM settings WHERE POSITION(? IN key)>0', userId);
+        await tRun('DELETE FROM access_requests WHERE LOWER(email)=LOWER(?)', account.email);
+        await tRun('DELETE FROM waitlist WHERE LOWER(email)=LOWER(?)', account.email);
+        const deleted = await tRun('DELETE FROM users WHERE id=?', userId);
+        return { deleted: deleted.changes > 0, successorId };
+      });
+    },
     async claimOrphans(userId) {
       await run('UPDATE messages SET user_id=? WHERE user_id IS NULL', userId);
       await run('UPDATE memories SET user_id=? WHERE user_id IS NULL', userId);
