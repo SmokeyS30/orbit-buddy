@@ -1,8 +1,10 @@
-# Native iOS push notifications — owner setup
+# Native iOS push notifications
 
-The code is done and deployed. Three things remain, all in your lane:
+All three layers below must be present for native delivery. The repository now
+contains the iOS capability and immediate delivery verification; production
+credentials remain server-side in Azure.
 
-## 1. Apple Developer portal — create the APNs key (one time)
+## 1. Apple Developer portal — APNs key (one time)
 
 1. Go to [developer.apple.com](https://developer.apple.com) → **Certificates, Identifiers & Profiles** → **Keys** → **+**.
 2. Name it `Orbit Buddy APNs`, check **Apple Push Notifications service (APNs)**, click **Continue** → **Register**.
@@ -10,13 +12,13 @@ The code is done and deployed. Three things remain, all in your lane:
 4. On the key's detail page, copy the **Key ID** (10 characters, e.g. `AB12CD34EF`).
 5. Go to **Membership details** and copy your **Team ID**.
 
-## 2. Xcode — enable the Push Notifications capability
+## 2. Xcode — Push Notifications capability
 
 1. Open `ios/App/App.xcodeproj`, select the **App** target → **Signing & Capabilities**.
-2. Click **+ Capability** → add **Push Notifications**.
-3. Rebuild / re-archive after this — the entitlement must be in the binary.
+2. Confirm **Push Notifications** is listed and `App/App.entitlements` contains `aps-environment`.
+3. Rebuild / re-archive after any signing change — the exported app must contain the production APNs entitlement.
 
-## 3. Azure portal — set the env vars
+## 3. Azure — server credentials
 
 In the orbit-buddy Container App → **Environment variables**, add:
 
@@ -41,4 +43,5 @@ Then **restart** the container app revision so the new vars take effect.
 1. Set the env vars + restart Azure.
 2. Install a TestFlight build that includes the Push capability (step 2).
 3. In the app: Settings → Enable on this device → allow notifications.
-4. Trigger the nudge: open the registration door (Safety tab) and leave it open for over an hour — or ask Orbit to simulate it. Your iPhone should get the push.
+4. Orbit immediately sends a test notification. The button only reports success after the backend has stored the token and Apple has accepted that test push.
+5. Trigger a normal nudge or reminder afterward to confirm background delivery with the app closed.

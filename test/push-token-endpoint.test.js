@@ -23,7 +23,7 @@ async function register(base, email = 'owner@example.com') {
 }
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
-const postToken = (base, headers, token) => fetch(`${base}/api/push/token`, { method: 'POST', headers, body: JSON.stringify({ token }) });
+const postToken = (base, headers, token, verifyDelivery = false) => fetch(`${base}/api/push/token`, { method: 'POST', headers, body: JSON.stringify({ token, verifyDelivery }) });
 
 test('push token: 401 unauthenticated, 400 malformed, 201 stores', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
@@ -41,12 +41,21 @@ test('push token: 401 unauthenticated, 400 malformed, 201 stores', async (t) => 
   const token = 'ab'.repeat(32);
   const ok = await postToken(base, headers, token);
   assert.equal(ok.status, 201);
-  assert.deepEqual(await ok.json(), { ok: true });
+  assert.deepEqual(await ok.json(), { ok: true, verified: false });
   const rows = app.db.listApnsTokens(auth.userId);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].device_token, token);
   assert.equal(rows[0].platform, 'ios');
   assert.equal(rows[0].apns_environment, 'production');
+});
+
+test('push token: explicit delivery verification fails clearly when APNs is not configured', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const response = await postToken(base, authHeaders(auth), 'ab'.repeat(32), true);
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /not configured/i);
+  assert.equal(app.db.listApnsTokens(auth.userId).length, 1, 'token remains stored for a later retry');
 });
 
 test('push token: upserted (no duplicates) and lowercased', async (t) => {

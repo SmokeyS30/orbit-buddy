@@ -45,9 +45,9 @@ test('APNs registration event uploads the token via the authenticated api() help
   assert.match(appJs, /addListener\('PushNotifications','registration'/);
   const listenerIdx = appJs.indexOf("addListener('PushNotifications','registration'");
   const region = appJs.slice(listenerIdx, listenerIdx + 600);
-  assert.match(region, /postApnsToken\(token\)/);
+  assert.match(region, /postApnsToken\(token,verifyDelivery\)/);
   // postApnsToken itself POSTs through the authenticated api() helper.
-  assert.match(appJs, /async function postApnsToken\(token\)\{[^}]*api\('\/api\/push\/token',\{method:'POST'/);
+  assert.match(appJs, /async function postApnsToken\(token,verifyDelivery=false\)\{[^}]*api\('\/api\/push\/token',\{method:'POST'/);
 });
 
 test('native enable flow requests permission then registers via the bridge', () => {
@@ -94,12 +94,33 @@ test('push success toast fires only after the token upload completes', () => {
     clickBody.slice(0, clickBody.indexOf('pushRegistrationPending=true')),
     /toast\('Push notifications enabled\.'\)/
   );
-  assert.match(appJs, /postApnsToken\(token\)\.then\(\(\)=>\{toast\('Push notifications enabled\.'\);/);
+  assert.match(appJs, /postApnsToken\(token,verifyDelivery\)\.then\(\(\)=>\{toast\(verifyDelivery\?'Push notifications enabled — test sent\.':'Push notifications enabled\.'\);/);
 });
 
 test('push registration has a timeout when Apple never responds', () => {
   assert.match(appJs, /pushRegistrationPending=true;/);
   assert.match(appJs, /setTimeout\(\(\)=>\{if\(pushRegistrationPending\)\{pushRegistrationPending=false;toast\('Push setup timed out/);
+});
+
+test('explicit enable verifies delivery while launch refresh does not spam a test push', () => {
+  assert.match(appJs, /const verifyDelivery=pushRegistrationPending;/);
+  assert.match(appJs, /postApnsToken\(token,verifyDelivery\)/);
+  assert.match(appJs, /JSON\.stringify\(\{token,verifyDelivery\}\)/);
+  const setupIdx = appJs.indexOf('async function setupNativePush()');
+  const setupBody = appJs.slice(setupIdx, setupIdx + 800);
+  assert.doesNotMatch(setupBody, /pushRegistrationPending=true/);
+});
+
+test('foreground native pushes surface visibly instead of logging only', () => {
+  assert.match(appJs, /addListener\('PushNotifications','pushNotificationReceived'.*toast\(/);
+});
+
+test('iOS target carries the APNs entitlement and capability', () => {
+  const entitlements = fs.readFileSync(path.join(root, 'ios', 'App', 'App', 'App.entitlements'), 'utf8');
+  const project = fs.readFileSync(path.join(root, 'ios', 'App', 'App.xcodeproj', 'project.pbxproj'), 'utf8');
+  assert.match(entitlements, /<key>aps-environment<\/key>/);
+  assert.match(project, /CODE_SIGN_ENTITLEMENTS = App\/App\.entitlements;/);
+  assert.match(project, /com\.apple\.Push = \{[\s\S]*?enabled = 1;/);
 });
 
 test('AppDelegate forwards Apple push callbacks to Capacitor', () => {
