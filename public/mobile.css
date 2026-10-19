@@ -74,5 +74,84 @@
      Keep every form field at 16px on mobile so focus never triggers a zoom. */
   input,textarea,select{font-size:16px}
   /* Belt and braces: never inflate text anywhere on mobile, not just the header */
-  html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+  html{-webkit-text-size-adjust:100%;text-size-adjust:100%;max-width:100%;overflow-x:hidden}
+  body{-webkit-text-size-adjust:100%;text-size-adjust:100%;max-width:100%;overflow-x:hidden}
+}
+
+/* --- iPhone visual-fit pass: keep every app surface inside the safe viewport --- */
+@media(max-width:760px){
+  body{min-height:100dvh}
+  .shell{width:calc(100% - 24px);padding:8px 0 calc(48px + env(safe-area-inset-bottom))}
+  .topbar{padding-inline:2px}
+  .top-actions{min-width:0}
+
+  /* Headings and cards should feel native-sized instead of desktop-scaled. */
+  .hero-card{min-height:0;padding:22px 18px;border-radius:22px}
+  .orb-wrap{height:148px}
+  .orb{width:96px;height:96px}
+  .eye{top:38px}
+  .eye-left{left:30px}
+  .eye-right{right:30px}
+  .ring-a{width:148px;height:82px}
+  .ring-b{width:164px;height:104px}
+  .hero-copy h1{font-size:clamp(30px,9vw,35px);line-height:1.05;margin-bottom:14px}
+  .split-heading{flex-direction:column;align-items:flex-start;margin:12px 2px 18px}
+  .split-heading h1{font-size:clamp(30px,9vw,36px);line-height:1.05;margin:4px 0 8px}
+  .panel{padding:17px;border-radius:18px}
+  .item-card,.focus-card,.briefing-card,.intro-card{padding:16px;border-radius:15px}
+  .intro-card{margin-bottom:14px}
+
+  /* Conversation controls previously competed for one narrow row. */
+  .panel-heading{flex-direction:column;align-items:stretch;gap:14px}
+  .chat-search{width:100%;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center}
+  #chat-search-input{width:100%;min-width:0;font-size:16px}
+  .chat-search-filters-toggle{margin-left:0;min-height:44px}
+  .chat-search-results,.chat-search-filters{left:0;right:0;width:auto;max-width:100%}
+  .messages{max-height:min(52dvh,480px);padding:18px 2px;gap:10px}
+  .message{max-width:94%;padding:12px 14px;overflow-wrap:anywhere}
+  .composer{grid-template-columns:auto auto minmax(0,1fr);gap:8px;align-items:center}
+  .composer #chat-input{grid-column:1/-1;grid-row:1;min-width:0;min-height:50px;max-height:32dvh;resize:none}
+  .composer #attach-button{grid-column:1;grid-row:2}
+  .composer #voice-button{grid-column:2;grid-row:2}
+  .composer .primary{grid-column:3;grid-row:2;justify-self:stretch;min-height:44px}
+  .icon-button{min-width:44px;min-height:44px;padding:10px 12px}
+
+  /* Let dense utility views wrap rather than widening the whole webview. */
+  .section-title,.item-card header,.actions,.mini-actions,.check-row{flex-wrap:wrap}
+  .section-title{align-items:flex-start}
+  .item-card header{min-width:0}
+  .item-card header>*,.section-title>*{min-width:0}
+  .forecast-strip,.view-toggle,.thread-bar,.timeline-points{max-width:100%;-webkit-overflow-scrolling:touch}
+  .forecast-strip{overflow-x:auto;padding-bottom:4px}
+  .forecast-day{min-width:86px}
+  .weather-now strong{font-size:38px}
+  .agenda-row{align-items:flex-start}
+  .agenda-time{min-width:70px}
+  .project-step{width:100%;min-width:0}
+  .project-step .mini-actions{width:100%}
+  .codes,.message .md pre,.message .md table{max-width:100%;overflow:auto}
+
+  /* Sheets and dialogs follow the dynamic viewport and iPhone safe areas. */
+  dialog{max-width:100%;max-height:100dvh}
+  .login-card{width:calc(100vw - 24px);max-height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px);padding:22px 18px;border-radius:20px;overflow:auto}
+  #voice-overlay{padding:calc(12px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom))}
+  .voice-shell{max-height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px);padding:24px 18px 18px}
+  .voice-shell h2{font-size:26px}
+  .rev-sheet{max-height:calc(100dvh - env(safe-area-inset-top) - 12px)}
+  .camera-overlay{padding:calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))}
+  .camera-video{max-width:100%;max-height:58dvh}
+  .toast{width:max-content;max-width:calc(100vw - 24px);text-align:center}
+}
+
+/* Extra-tight phones and Display Zoom get a deliberate compact layout. */
+@media(max-width:380px){
+  .shell{width:calc(100% - 20px)}
+  .brand small{display:none}
+  #account-button{max-width:42vw}
+  .tabs{border-radius:13px}
+  .tabs .tab{padding:9px 11px;font-size:13px}
+  .hero-card{padding-inline:15px}
+  .panel{padding:15px}
+  .hero-copy h1,.split-heading h1{font-size:30px}
+  .message{max-width:96%}
 }
