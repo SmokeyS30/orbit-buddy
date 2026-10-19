@@ -165,7 +165,7 @@ test('every table the Postgres adapter queries exists in postgres-schema.sql', (
     ...[...schema.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
     ...[...pg.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
   ]);
-  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'text', 'context', 'today', 'existing', 'values']);
+  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'information_schema', 'text', 'context', 'today', 'existing', 'values']);
   const missing = [...referenced].filter((t) => !defined.has(t) && !keywords.has(t));
   assert.deepEqual(missing, [], `adapter tables missing from postgres-schema.sql: ${missing.join(', ')}`);
 });

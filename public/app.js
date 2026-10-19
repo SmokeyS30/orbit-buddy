@@ -769,7 +769,7 @@ async function refresh(){if(refreshInFlight)return;refreshInFlight=true;try{stat
 // this page load — later refreshes overwrite it with "just now", which would
 // erase the 6h+ absence the away card needs to detect.
 if(state.catchupSince===undefined)state.catchupSince=state.snapshot.lastAppOpenAt||null;try{state.writingVoice=await api('/api/writing-voice');}catch(_){state.writingVoice=null;}state.accessRequests=[];state.users=[];if(state.user&&state.user.role==='owner'){try{state.accessRequests=(await api('/api/admin/access-requests')).requests||[];}catch(_){}try{state.users=(await api('/api/admin/users')).users||[];}catch(_){}}if(state.snapshot.activeConversation){activeConversationId=state.snapshot.activeConversation.id;try{localStorage.setItem('orbit-convo',activeConversationId);}catch(_){}}$('#brand-name').textContent=state.status.buddyName;$('#status-text').textContent=state.status.paused?'Paused':'Online';$('.status').classList.toggle('online',!state.status.paused);const modelState=state.status.modelStatus?.state;renderModelPill();if(state.status.modelConfigured&&modelState==='unverified'&&!modelCheckInFlight){modelCheckInFlight=true;checkModelConnection(true).finally(()=>{modelCheckInFlight=false;});}if(!isComposing())render();else syncTypingBubble();if(state.user&&$('#today').classList.contains('active')){loadBriefing();loadCatchupCard();}}finally{refreshInFlight=false;}}
-async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');await refresh();maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(IS_NATIVE&&!state.launchSignin){
+async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');$('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);$('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');await refresh();maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner?'register':'login');if(IS_NATIVE&&!state.launchSignin){
           const goWelcome=()=>{location.href='welcome.html';};
           if(window.__orbitSplashComplete){goWelcome();return;}
           let splashWaited=false;
@@ -1005,6 +1005,20 @@ $('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=tr
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{try{clearGeoAsked(safeStorage());}catch(_){}try{await api('/api/auth/logout',{method:'POST'});}catch(_){}setNativeToken(null);location.reload();});
+$('#delete-account-button')?.addEventListener('click',async()=>{
+  const password=$('#delete-account-password')?.value||'';
+  if(!password){toast('Enter your current password first.');return;}
+  const confirmation=window.prompt('This permanently deletes your Orbit account and data. Type DELETE to continue.');
+  if(confirmation!=='DELETE')return;
+  if(!window.confirm('Delete this account permanently? This cannot be undone.'))return;
+  const btn=$('#delete-account-button');btn.disabled=true;btn.textContent='Deleting…';
+  try{
+    await api('/api/account',{method:'DELETE',body:JSON.stringify({password,confirm:'DELETE'})});
+    setNativeToken(null);
+    try{localStorage.clear();sessionStorage.clear();}catch(_){}
+    location.replace('/welcome.html');
+  }catch(error){toast(error.message||'Account deletion failed.');btn.disabled=false;btn.textContent='Delete my account';}
+});
 // --- Offline message queue (Q5) ---
 // Typed messages queue locally when the network drops and send automatically
 // when connectivity returns — no error, no lost message, no extra UI.

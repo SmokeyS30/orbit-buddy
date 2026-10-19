@@ -36,5 +36,5 @@ test('welcome screen keeps compact iPhone controls and 16px form inputs', () => 
 
 test('native bundle uses the polished CSS revision and a new TestFlight build number', () => {
   assert.match(index, /mobile\.css\?v=20261019c/);
-  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261022;/g) || []).length, 2);
+  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261023;/g) || []).length, 2);
 });
