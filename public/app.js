@@ -76,9 +76,31 @@ function showCodes(codes){$('#codes-output').textContent=codes.join('\n');$('#co
 let typingActive=false;
 function appendTypingBubble(){const root=$('#messages');if(!root||root.querySelector('.typing-bubble'))return;const el=document.createElement('div');el.className='message assistant typing-bubble';el.setAttribute('role','status');const label=document.createElement('span');label.className='typing-label';label.textContent=`${state.status?.buddyName||'Orbit'} is typing`;const dots=document.createElement('span');dots.className='typing-dots';dots.setAttribute('aria-hidden','true');for(let i=0;i<3;i++)dots.append(document.createElement('span'));const stream=document.createElement('span');stream.className='stream-text';el.append(label,dots,stream);root.append(el);}
 function setStreamText(text){const el=document.querySelector('#messages .typing-bubble');if(!el)return;const root=$('#messages');const keepAtBottom=isNearBottom(root);const stream=el.querySelector('.stream-text');const label=el.querySelector('.typing-label');const dots=el.querySelector('.typing-dots');if(text){stream.textContent=text;label.style.display='none';dots.style.display='none';if(keepAtBottom)scrollToBottom(root);}else{stream.textContent='';label.style.display='';dots.style.display='';}}
-let streamTimer=null,streamTurn=-1;
-function syncStreamPoller(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!streamTimer){streamTurn=-1;streamTimer=setInterval(pollStream,1000);pollStream();}else if(!want&&streamTimer){clearInterval(streamTimer);streamTimer=null;}}
-async function pollStream(){if(!activeConversationId)return;let data;try{data=await api('/api/chat/stream-state?conversationId='+encodeURIComponent(activeConversationId));}catch(_){return;}if(!data)return;if(data.state==='streaming'){if(data.turn!==streamTurn){streamTurn=data.turn;setStreamText('');}setStreamText(data.text||'');}else if(data.state==='done'){if(streamTimer){clearInterval(streamTimer);streamTimer=null;}setStreamText('');refresh().catch(()=>{});}else{setStreamText('');}}
+let streamTimer=null,streamTurn=-1,streamSource=null,streamBuffer='';
+function syncStreamPoller(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!streamTimer&&!streamSource)startChatStream();else if(!want&&(streamTimer||streamSource))stopChatStream();}
+function stopChatStream(){if(streamSource){streamSource.close();streamSource=null;}if(streamTimer){clearInterval(streamTimer);streamTimer=null;}}
+// True SSE streaming: one long-lived EventSource per reply; deltas append to
+// the typing bubble as they arrive instead of 1s polling. Native apps can't
+// set the Authorization header on an EventSource, so they (and any SSE
+// failure) fall back to the 1s polling path below.
+function startChatStream(){
+  if(streamSource||streamTimer||!activeConversationId)return;
+  if(IS_NATIVE&&nativeToken()){startStreamPollFallback();return;}
+  streamTurn=-1;streamBuffer='';
+  let source;
+  try{source=new EventSource((API_BASE||'')+'/api/chat/stream?conversationId='+encodeURIComponent(activeConversationId),{withCredentials:true});}
+  catch(_){startStreamPollFallback();return;}
+  const parse=(event)=>{try{return JSON.parse(event.data);}catch(_){return null;}};
+  source.addEventListener('sync',(event)=>{const data=parse(event);if(!data)return;if((data.turn??-1)!==streamTurn){streamTurn=data.turn??-1;streamBuffer='';}streamBuffer=String(data.text||'');setStreamText(streamBuffer);});
+  source.addEventListener('delta',(event)=>{const data=parse(event);if(!data)return;if((data.turn??-1)!==streamTurn){streamTurn=data.turn??-1;streamBuffer='';}streamBuffer+=String(data.delta||'');setStreamText(streamBuffer);});
+  source.addEventListener('done',()=>{stopChatStream();setStreamText('');refresh().catch(()=>{});});
+  source.onerror=()=>{if(streamSource){stopChatStream();startStreamPollFallback();}};
+  streamSource=source;
+}
+function startStreamPollFallback(){if(streamTimer||streamSource||!activeConversationId)return;streamTurn=-1;streamTimer=setInterval(pollStream,1000);pollStream();}
+// 1s polling fallback (also used by native apps): kept intact so any SSE
+// failure degrades gracefully instead of stalling the typing bubble.
+async function pollStream(){if(!activeConversationId)return;let data;try{data=await api('/api/chat/stream-state?conversationId='+encodeURIComponent(activeConversationId));}catch(_){return;}if(!data)return;if(data.state==='streaming'){if(data.turn!==streamTurn){streamTurn=data.turn;setStreamText('');}setStreamText(data.text||'');}else if(data.state==='done'){stopChatStream();setStreamText('');refresh().catch(()=>{});}else{setStreamText('');}}
 function showTyping(shouldScrollToBottom){typingActive=true;appendTypingBubble();if(shouldScrollToBottom)settleAtBottom($('#messages'));}
 function hideTyping(){typingActive=false;const el=document.querySelector('#messages .typing-bubble');if(el)el.remove();}
 const pendingReplies=new Map();

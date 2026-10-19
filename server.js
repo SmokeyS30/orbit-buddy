@@ -6,7 +6,7 @@ import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
-import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE } from './src/model.js';
+import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
@@ -263,6 +263,23 @@ export function stripSuggestMarkers(text){
   return text.replace(/\[SUGGEST_MEMORY:[^\]\n]*\]/gi,'').replace(/\n{3,}/g,'\n\n').trim();
 }
 export function stripModelMarkers(text){return stripCitationMarkers(stripSuggestMarkers(stripFollowUpMarkers(text)));}
+// Chat-latency trims (2026-10-18): pure helpers deciding WHEN pre-model DB
+// reads happen. They never change what data the model can receive — only
+// whether an extra read is needed on this turn.
+export function needsFullAmbientHistoryRead(baseHistory=[]){
+  // baseHistory holds the most recent 24 messages, so a >=4 user-turn count
+  // there can only grow with more history — no extra read needed. The full
+  // 50-message read is only required when baseHistory was truncated at 24
+  // AND still shows fewer than 4 user turns (older turns may exist).
+  return baseHistory.length===24&&baseHistory.filter((m)=>m.role==='user').length<4;
+}
+export function shouldDeferProactiveSurfacing({recalledMemories=[],message=''}={}){
+  // The three proactive-surfacing DB reads (surfacings, memories, personal
+  // dates) run every turn today, but short messages with no recalled
+  // memories almost never produce a surfacing — defer the reads in that
+  // case. The model receives the same data shape when the reads do run.
+  return !(recalledMemories.length>0||String(message||'').trim().length>15);
+}
 //
 // Memory v2 — chat-native review/delete (2026-10-16, invisible complexity).
 // No settings UI, no toggles, no dashboard for memory. The owner reviews and
@@ -633,9 +650,17 @@ export function createOrbitServer(options={}) {
       let needsAmbientAsk=false;
       if(!db.getSetting(`ambient_context_${userId}`)){
         const ambientAskedAt=Number(db.getSetting(`ambient_asked_${userId}`)||0);
-        const userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
-        if(userTurns>=4&&(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000)){
-          needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));
+        if(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000){
+          // baseHistory (24 msgs, already loaded above) usually settles the
+          // >=4 user-turn gate on its own — the extra 50-message read only
+          // runs when it was truncated and still shows <4 user turns.
+          // historyOverride (regenerate) truncates baseHistory artificially,
+          // so it keeps the original full-conversation read.
+          let userTurns=baseHistory.filter((m)=>m.role==='user').length;
+          if(historyOverride||needsFullAmbientHistoryRead(baseHistory)){
+            userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
+          }
+          if(userTurns>=4){needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));}
         }
       }
       // X5 "Writes like you": inject the learned voice as a drafting-only style
@@ -677,6 +702,34 @@ export function createOrbitServer(options={}) {
         answer=soulCommand||adaptationCommand||emotionCommand||memoryCommand;
         storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       }else{
+      // Luna chitchat fast-path (2026-10-18): obvious small talk ("hey",
+      // "thanks!") skips ALL the heavy pre-model DB work below and answers
+      // with a single gpt-6-luna call, no tools. Command handlers above
+      // already ran, so "call you X" etc. still resolve instantly. Image
+      // turns never take this path. Any luna failure falls through to the
+      // full sol path — the turn never fails here.
+      let chitchatAnswered=false;
+      if(images.length===0&&isChitchatMessage(message)){
+        try{
+          const { text: chitchatText }=await model.respondChitchat({
+            buddyName:customBuddyName||defaultBuddyName,
+            userName:user?.display_name,
+            message,
+            // resolveAdaptiveSoulDirective needs several DB reads; luna uses
+            // its default personality for chitchat instead.
+            soulDirective:null,
+            userTimeZone:preferences.time_zone,
+            onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},
+            onToken:(delta)=>{streamState.text+=delta;}
+          });
+          answer=chitchatText;
+          storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
+          chitchatAnswered=true;
+        }catch(chitchatError){
+          console.error('chitchat fast-path failed, falling back to full path',chitchatError&&chitchatError.message);
+        }
+      }
+      if(!chitchatAnswered){
       // Soul directive renders the user's tuned personality (or the demo
       // neutral default) into the system-prompt layer for this turn, plus the
       // adaptive soul layer: context-driven tone shifts around the tuned
@@ -701,7 +754,12 @@ export function createOrbitServer(options={}) {
       // natural aside — graceful by design: the model gets a hint it may use
       // or skip silently, never more than one per turn, never in demo mode.
       let proactiveSurfacing=null;
-      if(!isDemoUser(user)){
+      // Chat-latency trim: skip the three surfacing DB reads (surfacings,
+      // memories, personal dates) for short messages with no recalled
+      // memories — they almost never surface anything (see
+      // shouldDeferProactiveSurfacing). Only load timing changes; the model
+      // receives the same data shape when the reads do run.
+      if(!isDemoUser(user)&&!shouldDeferProactiveSurfacing({recalledMemories,message})){
         try{
           const surfacedRows=db.listMemorySurfacings(userId,200);
           // Memory connections (2026-10-16): unified chooser — date triggers
@@ -768,6 +826,7 @@ export function createOrbitServer(options={}) {
             db.addEvent(userId,'memory_surfaced_chat',`Volunteered a timely memory in chat (${proactiveSurfacing.reason}).`);
           }
         }catch(error){console.error('proactive memory record failed',error&&error.message);}
+      }
       }
       }
       if(db.getSetting(`ambient_context_${userId}`)==='granted'){
@@ -2701,6 +2760,36 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{months:out});
         }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
+        // True SSE chat streaming: one long-lived connection per reply pushes
+        // token deltas as they arrive (~100ms granularity) instead of 1s
+        // polling. Same auth, ownership, and rate-limit checks as
+        // /api/chat/stream-state (that endpoint is left untouched — the
+        // WhatsApp flow and the polling fallback keep using it).
+        if(req.method==='GET'&&url.pathname==='/api/chat/stream'){
+          if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const conversationId=url.searchParams.get('conversationId');
+          if(!conversationId||!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});
+          res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
+          res.write(': connected\n\n');
+          let closed=false;
+          let lastTurn=-2,lastSentLen=0,lastBeat=Date.now();
+          const sseSend=(event,payload)=>{if(!closed)res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);};
+          const tick=()=>{
+            if(closed)return;
+            const stream=pendingStreams.get(conversationId);
+            if(!stream){sseSend('done',{turn:-1});clearInterval(timer);res.end();return;}
+            const turn=stream.turn,text=stripModelMarkers(stream.text||'');
+            if(turn!==lastTurn){lastTurn=turn;lastSentLen=0;sseSend('sync',{turn,text});}
+            if(text.length>lastSentLen){sseSend('delta',{turn,delta:text.slice(lastSentLen)});lastSentLen=text.length;}
+            if(Date.now()-lastBeat>=15000){lastBeat=Date.now();if(!closed)res.write(': heartbeat\n\n');}
+            if(stream.done){sseSend('done',{turn});clearInterval(timer);res.end();}
+          };
+          const timer=setInterval(tick,100);
+          timer.unref();
+          req.on('close',()=>{closed=true;clearInterval(timer);});
+          tick();
+          return;
+        }
         if(req.method==='GET'&&url.pathname==='/api/calendar-feeds')return json(res,200,{feeds:db.listCalendarFeeds(userId).map(publicFeed)});
         if(req.method==='POST'&&url.pathname==='/api/calendar-feeds'){const body=await readJson(req);const label=cleanText(body.label,60,'label');const feedUrl=normalizeFeedUrl(cleanText(body.url,2000,'url'));let text;try{text=await fetchFeedText(feedUrl);}catch(error){throw Object.assign(new Error(`Could not read that calendar: ${error.message}`),{status:400});}const vevents=parseIcs(text);if(!vevents.length)throw Object.assign(new Error('That URL did not return a readable calendar (no events found).'),{status:400});const feed=db.addCalendarFeed(userId,{label,url:feedUrl});db.addEvent(userId,'calendar_feed_added',`Connected calendar \u201c${label}\u201d (${vevents.length} events found).`);return json(res,201,{feed:publicFeed(feed),eventsFound:vevents.length});}
         const feedMatch=url.pathname.match(/^\/api\/calendar-feeds\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&feedMatch){if(!db.deleteCalendarFeed(userId,feedMatch[1]))throw Object.assign(new Error('Calendar feed not found.'),{status:404});dropFeedCache(feedMatch[1]);db.addEvent(userId,'calendar_feed_removed','Removed a calendar feed.');return json(res,200,{ok:true});}
@@ -3099,7 +3188,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,push,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+  return {server,db,push,pendingStreams,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
     startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
