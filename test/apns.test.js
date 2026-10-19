@@ -128,7 +128,7 @@ test('410 Unregistered deletes the dead token', async () => {
   const { db, deleted } = mockDb();
   const apns = createApnsService({ APNS_KEY_P8: p8, APNS_KEY_ID: 'K', APNS_TEAM_ID: 'T' }, db, { connect });
   const result = await apns.notify('user-1', 'A', 'B');
-  assert.deepEqual(result, { sent: 0, failed: 1 });
+  assert.deepEqual(result, { sent: 0, failed: 1, error: 'Unregistered' });
   assert.deepEqual(deleted, [TOKEN64]);
 });
 

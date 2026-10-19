@@ -1684,8 +1684,8 @@ function capPushPlugin(){
 }
 function nativePushAvailable(){return isNativeRuntime(window)&&!!capPushPlugin();}
 function apnsRegistered(){try{return localStorage.getItem(APNS_REGISTERED_KEY)==='1';}catch(_){return false;}}
-async function postApnsToken(token){
-  await api('/api/push/token',{method:'POST',body:JSON.stringify({token})});
+async function postApnsToken(token,verifyDelivery=false){
+  await api('/api/push/token',{method:'POST',body:JSON.stringify({token,verifyDelivery})});
   try{localStorage.setItem(APNS_REGISTERED_KEY,'1');}catch(_){}
 }
 let pushRegistrationPending=false;
@@ -1694,13 +1694,14 @@ function attachNativePushListeners(){
   if(!cap||nativePushListenersAttached)return;
   nativePushListenersAttached=true;
   cap.addListener('PushNotifications','registration',(info)=>{
+    const verifyDelivery=pushRegistrationPending;
     pushRegistrationPending=false;
     const token=info&&info.value;
     if(!token||typeof token!=='string'){toast('Push setup failed: no device token from Apple.');return;}
-    postApnsToken(token).then(()=>{toast('Push notifications enabled.');updatePushButton();}).catch((error)=>toast('Push setup failed: '+(error&&error.message||error)));
+    postApnsToken(token,verifyDelivery).then(()=>{toast(verifyDelivery?'Push notifications enabled — test sent.':'Push notifications enabled.');updatePushButton();}).catch((error)=>toast('Push setup failed: '+(error&&error.message||error)));
   });
   cap.addListener('PushNotifications','registrationError',(info)=>{pushRegistrationPending=false;toast('Push registration failed: '+((info&&info.error)||'unknown error'));});
-  cap.addListener('PushNotifications','pushNotificationReceived',(notification)=>{console.info('[push] notification received',notification&&notification.title);});
+  cap.addListener('PushNotifications','pushNotificationReceived',(notification)=>{const title=notification&&notification.title;toast(title?`Notification received: ${title}`:'Notification received from Orbit.');});
 }
 async function setupNativePush(){
   const cap=capPushPlugin();
@@ -1728,8 +1729,8 @@ const cap=window.Capacitor;
 attachNativePushListeners();
 const perm=await cap.nativePromise('PushNotifications','requestPermissions',{});
 if(!perm||perm.receive!=='granted')throw new Error('Notification permission was not granted.');
-await cap.nativePromise('PushNotifications','register',{});
 pushRegistrationPending=true;
+await cap.nativePromise('PushNotifications','register',{});
 setTimeout(()=>{if(pushRegistrationPending){pushRegistrationPending=false;toast('Push setup timed out: no response from Apple. Check the build includes the Push Notifications capability, then try again.');}},12000);
 updatePushButton();return;
 }

@@ -111,18 +111,20 @@ export function createApnsService(env, db, { connect = http2.connect } = {}) {
       if (!configured) return { sent: 0, failed: 0, skipped: true };
       let sent = 0;
       let failed = 0;
+      let firstError = null;
       for (const row of db.listApnsTokens(userId)) {
         try {
           await sendToToken(row.device_token, { title, body, data });
           sent += 1;
         } catch (error) {
           failed += 1;
+          if (!firstError) firstError = error?.apnsReason || error?.message || 'APNs delivery failed';
           if (error && (error.apnsStatus === 410 || error.apnsReason === 'Unregistered')) {
             try { db.deleteApnsToken(row.device_token); } catch (_) {}
           }
         }
       }
-      return { sent, failed };
+      return { sent, failed, ...(firstError ? { error: firstError } : {}) };
     },
     close() {
       try { if (session) session.close(); } catch (_) {}
