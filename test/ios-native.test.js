@@ -180,6 +180,26 @@ test('native login response includes sessionToken in body; web login does not', 
   assert.equal(webBody.sessionToken, undefined, 'web login body must NOT include sessionToken');
 });
 
+test('native demo response includes sessionToken in body; web demo does not', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const nativeDemo = await fetch(`${base}/api/demo/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Orbit-Native': '1' },
+  });
+  assert.equal(nativeDemo.status, 201);
+  const nativeBody = await nativeDemo.json();
+  assert.ok(nativeBody.sessionToken, 'native demo body must include sessionToken');
+  assert.equal(typeof nativeBody.sessionToken, 'string');
+
+  const webDemo = await fetch(`${base}/api/demo/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  assert.equal(webDemo.status, 201);
+  const webBody = await webDemo.json();
+  assert.equal(webBody.sessionToken, undefined, 'web demo body must NOT include sessionToken');
+});
+
 test('Bearer token authenticates requests without a cookie', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const email = `bt${Date.now()}@example.com`;

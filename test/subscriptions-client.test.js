@@ -96,3 +96,12 @@ test('(f) native plugin sends the real StoreKit JWS and is compiled/registered',
   assert.match(project, /StoreKitPlugin\.swift in Sources/);
   assert.match(project, /OrbitBridgeViewController\.swift in Sources/);
 });
+
+test('(g) subscription plans include Apple renewal disclosure and account links', () => {
+  assert.ok(SRC.includes('Subscriptions renew automatically unless canceled at least 24 hours before the current period ends.'));
+  assert.ok(SRC.includes('https://apps.apple.com/account/subscriptions'));
+  assert.ok(SRC.includes('https://orbitbuddy.app/terms'));
+  assert.ok(SRC.includes('https://orbitbuddy.app/privacy'));
+  assert.ok(SRC.includes('appendSubscriptionDisclosure(actions)'));
+  assert.ok(SRC.includes('appendSubscriptionDisclosure(panel)'));
+});
