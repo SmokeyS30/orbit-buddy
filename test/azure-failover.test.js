@@ -7,9 +7,11 @@ const ENV = {
   AZURE_OPENAI_ENDPOINT: 'https://primary.openai.azure.com',
   AZURE_OPENAI_API_KEY: 'primary-key',
   AZURE_OPENAI_DEPLOYMENT: 'gpt-6.1-sol',
+  AZURE_OPENAI_LUNA_DEPLOYMENT: 'orbit-luna-east',
   AZURE_OPENAI_FALLBACK_DEPLOYMENTS: 'gpt-6-astra,gpt-6-luna',
   AZURE_OPENAI_SECONDARY_ENDPOINT: 'https://secondary.cognitiveservices.azure.com',
-  AZURE_OPENAI_SECONDARY_KEY: 'secondary-key'
+  AZURE_OPENAI_SECONDARY_KEY: 'secondary-key',
+  AZURE_OPENAI_SECONDARY_LUNA_DEPLOYMENT: 'orbit-luna-west'
 };
 
 function mockFetch(handler) {
@@ -73,11 +75,19 @@ test('failback: requests return to primary automatically on recovery', async () 
   } finally { restore(); }
 });
 
-test('chat request fails over to secondary after primary 503s (with backoff)', async () => {
+test('pinned Luna request uses each Azure region\'s configured deployment name', async () => {
   let primaryHits = 0;
-  const { calls, restore } = mockFetch((url) => {
+  const requestModels = [];
+  const { calls, restore } = mockFetch((url, opts) => {
     if (url.includes('/responses')) {
-      if (url.includes('primary')) { primaryHits += 1; return err503(); }
+      const requestedModel = JSON.parse(opts.body).model;
+      requestModels.push({ url, requestedModel });
+      if (url.includes('primary')) {
+        primaryHits += 1;
+        assert.equal(requestedModel, 'orbit-luna-east');
+        return err503();
+      }
+      assert.equal(requestedModel, 'orbit-luna-west');
       return okResponses('hello from secondary');
     }
     return okModels(['gpt-6.1-sol']);
@@ -85,12 +95,13 @@ test('chat request fails over to secondary after primary 503s (with backoff)', a
   try {
     const client = createModelClient({ ...ENV });
     const started = Date.now();
-    const result = await client.respond({ buddyName: 'Orbit', userName: 'Edward', message: 'hi', tools: false });
+    const result = await client.respondChitchat({ buddyName: 'Orbit', userName: 'Edward', message: 'hi' });
     const elapsed = Date.now() - started;
     assert.equal(result.text, 'hello from secondary');
     // 1 initial + 3 retries on primary before failover
     assert.equal(primaryHits, 4);
     assert.ok(calls.some((u) => u.includes('secondary') && u.includes('/responses')));
+    assert.ok(requestModels.some((call) => call.url.includes('secondary') && call.requestedModel === 'orbit-luna-west'));
     // backoff delays actually happened (~1s + ~2s + ~4s jittered)
     assert.ok(elapsed >= 3000, `expected backoff delay, got ${elapsed}ms`);
     const diag = client.diagnostics();

@@ -2772,15 +2772,23 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
           res.write(': connected\n\n');
           let closed=false;
-          let lastTurn=-2,lastSentLen=0,lastBeat=Date.now();
+          let lastTurn=-2,lastSentText='',lastBeat=Date.now();
           const sseSend=(event,payload)=>{if(!closed)res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);};
           const tick=()=>{
             if(closed)return;
             const stream=pendingStreams.get(conversationId);
             if(!stream){sseSend('done',{turn:-1});clearInterval(timer);res.end();return;}
             const turn=stream.turn,text=stripModelMarkers(stream.text||'');
-            if(turn!==lastTurn){lastTurn=turn;lastSentLen=0;sseSend('sync',{turn,text});}
-            if(text.length>lastSentLen){sseSend('delta',{turn,delta:text.slice(lastSentLen)});lastSentLen=text.length;}
+            if(turn!==lastTurn){
+              lastTurn=turn;lastSentText=text;sseSend('sync',{turn,text});
+            }else if(text.startsWith(lastSentText)){
+              if(text.length>lastSentText.length)sseSend('delta',{turn,delta:text.slice(lastSentText.length)});
+              lastSentText=text;
+            }else if(text!==lastSentText){
+              // Marker removal and other sanitizers can rewrite or shrink the
+              // visible prefix. A full sync prevents duplicated or lost text.
+              lastSentText=text;sseSend('sync',{turn,text});
+            }
             if(Date.now()-lastBeat>=15000){lastBeat=Date.now();if(!closed)res.write(': heartbeat\n\n');}
             if(stream.done){sseSend('done',{turn});clearInterval(timer);res.end();}
           };

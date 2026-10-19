@@ -79,6 +79,53 @@ test('SSE endpoint emits sync then delta events as the stream grows', async (t) 
   assert.equal(events[events.length - 1].event, 'done', 'final event is done');
 });
 
+test('SSE initial sync does not repeat already-generated text as a delta', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const convo = app.db.ensureDefaultConversation(auth.userId);
+  const stream = { turn: 0, text: 'Already here', done: false };
+  app.pendingStreams.set(convo.id, stream);
+  const collected = collectSse(base, `?conversationId=${convo.id}`, { Cookie: auth.cookie });
+  await new Promise((r) => setTimeout(r, 250));
+  stream.text = 'Already here and growing';
+  await new Promise((r) => setTimeout(r, 250));
+  stream.done = true;
+  const events = await collected;
+  const sync = events.find((event) => event.event === 'sync');
+  const deltas = events.filter((event) => event.event === 'delta');
+  assert.equal(sync.data.text, 'Already here');
+  assert.equal(deltas.map((event) => event.data.delta).join(''), ' and growing');
+  assert.equal(sync.data.text + deltas.map((event) => event.data.delta).join(''), 'Already here and growing');
+});
+
+test('SSE resynchronizes when marker stripping rewrites the visible prefix', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const convo = app.db.ensureDefaultConversation(auth.userId);
+  const stream = { turn: 0, text: 'Hello [SUGGEST_MEMORY: favorite', done: false };
+  app.pendingStreams.set(convo.id, stream);
+  const collected = collectSse(base, `?conversationId=${convo.id}`, { Cookie: auth.cookie });
+  await new Promise((r) => setTimeout(r, 250));
+  stream.text = 'Hello [SUGGEST_MEMORY: favorite color is blue]';
+  await new Promise((r) => setTimeout(r, 250));
+  stream.text = 'Hello [SUGGEST_MEMORY: favorite color is blue] world';
+  await new Promise((r) => setTimeout(r, 250));
+  stream.done = true;
+  const events = await collected;
+  const syncs = events.filter((event) => event.event === 'sync');
+  assert.ok(syncs.some((event) => event.data.text === 'Hello'), 'sanitized rewrite sends a corrective sync');
+  let visible = '';
+  let turn = -1;
+  for (const event of events) {
+    if (event.event === 'sync') { turn = event.data.turn; visible = event.data.text; }
+    if (event.event === 'delta') {
+      if (event.data.turn !== turn) { turn = event.data.turn; visible = ''; }
+      visible += event.data.delta;
+    }
+  }
+  assert.equal(visible, 'Hello  world');
+});
+
 test('SSE endpoint closes the connection after the done event', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const auth = await register(base);
