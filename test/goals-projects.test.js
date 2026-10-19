@@ -179,7 +179,9 @@ test('buildGoalArc renders an accessible SVG ring', () => {
 test('buildGoalArc colors the ring by the status rule and clamps text', () => {
   const overdue = buildGoalArc({ title: 'G', progress: 90, status: 'active', target_date: '2026-10-01' });
   assert.equal(overdue.querySelectorAll('path')[0].getAttribute('stroke'), 'var(--coral)');
-  const atRisk = buildGoalArc({ title: 'G', progress: 10, status: 'active', target_date: '2026-10-18' });
+  const soon = new Date(); soon.setDate(soon.getDate() + 3);
+  const atRiskDate = soon.toISOString().slice(0, 10);
+  const atRisk = buildGoalArc({ title: 'G', progress: 10, status: 'active', target_date: atRiskDate });
   assert.equal(atRisk.querySelectorAll('path')[0].getAttribute('stroke'), 'var(--violet)');
   const clamped = buildGoalArc({ title: 'G', progress: 150, status: 'active' });
   assert.equal(clamped.querySelectorAll('text')[0].textContent, '100%');
