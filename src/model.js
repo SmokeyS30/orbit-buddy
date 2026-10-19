@@ -45,24 +45,36 @@ export function processImageInput({ bytes, mimeType }) {
 }
 
 // ---- Luna chitchat fast-path -------------------------------------------
-// High-precision classifier: true ONLY for obvious small talk that needs no
-// tools, memory, knowledge, or history. When in doubt -> false (the full sol
-// path handles it). Guards: <=60 chars, no question mark, no question words,
-// no memory/soul command patterns, no URLs, no data-like numbers.
-const CHITCHAT_QUESTION_WORDS = /\b(what|when|where|why|how|who|whom|whose|which|whether)\b/i;
-const CHITCHAT_COMMAND_PATTERNS = /\b(remind me|remember (that|this)|set (a |the )?reminder|call you|your name is|forget |quiz me|catch me up|schedule |add (a |the )?(task|goal)|track (a |the )?goal|delete |what do you know about me|learn how i write)\b/i;
+// Positive allowlist: true ONLY for complete, obvious social acknowledgements
+// that need no tools, memory, knowledge, safety reasoning, or history. A
+// blacklist is not safe here: short substantive requests such as "send an
+// email" or "my chest hurts" must stay on the full path even when they contain
+// no question mark or digits.
 const CHITCHAT_URL_PATTERN = /(https?:\/\/|www\.|\b[a-z0-9-]+\.(com|net|org|io|app|dev)\b)/i;
 const CHITCHAT_NUMBER_PATTERN = /\d/;
+const CHITCHAT_PATTERNS = [
+  /^(?:hi+|hey+|hello+|yo+|howdy|sup)(?: there| orbit)?$/,
+  /^(?:good )?(?:morning|afternoon|evening|night)(?: orbit)?$/,
+  /^(?:thanks|thank you|thx)(?: so much| a lot)?$/,
+  /^(?:you'?re welcome|no problem)$/,
+  /^(?:lol|lmao|rofl|(?:ha){2,}|hehe+)(?: (?:nice|true|yeah|yep))?$/,
+  /^(?:ok|okay|alright|sure|got it|sounds good|understood|cool|nice|awesome|great|perfect|fair enough|makes sense)(?: (?:thanks|thank you))?$/,
+  /^(?:bye|goodbye|see you|see ya|talk later|catch you later)$/
+];
 
 export function isChitchatMessage(message) {
   const text = String(message || '').trim();
   if (!text || text.length > 60) return false;
   if (text.includes('?')) return false;
-  if (CHITCHAT_QUESTION_WORDS.test(text)) return false;
-  if (CHITCHAT_COMMAND_PATTERNS.test(text)) return false;
   if (CHITCHAT_URL_PATTERN.test(text)) return false;
   if (CHITCHAT_NUMBER_PATTERN.test(text)) return false;
-  return true;
+  const normalized = text
+    .toLowerCase()
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{M}'\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return CHITCHAT_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 // Minimal prompt for the luna chitchat fast-path: personality/soul, buddy
@@ -359,6 +371,12 @@ export function createModelClient(env = process.env) {
   // Luna chitchat fast-path model (see respondChitchat): overridable via
   // OPENAI_LUNA_MODEL for testing; defaults to gpt-6-luna.
   const lunaModel = normalizeModelName(env.OPENAI_LUNA_MODEL) || DEFAULT_MODEL;
+  // Azure's v1 API expects a deployment name in the `model` field. Deployment
+  // names are user-defined and are not guaranteed to equal the model id, so
+  // keep explicit primary/secondary mappings for the pinned Luna route.
+  const azureLunaDeployment = usingAzure
+    ? (env.AZURE_OPENAI_LUNA_DEPLOYMENT?.trim() || lunaModel)
+    : '';
   const allowInsecureModelUrl = env.ALLOW_INSECURE_MODEL_URL === 'true';
   // Multi-region Azure failover: an optional secondary endpoint (West US 3)
   // takes over on 5xx/network failures. Health probes and every request start
@@ -366,20 +384,25 @@ export function createModelClient(env = process.env) {
   const azureSecondaryEndpoint = usingAzure ? env.AZURE_OPENAI_SECONDARY_ENDPOINT?.trim().replace(/\/+$/, '') : '';
   const azureSecondaryApiKey = usingAzure ? env.AZURE_OPENAI_SECONDARY_KEY?.trim() : '';
   const azureSecondaryDeployment = usingAzure ? (env.AZURE_OPENAI_SECONDARY_DEPLOYMENT?.trim() || azureDeployment) : '';
+  const azureSecondaryLunaDeployment = usingAzure
+    ? (env.AZURE_OPENAI_SECONDARY_LUNA_DEPLOYMENT?.trim() || azureLunaDeployment)
+    : '';
   const requestEndpoints = [];
   if (usingAzure) {
     requestEndpoints.push({
       name: 'primary',
       baseUrl: validateBaseUrl(`${azureEndpoint}/openai/v1`, allowInsecureModelUrl),
       authHeaders: { 'api-key': azureApiKey },
-      deployment: azureDeployment
+      deployment: azureDeployment,
+      pinnedDeployments: { [lunaModel]: azureLunaDeployment }
     });
     if (azureSecondaryEndpoint && azureSecondaryApiKey) {
       requestEndpoints.push({
         name: 'secondary',
         baseUrl: validateBaseUrl(`${azureSecondaryEndpoint}/openai/v1`, allowInsecureModelUrl),
         authHeaders: { 'api-key': azureSecondaryApiKey },
-        deployment: azureSecondaryDeployment
+        deployment: azureSecondaryDeployment,
+        pinnedDeployments: { [lunaModel]: azureSecondaryLunaDeployment }
       });
     }
   } else {
@@ -458,7 +481,9 @@ export function createModelClient(env = process.env) {
   const requestWithResilience = async (singleRequest, modelInput, modelName, { pinModel = false } = {}) => {
     let lastError = null;
     for (const endpoint of requestEndpoints) {
-      const endpointModel = pinModel ? modelName : (endpoint.deployment || modelName);
+      const endpointModel = pinModel
+        ? (endpoint.pinnedDeployments?.[modelName] || modelName)
+        : (endpoint.deployment || modelName);
       let delayMs = RETRY_BASE_DELAY_MS;
       for (let attempt = 0; ; attempt += 1) {
         try {
@@ -885,10 +910,10 @@ export function createModelClient(env = process.env) {
     // Luna chitchat fast-path: obvious small talk ("hey", "thanks!") gets a
     // single gpt-6-luna call with no tools, no memories, no history — just
     // the minimal prompt from buildChitchatPrompt. Reuses the shared request
-    // pipeline (retries, cross-region failover, fallback chain); pinModel
-    // routes by model name even on fixed-deployment Azure endpoints. Throws
-    // on failure so the caller can fall back to the full sol path — this
-    // method never fails the turn by itself.
+    // pipeline for retries and cross-region failover; pinModel resolves the
+    // configured Luna deployment name for each Azure endpoint. Throws when
+    // Luna cannot serve the request so the caller can retry on the full Sol
+    // path — this method never fails the turn by itself.
     async respondChitchat({ buddyName, userName, message, soulDirective = null, userTimeZone = 'America/New_York', onToken = null, onTurn = null }) {
       if (!apiKey) {
         return { text: `I'm ${buddyName || 'Orbit'}, running in demo mode. Add OPENAI_API_KEY to enable model-generated responses. Your message was: “${String(message || '').slice(0, 240)}”`, toolCalls: [] };
@@ -901,7 +926,10 @@ export function createModelClient(env = process.env) {
         : (input, modelName) => requestModel(input, modelName, requestOptions);
       try {
         const { output } = await callWithFallback(requestFn, modelInput, {
-          candidates: [lunaModel, ...fallbackModels],
+          // Only Luna belongs on the minimal, tool-free prompt. If it is not
+          // available, throw so runChatReplyJob retries through the complete
+          // Sol path with tools, memories, history, and safety context intact.
+          candidates: [lunaModel],
           routeTargetModel: lunaModel,
           // A luna reply must never become the preferred model for full turns.
           updatePreferredModel: () => false

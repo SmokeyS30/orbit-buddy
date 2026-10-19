@@ -16,7 +16,7 @@ test('isChitchatMessage qualifies obvious small talk', () => {
   }
 });
 
-test('isChitchatMessage rejects anything needing tools, knowledge, or memory', () => {
+test('isChitchatMessage rejects anything needing tools, knowledge, safety reasoning, or memory', () => {
   const rejects = [
     "thanks, what's the weather?",          // question mark + question word
     'hey can you check my calendar?',        // question mark
@@ -33,6 +33,17 @@ test('isChitchatMessage rejects anything needing tools, knowledge, or memory', (
     'check out https://example.com',         // URL
     'see you at 5',                          // data-like number
     'quiz me on Security+',                  // study coach command
+    'Explain photosynthesis',                // substantive request without ?
+    'Write a poem about grief',              // writing task
+    'Translate hello to French',             // transformation task
+    'Tell me about quantum physics',          // knowledge request
+    'Help me with my homework',               // substantive request
+    'Search for nearby hospitals',            // tool/safety request
+    'Send an email to Bob',                   // tool request
+    'Create a reminder for tomorrow',         // command paraphrase
+    'My chest hurts',                         // medical/safety context
+    'I feel suicidal',                        // crisis/safety context
+    'a'.repeat(60),                           // length alone is never enough
     '',                                      // empty
     null,
     undefined
@@ -42,8 +53,8 @@ test('isChitchatMessage rejects anything needing tools, knowledge, or memory', (
   }
 });
 
-test('isChitchatMessage boundary: 60 chars ok, 61 rejected', () => {
-  assert.equal(isChitchatMessage('a'.repeat(60)), true);
+test('isChitchatMessage keeps the 60-character ceiling without treating arbitrary text as chat', () => {
+  assert.equal(isChitchatMessage('a'.repeat(60)), false);
   assert.equal(isChitchatMessage('a'.repeat(61)), false);
 });
 
@@ -155,7 +166,7 @@ test('respondChitchat streams deltas through onToken/onTurn', async () => {
   }
 });
 
-test('respondChitchat falls back to the next configured model when luna is unavailable', async () => {
+test('respondChitchat throws when luna is unavailable so the caller can use the full path', async () => {
   let calls = 0;
   const modelsSeen = [];
   const restore = stubFetch(async (_url, init) => {
@@ -169,10 +180,12 @@ test('respondChitchat falls back to the next configured model when luna is unava
   });
   try {
     const client = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_FALLBACK_MODELS: 'gpt-6.1-sol' });
-    const { text } = await client.respondChitchat({ buddyName: 'Orbit', message: 'hey' });
-    assert.equal(text, 'Hey there!');
-    assert.deepEqual(modelsSeen, ['gpt-6-luna', 'gpt-6.1-sol']);
-    assert.equal(calls, 2);
+    await assert.rejects(
+      client.respondChitchat({ buddyName: 'Orbit', message: 'hey' }),
+      /model not found/
+    );
+    assert.deepEqual(modelsSeen, ['gpt-6-luna']);
+    assert.equal(calls, 1);
   } finally {
     restore();
   }
