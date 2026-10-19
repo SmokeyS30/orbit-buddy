@@ -99,9 +99,15 @@ test('(f) native plugin sends the real StoreKit JWS and is compiled/registered',
 
 test('(g) subscription plans include Apple renewal disclosure and account links', () => {
   assert.ok(SRC.includes('Subscriptions renew automatically unless canceled at least 24 hours before the current period ends.'));
-  assert.ok(SRC.includes('https://apps.apple.com/account/subscriptions'));
-  assert.ok(SRC.includes('https://orbitbuddy.app/terms'));
-  assert.ok(SRC.includes('https://orbitbuddy.app/privacy'));
+  const disclosureStart = SRC.indexOf('function appendSubscriptionDisclosure');
+  const disclosureEnd = SRC.indexOf('let subProductsCache', disclosureStart);
+  const disclosure = SRC.slice(disclosureStart, disclosureEnd);
+  const links = [...disclosure.matchAll(/\['([^']+)','([^']+)'\]/g)].map((match) => match.slice(1));
+  assert.deepEqual(links, [
+    ['Manage subscriptions', 'https://apps.apple.com/account/subscriptions'],
+    ['Terms', 'https://orbitbuddy.app/terms'],
+    ['Privacy', 'https://orbitbuddy.app/privacy'],
+  ]);
   assert.ok(SRC.includes('appendSubscriptionDisclosure(actions)'));
   assert.ok(SRC.includes('appendSubscriptionDisclosure(panel)'));
 });
