@@ -1001,7 +1001,7 @@ $('#model-check-button')?.addEventListener('click',checkModelConnection);
 $('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await nativeFetch(API_BASE+'/api/auth/forgot-password',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await nativeFetch(API_BASE+'/api/auth/recover',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value}:{email:$('#auth-email').value,password:$('#auth-password').value};const response=await nativeFetch(API_BASE+endpoint,{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;if(body.sessionToken)setNativeToken(body.sessionToken);if(body.recoveryCodes)showCodes(body.recoveryCodes);if(mode==='register')state.justRegistered=true;await connect();}catch(error){$('#auth-error').textContent=error.message;}});
 $('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-register').addEventListener('click',()=>setAuthMode('register'));$('#show-recover').addEventListener('click',()=>setAuthMode('recover'));$('#show-forgot')?.addEventListener('click',()=>setAuthMode('forgot'));
 $('#hero-signin')?.addEventListener('click',()=>{const d=$('#auth-dialog');if(d&&!d.open)d.showModal();});
-$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;await connect();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
+$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;if(body.sessionToken)setNativeToken(body.sessionToken);await connect();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{try{clearGeoAsked(safeStorage());}catch(_){}try{await api('/api/auth/logout',{method:'POST'});}catch(_){}setNativeToken(null);location.reload();});
@@ -1766,6 +1766,21 @@ function productPriceLine(p){
   const price=(p.price!=null)?formatStoreKitPrice(p):(p.fallbackPrice||null);
   return price?(p.title+' — '+price):p.title;
 }
+function appendSubscriptionDisclosure(root){
+  if(!root||root.querySelector('.subscription-disclosure'))return;
+  const disclosure=document.createElement('div');disclosure.className='subscription-disclosure';
+  const renewal=document.createElement('p');renewal.textContent='Payment is charged to your Apple ID at confirmation. Subscriptions renew automatically unless canceled at least 24 hours before the current period ends.';
+  const links=document.createElement('p');
+  for(const [label,href] of [
+    ['Manage subscriptions','https://apps.apple.com/account/subscriptions'],
+    ['Terms','https://orbitbuddy.app/terms'],
+    ['Privacy','https://orbitbuddy.app/privacy'],
+  ]){
+    if(links.childNodes.length)links.append(document.createTextNode(' · '));
+    const link=document.createElement('a');link.textContent=label;link.href=href;link.target='_blank';link.rel='noopener';links.append(link);
+  }
+  disclosure.append(renewal,links);root.append(disclosure);
+}
 let subProductsCache=null,subProductsPromise=null;
 const STOREKIT_PENDING_KEY='orbit_storekit_pending_v1';
 function setPendingStoreKitPurchase(value){try{if(value)localStorage.setItem(STOREKIT_PENDING_KEY,JSON.stringify(value));else localStorage.removeItem(STOREKIT_PENDING_KEY);}catch(_){}}
@@ -1877,13 +1892,14 @@ function showInlinePaywall(){
   const copy=document.createElement('p');copy.textContent='The free plan covers 25 messages a day and resets at midnight Eastern. Unlimited chat is a subscription through the App Store.';
   el.append(title,copy);
   if(storeKitAvailable()){
-    const actions=document.createElement('div');actions.className='mini-actions';el.append(actions);
+    const actions=document.createElement('div');actions.className='mini-actions subscription-plans';el.append(actions);
     const loading=document.createElement('p');loading.className='muted';loading.textContent='Loading plans…';actions.append(loading);
     loadStoreKitProducts().then((products)=>{
       loading.remove();
       if(!products.length)throw new Error('no plans');
       for(const p of products)actions.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
       actions.append(button('Restore purchases','ghost',restorePurchases));
+      appendSubscriptionDisclosure(actions);
     }).catch(()=>{loading.textContent='Plans are unavailable right now.';});
   }else{
     const note=document.createElement('p');note.className='muted';note.textContent='Subscriptions are managed in the Orbit iOS app — open it on your iPhone to upgrade or restore a purchase.';
@@ -1919,9 +1935,10 @@ $('#subscriptions-button').addEventListener('click',async()=>{
   btn.disabled=true;btn.textContent='Loading…';
   try{
     const products=await loadStoreKitProducts();
-    panel=document.createElement('div');panel.id='subscriptions-plans';panel.className='mini-actions block-top';
+    panel=document.createElement('div');panel.id='subscriptions-plans';panel.className='mini-actions subscription-plans block-top';
     for(const p of products)panel.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
     panel.append(button('Restore purchases','ghost',restorePurchases));
+    appendSubscriptionDisclosure(panel);
     btn.after(panel);btn.textContent='Hide plans';
   }catch(error){toast(error.message||'Couldn’t load plans right now.');btn.textContent='View plans';}
   finally{btn.disabled=false;}

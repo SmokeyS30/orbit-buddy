@@ -35,7 +35,8 @@ Set on the orbit-buddy Container App (all as secrets except where noted):
 | `APPSTORE_APP_APPLE_ID` | Orbit Buddy's numeric Apple app ID (required for production JWS validation) |
 | `APPSTORE_BUNDLE_ID` | Optional — defaults to `com.smokeys30.orbitbuddy` |
 | `APPSTORE_SANDBOX` | `true` for sandbox testing, absent/false for production |
-| `COMPED_USER_IDS` | Optional comma-separated Orbit user IDs that get unlimited chat free, bypassing both the subscription check and the 25/day limit — regardless of `SUBSCRIPTIONS_ENABLED`. The `owner` role is always exempt automatically. Use this for the 3 additional people (mom, dad, one friend — their user IDs go here at activation time). No app update needed. |
+| `COMPED_USER_IDS` | Optional comma-separated Orbit user IDs that get unlimited chat free, bypassing both the subscription check and the 25/day limit — regardless of `SUBSCRIPTIONS_ENABLED`. |
+| `COMPED_USER_EMAILS` | Optional comma-separated, case-insensitive Orbit account emails. Use this for the owner's mom, dad, and friend so they remain free even if their accounts are created after deployment. The `owner` role is always exempt automatically. No app update is needed when this list changes. |
 
 Create the key in **Users and Access → Integrations → In-App Purchase**.
 Download the .p8 once; Apple never shows it again. Keep it only in Azure's
@@ -77,14 +78,17 @@ only after success, and released on failure so Apple's retry is not lost.
    `subscription_purchase_intents`, `daily_usage`, and
    `processed_notifications`) are created by additive startup migrations on both
    SQLite and Postgres. Verify with `GET /api/subscriptions/status`:
-   expect `{enabled:false, configured:false, ready:false}`.
+   expect `{enabled:false, configured:false, ready:false, enforcementReady:false}`.
 3. Complete the App Store Connect products + webhook above.
 4. Set the `APPSTORE_*` secrets in Azure (keep `SUBSCRIPTIONS_ENABLED=false`).
 5. Redeploy; verify `GET /api/subscriptions/status` shows
-   `{enabled:false, configured:true, ready:false}`.
+   `{enabled:false, configured:true, ready:true, enforcementReady:false}`. StoreKit
+   purchases and server verification are now available for sandbox testing, but
+   the daily limit remains fail-open.
 6. Sandbox test (below) with a TestFlight build.
-7. Only after sandbox passes: set `SUBSCRIPTIONS_ENABLED=true`, redeploy,
-   verify `ready:true`. The quota is now live.
+7. Only after sandbox passes and the subscription-capable app version is ready
+   for release: set `SUBSCRIPTIONS_ENABLED=true`, redeploy, and verify
+   `ready:true` plus `enforcementReady:true`. The quota is now live.
 
 ## Sandbox acceptance plan (TestFlight + sandbox Apple ID)
 

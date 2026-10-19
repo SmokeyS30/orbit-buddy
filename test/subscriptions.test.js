@@ -105,6 +105,17 @@ test('invalid or incomplete Apple configuration fails open', () => {
   assert.equal(db.getDailyUsageCount('u1', nyDayKey()), 0);
 });
 
+test('configured StoreKit remains testable while quota enforcement is disabled', async () => {
+  const db = mockDb(); const apple = appleRuntime();
+  const service = createSubscriptionService({ SUBSCRIPTIONS_ENABLED: 'false' }, db, { appleRuntime: apple.runtime });
+  assert.equal(service.ready, true);
+  assert.equal(service.enforcementReady, false);
+  for (let i = 0; i < 30; i++) assert.equal(service.consumeQuota('u1').allowed, true);
+  assert.equal(db.getDailyUsageCount('u1', nyDayKey()), 0);
+  const result = await service.verifyTransaction('device', { expectedAppAccountToken: TOKEN, expectedProductId: PRODUCT });
+  assert.equal(result.status, 'active');
+});
+
 test('atomic quota accepts messages 1-25 and blocks 26', () => {
   const db = mockDb(); const { service } = enabledService(db);
   const now = new Date('2026-10-18T12:00:00Z');
@@ -195,8 +206,12 @@ test('catalog and additive SQLite/Postgres migrations cover subscription state',
 
 test('owner and configured comped users remain unlimited', () => {
   const db = mockDb(); const apple = appleRuntime();
-  const service = createSubscriptionService({ SUBSCRIPTIONS_ENABLED: 'true', COMPED_USER_IDS: 'mom,dad,friend' }, db, { appleRuntime: apple.runtime });
-  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', null], ['dad', null], ['friend', null]]) {
+  const service = createSubscriptionService({
+    SUBSCRIPTIONS_ENABLED: 'true',
+    COMPED_USER_IDS: 'dad,friend',
+    COMPED_USER_EMAILS: ' MOM@EXAMPLE.COM ',
+  }, db, { appleRuntime: apple.runtime });
+  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', { email: 'mom@example.com' }], ['dad', null], ['friend', null]]) {
     for (let i = 0; i < 30; i++) assert.equal(service.consumeQuota(id, user).allowed, true);
   }
 });

@@ -101,6 +101,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   const appAppleId = /^\d+$/.test(appAppleIdRaw) ? Number(appAppleIdRaw) : NaN;
   const sandboxOnly = String(env.APPSTORE_SANDBOX || '').toLowerCase() === 'true';
   const compedUserIds = new Set(String(env.COMPED_USER_IDS || '').split(',').map((value) => value.trim()).filter(Boolean));
+  const compedUserEmails = new Set(String(env.COMPED_USER_EMAILS || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
 
   let runtime = dependencies.appleRuntime || null;
   let configurationError = null;
@@ -112,7 +113,11 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     }
   }
   const configured = Boolean(runtime && (runtime.production || runtime.sandbox));
-  const ready = enabled && configured;
+  // Purchases and receipt verification must be testable before quota
+  // enforcement is enabled. Keep these two readiness states separate so the
+  // rollout can fail open for chat while StoreKit is exercised in sandbox.
+  const purchaseReady = configured;
+  const enforcementReady = enabled && configured;
   if (!enabled) console.log('[subscriptions] disabled; quota enforcement is fail-open.');
   else if (!configured) console.warn(`[subscriptions] not ready (${configurationError || 'configuration incomplete'}); quota enforcement is fail-open.`);
 
@@ -164,7 +169,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   }
 
   async function verifyTransaction(signedTransaction, { expectedAppAccountToken, expectedProductId } = {}) {
-    if (!ready) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
+    if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
     if (!expectedAppAccountToken) throw Object.assign(new Error('Purchase is not bound to this Orbit account.'), { status: 403 });
     const { payload: deviceTxn, target: signedTarget } = await verifySigned('transaction', signedTransaction);
     if (!deviceTxn.transactionId || !PRODUCTS[deviceTxn.productId]) throw Object.assign(new Error('Unknown transaction product.'), { status: 400 });
@@ -185,7 +190,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   }
 
   async function fetchEntitlements(userId) {
-    if (!ready) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
+    if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
     const current = db.getSubscription(userId);
     if (!current?.original_transaction_id || !current?.app_account_token) return [];
     const preferred = current.environment === 'sandbox' ? runtime.sandbox : runtime.production;
@@ -222,17 +227,20 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     }
   }
 
-  const isComped = (userId, user) => compedUserIds.has(String(userId)) || user?.role === 'owner' || user?.user_role === 'owner';
+  const isComped = (userId, user) => {
+    const email = String(user?.email || user?.user_email || '').trim().toLowerCase();
+    return compedUserIds.has(String(userId)) || (email && compedUserEmails.has(email)) || user?.role === 'owner' || user?.user_role === 'owner';
+  };
   function isPaid(userId, user) {
     if (isComped(userId, user)) return true;
-    if (!ready) return false;
+    if (!configured) return false;
     const sub = db.getSubscription(userId);
     return Boolean(sub && UNLIMITED_STATUSES.has(sub.status) && (!sub.expires_at || new Date(sub.expires_at) > Date.now()));
   }
 
   function consumeQuota(userId, user, now = new Date()) {
     if (isComped(userId, user)) return { allowed: true, unlimited: true, comped: true };
-    if (!ready) return { allowed: true, enforced: false };
+    if (!enforcementReady) return { allowed: true, enforced: false };
     if (isPaid(userId, user)) return { allowed: true, enforced: true, unlimited: true };
     const day = nyDayKey(now);
     const result = db.consumeDailyUsage(userId, day, FREE_DAILY_LIMIT);
@@ -253,14 +261,14 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     const sub = userId ? db.getSubscription(userId) : null;
     const comped = userId ? isComped(userId, user) : false;
     return {
-      enabled, configured, ready, comped, environment: sandboxOnly ? 'sandbox' : 'production', products: Object.keys(PRODUCTS),
+      enabled, configured, ready: purchaseReady, enforcementReady, comped, environment: sandboxOnly ? 'sandbox' : 'production', products: Object.keys(PRODUCTS),
       entitlement: sub ? { product: sub.product_id, status: sub.status, expiresAt: sub.expires_at, unlimited: isPaid(userId, user) }
         : (comped ? { product: 'comped', status: 'active', expiresAt: null, unlimited: true } : null),
     };
   }
 
   return {
-    enabled, configured, get ready() { return ready; }, PRODUCTS, FREE_DAILY_LIMIT,
+    enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT,
     status, verifyTransaction, fetchEntitlements, handleNotification,
     isPaid, isComped, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
   };

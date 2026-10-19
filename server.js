@@ -2330,8 +2330,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         try{cleanupExpiredDemos(db);}catch{}
         const user=db.createDemoUser();
         seedDemoData(db,user.id);
-        const{csrf}=createSession(user,req,res);
-        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP});
+        const{csrf,token:sessionToken}=createSession(user,req,res);
+        return json(res,201,{user:{...publicUser(user),isDemo:true},csrf,demoCap:DEMO_MESSAGE_CAP,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/registration-request'){
         if(hourlyLimited(req,3,'reg-request'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
