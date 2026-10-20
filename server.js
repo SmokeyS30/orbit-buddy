@@ -33,6 +33,7 @@ import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
 import { buildCatchupDigest, isAwayEnough, clampSinceMs } from './src/catchup.js';
+import { evaluateSignupRisk, shouldBlockSignup, signupAuditSubject, signupRiskMode, signupsPaused } from './src/signup-risk.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -2630,7 +2631,16 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
-        const password=await hashPassword(body.password);const count=db.countUsers();
+        const count=db.countUsers();
+        if(count>0&&signupsPaused(env))throw Object.assign(new Error('New signups are temporarily paused. Please try again later.'),{status:503});
+        const riskMode=signupRiskMode(env);
+        const risk=evaluateSignupRisk({email,userAgent:req.headers['user-agent'],native:isNativeRequest(req),attested:false});
+        if(riskMode!=='off')db.recordSignupRiskDecision({
+          subjectHash:signupAuditSubject(email,env.SIGNUP_AUDIT_KEY),mode:riskMode,
+          decision:risk.decision,score:risk.score,signals:risk.signals
+        });
+        if(shouldBlockSignup(riskMode,risk))throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
+        const password=await hashPassword(body.password);
         if(count>0&&!registrationOpen())throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});

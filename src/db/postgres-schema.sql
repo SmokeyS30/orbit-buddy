@@ -486,6 +486,18 @@ CREATE TABLE IF NOT EXISTS waitlist (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS signup_risk_events (
+  id TEXT PRIMARY KEY,
+  subject_hash TEXT,
+  mode TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  score INTEGER NOT NULL,
+  signals_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS whatsapp_links (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   phone_e164 TEXT NOT NULL UNIQUE,

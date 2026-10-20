@@ -103,6 +103,10 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       )`,
       'CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at)',
+      `CREATE TABLE IF NOT EXISTS signup_risk_events (
+        id TEXT PRIMARY KEY, subject_hash TEXT, mode TEXT NOT NULL, decision TEXT NOT NULL,
+        score INTEGER NOT NULL, signals_json TEXT NOT NULL, created_at TEXT NOT NULL
+      )`,
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
@@ -319,6 +323,7 @@ const indexMigrations = [
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -1443,6 +1448,7 @@ const indexMigrations = [
 
     // --- Waitlist ---
     addWaitlistEntry: async ({ id, email, name }) => { await run('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, name || null, 'pending', timestamp(), timestamp()); },
+    recordSignupRiskDecision: async ({ subjectHash = null, mode, decision, score, signals = [] }) => { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};await run('INSERT INTO signup_risk_events(id,subject_hash,mode,decision,score,signals_json,created_at) VALUES(?,?,?,?,?,?,?)',row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },
     listWaitlist: async () => all('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
     updateWaitlistStatus: async (id, status) => (await run('UPDATE waitlist SET status=?,updated_at=? WHERE id=?', status, timestamp(), id)).changes > 0,
     waitlistPosition: async (createdAt) => (await get("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?", createdAt)).c,

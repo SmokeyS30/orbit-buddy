@@ -387,6 +387,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
+    CREATE TABLE IF NOT EXISTS signup_risk_events (
+      id TEXT PRIMARY KEY, subject_hash TEXT, mode TEXT NOT NULL, decision TEXT NOT NULL,
+      score INTEGER NOT NULL, signals_json TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
@@ -751,6 +756,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     addWaitlistEntry: db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)'),
+    addSignupRiskEvent: db.prepare('INSERT INTO signup_risk_events(id,subject_hash,mode,decision,score,signals_json,created_at) VALUES(?,?,?,?,?,?,?)'),
     listWaitlist: db.prepare('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
     updateWaitlistStatus: db.prepare('UPDATE waitlist SET status=?,updated_at=? WHERE id=?'),
     waitlistPosition: db.prepare("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?"),
@@ -1343,6 +1349,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     listAccessRequests: () => s.listAccessRequests.all(),
     addWaitlistEntry({id,email,name}) { s.addWaitlistEntry.run(id,email,name||null,'pending',timestamp(),timestamp()); },
+    recordSignupRiskDecision({subjectHash=null,mode,decision,score,signals=[]}) { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};s.addSignupRiskEvent.run(row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },
     listWaitlist: () => s.listWaitlist.all(),
     updateWaitlistStatus: (id,status) => s.updateWaitlistStatus.run(status,timestamp(),id).changes>0,
     waitlistPosition: (createdAt) => s.waitlistPosition.get(createdAt).c,
