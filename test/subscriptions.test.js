@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Environment, SignedDataVerifier, Status } from '@apple/app-store-server-library';
 import {
-  APPLE_ROOT_CA_DER_BASE64, BUNDLE_ID_DEFAULT, createSubscriptionService, FREE_DAILY_LIMIT,
+  APPLE_ROOT_CA_DER_BASE64, BASIC_DAILY_LIMIT, BUNDLE_ID_DEFAULT, createSubscriptionService, FREE_DAILY_LIMIT,
   mapAppleStatus, nextResetUtc, nyDayKey, PRODUCTS,
 } from '../src/subscriptions.js';
 
@@ -124,6 +124,23 @@ test('atomic quota accepts messages 1-25 and blocks 26', () => {
   assert.equal(blocked.allowed, false); assert.equal(blocked.used, 25); assert.equal(blocked.limit, FREE_DAILY_LIMIT);
 });
 
+test('Basic receives exactly 100 daily messages while Plus and Unlimited are uncapped', () => {
+  const db = mockDb(); const { service } = enabledService(db);
+  const expiresAt = new Date(future()).toISOString();
+  db.saveSubscription('basic', { productId: 'com.smokeys30.orbitbuddy.basic.monthly', status: 'active', expiresAt });
+  for (let i = 1; i <= BASIC_DAILY_LIMIT; i++) assert.equal(service.consumeQuota('basic').allowed, true);
+  const blocked = service.consumeQuota('basic');
+  assert.equal(blocked.allowed, false); assert.equal(blocked.limit, BASIC_DAILY_LIMIT); assert.equal(blocked.plan, 'basic');
+  for (const [id, productId, plan] of [
+    ['plus', 'com.smokeys30.orbitbuddy.standard.monthly', 'plus'],
+    ['unlimited', 'com.smokeys30.orbitbuddy.pro.monthly', 'unlimited'],
+  ]) {
+    db.saveSubscription(id, { productId, status: 'active', expiresAt });
+    for (let i = 0; i < 150; i++) assert.equal(service.consumeQuota(id).allowed, true);
+    assert.equal(service.tier(id), plan);
+  }
+});
+
 test('active and grace are unlimited; retry, expired, and revoked are not', () => {
   const db = mockDb(); const { service } = enabledService(db);
   for (const status of ['active', 'grace', 'billing-retry', 'expired', 'revoked']) {
@@ -195,8 +212,10 @@ test('bundled Apple roots match the pinned SHA-256 fingerprints', () => {
 
 test('catalog and additive SQLite/Postgres migrations cover subscription state', () => {
   assert.deepEqual(Object.keys(PRODUCTS).sort(), [
-    'com.smokeys30.orbitbuddy.pro.monthly', 'com.smokeys30.orbitbuddy.standard.monthly', 'com.smokeys30.orbitbuddy.standard.yearly',
+    'com.smokeys30.orbitbuddy.basic.monthly', 'com.smokeys30.orbitbuddy.pro.monthly', 'com.smokeys30.orbitbuddy.standard.monthly', 'com.smokeys30.orbitbuddy.standard.yearly',
   ]);
+  assert.equal(PRODUCTS['com.smokeys30.orbitbuddy.standard.monthly'].plan, 'plus');
+  assert.equal(PRODUCTS['com.smokeys30.orbitbuddy.pro.monthly'].plan, 'unlimited');
   for (const file of ['src/database.js', 'src/db/postgres-adapter.js', 'src/db/postgres-schema.sql']) {
     const source = fs.readFileSync(path.join(root, file), 'utf8');
     for (const table of ['subscriptions', 'subscription_purchase_intents', 'daily_usage', 'processed_notifications']) assert.match(source, new RegExp(`CREATE TABLE IF NOT EXISTS ${table} \\(`));

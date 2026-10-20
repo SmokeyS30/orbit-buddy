@@ -1559,7 +1559,7 @@ async function sendChatMessage(text){
     // Daily free limit hit: inline paywall nudge in the conversation, never
     // the generic error toast. No refresh() here — it would re-render the
     // message list and wipe the nudge.
-    else if(isPaywallError(error)){input.value=message;if(el)el.remove();showInlinePaywall();}
+    else if(isPaywallError(error)){input.value=message;if(el)el.remove();showInlinePaywall(error.body&&error.body.quota);}
     else{input.value=message;if(el)el.remove();toast(error.message);await refresh();}
   }finally{if(submit)submit.disabled=false;}
   }finally{releaseSend();}
@@ -1781,9 +1781,15 @@ function storeKitAvailable(){return isNativeRuntime(window)&&!!capStoreKitPlugin
 // the native product lookup fails or returns nothing. Server truth lives in
 // /api/subscriptions/status; these are display-only fallbacks.
 const SUB_PRODUCT_FALLBACK=[
-  {id:'com.smokeys30.orbitbuddy.standard.monthly',title:'Standard Monthly',fallbackPrice:'$5.99/month'},
-  {id:'com.smokeys30.orbitbuddy.standard.yearly',title:'Standard Yearly',fallbackPrice:'$59.99/year'},
-  {id:'com.smokeys30.orbitbuddy.pro.monthly',title:'Pro Monthly',fallbackPrice:'$19.99/month'},
+  {id:'com.smokeys30.orbitbuddy.basic.monthly',title:'Basic Monthly',fallbackPrice:'$2.99/month'},
+  {id:'com.smokeys30.orbitbuddy.standard.monthly',title:'Plus Monthly',fallbackPrice:'$5.99/month'},
+  {id:'com.smokeys30.orbitbuddy.standard.yearly',title:'Plus Yearly',fallbackPrice:'$59.99/year'},
+  {id:'com.smokeys30.orbitbuddy.pro.monthly',title:'Unlimited Monthly',fallbackPrice:'$19.99/month'},
+];
+const MEMBERSHIP_PLANS=[
+  {id:'basic',name:'Basic',kicker:'More room for everyday conversations',summary:'A low-cost step up when 25 included messages are not enough.',productIds:['com.smokeys30.orbitbuddy.basic.monthly'],benefits:['100 messages every day','Memory across conversations','Voice conversations','Goals, reminders, and routines','Secure sync across devices']},
+  {id:'plus',name:'Plus',kicker:'Your everyday Orbit, without limits',summary:'Unlimited conversations and the complete everyday Orbit experience.',badge:'Most popular',productIds:['com.smokeys30.orbitbuddy.standard.monthly','com.smokeys30.orbitbuddy.standard.yearly'],benefits:['Unlimited conversations','Persistent memory and history','Goals, reminders, and routines','Voice conversations','Secure sync across devices']},
+  {id:'unlimited',name:'Unlimited',kicker:'Orbit at its most capable',summary:'The strongest model and longest live context for demanding work.',productIds:['com.smokeys30.orbitbuddy.pro.monthly'],benefits:['Everything in Plus','Strongest AI model for every message','Longer live conversation context','Expanded response capacity','Built for complex projects']},
 ];
 function formatStoreKitPrice(p){
   const n=Number(p&&p.price);
@@ -1808,6 +1814,113 @@ function appendSubscriptionDisclosure(root){
     const link=document.createElement('a');link.textContent=label;link.href=href;link.target='_blank';link.rel='noopener';links.append(link);
   }
   disclosure.append(renewal,links);root.append(disclosure);
+}
+function fallbackStoreKitProducts(){
+  return SUB_PRODUCT_FALLBACK.map((p)=>({id:p.id,title:p.title,description:'',price:null,currencyCode:null,fallbackPrice:p.fallbackPrice}));
+}
+function membershipPlan(planId){return MEMBERSHIP_PLANS.find((plan)=>plan.id===planId)||null;}
+function membershipProductsFor(plan,products){return plan.productIds.map((id)=>products.find((p)=>p.id===id)||SUB_PRODUCT_FALLBACK.find((p)=>p.id===id)).filter(Boolean);}
+function membershipPrice(product){
+  if(!product)return '';
+  const price=product.price!=null?formatStoreKitPrice(product):String(product.fallbackPrice||'');
+  return price.replace('/month',' / month').replace('/year',' / year');
+}
+function orbitMembershipMark(){
+  const mark=document.createElement('span');mark.className='membership-orbit-mark';mark.setAttribute('aria-hidden','true');mark.append(document.createElement('span'));return mark;
+}
+function membershipButton(label,className,onClick){
+  const el=document.createElement('button');el.type='button';el.className=className;el.textContent=label;el.addEventListener('click',onClick);return el;
+}
+let membershipReturnFocus=null;
+function closeMembershipExperience(){
+  const overlay=$('#membership-experience');if(!overlay)return;
+  overlay.remove();document.body.classList.remove('membership-open');
+  document.removeEventListener('keydown',membershipEscapeHandler);
+  if(membershipReturnFocus&&typeof membershipReturnFocus.focus==='function')membershipReturnFocus.focus();
+  membershipReturnFocus=null;
+}
+function membershipEscapeHandler(event){if(event.key==='Escape')closeMembershipExperience();}
+function membershipHeader({detail=false}={}){
+  const header=document.createElement('header');header.className='membership-header';
+  header.append(membershipButton(detail?'Back':'Close','membership-back',detail?()=>renderMembershipExperience('chooser'):closeMembershipExperience));
+  const brand=document.createElement('div');brand.className='membership-brand';brand.append(orbitMembershipMark());
+  const label=document.createElement('span');label.textContent='ORBIT BUDDY';brand.append(label);header.append(brand);
+  const spacer=document.createElement('span');spacer.className='membership-header-spacer';spacer.setAttribute('aria-hidden','true');header.append(spacer);
+  return header;
+}
+function membershipFooter(root){
+  const restore=membershipButton('Restore purchases','membership-link',restorePurchases);root.append(restore);appendSubscriptionDisclosure(root);
+}
+function renderMembershipChooser(shell,products){
+  shell.append(membershipHeader());
+  const intro=document.createElement('div');intro.className='membership-intro';
+  const eyebrow=document.createElement('p');eyebrow.className='membership-eyebrow';eyebrow.textContent='MEMBERSHIPS';
+  const title=document.createElement('h1');title.textContent='Choose your Orbit';
+  const copy=document.createElement('p');copy.textContent='Pick the level that fits how you want Orbit beside you. Every choice stays private and secure.';
+  intro.append(eyebrow,title,copy);shell.append(intro);
+  const grid=document.createElement('div');grid.className='membership-grid';
+  for(const plan of MEMBERSHIP_PLANS){
+    const card=document.createElement('button');card.type='button';card.className=`membership-choice membership-choice-${plan.id}`;card.addEventListener('click',()=>renderMembershipExperience(plan.id));
+    const top=document.createElement('span');top.className='membership-choice-top';
+    const name=document.createElement('strong');name.textContent=plan.name;top.append(name);
+    if(plan.badge){const badge=document.createElement('span');badge.className='membership-badge';badge.textContent=plan.badge;top.append(badge);}
+    const summary=document.createElement('span');summary.className='membership-choice-summary';summary.textContent=plan.summary;
+    const prices=membershipProductsFor(plan,products);const price=document.createElement('span');price.className='membership-choice-price';
+    price.textContent=plan.id==='plus'?`From ${membershipPrice(prices[0])}`:membershipPrice(prices[0]);
+    const arrow=document.createElement('span');arrow.className='membership-choice-arrow';arrow.textContent='View details →';
+    card.append(top,summary,price,arrow);grid.append(card);
+  }
+  shell.append(grid);
+  const note=document.createElement('p');note.className='membership-included-note';note.textContent='Every account includes 25 messages each day before a paid membership is needed.';shell.append(note);
+  membershipFooter(shell);
+}
+function renderMembershipDetail(shell,plan,products){
+  shell.append(membershipHeader({detail:true}));
+  const hero=document.createElement('div');hero.className='membership-detail-hero';hero.append(orbitMembershipMark());
+  const eyebrow=document.createElement('p');eyebrow.className='membership-eyebrow';eyebrow.textContent='ORBIT BUDDY';
+  const title=document.createElement('h1');title.textContent=plan.name;
+  const kicker=document.createElement('p');kicker.className='membership-kicker';kicker.textContent=plan.kicker;
+  hero.append(eyebrow,title,kicker);shell.append(hero);
+  const available=membershipProductsFor(plan,products);let selected=available[0]||null;
+  const price=document.createElement('p');price.className='membership-detail-price';price.textContent=membershipPrice(selected);shell.append(price);
+  let choiceRow=null;
+  if(available.length>1){
+    choiceRow=document.createElement('div');choiceRow.className='membership-billing';choiceRow.setAttribute('role','group');choiceRow.setAttribute('aria-label','Billing period');
+    const syncSelection=()=>{
+      for(const child of choiceRow.children)child.classList.toggle('selected',child.dataset.productId===selected.id);
+      price.textContent=membershipPrice(selected);
+    };
+    for(const product of available){
+      const isYear=product.id.endsWith('.yearly');const option=membershipButton(isYear?'Yearly · save $11.89':'Monthly','membership-billing-option',()=>{selected=product;syncSelection();});option.dataset.productId=product.id;choiceRow.append(option);
+    }
+    shell.append(choiceRow);syncSelection();
+  }
+  const benefits=document.createElement('ul');benefits.className='membership-benefits';
+  for(const item of plan.benefits){const row=document.createElement('li');const check=document.createElement('span');check.textContent='✓';const text=document.createElement('span');text.textContent=item;row.append(check,text);benefits.append(row);}shell.append(benefits);
+  const choose=membershipButton(`Choose ${plan.name}`,'membership-choose',()=>{if(selected)purchaseProduct(selected.id);});
+  if(!storeKitAvailable()){choose.textContent='Open Orbit on iPhone to subscribe';choose.disabled=true;}
+  shell.append(choose,membershipButton('Compare all memberships','membership-link',()=>renderMembershipExperience('chooser')));
+  membershipFooter(shell);
+}
+async function renderMembershipExperience(view='chooser'){
+  const overlay=$('#membership-experience');if(!overlay)return;
+  const shell=document.createElement('section');shell.className='membership-shell';shell.setAttribute('aria-live','polite');
+  const loading=document.createElement('p');loading.className='membership-loading';loading.textContent='Loading memberships…';shell.append(loading);overlay.replaceChildren(shell);
+  let products=fallbackStoreKitProducts();
+  if(storeKitAvailable()){try{products=await loadStoreKitProducts();}catch(_){/* Apple prices can retry at purchase time; keep the known catalog visible. */}}
+  shell.replaceChildren();
+  const plan=membershipPlan(view);
+  if(plan)renderMembershipDetail(shell,plan,products);else renderMembershipChooser(shell,products);
+  const focusTarget=shell.querySelector('button');if(focusTarget)focusTarget.focus();
+}
+function openMembershipExperience(planId='chooser'){
+  let overlay=$('#membership-experience');
+  if(!overlay){
+    membershipReturnFocus=document.activeElement;
+    overlay=document.createElement('div');overlay.id='membership-experience';overlay.className='membership-experience';overlay.setAttribute('role','region');overlay.setAttribute('aria-label','Orbit Buddy memberships');document.body.append(overlay);
+    document.body.classList.add('membership-open');document.addEventListener('keydown',membershipEscapeHandler);
+  }
+  renderMembershipExperience(planId);
 }
 let subProductsCache=null,subProductsPromise=null;
 const STOREKIT_PENDING_KEY='orbit_storekit_pending_v1';
@@ -1840,7 +1953,6 @@ async function loadStoreKitProducts(){
 }
 async function refreshSubscriptionState(){
   try{const status=await api('/api/subscriptions/status');state.subscription=status&&status.entitlement||null;}catch(_){}
-  updateSubscriptionsButton();
 }
 async function purchaseProduct(productId){
   if(!storeKitAvailable()){toast('Subscriptions are managed in the Orbit iOS app.');return;}
@@ -1870,7 +1982,8 @@ async function purchaseProduct(productId){
     await cap.nativePromise('StoreKit','finish',{transactionId:verified.transactionId});
     setPendingStoreKitPurchase(null);
     await refreshSubscriptionState();
-    toast('Unlimited chat is on — enjoy.');
+    closeMembershipExperience();
+    toast('Your Orbit membership is active — enjoy.');
   }catch(error){toast(error.message||'Purchase failed. Please try again.');}
 }
 async function restorePurchases(){
@@ -1887,7 +2000,7 @@ async function restorePurchases(){
       try{const v=await api('/api/subscriptions/verify',{method:'POST',body:JSON.stringify({signedTransaction})});if(v&&v.ok){await cap.nativePromise('StoreKit','finish',{transactionId:v.transactionId});confirmed++;}}
       catch(_){/* one unverifiable receipt must not kill the batch */}
     }
-    if(confirmed){await refreshSubscriptionState();toast('Purchase restored — unlimited chat is back on.');}
+    if(confirmed){await refreshSubscriptionState();closeMembershipExperience();toast('Your Orbit membership is restored.');}
     else toast('Couldn’t restore any purchases. If you bought Orbit in the App Store, try again.');
   }catch(error){toast(error.message||'Restore failed. Please try again.');}
 }
@@ -1909,69 +2022,19 @@ function attachStoreKitListener(){
 }
 // 402 + paywall:true from POST /api/chat: the daily free limit is hit.
 function isPaywallError(error){return !!(error&&error.status===402&&error.body&&error.body.paywall===true);}
-// Inline paywall nudge — a styled assistant message in the conversation.
-// Never a modal, dialog, or popup.
-function showInlinePaywall(){
+// Keep a return point in the conversation, then transition to the dedicated
+// full-screen membership experience. The screen is an app page (with Close
+// and Back navigation), not a blocking system alert.
+function showInlinePaywall(quota=null){
   const root=$('#messages');if(!root)return;
-  // One nudge at a time: scroll to the existing one instead of stacking.
-  if(root.querySelector('.message.paywall-nudge')){scrollToBottom(root);return;}
+  if(root.querySelector('.message.paywall-nudge')){scrollToBottom(root);openMembershipExperience();return;}
   const el=document.createElement('div');el.className='message assistant paywall-nudge';
-  const title=document.createElement('p');title.className='paywall-title';title.textContent='You’ve hit today’s free limit';
-  const copy=document.createElement('p');copy.textContent='The free plan covers 25 messages a day and resets at midnight Eastern. Unlimited chat is a subscription through the App Store.';
-  el.append(title,copy);
-  if(storeKitAvailable()){
-    const actions=document.createElement('div');actions.className='mini-actions subscription-plans';el.append(actions);
-    const loading=document.createElement('p');loading.className='muted';loading.textContent='Loading plans…';actions.append(loading);
-    loadStoreKitProducts().then((products)=>{
-      loading.remove();
-      if(!products.length)throw new Error('no plans');
-      for(const p of products)actions.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
-      actions.append(button('Restore purchases','ghost',restorePurchases));
-      appendSubscriptionDisclosure(actions);
-    }).catch(()=>{loading.textContent='Plans are unavailable right now.';});
-  }else{
-    const note=document.createElement('p');note.className='muted';note.textContent='Subscriptions are managed in the Orbit iOS app — open it on your iPhone to upgrade or restore a purchase.';
-    el.append(note);
-  }
-  root.append(el);scrollToBottom(root);
+  const isBasic=quota&&quota.plan==='basic';
+  const title=document.createElement('p');title.className='paywall-title';title.textContent=isBasic?'You’ve used today’s Basic messages':'Today’s included messages are used';
+  const copy=document.createElement('p');copy.textContent='Choose a membership to keep the conversation going. Your messages reset at midnight Eastern.';
+  const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('View memberships','primary',()=>openMembershipExperience()));
+  el.append(title,copy,actions);root.append(el);scrollToBottom(root);openMembershipExperience();
 }
-// One subtle Settings entry point next to the push panel — no toggles.
-async function updateSubscriptionsButton(){
-  const btn=$('#subscriptions-button'),hint=$('#subscriptions-hint');
-  if(!btn)return;
-  if(!storeKitAvailable()){
-    if(hint)hint.textContent='Unlimited chat is a subscription managed in the Orbit iOS app.';
-    btn.classList.add('hidden');
-    return;
-  }
-  try{
-    const status=await api('/api/subscriptions/status');
-    const ent=status&&status.entitlement;
-    if(ent&&ent.unlimited){
-      if(hint)hint.textContent='Unlimited chat is active. Manage it in the App Store under your Apple ID.';
-      btn.classList.add('hidden');
-    }else{
-      if(hint)hint.textContent=(status&&status.ready)?'Three plans, unlimited chat, billed through the App Store.':'Subscriptions aren’t ready yet — check back shortly.';
-      btn.classList.remove('hidden');
-    }
-  }catch(_){if(hint)hint.textContent='Couldn’t check subscription status right now.';}
-}
-$('#subscriptions-button').addEventListener('click',async()=>{
-  const btn=$('#subscriptions-button');if(!btn)return;
-  let panel=$('#subscriptions-plans');
-  if(panel){panel.remove();btn.textContent='View plans';return;}
-  btn.disabled=true;btn.textContent='Loading…';
-  try{
-    const products=await loadStoreKitProducts();
-    panel=document.createElement('div');panel.id='subscriptions-plans';panel.className='mini-actions subscription-plans block-top';
-    for(const p of products)panel.append(button(productPriceLine(p),'primary',()=>purchaseProduct(p.id)));
-    panel.append(button('Restore purchases','ghost',restorePurchases));
-    appendSubscriptionDisclosure(panel);
-    btn.after(panel);btn.textContent='Hide plans';
-  }catch(error){toast(error.message||'Couldn’t load plans right now.');btn.textContent='View plans';}
-  finally{btn.disabled=false;}
-});
-updateSubscriptionsButton();
 if(isNativeRuntime(window))attachStoreKitListener();
 $('#export-backup').addEventListener('click',async()=>{try{const passphrase=$('#backup-passphrase').value;const response=await nativeFetch(API_BASE+'/api/backups/export',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json','X-Orbit-CSRF':state.csrf},body:JSON.stringify({passphrase})});if(!response.ok)throw new Error((await response.json()).error);const blob=await response.blob();const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download=`orbit-backup-${new Date().toISOString().slice(0,10)}.orbitbackup`;link.click();URL.revokeObjectURL(url);toast('Encrypted backup downloaded.');}catch(error){toast(error.message);}});
 $('#restore-backup').addEventListener('click',async()=>{try{const file=$('#restore-file').files[0];if(!file)throw new Error('Choose an Orbit backup first.');if(file.size>10*1024*1024)throw new Error('Backup is too large.');if(prompt('Restoring merges data and pauses Orbit. Type RESTORE to continue:')!=='RESTORE')return;const payload=await file.text();await api('/api/backups/restore',{method:'POST',body:JSON.stringify({payload,passphrase:$('#backup-passphrase').value,confirm:'RESTORE'})});await refresh();toast('Backup restored. Orbit remains paused for review.');}catch(error){toast(error.message);}});

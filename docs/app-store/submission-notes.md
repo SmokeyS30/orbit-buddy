@@ -4,25 +4,28 @@
 
 | Plan | Product ID | Price |
 | --- | --- | --- |
-| Standard Monthly | `com.smokeys30.orbitbuddy.standard.monthly` | $5.99/month |
-| Standard Yearly | `com.smokeys30.orbitbuddy.standard.yearly` | $59.99/year |
-| Pro Monthly | `com.smokeys30.orbitbuddy.pro.monthly` | $19.99/month |
+| Basic Monthly | `com.smokeys30.orbitbuddy.basic.monthly` | $2.99/month |
+| Plus Monthly | `com.smokeys30.orbitbuddy.standard.monthly` | $5.99/month |
+| Plus Yearly | `com.smokeys30.orbitbuddy.standard.yearly` | $59.99/year |
+| Unlimited Monthly | `com.smokeys30.orbitbuddy.pro.monthly` | $19.99/month |
 
-The free tier includes 25 chat messages per New York calendar day. A
-non-blocking inline upgrade prompt appears when a free user attempts message
-26. Active Standard and Pro subscriptions have unlimited chat.
+Every account includes 25 chat messages per New York calendar day before a
+paid membership is required. Basic includes 100/day. Plus and Unlimited have
+unlimited chat; Unlimited also receives stronger-model routing and longer live
+conversation context.
 
 ## App Review notes
 
 Orbit Buddy is a persistent AI companion for conversations, goals, reminders,
-and background tasks. The iOS app uses StoreKit 2 for three auto-renewable
+and background tasks. The iOS app uses StoreKit 2 for four auto-renewable
 subscription products. The app sends the StoreKit signed transaction to the
 Orbit backend, which validates it with Apple before granting an entitlement.
-Restore Purchases is available directly below the plan choices.
+Restore Purchases is available directly below the membership choices.
 
-Subscriptions unlock unlimited chat. The free tier includes 25 chat messages
-per New York calendar day. The upgrade prompt is inline in the conversation and
-never blocks the current exchange with a modal.
+Every account receives 25 included messages per New York calendar day. When
+the allowance is used, Orbit preserves an in-chat return point and opens a
+closable full-screen chooser for Basic, Plus, and Unlimited. It never interrupts
+an assistant response in progress.
 
 The subscription screen includes the auto-renewal disclosure, a Manage
 Subscriptions link, Terms of Use, and Privacy Policy. Apple server notification
@@ -34,7 +37,7 @@ v2 events are received at:
 
 - `screenshots/orbit-today-iphone-18-pro.jpg` — main Today experience.
 - `screenshots/orbit-chat-iphone-18-pro.jpg` — sample conversation and composer.
-- `screenshots/orbit-subscriptions-iphone-18-pro.jpg` — all three plans,
+- `screenshots/orbit-memberships-iphone-18-pro.jpg` — all three paid memberships,
   Restore Purchases, renewal disclosure, Terms, and Privacy.
 
 All three screenshots are 1206 by 2622 pixels, RGB JPEGs captured from the
@@ -46,7 +49,7 @@ iPhone 18 Pro Simulator, an accepted Dynamic Island medium-display size.
    renewal, expiry, refund, billing-retry, and restore testing.
 2. Confirm the owner and the three approved complimentary emails return
    `comped: true` from the authenticated subscription status endpoint.
-3. Attach the three subscriptions to the same app-version submission.
+3. Attach the four subscription products to the same app-version submission.
 4. Submit the app version and subscription group together for Apple's review.
 5. Set `SUBSCRIPTIONS_ENABLED=true` only after the subscription-capable version
    is approved and available to users.

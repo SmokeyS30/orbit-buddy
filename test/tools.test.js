@@ -192,6 +192,34 @@ test('messages longer than 800 characters use the complex model without making i
   assert.deepEqual(attempted, ['gpt-6-luna', 'gpt-6.1-sol', 'gpt-6-luna']);
 });
 
+test('Unlimited routes even short messages to the complex model with longer context', async (t) => {
+  let sent;
+  const stub = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      sent = JSON.parse(body);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [{ type: 'message', content: [{ type: 'output_text', text: 'Premium route.' }] }] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({
+    OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6-luna', OPENAI_COMPLEX_MODEL: 'gpt-6.1-sol',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true'
+  });
+  const history = Array.from({ length: 40 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: `history-${i}` }));
+
+  const result = await model.respond({ buddyName: 'Orbit', message: 'hello', history, membershipTier: 'unlimited' });
+
+  assert.equal(result.text, 'Premium route.');
+  assert.equal(sent.model, 'gpt-6.1-sol');
+  assert.equal(sent.max_output_tokens, 1000);
+  assert.ok(sent.input.some((item) => item.content === 'history-8'));
+  assert.ok(!sent.input.some((item) => item.content === 'history-7'));
+});
+
 test('complex-model routing falls back through the primary model normally', async (t) => {
   const attempted = [];
   const stub = http.createServer((req, res) => {
