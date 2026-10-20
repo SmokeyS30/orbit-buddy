@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SRC = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
+const INDEX = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
 
 // Slice one top-level declaration out of the bundle: everything from the
 // start marker to the next line that begins a new top-level statement.
@@ -42,22 +43,26 @@ test('(a) purchase flow calls purchase-intent before the StoreKit purchase, veri
   assert.ok(src.includes('JSON.stringify({signedTransaction,appAccountToken,productId})'), 'purchase verification must include the server-issued binding token and product');
 });
 
-test('(b) 402+paywall triggers the inline nudge, not the generic error toast', () => {
+test('(b) 402+paywall preserves an inline return point and opens the membership page', () => {
   const src = sendChatSrc();
   const branch = src.match(/else if\(isPaywallError\(error\)\)\{([^}]*)\}/);
   assert.ok(branch, 'sendChatMessage must have an isPaywallError(error) branch');
-  assert.ok(branch[1].includes('showInlinePaywall()'), 'paywall branch must insert the inline nudge');
+  assert.ok(branch[1].includes('showInlinePaywall('), 'paywall branch must insert the inline return point');
   assert.ok(!branch[1].includes('toast('), 'paywall branch must NOT show the generic error toast');
   assert.ok(!paywallSrc().includes('toast('), 'showInlinePaywall itself must never toast');
   assert.ok(!paywallSrc().includes('await refresh()'), 'paywall path must skip refresh() so the nudge is not wiped');
 });
 
-test('(c) no modal, dialog, or popup code in the paywall path', () => {
+test('(c) paywall uses a closable full-screen app page, never a system modal', () => {
   const src = paywallSrc();
   for (const banned of ['showModal', 'alert(', 'confirm(', 'prompt(', 'window.open(', 'openBlankWindow', 'show(']) {
     assert.ok(!src.includes(banned), `showInlinePaywall must not use ${banned}`);
   }
   assert.ok(src.includes('paywall-nudge'), 'nudge must be an inline message element in the chat');
+  assert.ok(src.includes('openMembershipExperience()'), 'nudge must transition to the dedicated membership page');
+  const openSrc = fnSource("function openMembershipExperience(");
+  assert.ok(openSrc.includes("setAttribute('role','region')"));
+  assert.ok(!openSrc.includes("setAttribute('role','dialog')"));
 });
 
 test('(d) every StoreKit call is gated behind the native check', () => {
@@ -108,6 +113,17 @@ test('(g) subscription plans include Apple renewal disclosure and account links'
     ['Terms', 'https://orbitbuddy.app/terms'],
     ['Privacy', 'https://orbitbuddy.app/privacy'],
   ]);
-  assert.ok(SRC.includes('appendSubscriptionDisclosure(actions)'));
-  assert.ok(SRC.includes('appendSubscriptionDisclosure(panel)'));
+  const footer = fnSource('function membershipFooter(');
+  assert.ok(footer.includes('appendSubscriptionDisclosure(root)'));
+});
+
+test('(h) membership chooser is paid-only and subscriptions are removed from Safety', () => {
+  const catalogStart = SRC.indexOf('const MEMBERSHIP_PLANS=');
+  const catalogEnd = SRC.indexOf('function formatStoreKitPrice', catalogStart);
+  const catalog = SRC.slice(catalogStart, catalogEnd);
+  for (const name of ["name:'Basic'", "name:'Plus'", "name:'Unlimited'"]) assert.ok(catalog.includes(name));
+  assert.ok(!catalog.includes("name:'Free'"));
+  assert.ok(catalog.includes('com.smokeys30.orbitbuddy.basic.monthly'));
+  assert.ok(!INDEX.includes('id="subscriptions-button"'));
+  assert.ok(!INDEX.includes('<h2>Subscriptions</h2>'));
 });

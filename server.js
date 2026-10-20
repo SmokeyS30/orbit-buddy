@@ -633,6 +633,9 @@ export function createOrbitServer(options={}) {
   // in place instead of appending it at the end).
   async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null}){
     if(!db.getConversation(userId,conversation.id))return null;
+    // Membership is resolved from the server-side, Apple-verified entitlement.
+    // The client cannot opt itself into stronger model routing.
+    const membershipTier=subscriptions.tier(userId,user);
     const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
     let answer=null;
     const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
@@ -711,7 +714,7 @@ export function createOrbitServer(options={}) {
       // turns never take this path. Any luna failure falls through to the
       // full sol path — the turn never fails here.
       let chitchatAnswered=false;
-      if(images.length===0&&isChitchatMessage(message)){
+      if(membershipTier!=='unlimited'&&images.length===0&&isChitchatMessage(message)){
         try{
           const { text: chitchatText }=await model.respondChitchat({
             buddyName:customBuddyName||defaultBuddyName,
@@ -781,7 +784,7 @@ export function createOrbitServer(options={}) {
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
@@ -2868,7 +2871,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // One atomic database operation both checks and consumes the free
           // allowance, so simultaneous requests cannot send message 26.
           const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true});
+          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
           const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
           enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
@@ -3259,7 +3262,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,true);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessDeny[1]);db.addEvent(user.id,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
         return json(res,404,{error:'API route not found.'});
       }
-    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag)); }
+    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true,quota:error.quota||null}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag)); }
 
     if(url.pathname==='/reset-password'&&['GET','HEAD'].includes(req.method)){const resolved=path.resolve(publicRoot,'./index.html');res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);return;}
     if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});

@@ -7,10 +7,15 @@ import {
 
 export const BUNDLE_ID_DEFAULT = 'com.smokeys30.orbitbuddy';
 export const FREE_DAILY_LIMIT = 25;
+export const BASIC_DAILY_LIMIT = 100;
 export const PRODUCTS = {
-  'com.smokeys30.orbitbuddy.standard.monthly': { price: 5.99, interval: 'month', level: 2, name: 'Standard Monthly' },
-  'com.smokeys30.orbitbuddy.standard.yearly': { price: 59.99, interval: 'year', level: 2, name: 'Standard Yearly' },
-  'com.smokeys30.orbitbuddy.pro.monthly': { price: 19.99, interval: 'month', level: 1, name: 'Pro Monthly' },
+  'com.smokeys30.orbitbuddy.basic.monthly': { price: 2.99, interval: 'month', level: 3, plan: 'basic', dailyLimit: BASIC_DAILY_LIMIT, name: 'Basic Monthly' },
+  // Keep the original product identifiers so existing Standard subscribers
+  // retain their entitlement while the customer-facing plan becomes Plus.
+  'com.smokeys30.orbitbuddy.standard.monthly': { price: 5.99, interval: 'month', level: 2, plan: 'plus', dailyLimit: null, name: 'Plus Monthly' },
+  'com.smokeys30.orbitbuddy.standard.yearly': { price: 59.99, interval: 'year', level: 2, plan: 'plus', dailyLimit: null, name: 'Plus Yearly' },
+  // The existing Pro product becomes Unlimited without invalidating receipts.
+  'com.smokeys30.orbitbuddy.pro.monthly': { price: 19.99, interval: 'month', level: 1, plan: 'unlimited', dailyLimit: null, name: 'Unlimited Monthly' },
 };
 
 const UNLIMITED_STATUSES = new Set(['active', 'grace']);
@@ -231,22 +236,32 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     const email = String(user?.email || user?.user_email || '').trim().toLowerCase();
     return compedUserIds.has(String(userId)) || (email && compedUserEmails.has(email)) || user?.role === 'owner' || user?.user_role === 'owner';
   };
-  function isPaid(userId, user) {
-    if (isComped(userId, user)) return true;
-    if (!configured) return false;
+  function activeProduct(userId, user) {
+    if (isComped(userId, user)) return { plan: 'unlimited', dailyLimit: null, comped: true };
+    if (!configured) return null;
     const sub = db.getSubscription(userId);
-    return Boolean(sub && UNLIMITED_STATUSES.has(sub.status) && (!sub.expires_at || new Date(sub.expires_at) > Date.now()));
+    if (!sub || !UNLIMITED_STATUSES.has(sub.status) || (sub.expires_at && new Date(sub.expires_at) <= Date.now())) return null;
+    return PRODUCTS[sub.product_id] || null;
+  }
+  function isPaid(userId, user) {
+    return Boolean(activeProduct(userId, user));
+  }
+
+  function tier(userId, user) {
+    return activeProduct(userId, user)?.plan || 'included';
   }
 
   function consumeQuota(userId, user, now = new Date()) {
     if (isComped(userId, user)) return { allowed: true, unlimited: true, comped: true };
     if (!enforcementReady) return { allowed: true, enforced: false };
-    if (isPaid(userId, user)) return { allowed: true, enforced: true, unlimited: true };
+    const product = activeProduct(userId, user);
+    if (product && product.dailyLimit == null) return { allowed: true, enforced: true, unlimited: true, plan: product.plan };
+    const limit = product?.dailyLimit || FREE_DAILY_LIMIT;
     const day = nyDayKey(now);
-    const result = db.consumeDailyUsage(userId, day, FREE_DAILY_LIMIT);
+    const result = db.consumeDailyUsage(userId, day, limit);
     return result.allowed
-      ? { allowed: true, enforced: true, used: result.count, limit: FREE_DAILY_LIMIT, day }
-      : { allowed: false, enforced: true, used: result.count, limit: FREE_DAILY_LIMIT, day, resetAt: nextResetUtc(now).toISOString() };
+      ? { allowed: true, enforced: true, used: result.count, limit, day, plan: product?.plan || 'included' }
+      : { allowed: false, enforced: true, used: result.count, limit, day, plan: product?.plan || 'included', resetAt: nextResetUtc(now).toISOString() };
   }
 
   function runDailyReset(now = new Date()) {
@@ -260,16 +275,17 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   function status(userId, user) {
     const sub = userId ? db.getSubscription(userId) : null;
     const comped = userId ? isComped(userId, user) : false;
+    const product = userId ? activeProduct(userId, user) : null;
     return {
       enabled, configured, ready: purchaseReady, enforcementReady, comped, environment: sandboxOnly ? 'sandbox' : 'production', products: Object.keys(PRODUCTS),
-      entitlement: sub ? { product: sub.product_id, status: sub.status, expiresAt: sub.expires_at, unlimited: isPaid(userId, user) }
-        : (comped ? { product: 'comped', status: 'active', expiresAt: null, unlimited: true } : null),
+      entitlement: sub ? { product: sub.product_id, plan: PRODUCTS[sub.product_id]?.plan || null, status: sub.status, expiresAt: sub.expires_at, unlimited: Boolean(product && product.dailyLimit == null) }
+        : (comped ? { product: 'comped', plan: 'unlimited', status: 'active', expiresAt: null, unlimited: true } : null),
     };
   }
 
   return {
-    enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT,
+    enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT, BASIC_DAILY_LIMIT,
     status, verifyTransaction, fetchEntitlements, handleNotification,
-    isPaid, isComped, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
+    isPaid, isComped, tier, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
   };
 }

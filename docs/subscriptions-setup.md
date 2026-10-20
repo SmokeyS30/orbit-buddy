@@ -6,7 +6,7 @@ Server Library. No entitlement is granted without Apple API confirmation.
 
 ## Production quota enforcement: DISABLED by default
 
-`SUBSCRIPTIONS_ENABLED` defaults to **false**. The 25/day free-tier limit is
+`SUBSCRIPTIONS_ENABLED` defaults to **false**. The 25/day included allowance is
 **never** enforced unless **both** are true:
 
 1. `SUBSCRIPTIONS_ENABLED=true` is set on the server, **AND**
@@ -35,7 +35,7 @@ Set on the orbit-buddy Container App (all as secrets except where noted):
 | `APPSTORE_APP_APPLE_ID` | Orbit Buddy's numeric Apple app ID (required for production JWS validation) |
 | `APPSTORE_BUNDLE_ID` | Optional — defaults to `com.smokeys30.orbitbuddy` |
 | `APPSTORE_SANDBOX` | `true` for sandbox testing, absent/false for production |
-| `COMPED_USER_IDS` | Optional comma-separated Orbit user IDs that get unlimited chat free, bypassing both the subscription check and the 25/day limit — regardless of `SUBSCRIPTIONS_ENABLED`. |
+| `COMPED_USER_IDS` | Optional comma-separated Orbit user IDs that receive Unlimited access without billing, bypassing both the subscription check and included allowance — regardless of `SUBSCRIPTIONS_ENABLED`. |
 | `COMPED_USER_EMAILS` | Optional comma-separated, case-insensitive Orbit account emails. Use this for the owner's mom, dad, and friend so they remain free even if their accounts are created after deployment. The `owner` role is always exempt automatically. No app update is needed when this list changes. |
 
 Create the key in **Users and Access → Integrations → In-App Purchase**.
@@ -50,12 +50,14 @@ their SHA-256 fingerprints are covered by regression tests.
 
    | Product ID | Name | Price | Service level |
    |---|---|---|---|
-   | `com.smokeys30.orbitbuddy.standard.monthly` | Standard Monthly | $5.99/mo | 2 |
-   | `com.smokeys30.orbitbuddy.standard.yearly` | Standard Yearly | $59.99/yr | 2 |
-   | `com.smokeys30.orbitbuddy.pro.monthly` | Pro Monthly | $19.99/mo | 1 |
+   | `com.smokeys30.orbitbuddy.basic.monthly` | Basic Monthly | $2.99/mo | 3 |
+   | `com.smokeys30.orbitbuddy.standard.monthly` | Plus Monthly | $5.99/mo | 2 |
+   | `com.smokeys30.orbitbuddy.standard.yearly` | Plus Yearly | $59.99/yr | 2 |
+   | `com.smokeys30.orbitbuddy.pro.monthly` | Unlimited Monthly | $19.99/mo | 1 |
 
-   Pro has **no** yearly product. Service levels: Standard = 2, Pro = 1
-   (higher number = higher level for upgrade/downgrade ranking).
+   Basic and Unlimited have **no** yearly product. Service levels: Basic = 3,
+   Plus = 2, Unlimited = 1. The legacy `standard` and `pro` identifiers stay
+   unchanged so existing receipts remain valid; only their display names change.
 3. **App Store Server Notifications v2**: set the webhook URL to
    `https://orbitbuddy.app/api/subscriptions/apple-notifications`
    (version 2, all notification types).
@@ -93,15 +95,16 @@ only after success, and released on failure so Apple's retry is not lost.
 ## Sandbox acceptance plan (TestFlight + sandbox Apple ID)
 
 - [ ] Products load with correct prices in the app
-- [ ] Purchase Standard Monthly (sandbox) → entitlement active, unlimited chat
-- [ ] Message 26 as a free user → inline paywall appears in chat (no popup)
-- [ ] Cancel in sandbox → `DID_FAIL_TO_RENEW`/expiry → back to free tier
-- [ ] Refund via sandbox → `REFUND` → revoked → free tier
+- [ ] Purchase Basic Monthly (sandbox) → messages 1–100 accepted and 101 blocked
+- [ ] Purchase Plus Monthly (sandbox) → entitlement active, unlimited chat
+- [ ] Message 26 without a membership → full-screen paid membership chooser opens after the in-chat return point
+- [ ] Cancel in sandbox → `DID_FAIL_TO_RENEW`/expiry → back to the included allowance
+- [ ] Refund via sandbox → `REFUND` → revoked → back to the included allowance
 - [ ] Restore Purchases on a second device → entitlement recovered
 - [ ] Ask-to-Buy pending → app shows "waiting for approval", no charge, no entitlement
 - [ ] Approve Ask-to-Buy later → transaction update verifies, unlocks, and finishes
 - [ ] Billing retry without grace → free allowance; grace period → unlimited until grace expiry
-- [ ] Upgrade Standard → Pro and downgrade Pro → Standard at the next renewal
+- [ ] Upgrade Basic → Plus → Unlimited and test downgrade timing in the same group
 - [ ] Webhook receives `DID_RENEW` on renewal (check server logs for
       `[subscriptions]`, never the payload)
 - [ ] Daily reset: usage counter clears at midnight ET (04:00 UTC in EDT)

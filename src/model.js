@@ -723,7 +723,7 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null, emotionContext = null }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null, emotionContext = null, membershipTier = 'included' }) {
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -736,7 +736,10 @@ export function createModelClient(env = process.env) {
             return `${index + 1}. [${entry.kind || 'fact'}]${episodic} ${entry.content}`;
           }).join('\n')
         : 'No user-approved memories are stored.';
-      const recentHistory = history.slice(-16).map((entry) => ({ role: entry.role, content: entry.content }));
+      // Unlimited receives a longer live context window. Entitlement is
+      // supplied by the server after Apple verification, never by the client.
+      const recentHistoryLimit = membershipTier === 'unlimited' ? 32 : 16;
+      const recentHistory = history.slice(-recentHistoryLimit).map((entry) => ({ role: entry.role, content: entry.content }));
       const goalText = goals.length
         ? goals.slice(0, 8).map((goal) => `- ID ${goal.id}: ${goal.title} (${goal.progress}% complete, ${goal.status}, priority ${goal.priority}${goal.target_date ? `, target ${goal.target_date}` : ''}${goal.next_step ? `, next: ${goal.next_step}` : ''})`).join('\n')
         : 'No active goals are being tracked.';
@@ -804,7 +807,7 @@ export function createModelClient(env = process.env) {
       ];
       const toolCalls = [];
       let lastOutput = [];
-      const useComplexModel = String(message || '').length > 800;
+      const useComplexModel = membershipTier === 'unlimited' || String(message || '').length > 800;
       const routeTargetModel = useComplexModel ? complexModel : model;
       let selectedModel = useComplexModel ? complexModel : preferredModel;
       // Thin adapter over the shared callWithFallback, preserving respond()'s
@@ -822,9 +825,10 @@ export function createModelClient(env = process.env) {
           return output;
         });
       const requestOutput = async (input, stream) => {
+        const extra = membershipTier === 'unlimited' ? { max_output_tokens: 1000 } : {};
         const requestFn = stream
-          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools })
-          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools });
+          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools, extra })
+          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools, extra });
         let failure;
         try {
           const output = await callModelWithFallback(requestFn, input);
@@ -841,7 +845,7 @@ export function createModelClient(env = process.env) {
         let classification = failure?.classification || classifyModelError(failure);
         if (stream && ['request', 'stream'].includes(classification)) {
           try {
-            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools }), input);
+            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools, extra }), input);
           } catch (error) {
             failure = error;
             classification = error?.classification || classifyModelError(error);

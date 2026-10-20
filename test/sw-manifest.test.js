@@ -38,9 +38,11 @@ test('precache manifest includes the versioned styles.css', () => {
 test('precache manifest covers desktop assets (W7: voice/canvas chunks excluded)', () => {
   const { sandbox } = loadSw();
   const manifest = sandbox.buildPrecacheManifest();
-  for (const asset of ['/desktop.css', '/pwa-install.js', '/app.js']) {
+  for (const asset of ['/desktop.css', '/pwa-install.js']) {
     assert.ok(manifest.includes(asset), `missing ${asset} in ${manifest.join(', ')}`);
   }
+  assert.ok(manifest.some((asset) => /^\/app\.js\?v=/.test(asset)), `missing versioned /app.js in ${manifest.join(', ')}`);
+  assert.ok(!manifest.includes('/app.js'), 'stale unversioned /app.js must not be precached');
   // W7 code-split: the lazily-loaded chunks must not be precached — they are
   // fetched on first use and served via the runtime stale-while-revalidate
   // path instead.
