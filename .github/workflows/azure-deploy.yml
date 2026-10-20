@@ -162,12 +162,15 @@ jobs:
           done
           echo "healthy=false" >> $GITHUB_OUTPUT
 
-      - name: Test health endpoint (direct, bypassing Cloudflare)
+      - name: Test production health endpoint
         id: public
         if: steps.health.outputs.healthy == 'true'
         run: |
-          APP_URL=$(az containerapp show -g orbit-buddy-rg -n orbit-buddy --query "properties.configuration.ingress.fqdn" -o tsv)
-          echo "Testing https://$APP_URL/healthz (bypassing Cloudflare)"
+          # Azure RBAC intentionally rejects requests to the generated
+          # *.azurecontainerapps.io hostname. Exercise the same public custom
+          # domain that web and native clients use instead.
+          APP_URL="orbitbuddy.app"
+          echo "Testing https://$APP_URL/healthz"
           for i in $(seq 1 8); do
             CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://$APP_URL/healthz || echo "000")
             echo "Attempt $i: HTTP $CODE"
