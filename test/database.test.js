@@ -43,6 +43,17 @@ test('external tasks wait for approval and emergency state persists', () => {
   db.close();
 });
 
+test('external auth identities link once and disappear with the user', () => {
+  const { db, user } = fixture();
+  const linked = db.linkAuthIdentity('apple', 'apple-subject-1', user.id);
+  assert.equal(linked.user_id, user.id);
+  assert.equal(db.getAuthIdentity('apple', 'apple-subject-1').user_id, user.id);
+  assert.throws(() => db.linkAuthIdentity('apple', 'apple-subject-1', user.id));
+  db.deleteUserAccount(user.id);
+  assert.equal(db.getAuthIdentity('apple', 'apple-subject-1'), undefined);
+  db.close();
+});
+
 test('addTask persists deliveryChannel with a push default', () => {
   const { db, user } = fixture();
   const wa = db.addTask(user.id, { title: 'WhatsApp reminder', prompt: 'Text me', scheduleAt: '2026-10-13T12:00:00Z', deliveryChannel: 'whatsapp' });

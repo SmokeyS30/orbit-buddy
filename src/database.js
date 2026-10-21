@@ -77,6 +77,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, user_agent TEXT
     );
+    CREATE TABLE IF NOT EXISTS auth_identities (
+      provider TEXT NOT NULL, subject TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(provider, subject), UNIQUE(provider, user_id)
+    );
     CREATE TABLE IF NOT EXISTS recovery_codes (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       code_hash TEXT NOT NULL UNIQUE, used_at TEXT, created_at TEXT NOT NULL
@@ -507,6 +513,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
+    authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
+    linkAuthIdentity: db.prepare('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)'),
     updatePassword: db.prepare('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?'),
     setUserDisabled: db.prepare('UPDATE users SET disabled=?, updated_at=? WHERE id=?'),
     markUserEmailVerified: db.prepare('UPDATE users SET email_verified_at=?, updated_at=? WHERE id=? AND email_verified_at IS NULL'),
@@ -879,6 +887,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    getAuthIdentity: (provider, subject) => s.authIdentity.get(provider, subject),
+    linkAuthIdentity(provider, subject, userId) {
+      const now = timestamp();
+      s.linkAuthIdentity.run(provider, subject, userId, now, now);
+      return s.authIdentity.get(provider, subject);
+    },
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled(id, disabled) { s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id); },
     markUserEmailVerified(id) { const now=timestamp();return s.markUserEmailVerified.run(now,now,id).changes>0; },

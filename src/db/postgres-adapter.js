@@ -111,6 +111,12 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         token_hash TEXT PRIMARY KEY, email_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
         used_at TEXT, created_at TEXT NOT NULL
       )`,
+      `CREATE TABLE IF NOT EXISTS auth_identities (
+        provider TEXT NOT NULL, subject TEXT NOT NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(provider, subject), UNIQUE(provider, user_id)
+      )`,
       'CREATE INDEX IF NOT EXISTS idx_signup_verification_expiry ON signup_verification_tokens(expires_at)',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_signup_verification_email ON signup_verification_tokens(email_hash)',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
@@ -433,6 +439,12 @@ const indexMigrations = [
     // email column is CITEXT: plain = is already case-insensitive
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
+    getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
+    async linkAuthIdentity(provider, subject, userId) {
+      const now = timestamp();
+      await run('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)', provider, subject, userId, now, now);
+      return get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject);
+    },
     updatePassword: async (id, passwordHash, passwordSalt) => { await run('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?', passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled: async (id, disabled) => { await run('UPDATE users SET disabled=?, updated_at=? WHERE id=?', disabled ? 1 : 0, timestamp(), id); },
     markUserEmailVerified: async (id) => { const now=timestamp();return (await run('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=? AND email_verified_at IS NULL',now,now,id)).changes>0; },
