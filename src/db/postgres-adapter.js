@@ -1449,6 +1449,7 @@ const indexMigrations = [
     // --- Waitlist ---
     addWaitlistEntry: async ({ id, email, name }) => { await run('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, name || null, 'pending', timestamp(), timestamp()); },
     recordSignupRiskDecision: async ({ subjectHash = null, mode, decision, score, signals = [] }) => { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};await run('INSERT INTO signup_risk_events(id,subject_hash,mode,decision,score,signals_json,created_at) VALUES(?,?,?,?,?,?,?)',row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },
+    listSignupRiskEvents: async (limit = 100) => all('SELECT mode,decision,score,signals_json,created_at FROM signup_risk_events ORDER BY created_at DESC,id DESC LIMIT ?', Math.max(1, Math.min(500, Number(limit) || 100))),
     listWaitlist: async () => all('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
     updateWaitlistStatus: async (id, status) => (await run('UPDATE waitlist SET status=?,updated_at=? WHERE id=?', status, timestamp(), id)).changes > 0,
     waitlistPosition: async (createdAt) => (await get("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?", createdAt)).c,

@@ -33,7 +33,7 @@ import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
 import { buildCatchupDigest, isAwayEnough, clampSinceMs } from './src/catchup.js';
-import { evaluateSignupRisk, signupAdmission, signupAuditSubject, signupRiskMode, signupsPaused } from './src/signup-risk.js';
+import { evaluateSignupRisk, signupAdmission, signupAuditSubject, signupRiskMode, signupsPaused, summarizeSignupRiskEvents } from './src/signup-risk.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -3269,6 +3269,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
         if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.setSetting('registration_opened_at',open?new Date().toISOString():'');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/signup-risk'){requireOwner(user);return json(res,200,summarizeSignupRiskEvents(db.listSignupRiskEvents(100)));}
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
         if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}

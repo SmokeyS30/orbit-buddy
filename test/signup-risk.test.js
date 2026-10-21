@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
-import { evaluateSignupRisk, shouldBlockSignup, signupAdmission, signupAuditSubject, signupRiskMode, signupsPaused } from '../src/signup-risk.js';
+import { evaluateSignupRisk, shouldBlockSignup, signupAdmission, signupAuditSubject, signupRiskMode, signupsPaused, summarizeSignupRiskEvents } from '../src/signup-risk.js';
 
 test('signup risk defaults off and pause defaults false', () => {
   assert.equal(signupRiskMode({}), 'off');
@@ -40,6 +40,18 @@ test('audit subjects are keyed and never store the raw email', () => {
   assert.equal(signupAuditSubject('person@example.com', ''), null);
 });
 
+test('owner audit summary contains decisions and signals but no applicant identifiers', () => {
+  const summary = summarizeSignupRiskEvents([
+    { subject_hash: 'secret-a', mode: 'observe', decision: 'allow', score: 0, signals_json: '[]', created_at: '2026-10-20T20:00:00.000Z' },
+    { subject_hash: 'secret-b', mode: 'observe', decision: 'deny', score: 80, signals_json: '["automation_user_agent"]', created_at: '2026-10-20T19:00:00.000Z' },
+  ]);
+  assert.equal(summary.total, 2);
+  assert.deepEqual(summary.decisions, { allow: 1, verify: 0, deny: 1 });
+  assert.equal(summary.signals.automation_user_agent, 1);
+  assert.equal(summary.latestAt, '2026-10-20T20:00:00.000Z');
+  assert.doesNotMatch(JSON.stringify(summary), /secret-[ab]/);
+});
+
 test('observation mode records risk but does not block registration', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-signup-risk-'));
   const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', SIGNUP_RISK_MODE: 'observe', SIGNUP_AUDIT_KEY: 'test-secret' } });
@@ -57,10 +69,22 @@ test('enforcement automatically admits low-risk members without opening the lega
   t.after(() => app.close());
   const base = `http://127.0.0.1:${app.server.address().port}`;
   const register = (email, agent) => fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': agent }, body: JSON.stringify({ email, displayName: 'Person', password: 'correct horse battery staple' }) });
-  assert.equal((await register('owner@example.com', 'HeadlessBot/1.0')).status, 201, 'initial owner must not be locked out');
+  const ownerResponse = await register('owner@example.com', 'HeadlessBot/1.0');
+  assert.equal(ownerResponse.status, 201, 'initial owner must not be locked out');
+  const ownerCookie = ownerResponse.headers.get('set-cookie').split(';')[0];
   const setup = await (await fetch(`${base}/api/auth/setup-status`)).json();
   assert.equal(setup.registrationOpen, false);
   assert.equal(setup.automaticSignup, true);
-  assert.equal((await register('member@example.com', 'OrbitBuddy/1.1')).status, 201);
+  const memberResponse = await register('member@example.com', 'OrbitBuddy/1.1');
+  assert.equal(memberResponse.status, 201);
+  const memberCookie = memberResponse.headers.get('set-cookie').split(';')[0];
   assert.equal((await register('bot@example.com', 'HeadlessBot/1.0')).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/signup-risk`)).status, 401);
+  assert.equal((await fetch(`${base}/api/admin/signup-risk`, { headers: { Cookie: memberCookie } })).status, 403);
+  const auditResponse = await fetch(`${base}/api/admin/signup-risk`, { headers: { Cookie: ownerCookie } });
+  assert.equal(auditResponse.status, 200);
+  const audit = await auditResponse.json();
+  assert.equal(audit.total, 3);
+  assert.deepEqual(audit.decisions, { allow: 1, verify: 0, deny: 2 });
+  assert.doesNotMatch(JSON.stringify(audit), /subject|owner@example|member@example|bot@example/);
 });

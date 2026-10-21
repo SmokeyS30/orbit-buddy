@@ -58,3 +58,26 @@ export function signupAdmission({ mode, result, hasOwner, registrationOpen = fal
   if (result?.decision === 'verify') return { action: 'verify', reason: 'step_up_required' };
   return { action: 'allow', reason: 'low_risk' };
 }
+
+export function summarizeSignupRiskEvents(rows = []) {
+  const decisions = { allow: 0, verify: 0, deny: 0 };
+  const signals = {};
+  const events = [];
+  for (const row of rows) {
+    const decision = String(row?.decision || '');
+    if (Object.hasOwn(decisions, decision)) decisions[decision]++;
+    let parsed = [];
+    try { parsed = JSON.parse(row?.signals_json || '[]'); } catch {}
+    if (!Array.isArray(parsed)) parsed = [];
+    parsed = parsed.map((signal) => String(signal).slice(0, 80)).filter(Boolean);
+    for (const signal of parsed) signals[signal] = (signals[signal] || 0) + 1;
+    events.push({
+      mode: String(row?.mode || 'off'),
+      decision,
+      score: Number(row?.score) || 0,
+      signals: parsed,
+      createdAt: row?.created_at || null,
+    });
+  }
+  return { total: rows.length, decisions, signals, latestAt: events[0]?.createdAt || null, events };
+}

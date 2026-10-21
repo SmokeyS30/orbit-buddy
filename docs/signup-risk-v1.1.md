@@ -18,6 +18,10 @@ registration. Initial owner creation always bypasses risk enforcement.
 
 `SIGNUPS_PAUSED=true` is an emergency server-side stop for new member accounts; it never disables existing users or the initial owner account. `SIGNUP_AUDIT_KEY` enables keyed, non-reversible applicant correlation. Raw email addresses and IP addresses are not written to the risk audit table.
 
+The owner-only `GET /api/admin/signup-risk` endpoint returns decision and signal
+counts plus sanitized recent events. It deliberately omits event IDs and keyed
+subject hashes so the operational view cannot reveal applicant identifiers.
+
 ## Decision policy
 
 - Default to immediate access.
@@ -31,7 +35,7 @@ registration. Initial owner creation always bypasses risk enforcement.
 - Implement the verified-email step-up that the `verify` decision now reserves.
 - Sign in with Apple and verified-email account linking.
 - App Attest assertion at signup with simulator/TestFlight fallbacks.
-- Owner audit dashboard and emergency control UI.
+- Render the owner audit summary and emergency signup pause in the Safety UI.
 - Recovery and appeal flow.
 - Shadow-mode telemetry review and false-positive thresholds.
 - TestFlight validation on existing and newly created accounts.
