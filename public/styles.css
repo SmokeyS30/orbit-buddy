@@ -339,3 +339,17 @@ body.membership-open{overflow:hidden}
 .empty-suggest{display:block;margin:0 auto 30px;max-width:100%}
 
 #enable-push:disabled{background:var(--panel2);color:var(--muted);border:1px solid var(--line);opacity:.45;cursor:not-allowed}
+#apple-link:disabled{background:var(--panel2);color:var(--muted);border:1px solid var(--line);opacity:.65;cursor:not-allowed}
+
+/* Keep native iOS time pickers inside the Safety card at narrow widths. */
+.settings-grid>.panel{min-width:0}
+#preferences-form{min-width:0}
+#preferences-form>label{display:block;min-width:0;margin-top:14px}
+#preferences-form .form-grid>label{min-width:0;margin:0}
+#preferences-form .form-grid:not(.quiet-hours-fields){margin-top:14px}
+#preferences-form .quiet-hours-fields{min-width:0;margin:16px 0 4px;padding:14px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.025);gap:12px}
+#preferences-form input:not([type="checkbox"]){display:block;min-width:0;max-width:100%;min-height:46px;margin-top:7px}
+#preferences-form select{display:block;min-width:0;max-width:100%;height:46px;margin-top:7px;-webkit-appearance:none;appearance:none;padding-right:38px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%23a6a6b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-size:16px;background-position:right 14px center}
+#preferences-form input[type="time"]{width:100%;overflow:hidden}
+#preferences-form .check{margin-top:16px}
+#preferences-form>button{margin-top:18px}

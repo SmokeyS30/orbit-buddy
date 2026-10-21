@@ -21,7 +21,7 @@
     />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261021f" />
+    <link rel="stylesheet" href="/styles.css?v=20261021g" />
     <link rel="stylesheet" href="/mobile.css?v=20261019c" />
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
@@ -736,7 +736,7 @@
                 <option value="Asia/Tokyo"></option>
                 <option value="Australia/Sydney"></option>
               </datalist>
-              <div class="form-grid two">
+              <div class="form-grid two quiet-hours-fields" role="group" aria-label="Quiet hours">
                 <label
                   >Quiet from<input
                     id="preference-quiet-start"
@@ -851,8 +851,8 @@
             <div id="signup-appeals" class="card-list"></div>
           </section>
           <section class="panel hidden" id="apple-link-panel">
-            <h2>Sign in with Apple</h2><p class="muted">Link Apple to this account while keeping your password and recovery codes.</p>
-            <label>Current password<input id="apple-link-password" type="password" autocomplete="current-password" /></label>
+            <h2>Sign in with Apple</h2><p class="muted" id="apple-link-description">Link Apple to this account while keeping your password and recovery codes.</p>
+            <label id="apple-link-password-label">Current password<input id="apple-link-password" type="password" autocomplete="current-password" /></label>
             <button id="apple-link" type="button" class="primary">Link Apple</button>
           </section>
           <section class="panel hidden" id="access-panel">
@@ -1034,6 +1034,6 @@
     <script src="/vendor/marked.min.js" defer></script>
     <script src="/vendor/purify.min.js" defer></script>
     <script src="/pwa-install.js" defer></script>
-    <script type="module" src="/app.js?v=20261021f"></script>
+    <script type="module" src="/app.js?v=20261021g"></script>
   </body>
 </html>

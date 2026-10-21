@@ -122,3 +122,30 @@ perceived responsiveness improvement remain unverified until these checks pass.
 - Dependency installation initially failed because npm's default cache path was
   unavailable; rerunning with a writable `/tmp/orbit-npm-cache` succeeded.
 - Supporting logs: `/tmp/orbit-chat-targeted.log`, `/tmp/orbit-chat-check.log`.
+
+## Mac follow-up and 1.1.1 preparation — 2026-10-21
+
+The validation results above describe the initial typing-race patch. On the Mac,
+the draft PR was extended with a separate Safety cleanup: Quiet Hours fields stay
+inside their card, briefing selects have consistent WebKit sizing, and the signed-in
+Apple link control becomes gray and disabled only when authenticated account data
+confirms that Apple is linked. The logged-out Sign in with Apple control and password
+login remain available. The server exposes the current account's linked state in
+`/api/status`; that server change must reach the app's backend before a released
+client can display the confirmed state on a fresh launch.
+
+Locked dependencies installed with scripts disabled. `npm run check` passed all
+911 tests with an isolated, disposable local PostgreSQL 16 database. Static WebKit
+and Chromium Safety fixtures were inspected at 320, 375, and 430 px, landscape,
+and enlarged text. No horizontal overflow was measured; time fields, selects,
+and the proactive checkbox accepted input. Static Today, Goals, and Tasks layouts
+were also inspected at narrow and landscape sizes. An account-free staging bundle
+built and cold-launched in an iPhone Simulator. These fixture and Simulator checks
+do not establish live authenticated behavior or resolution of the reported freeze.
+
+The proposed 1.1.1 release uses build 20261026, one above the highest local Orbit
+archive. App Store Connect build-number availability was not independently checked.
+The release archive must explicitly bundle `https://orbitbuddy.app`; staging
+screenshots and test accounts must not be treated as production validation. The
+real-iPhone comparison, keyboard and IME cases, live notifications, offline flows,
+and input-to-paint profiling in the checklist above remain open.

@@ -1,4 +1,4 @@
-import { renderAppleAuthControls } from './signup-ui.js';
+import { renderAppleAuthControls, renderAppleLinkControl } from './signup-ui.js';
 import { NATIVE_API_BASE } from './native-config.js';
 // Orbit Buddy frontend v2.1 - optimistic chat send
 import { isNearBottom, scrollToBottom, settleAtBottom, shouldSettleAtBottom } from './chat-scroll.js';
@@ -2212,20 +2212,23 @@ async function signupAttestation(email){
 }
 async function appleSignIn(purpose){
   const plugin=signupPlugin();if(!plugin)throw new Error('Apple sign-in requires the iPhone app.');
+  if(purpose==='link'&&(state.status?.appleLinked||state.appleLinkPending))return;
+  const linkUserId=state.user?.id;
   const password=purpose==='link'?$('#apple-link-password').value:undefined;
+  if(purpose==='link'){state.appleLinkPending=true;renderSignupSafety();}
   try{
     const challenge=await signupPost('/api/auth/apple/challenge',{purpose});
     const credentials=await plugin.signIn({nonce:challenge.nonce});
     const result=await signupPost('/api/auth/apple/complete',{...credentials,nonce:challenge.nonce,purpose,password});
     if(purpose==='signup'){state.appleSignupProof=result.appleSignupProof;setAuthMode('register');$('#auth-email').value=result.email;$('#auth-password').required=false;$('#auth-copy').textContent='Apple verified your email. Enter your name to finish creating your account. A password is optional; recovery codes will be provided.';return;}
-    if(purpose==='link'){toast('Apple linked. Your password still works.');return;}
+    if(purpose==='link'){if(state.user?.id===linkUserId){state.status={...state.status,appleLinked:true};renderSignupSafety();}toast('Apple linked. Your password still works.');return;}
     state.user=result.user;state.csrf=result.csrf;if(result.sessionToken)setNativeToken(result.sessionToken);await connect();
-  }finally{if(purpose==='link')$('#apple-link-password').value='';}
+  }finally{if(purpose==='link'){state.appleLinkPending=false;$('#apple-link-password').value='';renderSignupSafety();}}
 }
 function renderSignupSafety(){
   const owner=state.user?.role==='owner',risk=state.signupRisk;
   $('#signup-risk-panel')?.classList.toggle('hidden',!owner);
-  $('#apple-link-panel')?.classList.toggle('hidden',!signupPlugin()||!state.setup?.appleSignInReady);
+  renderAppleLinkControl(document,{nativeReady:!!signupPlugin(),loginReady:!!state.setup?.appleSignInReady,linked:state.status?.appleLinked===true,pending:!!state.appleLinkPending});
   if(!owner||!risk)return;
   $('#signup-risk-status').textContent=`Mode: ${risk.mode}. New signups ${risk.paused?'paused':'not paused'}. Existing logins remain available.`;
   $('#signup-risk-counts').textContent=`Latest ${risk.total} recorded attempts: ${risk.decisions.allow} allow, ${risk.decisions.verify} verify, ${risk.decisions.deny} deny. Observations are not admission decisions.`;

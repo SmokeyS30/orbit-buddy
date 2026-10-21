@@ -501,6 +501,7 @@ const indexMigrations = [
       await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);return true;
     }),
     getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
+    hasAuthIdentityForUser: async (provider, userId) => !!(await get('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1', provider, userId)),
     async linkAuthIdentity(provider, subject, userId) {
       const now = timestamp();
       await run('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)', provider, subject, userId, now, now);

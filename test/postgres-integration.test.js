@@ -60,6 +60,10 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.ok(user.id, 'user created with id');
     assert.equal(user.email, email);
     userId = user.id;
+    assert.equal(db.hasAuthIdentityForUser('apple',userId),false);
+    db.linkAuthIdentity('apple',`pgtest-${Date.now()}`,userId);
+    assert.equal(db.hasAuthIdentityForUser('apple',userId),true);
+    assert.equal(db.hasAuthIdentityForUser('other',userId),false);
 
     // 3. Read: fetch the user back. DB returns snake_case fields.
     const fetched = db.getUserByEmail(email);
@@ -339,6 +343,9 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     assert.deepEqual((await Promise.all([db.consumeSignupChallenge(suffix,'link',user.id),db.consumeSignupChallenge(suffix,'link',user.id)])).sort(),[false,true]);
     const links=await Promise.allSettled([db.linkAuthIdentity('apple',suffix,user.id),db.linkAuthIdentity('apple',suffix,other.id)]);
     assert.equal(links.filter(r=>r.status==='fulfilled').length,1);
+    const linkedUserId=(await db.getAuthIdentity('apple',suffix)).user_id;
+    assert.equal(await db.hasAuthIdentityForUser('apple',user.id),linkedUserId===user.id);
+    assert.equal(await db.hasAuthIdentityForUser('apple',other.id),linkedUserId===other.id);
     await db.addAppAttestKey(suffix,'public','production');
     assert.deepEqual((await Promise.all([db.advanceAppAttestCounter(suffix,0,1),db.advanceAppAttestCounter(suffix,0,2)])).sort(),[false,true]);
     await db.addSignupVerificationToken(suffix,suffix,expiry);

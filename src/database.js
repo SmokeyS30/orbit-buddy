@@ -516,6 +516,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
     authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
+    authIdentityForUser: db.prepare('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1'),
     linkAuthIdentity: db.prepare('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)'),
     updatePassword: db.prepare('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?'),
     setUserDisabled: db.prepare('UPDATE users SET disabled=?, updated_at=? WHERE id=?'),
@@ -954,6 +955,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       } catch(error) { db.exec('ROLLBACK');throw error; }
     },
     getAuthIdentity: (provider, subject) => s.authIdentity.get(provider, subject),
+    hasAuthIdentityForUser: (provider, userId) => !!s.authIdentityForUser.get(provider, userId),
     linkAuthIdentity(provider, subject, userId) {
       const now = timestamp();
       s.linkAuthIdentity.run(provider, subject, userId, now, now);

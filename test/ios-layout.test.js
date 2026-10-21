@@ -34,8 +34,8 @@ test('welcome screen keeps compact iPhone controls and 16px form inputs', () => 
   assert.match(welcome, /\.cta-row\{display:grid;grid-template-columns:1fr 1fr/);
 });
 
-test('native bundle uses the polished CSS revision and a new TestFlight build number', () => {
+test('native bundle uses the polished CSS revision and 1.1.1 release version', () => {
   assert.match(index, /mobile\.css\?v=20261019c/);
-  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261025;/g) || []).length, 2);
-  assert.equal((project.match(/MARKETING_VERSION = 1\.1;/g) || []).length, 2);
+  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261026;/g) || []).length, 2);
+  assert.equal((project.match(/MARKETING_VERSION = 1\.1\.1;/g) || []).length, 2);
 });
