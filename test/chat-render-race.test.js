@@ -48,7 +48,9 @@ test('an older render cannot overwrite a newer snapshot when chunk promises reso
 test('switching conversation during chunk load discards the previous history', async () => {
   const h=harness();
   const pending=h.render([message('1')]);
-  h.context.state.snapshot.activeConversation.id='b';
+  // Match renderThreads(): the selected ID changes immediately while the old
+  // snapshot stays in state until the replacement refresh finishes.
+  h.context.activeConversationId='b';
   h.loads.shift()(null); await pending;
   assert.equal(h.root.rebuilds, 0);
 });
