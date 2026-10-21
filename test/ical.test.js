@@ -135,6 +135,7 @@ test('dayStartMs computes zone day boundaries', () => {
 });
 
 test('read_calendar merges labelled events across feeds', async () => {
+  // HTTP is mocked; a public literal avoids an unrelated external DNS dependency.
   const realFetch = global.fetch;
   const { executeTool } = await import('../src/tools.js');
   const { dropFeedCache } = await import('../src/ical.js');
@@ -147,7 +148,7 @@ test('read_calendar merges labelled events across feeds', async () => {
     'SUMMARY:Gym', 'END:VEVENT'
   ].join('\n');
   global.fetch = async (url, options) => {
-    if (String(url).includes('example.com')) {
+    if (String(url).includes('93.184.216.34')) {
       return {
         ok: true,
         arrayBuffer: async () => Buffer.from(String(url).includes('school') ? icsSchool : icsPersonal)
@@ -160,8 +161,8 @@ test('read_calendar merges labelled events across feeds', async () => {
       userId: 'user-1',
       db: {
         listCalendarFeeds: () => [
-          { id: 'feed-school', label: 'School', url: 'https://example.com/school.ics' },
-          { id: 'feed-personal', label: 'Personal', url: 'https://example.com/personal.ics' }
+          { id: 'feed-school', label: 'School', url: 'https://93.184.216.34/school.ics' },
+          { id: 'feed-personal', label: 'Personal', url: 'https://93.184.216.34/personal.ics' }
         ]
       }
     };
@@ -209,12 +210,13 @@ async function registerUser(base, email = 'owner@example.com') {
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
 
 test('calendar feed endpoints: add, list masked, reject bad feeds, delete', async (t) => {
+  // HTTP is mocked; a public literal avoids an unrelated external DNS dependency.
   const realFetch = global.fetch;
   const { app, base } = await serverFixture(); t.after(() => { app.close(); global.fetch = realFetch; });
   const auth = await registerUser(base);
   const ics = ['BEGIN:VEVENT', 'UID:e1', 'DTSTART:20261005T120000Z', 'SUMMARY:Test', 'END:VEVENT'].join('\n');
   global.fetch = async (url, options) => {
-    if (String(url).includes('example.com')) {
+    if (String(url).includes('93.184.216.34')) {
       return { ok: true, arrayBuffer: async () => Buffer.from(ics) };
     }
     return realFetch(url, options);
@@ -223,7 +225,7 @@ test('calendar feed endpoints: add, list masked, reject bad feeds, delete', asyn
   // add
   const addRes = await fetch(`${base}/api/calendar-feeds`, {
     method: 'POST', headers: authHeaders(auth),
-    body: JSON.stringify({ label: 'School', url: 'https://example.com/feed.ics?secret=s3cr3t-token' })
+    body: JSON.stringify({ label: 'School', url: 'https://93.184.216.34/feed.ics?secret=s3cr3t-token' })
   });
   assert.equal(addRes.status, 201);
   const added = await addRes.json();
@@ -240,21 +242,21 @@ test('calendar feed endpoints: add, list masked, reject bad feeds, delete', asyn
 
   // reject non-calendar content
   global.fetch = async (url, options) => {
-    if (String(url).includes('example.com')) {
+    if (String(url).includes('93.184.216.34')) {
       return { ok: true, arrayBuffer: async () => Buffer.from('hello world') };
     }
     return realFetch(url, options);
   };
   const badContent = await fetch(`${base}/api/calendar-feeds`, {
     method: 'POST', headers: authHeaders(auth),
-    body: JSON.stringify({ label: 'Bad', url: 'https://example.com/not-ics' })
+    body: JSON.stringify({ label: 'Bad', url: 'https://93.184.216.34/not-ics' })
   });
   assert.equal(badContent.status, 400);
 
   // reject non-http URLs without any network access
   const badProto = await fetch(`${base}/api/calendar-feeds`, {
     method: 'POST', headers: authHeaders(auth),
-    body: JSON.stringify({ label: 'Bad', url: 'ftp://example.com/feed.ics' })
+    body: JSON.stringify({ label: 'Bad', url: 'ftp://93.184.216.34/feed.ics' })
   });
   assert.equal(badProto.status, 400);
 

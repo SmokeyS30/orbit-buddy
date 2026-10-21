@@ -7,6 +7,7 @@ final class OrbitBridgeViewController: CAPBridgeViewController {
         super.capacitorDidLoad()
         if #available(iOS 15.0, *) {
             bridge?.registerPluginInstance(StoreKitPlugin())
+            bridge?.registerPluginInstance(SignupSecurityPlugin())
         }
     }
 }

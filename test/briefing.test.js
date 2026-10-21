@@ -217,6 +217,7 @@ test('buildTodayBriefing carries the phase on the payload', async () => {
 
 test('buildTodayBriefing keeps tomorrow events and startMs for phase views', async () => {
   const { dropFeedCache } = await import('../src/ical.js');
+  // HTTP is mocked; a public literal avoids an unrelated external DNS dependency.
   const realFetch = global.fetch;
   const ics = [
     'BEGIN:VEVENT', 'UID:today1', 'DTSTART;TZID=America/New_York:20261012T090000',
@@ -224,10 +225,10 @@ test('buildTodayBriefing keeps tomorrow events and startMs for phase views', asy
     'BEGIN:VEVENT', 'UID:tmr1', 'DTSTART;TZID=America/New_York:20261013T140000',
     'DTEND;TZID=America/New_York:20261013T150000', 'SUMMARY:Dentist', 'END:VEVENT',
   ].join('\n');
-  global.fetch = async (url) => String(url) === 'https://example.com/cal.ics'
+  global.fetch = async (url) => String(url) === 'https://93.184.216.34/cal.ics'
     ? { ok: true, arrayBuffer: async () => Buffer.from(ics) }
     : realFetch(url);
-  const db = { ...fakeDb(), listCalendarFeeds: () => [{ id: 'f1', label: 'Cal', url: 'https://example.com/cal.ics' }] };
+  const db = { ...fakeDb(), listCalendarFeeds: () => [{ id: 'f1', label: 'Cal', url: 'https://93.184.216.34/cal.ics' }] };
   try {
     const b = await buildTodayBriefing(db, 'u1', { getWeather: async () => WEATHER_TEXT, nowMs: NOW });
     assert.equal(b.agenda.length, 1);

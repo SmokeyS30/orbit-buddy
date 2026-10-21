@@ -1,3 +1,4 @@
+import { signupSecuritySchema } from '../signup-security-schema.js';
 // PostgreSQL adapter for orbit-buddy (Stage 1)
 //
 // Implements the same method interface as src/database.js (SQLite version)
@@ -97,13 +98,31 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     await client.query('SELECT 1');
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
+      ...signupSecuritySchema,
       `CREATE TABLE IF NOT EXISTS waitlist (
         id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
         status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       )`,
       'CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at)',
+      `CREATE TABLE IF NOT EXISTS signup_risk_events (
+        id TEXT PRIMARY KEY, subject_hash TEXT, mode TEXT NOT NULL, decision TEXT NOT NULL,
+        score INTEGER NOT NULL, signals_json TEXT NOT NULL, created_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS signup_verification_tokens (
+        token_hash TEXT PRIMARY KEY, email_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
+        used_at TEXT, created_at TEXT NOT NULL
+      )`,
+      `CREATE TABLE IF NOT EXISTS auth_identities (
+        provider TEXT NOT NULL, subject TEXT NOT NULL,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        PRIMARY KEY(provider, subject), UNIQUE(provider, user_id)
+      )`,
+      'CREATE INDEX IF NOT EXISTS idx_signup_verification_expiry ON signup_verification_tokens(expires_at)',
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_signup_verification_email ON signup_verification_tokens(email_hash)',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id TEXT',
@@ -319,6 +338,7 @@ const indexMigrations = [
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
@@ -421,8 +441,74 @@ const indexMigrations = [
     // email column is CITEXT: plain = is already case-insensitive
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
+    setSignupPause: async (paused) => withTransaction(async ({query:tQuery,run:tRun}) => {
+      await tQuery('SELECT pg_advisory_xact_lock(1941101)');
+      await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
+    }),
+    createSignupAccount: async ({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) => withTransaction(async ({get:tGet,run:tRun,query:tQuery}) => {
+      // Serialize bootstrap across server processes without modifying existing accounts.
+      await tQuery('SELECT pg_advisory_xact_lock(1941101)');
+      const count=Number((await tGet('SELECT COUNT(*) AS count FROM users')).count);
+      if(count>0&&(environmentPaused||(await tGet("SELECT value FROM settings WHERE key='signups_paused'"))?.value==='true'||(!automatic&&(await tGet("SELECT value FROM settings WHERE key='registration_open'"))?.value!=='true')))throw new Error('Registration unavailable');
+      const apple=appleProofHash?await tGet('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject',appleProofHash,appleEmailHash,timestamp()):null;
+      if(appleProofHash&&!apple)throw new Error('Apple proof expired');
+      if(verificationHash && !(await tRun('UPDATE signup_verification_tokens SET used_at=? WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?',timestamp(),verificationHash,emailHash,timestamp())).changes)throw new Error('Verification expired');
+      const id=randomUUID(),now=timestamp();
+      await tRun('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,created_at,updated_at,email_verified_at) VALUES(?,?,?,?,?,?,?,?,?)',id,email,displayName,passwordHash,passwordSalt,count===0?'owner':'member',now,now,(verificationHash||apple)?now:null);
+      if(apple)await tRun('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)','apple',apple.subject,id,now,now);
+      return tGet('SELECT * FROM users WHERE id=?',id);
+    }),
+    async addAppleSignupProof(hash,subject,emailHash,expiresAt) {
+      await run('DELETE FROM apple_signup_proofs WHERE expires_at<=?',timestamp());
+      await run('INSERT INTO apple_signup_proofs VALUES(?,?,?,?)',hash,subject,emailHash,expiresAt);
+    },
+    getAppleSignupProof: async (hash,emailHash) => get('SELECT subject FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>?',hash,emailHash,timestamp()),
+    async addSignupChallenge(hash,purpose,binding,expiresAt) {
+      await run('DELETE FROM signup_challenges WHERE expires_at<=?',timestamp());
+      await run('INSERT INTO signup_challenges VALUES(?,?,?,?,?)',hash,purpose,binding,expiresAt,timestamp());
+    },
+    consumeSignupChallenge: async (hash,purpose,binding) => (await run('DELETE FROM signup_challenges WHERE token_hash=? AND purpose=? AND binding=? AND expires_at>?',hash,purpose,binding,timestamp())).changes>0,
+    getAppAttestKey: async (id) => get('SELECT * FROM app_attest_keys WHERE key_id=?',id),
+    addAppAttestKey: async (id,key,environment) => run('INSERT INTO app_attest_keys VALUES(?,?,?,0,?)',id,key,environment,timestamp()),
+    advanceAppAttestCounter: async (id,previous,next) => next>previous && (await run('UPDATE app_attest_keys SET sign_count=? WHERE key_id=? AND sign_count=?',next,id,previous)).changes>0,
+    async addSignupAppeal(email,note) {
+      const id=randomUUID(),now=timestamp();
+      await run('DELETE FROM signup_appeals WHERE created_at<?',new Date(Date.now()-30*86400_000).toISOString());
+      await run("INSERT INTO signup_appeals VALUES(?,?,?,'pending',?,?)",id,email,note,now,now);return id;
+    },
+    listSignupAppeals: async () => all('SELECT * FROM signup_appeals ORDER BY created_at DESC LIMIT 100'),
+    resolveSignupAppeal: async (id,status) => (await run('UPDATE signup_appeals SET status=?,updated_at=? WHERE id=?',status,timestamp(),id)).changes>0,
+    finishRecovery: async (userId,codeHash,passwordHash,passwordSalt,newCodes) => withTransaction(async ({get:tGet,run:tRun}) => {
+      const user=await tGet('SELECT * FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled)return false;
+      const row=await tGet('SELECT * FROM recovery_codes WHERE user_id=? AND code_hash=? AND used_at IS NULL FOR UPDATE',userId,codeHash);
+      if(!row)return false;
+      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,timestamp(),userId);
+      await tRun('DELETE FROM sessions WHERE user_id=?',userId);await tRun('DELETE FROM recovery_codes WHERE user_id=?',userId);
+      await tRun('UPDATE password_reset_tokens SET used=1 WHERE user_id=?',userId);
+      for(const hash of newCodes)await tRun('INSERT INTO recovery_codes VALUES(?,?,?,NULL,?)',randomUUID(),userId,hash,timestamp());
+      return true;
+    }),
+    finishPasswordReset: async (hash,passwordHash,passwordSalt) => withTransaction(async ({get:tGet,run:tRun}) => {
+      const row=await tGet('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?',hash,timestamp());
+      if(!row) return false;
+      const user=await tGet('SELECT * FROM users WHERE id=? FOR UPDATE',row.user_id);
+      if(!user || user.disabled) return false;
+      const fresh=await tGet('SELECT token_hash FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?',hash,timestamp());
+      if(!fresh)return false;
+      await tRun('UPDATE password_reset_tokens SET used=1 WHERE user_id=?',row.user_id);
+      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,timestamp(),row.user_id);
+      await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);return true;
+    }),
+    getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
+    async linkAuthIdentity(provider, subject, userId) {
+      const now = timestamp();
+      await run('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)', provider, subject, userId, now, now);
+      return get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject);
+    },
     updatePassword: async (id, passwordHash, passwordSalt) => { await run('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?', passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled: async (id, disabled) => { await run('UPDATE users SET disabled=?, updated_at=? WHERE id=?', disabled ? 1 : 0, timestamp(), id); },
+    markUserEmailVerified: async (id) => { const now=timestamp();return (await run('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=? AND email_verified_at IS NULL',now,now,id)).changes>0; },
     async deleteUserAccount(userId) {
       return withTransaction(async ({ get: tGet, all: tAll, run: tRun }) => {
         const account = await tGet('SELECT * FROM users WHERE id=?', userId);
@@ -477,9 +563,9 @@ const indexMigrations = [
         for (const hash of hashes) await tRun('INSERT INTO recovery_codes VALUES (?, ?, ?, NULL, ?)', randomUUID(), userId, hash, timestamp());
       });
     },
-    async consumeRecoveryCode(hash) {
+    async consumeRecoveryCode(hash,userId) {
       const row = await get('SELECT * FROM recovery_codes WHERE code_hash=? AND used_at IS NULL', hash);
-      if (!row) return null;
+      if (!row || (userId && row.user_id!==userId)) return null;
       const result = await run('UPDATE recovery_codes SET used_at=? WHERE id=? AND used_at IS NULL', timestamp(), row.id);
       return result.changes ? row : null;
     },
@@ -1443,6 +1529,8 @@ const indexMigrations = [
 
     // --- Waitlist ---
     addWaitlistEntry: async ({ id, email, name }) => { await run('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', id, email, name || null, 'pending', timestamp(), timestamp()); },
+    recordSignupRiskDecision: async ({ subjectHash = null, mode, decision, score, signals = [] }) => { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};await run('INSERT INTO signup_risk_events(id,subject_hash,mode,decision,score,signals_json,created_at) VALUES(?,?,?,?,?,?,?)',row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },
+    listSignupRiskEvents: async (limit = 100) => all('SELECT mode,decision,score,signals_json,created_at FROM signup_risk_events ORDER BY created_at DESC,id DESC LIMIT ?', Math.max(1, Math.min(500, Number(limit) || 100))),
     listWaitlist: async () => all('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
     updateWaitlistStatus: async (id, status) => (await run('UPDATE waitlist SET status=?,updated_at=? WHERE id=?', status, timestamp(), id)).changes > 0,
     waitlistPosition: async (createdAt) => (await get("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?", createdAt)).c,
@@ -1459,6 +1547,12 @@ const indexMigrations = [
     getPasswordResetToken: async (tokenHash) => get('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?', tokenHash, timestamp()),
     markPasswordResetTokenUsed: async (tokenHash) => { const r = await run('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0', tokenHash); return (r.changes||0)>0; },
     cleanExpiredPasswordResetTokens: async () => { await run('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1', timestamp()); },
+    async addSignupVerificationToken(tokenHash, emailHash, expiresAt) { await run('INSERT INTO signup_verification_tokens(token_hash,email_hash,expires_at,used_at,created_at) VALUES(?,?,?,NULL,?) ON CONFLICT(email_hash) DO UPDATE SET token_hash=excluded.token_hash,expires_at=excluded.expires_at,used_at=NULL,created_at=excluded.created_at',tokenHash,emailHash,expiresAt,timestamp()); },
+    getPendingSignupVerificationForEmail: async (emailHash) => get('SELECT token_hash FROM signup_verification_tokens WHERE email_hash=? AND used_at IS NULL AND expires_at>?',emailHash,timestamp()),
+    getSignupVerificationToken: async (tokenHash, emailHash) => get('SELECT token_hash FROM signup_verification_tokens WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?',tokenHash,emailHash,timestamp()),
+    consumeSignupVerificationToken: async (tokenHash, emailHash) => { const now=timestamp();const r=await run('UPDATE signup_verification_tokens SET used_at=? WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?',now,tokenHash,emailHash,now);return (r.changes||0)>0; },
+    deleteSignupVerificationToken: async (tokenHash) => (await run('DELETE FROM signup_verification_tokens WHERE token_hash=? AND used_at IS NULL',tokenHash)).changes>0,
+    cleanSignupVerificationTokens: async () => { await run('DELETE FROM signup_verification_tokens WHERE expires_at<=? OR used_at IS NOT NULL',timestamp()); },
 
     // --- Export / restore ---
     async exportUser(userId) {

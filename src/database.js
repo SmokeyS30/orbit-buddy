@@ -1,3 +1,4 @@
+import { signupSecuritySchema } from './signup-security-schema.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -56,6 +57,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     db.exec('PRAGMA journal_mode = DELETE;');
   }
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  for (const sql of signupSecuritySchema) db.exec(sql);
   const protectSecret = (value) => {
     const text = String(value || '');
     if (!text || text.startsWith('enc:v1:') || !encryptionKey) return text;
@@ -71,11 +73,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
       password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','member')),
-      disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      disabled INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, user_agent TEXT
+    );
+    CREATE TABLE IF NOT EXISTS auth_identities (
+      provider TEXT NOT NULL, subject TEXT NOT NULL,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+      PRIMARY KEY(provider, subject), UNIQUE(provider, user_id)
     );
     CREATE TABLE IF NOT EXISTS recovery_codes (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -287,6 +295,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL,
       used INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS signup_verification_tokens (
+      token_hash TEXT PRIMARY KEY, email_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
+      used_at TEXT, created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS whatsapp_links (
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       phone_e164 TEXT NOT NULL UNIQUE,
@@ -387,7 +399,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at);
+    CREATE TABLE IF NOT EXISTS signup_risk_events (
+      id TEXT PRIMARY KEY, subject_hash TEXT, mode TEXT NOT NULL, decision TEXT NOT NULL,
+      score INTEGER NOT NULL, signals_json TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_pw_reset_user ON password_reset_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_signup_verification_expiry ON signup_verification_tokens(expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_signup_verification_email ON signup_verification_tokens(email_hash);
     CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(status, schedule_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, created_at DESC);
@@ -404,6 +423,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
 
   // Upgrade v0.1 databases in place without discarding user data.
   ensureColumn(db, 'users', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'users', 'email_verified_at', 'TEXT');
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC)');
@@ -495,8 +515,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
+    authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
+    linkAuthIdentity: db.prepare('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)'),
     updatePassword: db.prepare('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?'),
     setUserDisabled: db.prepare('UPDATE users SET disabled=?, updated_at=? WHERE id=?'),
+    markUserEmailVerified: db.prepare('UPDATE users SET email_verified_at=?, updated_at=? WHERE id=? AND email_verified_at IS NULL'),
     claimMessages: db.prepare('UPDATE messages SET user_id=? WHERE user_id IS NULL'),
     claimMemories: db.prepare('UPDATE memories SET user_id=? WHERE user_id IS NULL'),
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
@@ -751,6 +774,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     addWaitlistEntry: db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)'),
+    addSignupRiskEvent: db.prepare('INSERT INTO signup_risk_events(id,subject_hash,mode,decision,score,signals_json,created_at) VALUES(?,?,?,?,?,?,?)'),
+    listSignupRiskEvents: db.prepare('SELECT mode,decision,score,signals_json,created_at FROM signup_risk_events ORDER BY created_at DESC,id DESC LIMIT ?'),
     listWaitlist: db.prepare('SELECT id,email,name,status,notes,created_at FROM waitlist ORDER BY created_at DESC LIMIT 500'),
     updateWaitlistStatus: db.prepare('UPDATE waitlist SET status=?,updated_at=? WHERE id=?'),
     waitlistPosition: db.prepare("SELECT COUNT(*) AS c FROM waitlist WHERE status='pending' AND created_at<=?"),
@@ -765,6 +790,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getPwResetToken: db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?'),
     usePwResetToken: db.prepare('UPDATE password_reset_tokens SET used=1 WHERE token_hash=? AND used=0'),
     cleanPwResetTokens: db.prepare('DELETE FROM password_reset_tokens WHERE expires_at<=? OR used=1'),
+    addSignupVerificationToken: db.prepare(`INSERT INTO signup_verification_tokens(token_hash,email_hash,expires_at,used_at,created_at) VALUES(?,?,?,NULL,?)
+      ON CONFLICT(email_hash) DO UPDATE SET token_hash=excluded.token_hash,expires_at=excluded.expires_at,used_at=NULL,created_at=excluded.created_at`),
+    getPendingSignupVerificationForEmail: db.prepare('SELECT token_hash FROM signup_verification_tokens WHERE email_hash=? AND used_at IS NULL AND expires_at>?'),
+    getSignupVerificationToken: db.prepare('SELECT token_hash FROM signup_verification_tokens WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?'),
+    useSignupVerificationToken: db.prepare('UPDATE signup_verification_tokens SET used_at=? WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?'),
+    deleteSignupVerificationToken: db.prepare('DELETE FROM signup_verification_tokens WHERE token_hash=? AND used_at IS NULL'),
+    cleanSignupVerificationTokens: db.prepare('DELETE FROM signup_verification_tokens WHERE expires_at<=? OR used_at IS NOT NULL'),
     linkWhatsApp: db.prepare(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
       VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,verified_at=excluded.verified_at,created_at=excluded.created_at`),
     getWhatsAppLink: db.prepare('SELECT * FROM whatsapp_links WHERE user_id=?'),
@@ -857,8 +889,79 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
+    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const apple=appleProofHash?db.prepare('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject').get(appleProofHash,appleEmailHash,timestamp()):null;
+        if(appleProofHash&&!apple)throw new Error('Apple proof expired');
+        if(verificationHash && !s.useSignupVerificationToken.run(timestamp(),verificationHash,emailHash,timestamp()).changes) throw new Error('Verification expired');
+        const count=s.countUsers.get().count;
+        if(count>0&&(environmentPaused||s.setting.get('signups_paused')?.value==='true'||(!automatic&&s.setting.get('registration_open')?.value!=='true')))throw new Error('Registration unavailable');
+        const role=count===0?'owner':'member';
+        const id=randomUUID(),now=timestamp();s.createUser.run(id,email,displayName,passwordHash,passwordSalt,role,now,now);
+        if(verificationHash||apple)s.markUserEmailVerified.run(now,now,id);
+        if(apple)s.linkAuthIdentity.run('apple',apple.subject,id,now,now);
+        db.exec('COMMIT');return s.userById.get(id);
+      } catch(error) {db.exec('ROLLBACK');throw error;}
+    },
+    addAppleSignupProof(hash,subject,emailHash,expiresAt) {
+      db.prepare('DELETE FROM apple_signup_proofs WHERE expires_at<=?').run(timestamp());
+      db.prepare('INSERT INTO apple_signup_proofs VALUES(?,?,?,?)').run(hash,subject,emailHash,expiresAt);
+    },
+    getAppleSignupProof: (hash,emailHash) => db.prepare('SELECT subject FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>?').get(hash,emailHash,timestamp()),
+    addSignupChallenge(hash, purpose, binding, expiresAt) {
+      db.prepare('DELETE FROM signup_challenges WHERE expires_at<=?').run(timestamp());
+      db.prepare('INSERT INTO signup_challenges VALUES(?,?,?,?,?)').run(hash,purpose,binding,expiresAt,timestamp());
+    },
+    consumeSignupChallenge(hash,purpose,binding) {
+      return db.prepare('DELETE FROM signup_challenges WHERE token_hash=? AND purpose=? AND binding=? AND expires_at>? RETURNING token_hash').get(hash,purpose,binding,timestamp()) != null;
+    },
+    getAppAttestKey: (id) => db.prepare('SELECT * FROM app_attest_keys WHERE key_id=?').get(id),
+    addAppAttestKey(id,key,environment) { db.prepare('INSERT INTO app_attest_keys VALUES(?,?,?,0,?)').run(id,key,environment,timestamp()); },
+    advanceAppAttestCounter(id,previous,next) {
+      return next>previous && db.prepare('UPDATE app_attest_keys SET sign_count=? WHERE key_id=? AND sign_count=?').run(next,id,previous).changes>0;
+    },
+    addSignupAppeal(email,note) {
+      const id=randomUUID(),now=timestamp();
+      db.prepare('DELETE FROM signup_appeals WHERE created_at<?').run(new Date(Date.now()-30*86400_000).toISOString());
+      db.prepare("INSERT INTO signup_appeals VALUES(?,?,?,'pending',?,?)").run(id,email,note,now,now);
+      return id;
+    },
+    listSignupAppeals: () => db.prepare('SELECT * FROM signup_appeals ORDER BY created_at DESC LIMIT 100').all(),
+    resolveSignupAppeal(id,status) { return db.prepare('UPDATE signup_appeals SET status=?,updated_at=? WHERE id=?').run(status,timestamp(),id).changes>0; },
+    finishRecovery(userId,codeHash,passwordHash,passwordSalt,newCodes) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const user=s.userById.get(userId),row=s.recovery.get(codeHash);
+        if(!user||user.disabled||!row||row.user_id!==userId||!s.useRecovery.run(timestamp(),row.id).changes){db.exec('ROLLBACK');return false;}
+        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),userId);s.deleteUserSessions.run(userId);s.clearRecovery.run(userId);
+        db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(userId);
+        for(const hash of newCodes)s.addRecovery.run(randomUUID(),userId,hash,timestamp());
+        db.exec('COMMIT');return true;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
+    finishPasswordReset(hash,passwordHash,passwordSalt) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row=s.getPwResetToken.get(hash,timestamp());
+        if(!row || !s.userById.get(row.user_id) || s.userById.get(row.user_id).disabled) { db.exec('ROLLBACK');return false; }
+        if(!s.usePwResetToken.run(hash).changes) { db.exec('ROLLBACK');return false; }
+        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),row.user_id);
+        s.deleteUserSessions.run(row.user_id);
+        db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(row.user_id);
+        db.exec('COMMIT');return true;
+      } catch(error) { db.exec('ROLLBACK');throw error; }
+    },
+    getAuthIdentity: (provider, subject) => s.authIdentity.get(provider, subject),
+    linkAuthIdentity(provider, subject, userId) {
+      const now = timestamp();
+      s.linkAuthIdentity.run(provider, subject, userId, now, now);
+      return s.authIdentity.get(provider, subject);
+    },
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled(id, disabled) { s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id); },
+    markUserEmailVerified(id) { const now=timestamp();return s.markUserEmailVerified.run(now,now,id).changes>0; },
     deleteUserAccount(userId) {
       const account = s.userById.get(userId);
       if (!account) return { deleted: false, successorId: null };
@@ -915,7 +1018,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         throw error;
       }
     },
-    consumeRecoveryCode(hash) { const row=s.recovery.get(hash); if(!row) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
+    consumeRecoveryCode(hash,userId) { const row=s.recovery.get(hash); if(!row || (userId && row.user_id!==userId)) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
     getSetting: (key, fallback=null) => s.setting.get(key)?.value ?? fallback,
     setSetting(key,value) { s.setSetting.run(key,String(value),timestamp()); },
     ensureDefaultConversation(userId) { const existing=s.listConversations.get(userId); if(existing){adoptOrphanMessages(db,userId);return existing;}
@@ -1341,8 +1444,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
+    getAccessRequest: (id) => s.getAccessRequest.get(id),
     listAccessRequests: () => s.listAccessRequests.all(),
     addWaitlistEntry({id,email,name}) { s.addWaitlistEntry.run(id,email,name||null,'pending',timestamp(),timestamp()); },
+    recordSignupRiskDecision({subjectHash=null,mode,decision,score,signals=[]}) { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};s.addSignupRiskEvent.run(row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },
+    listSignupRiskEvents: (limit=100) => s.listSignupRiskEvents.all(Math.max(1,Math.min(500,Number(limit)||100))),
     listWaitlist: () => s.listWaitlist.all(),
     updateWaitlistStatus: (id,status) => s.updateWaitlistStatus.run(status,timestamp(),id).changes>0,
     waitlistPosition: (createdAt) => s.waitlistPosition.get(createdAt).c,
@@ -1353,6 +1459,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getPasswordResetToken(tokenHash) { return s.getPwResetToken.get(tokenHash,timestamp()); },
     markPasswordResetTokenUsed(tokenHash) { return s.usePwResetToken.run(tokenHash).changes>0; },
     cleanExpiredPasswordResetTokens() { s.cleanPwResetTokens.run(timestamp()); },
+    addSignupVerificationToken(tokenHash,emailHash,expiresAt) { s.addSignupVerificationToken.run(tokenHash,emailHash,expiresAt,timestamp()); },
+    getPendingSignupVerificationForEmail(emailHash) { return s.getPendingSignupVerificationForEmail.get(emailHash,timestamp()); },
+    getSignupVerificationToken(tokenHash,emailHash) { return s.getSignupVerificationToken.get(tokenHash,emailHash,timestamp()); },
+    consumeSignupVerificationToken(tokenHash,emailHash) { const now=timestamp();return s.useSignupVerificationToken.run(now,tokenHash,emailHash,now).changes>0; },
+    deleteSignupVerificationToken(tokenHash) { return s.deleteSignupVerificationToken.run(tokenHash).changes>0; },
+    cleanSignupVerificationTokens() { s.cleanSignupVerificationTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
     exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
     restoreUser(userId, bundle) {

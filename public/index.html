@@ -21,7 +21,7 @@
     />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261020a" />
+    <link rel="stylesheet" href="/styles.css?v=20261021e" />
     <link rel="stylesheet" href="/mobile.css?v=20261019c" />
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
@@ -794,9 +794,10 @@
             <p class="muted">
               Receive task completion and safety alerts on supported devices.
             </p>
-            <button id="enable-push" class="primary">
-              Enable on this device
+            <button id="enable-push" class="primary" aria-describedby="push-setup-status">
+              Enable Notifications
             </button>
+            <p id="push-setup-status" class="muted" role="status" aria-live="polite"></p>
           </section>
           <section class="panel">
             <h2>Encrypted backup</h2>
@@ -841,6 +842,18 @@
             <button id="registration-toggle" class="primary block-top">
               Open
             </button>
+          </section>
+          <section class="panel hidden" id="signup-risk-panel">
+            <h2>Signup safety</h2><p id="signup-risk-status" class="muted"></p>
+            <button id="signup-pause-toggle" type="button" class="danger">Pause new signups</button>
+            <div id="signup-risk-counts" class="block-top"></div>
+            <h3>Signup appeals</h3><p class="muted">Review requests without changing account access. Use verified email recovery for existing accounts.</p>
+            <div id="signup-appeals" class="card-list"></div>
+          </section>
+          <section class="panel hidden" id="apple-link-panel">
+            <h2>Sign in with Apple</h2><p class="muted">Link Apple to this account while keeping your password and recovery codes.</p>
+            <label>Current password<input id="apple-link-password" type="password" autocomplete="current-password" /></label>
+            <button id="apple-link" type="button" class="primary">Link Apple</button>
           </section>
           <section class="panel hidden" id="access-panel">
             <h2>Access requests</h2>
@@ -922,6 +935,13 @@
         <p id="forgot-row" class="hidden" style="text-align:right;margin:4px 0 0;">
           <button type="button" id="show-forgot" class="ghost" style="font-size:.85em;padding:4px 8px;">Forgot password?</button>
         </p>
+        <button id="apple-login" type="button" class="ghost hidden">Sign in with Apple</button>
+        <button id="apple-signup" type="button" class="ghost hidden">Create account with Apple</button>
+        <details><summary>Need help joining?</summary>
+          <label>What happened?<textarea id="signup-appeal-note" maxlength="500"></textarea></label>
+          <button id="signup-appeal-send" type="button" class="ghost">Request signup review</button>
+          <p class="hint">Enter your email above. Existing accounts can use Forgot password or a recovery code.</p>
+        </details>
         <p id="auth-error" class="error" role="alert"></p>
         <div id="auth-closed" class="hidden">
           <p>Registration is closed — ask the owner for access.</p>
@@ -1014,6 +1034,6 @@
     <script src="/vendor/marked.min.js" defer></script>
     <script src="/vendor/purify.min.js" defer></script>
     <script src="/pwa-install.js" defer></script>
-    <script type="module" src="/app.js?v=20261020a"></script>
+    <script type="module" src="/app.js?v=20261021e"></script>
   </body>
 </html>
