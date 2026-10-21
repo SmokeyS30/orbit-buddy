@@ -1,3 +1,4 @@
+import { authLinkOrigin } from './src/auth-link-origin.js';
 import { appleAuthReady, validateAppleAuthorization } from './src/apple-auth.js';
 import { appAttestReady, verifyAppAttestation, verifyAppAssertion } from './src/app-attest.js';
 import http from 'node:http';
@@ -507,6 +508,7 @@ export function applyActivityRhythmDetection(db,user,{nowMs,timeZone}={}){
 
 export function createOrbitServer(options={}) {
   const env=options.env||process.env;
+  const emailLinkOrigin=authLinkOrigin(env);
   const defaultBuddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
@@ -2345,7 +2347,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured,appleSignInReady:appleAuthReady(env),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured,appleSignInReady:appleAuthReady(env),appleSignupReady:appleAuthReady(env)&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
@@ -2360,13 +2362,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=await readJson(req);const name=cleanText(body.name,80,'name');const email=safeEmail(body.email);
         const note=body.note&&String(body.note).trim()?cleanText(body.note,500,'note'):null;
         const saved=db.addAccessRequest({name,email,note});
-        // Create a disabled placeholder account now so approval is seamless (no duplication)
-        let existing=db.getUserByEmail(email);
-        if(!existing&&!signupPause()){
-          const tempPass=await hashPassword(randomToken(32));
-          existing=db.createUser({email,displayName:name,passwordHash:tempPass.hash,passwordSalt:tempPass.salt,role:'member'});
-          db.setUserDisabled(existing.id,true);
-        }
+        // Requests never reserve an email or create an account. The owner approval
+        // transaction creates it after the pause is lifted. Legacy placeholders remain supported.
         const owner=db.listUsers().find((u)=>u.role==='owner');
         if(owner){
           const doorToken='door_'+randomToken(24);
@@ -2644,15 +2641,15 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(req.method==='POST'&&url.pathname==='/api/auth/apple/challenge'){
         if(rateLimited(req,20,'apple-challenge'))return json(res,429,{error:'Try again later.'});
         if(!appleAuthReady(env))return json(res,503,{error:'Apple sign-in is not configured.'});
-        const body=await readJson(req);const purpose=body.purpose==='link'?'link':'login';
-        let binding='login';
+        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';
+        let binding=purpose;
         if(purpose==='link'){const user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;}
         const nonce=randomToken(32);db.addSignupChallenge(hashToken(nonce),'apple-'+purpose,binding,new Date(Date.now()+5*60_000).toISOString());
         return json(res,200,{nonce,purpose});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/apple/complete'){
         if(rateLimited(req,20,'apple-complete'))return json(res,429,{error:'Try again later.'});
-        const body=await readJson(req);const purpose=body.purpose==='link'?'link':'login';let user=null,binding='login';
+        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';let user=null,binding=purpose;
         if(purpose==='link'){
           user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;
           const account=db.getUserById(binding);
@@ -2666,6 +2663,17 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           if(linked&&linked.user_id!==binding)return json(res,409,{error:'This Apple identity is already linked.'});
           if(!linked){try{db.linkAuthIdentity('apple',identity.subject,binding);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}}
           db.addEvent(binding,'apple_linked','Linked Sign in with Apple.');return json(res,200,{ok:true});
+        }
+        if(purpose==='signup'){
+          if(linked)return json(res,409,{error:'This Apple identity already has an account. Use Sign in with Apple.'});
+          if(!identity.email)return json(res,409,{error:'Apple did not provide a verified email. Create a password account, then link Apple in Safety.'});
+          const email=safeEmail(identity.email);
+          if(db.getUserByEmail(email))return json(res,409,{error:'An account already uses this email. Sign in with your password and explicitly link Apple in Safety.'});
+          const key=env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY;
+          const emailHash=signupAuditSubject(email,key);
+          if(!emailHash)return json(res,503,{error:'Apple signup is not configured.'});
+          const proof=randomToken(32);db.addAppleSignupProof(hashToken(proof),identity.subject,emailHash,new Date(Date.now()+5*60_000).toISOString());
+          return json(res,200,{email,appleSignupProof:proof});
         }
         // Never link by email, even if Apple says that email is verified.
         if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
@@ -2721,7 +2729,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const verificationKey=env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY;
         const emailHash=signupAuditSubject(email,verificationKey);
         const verificationTokenHash=verificationToken?hashToken(verificationToken):null;
-        const verifiedEmail=Boolean(emailHash&&verificationTokenHash&&db.getSignupVerificationToken(verificationTokenHash,emailHash));
+        const appleProofHash=body.appleSignupProof?hashToken(String(body.appleSignupProof)):null;
+        const appleProof=appleProofHash&&emailHash?db.getAppleSignupProof(appleProofHash,emailHash):null;
+        if(appleProofHash&&!appleProof)return json(res,401,{error:'Apple signup proof expired or belongs to a different email. Start again.'});
+        const verifiedEmail=Boolean(appleProof||(emailHash&&verificationTokenHash&&db.getSignupVerificationToken(verificationTokenHash,emailHash)));
         const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen(),verifiedEmail});
         if(admission.action==='deny')throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
         if(admission.action==='verify'){
@@ -2731,12 +2742,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           db.cleanSignupVerificationTokens();
           const rawToken=randomToken(32);const expiresAt=new Date(Date.now()+15*60_000).toISOString();
           db.addSignupVerificationToken(hashToken(rawToken),emailHash,expiresAt);
-          const verifyUrl=`${originFor(req)}/index.html#signup-verify=${encodeURIComponent(rawToken)}`;
+          const verifyUrl=`${emailLinkOrigin}/index.html#signup-verify=${encodeURIComponent(rawToken)}`;
           const sent=await sendSignupVerificationEmail({to:email,verifyUrl});
           if(!sent){db.deleteSignupVerificationToken(hashToken(rawToken));throw Object.assign(new Error('Email verification is temporarily unavailable. Please try again later.'),{status:503});}
           throw Object.assign(new Error('Check your email to verify your address and finish creating your Orbit account.'),{status:403,verificationRequired:true,verificationSent:true});
         }
-        const password=await hashPassword(body.password);
+        const password=await hashPassword(appleProof&&!body.password?randomToken(48):body.password);
         if(admission.action==='closed')throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
         // Password hashing yields: recheck pause and the registration door afterward.
         const currentCount=db.countUsers();
@@ -2744,7 +2755,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(currentCount>0&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow')return json(res,403,{error:'Registration is not currently available.'});
         let user;
         try{user=db.createSignupAccount({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,
-          verificationHash:admission.reason==='verified_email'?verificationTokenHash:null,emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
+          verificationHash:admission.reason==='verified_email'&&!appleProof?verificationTokenHash:null,emailHash,appleProofHash,appleEmailHash:emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
         catch{return json(res,409,{error:'Account creation could not complete. Sign in or request a fresh verification link.'});}
         if(user.role==='owner')db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
         // L3: simpler onboarding — seed the default conversation with a warm welcome
@@ -2776,7 +2787,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();
             db.addPasswordResetToken(hashToken(token),user.id,expiresAt);
             db.cleanExpiredPasswordResetTokens();
-            const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;
+            const resetUrl=`${emailLinkOrigin}/reset-password?token=${token}`;
             const emailed=await sendPasswordResetEmail({to:email,resetUrl});
             // A failed email never sends a bearer reset link through push notifications.
             if(!emailed)db.markPasswordResetTokenUsed(hashToken(token));
@@ -3367,7 +3378,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='GET'&&url.pathname==='/api/admin/signup-risk'){requireOwner(user);return json(res,200,{...summarizeSignupRiskEvents(db.listSignupRiskEvents(100)),mode:signupRiskMode(env),paused:signupPause(),environmentPaused:signupsPaused(env)});}
         if(req.method==='POST'&&url.pathname==='/api/admin/signup-pause'){
           requireOwner(user);const body=await readJson(req);if(typeof body.paused!=='boolean')return json(res,400,{error:'paused must be boolean.'});
-          db.setSetting('signups_paused',String(body.paused));db.addEvent(userId,'signup_pause_changed',body.paused?'Paused new signups.':'Released owner signup pause.');
+          db.setSignupPause(body.paused);db.addEvent(userId,'signup_pause_changed',body.paused?'Paused new signups.':'Released owner signup pause.');
           return json(res,200,{paused:signupPause(),environmentPaused:signupsPaused(env)});
         }
         if(req.method==='GET'&&url.pathname==='/api/admin/signup-appeals'){requireOwner(user);return json(res,200,{appeals:db.listSignupAppeals()});}
@@ -3378,9 +3389,25 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
         if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
-        const accessApprove=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/approve$/);if(req.method==='POST'&&accessApprove){requireOwner(user);const req2=db.getAccessRequest(accessApprove[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,false);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessApprove[1]);db.addEvent(user.id,'access_approved',`Approved Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,approved:true});}
-        if(req.method==='POST'&&url.pathname==='/api/admin/reset-password'){requireOwner(user);const body=await readJson(req);const email=safeEmail(body.email);if(!email)throw Object.assign(new Error('Email required.'),{status:400});const target=db.getUserByEmail(email);if(!target)throw Object.assign(new Error('User not found.'),{status:404});const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();db.addPasswordResetToken(hashToken(token),target.id,expiresAt);db.cleanExpiredPasswordResetTokens();const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;const emailed=await sendPasswordResetEmail({to:email,resetUrl});db.addEvent(user.id,'password_reset',`Sent password reset email to ${target.email}.`);return json(res,200,{ok:true,emailed});}
-        const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,true);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessDeny[1]);db.addEvent(user.id,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
+        const accessApprove=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/approve$/);
+        if(req.method==='POST'&&accessApprove){
+          requireOwner(user);const request=db.getAccessRequest(accessApprove[1]);
+          if(!request||request.handled_at)return json(res,404,{error:'Pending request not found.'});
+          if(signupPause())return json(res,503,{error:'Resume new signups before approving this request.'});
+          let target=db.getUserByEmail(request.email);
+          if(!target){
+            const password=await hashPassword(randomToken(48));
+            const currentOwner=authenticate(req);if(!currentOwner)return json(res,401,{error:'Sign in again to approve access.'});requireOwner(currentOwner);
+            if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
+            try{target=db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
+            catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
+          }else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
+          db.dismissAccessRequest(request.id);
+          db.addEvent(userId,'access_approved','Approved a requested account; secure email recovery is required.');
+          return json(res,200,{ok:true,approved:true,requiresEmailRecovery:true});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/admin/reset-password'){requireOwner(user);const body=await readJson(req);const email=safeEmail(body.email);if(!email)throw Object.assign(new Error('Email required.'),{status:400});const target=db.getUserByEmail(email);if(!target)throw Object.assign(new Error('User not found.'),{status:404});const token=randomToken(32);const expiresAt=new Date(Date.now()+60*60_000).toISOString();db.addPasswordResetToken(hashToken(token),target.id,expiresAt);db.cleanExpiredPasswordResetTokens();const resetUrl=`${emailLinkOrigin}/reset-password?token=${token}`;const emailed=await sendPasswordResetEmail({to:email,resetUrl});if(!emailed)db.markPasswordResetTokenUsed(hashToken(token));db.addEvent(userId,'password_reset',emailed?'Sent a password reset email.':'Password reset email delivery failed; token invalidated.');return json(res,200,{ok:true,emailed});}
+        const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});db.dismissAccessRequest(accessDeny[1]);db.addEvent(userId,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
         return json(res,404,{error:'API route not found.'});
       }
     } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true,quota:error.quota||null}:{};const verificationFlag=error&&error.verificationRequired===true?{verificationRequired:true,verificationSent:error.verificationSent===true}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag,verificationFlag)); }

@@ -1,5 +1,8 @@
 // Additive and deliberately shared by SQLite startup and PostgreSQL upgrades.
 export const signupSecuritySchema = [
+  `CREATE TABLE IF NOT EXISTS apple_signup_proofs (
+    token_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, email_hash TEXT NOT NULL, expires_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS signup_challenges (
     token_hash TEXT PRIMARY KEY, purpose TEXT NOT NULL, binding TEXT NOT NULL,
     expires_at TEXT NOT NULL, created_at TEXT NOT NULL

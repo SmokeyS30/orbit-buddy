@@ -889,18 +889,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
-    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false}) {
+    setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
+    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');
       try {
+        const apple=appleProofHash?db.prepare('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject').get(appleProofHash,appleEmailHash,timestamp()):null;
+        if(appleProofHash&&!apple)throw new Error('Apple proof expired');
         if(verificationHash && !s.useSignupVerificationToken.run(timestamp(),verificationHash,emailHash,timestamp()).changes) throw new Error('Verification expired');
         const count=s.countUsers.get().count;
         if(count>0&&(environmentPaused||s.setting.get('signups_paused')?.value==='true'||(!automatic&&s.setting.get('registration_open')?.value!=='true')))throw new Error('Registration unavailable');
         const role=count===0?'owner':'member';
         const id=randomUUID(),now=timestamp();s.createUser.run(id,email,displayName,passwordHash,passwordSalt,role,now,now);
-        if(verificationHash)s.markUserEmailVerified.run(now,now,id);
+        if(verificationHash||apple)s.markUserEmailVerified.run(now,now,id);
+        if(apple)s.linkAuthIdentity.run('apple',apple.subject,id,now,now);
         db.exec('COMMIT');return s.userById.get(id);
       } catch(error) {db.exec('ROLLBACK');throw error;}
     },
+    addAppleSignupProof(hash,subject,emailHash,expiresAt) {
+      db.prepare('DELETE FROM apple_signup_proofs WHERE expires_at<=?').run(timestamp());
+      db.prepare('INSERT INTO apple_signup_proofs VALUES(?,?,?,?)').run(hash,subject,emailHash,expiresAt);
+    },
+    getAppleSignupProof: (hash,emailHash) => db.prepare('SELECT subject FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>?').get(hash,emailHash,timestamp()),
     addSignupChallenge(hash, purpose, binding, expiresAt) {
       db.prepare('DELETE FROM signup_challenges WHERE expires_at<=?').run(timestamp());
       db.prepare('INSERT INTO signup_challenges VALUES(?,?,?,?,?)').run(hash,purpose,binding,expiresAt,timestamp());
@@ -1435,6 +1444,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
     consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
+    getAccessRequest: (id) => s.getAccessRequest.get(id),
     listAccessRequests: () => s.listAccessRequests.all(),
     addWaitlistEntry({id,email,name}) { s.addWaitlistEntry.run(id,email,name||null,'pending',timestamp(),timestamp()); },
     recordSignupRiskDecision({subjectHash=null,mode,decision,score,signals=[]}) { const row={id:randomUUID(),subject_hash:subjectHash,mode,decision,score:Number(score)||0,signals_json:JSON.stringify(signals),created_at:timestamp()};s.addSignupRiskEvent.run(row.id,row.subject_hash,row.mode,row.decision,row.score,row.signals_json,row.created_at);return row; },

@@ -348,6 +348,18 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     assert.deepEqual((await Promise.all([db.finishPasswordReset(suffix,'first','salt'),db.finishPasswordReset(suffix,'second','salt')])).sort(),[false,true]);
     assert.ok(['first','second'].includes((await db.getUserById(user.id)).password_hash));
     assert.equal((await db.getUserById(other.id)).password_hash,'old');
+    await db.addAppleSignupProof('apple-'+suffix,'apple-'+suffix,'email-'+suffix,expiry);
+    const appleUser=await db.createSignupAccount({email:`apple-${suffix}@example.com`,displayName:'Apple',passwordHash:'unusable-random',passwordSalt:'salt',appleProofHash:'apple-'+suffix,appleEmailHash:'email-'+suffix,automatic:true});
+    assert.equal((await db.getAuthIdentity('apple','apple-'+suffix)).user_id,appleUser.id);
+    assert.ok(appleUser.email_verified_at);
+    await db.addAppleSignupProof('collision-'+suffix,'apple-'+suffix,'email2-'+suffix,expiry);
+    await assert.rejects(db.createSignupAccount({email:`apple-collision-${suffix}@example.com`,displayName:'Collision',passwordHash:'random',passwordSalt:'salt',appleProofHash:'collision-'+suffix,appleEmailHash:'email2-'+suffix,automatic:true}));
+    assert.ok(await db.getAppleSignupProof('collision-'+suffix,'email2-'+suffix),'identity collision rolls back proof consumption');
+    assert.equal(await db.getUserByEmail(`apple-collision-${suffix}@example.com`),null,'identity collision rolls back account creation');
+    await db.setSignupPause(true);
+    await assert.rejects(db.createSignupAccount({email:`paused-${suffix}@example.com`,displayName:'Paused',passwordHash:'random',passwordSalt:'salt',automatic:true}));
+    await db.setSignupPause(false);
+    await db.deleteUserAccount(appleUser.id);
     await db.deleteUserAccount(user.id);await db.deleteUserAccount(other.id);
   } finally { await db.close(); }
 });

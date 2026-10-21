@@ -19,8 +19,12 @@ public class SignupSecurityPlugin: CAPPlugin, CAPBridgedPlugin, ASAuthorizationC
     private var pendingSignIn: CAPPluginCall?
     private var anchor: ASPresentationAnchor?
     private var authorizationController: ASAuthorizationController?
-    private let keyName = "orbit.appAttest.key.v1"
-    private let registeredName = "orbit.appAttest.registered.v1"
+    private func storageKeys(_ call: CAPPluginCall) -> (key: String, registered: String) {
+        // Separate test-server enrollment from production enrollment on a device.
+        let namespace = call.getString("namespace") ?? "https://orbitbuddy.app"
+        let digest = SHA256.hash(data: Data(namespace.utf8)).map { String(format: "%02x", $0) }.joined()
+        return ("orbit.appAttest.key.v2." + digest, "orbit.appAttest.registered.v2." + digest)
+    }
 
     @objc func signIn(_ call: CAPPluginCall) {
         guard let nonce = call.getString("nonce"), nonce.count >= 32 else { call.reject("Missing server nonce"); return }
@@ -56,12 +60,13 @@ public class SignupSecurityPlugin: CAPPlugin, CAPBridgedPlugin, ASAuthorizationC
     }
     @objc func getKey(_ call: CAPPluginCall) {
         guard DCAppAttestService.shared.isSupported else { call.resolve(["supported": false]); return }
-        if let key = UserDefaults.standard.string(forKey: keyName) {
-            call.resolve(["supported": true, "keyId": key, "registered": UserDefaults.standard.bool(forKey: registeredName)]); return
+        let keys = storageKeys(call)
+        if let key = UserDefaults.standard.string(forKey: keys.key) {
+            call.resolve(["supported": true, "keyId": key, "registered": UserDefaults.standard.bool(forKey: keys.registered)]); return
         }
         DCAppAttestService.shared.generateKey { key, error in
             guard let key = key, error == nil else { call.reject("App Attest unavailable"); return }
-            UserDefaults.standard.set(key, forKey: self.keyName)
+            UserDefaults.standard.set(key, forKey: keys.key)
             call.resolve(["supported": true, "keyId": key, "registered": false])
         }
     }
@@ -82,6 +87,8 @@ public class SignupSecurityPlugin: CAPPlugin, CAPBridgedPlugin, ASAuthorizationC
         }
     }
     @objc func markRegistered(_ call: CAPPluginCall) {
-        UserDefaults.standard.set(true, forKey: registeredName); call.resolve()
+        let keys = storageKeys(call)
+        guard let key = call.getString("keyId"), key == UserDefaults.standard.string(forKey: keys.key) else { call.reject("Enrollment key changed"); return }
+        UserDefaults.standard.set(true, forKey: keys.registered); call.resolve()
     }
 }

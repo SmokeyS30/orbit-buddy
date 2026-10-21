@@ -441,16 +441,28 @@ const indexMigrations = [
     // email column is CITEXT: plain = is already case-insensitive
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
-    createSignupAccount: async ({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false}) => withTransaction(async ({get:tGet,run:tRun,query:tQuery}) => {
+    setSignupPause: async (paused) => withTransaction(async ({query:tQuery,run:tRun}) => {
+      await tQuery('SELECT pg_advisory_xact_lock(1941101)');
+      await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
+    }),
+    createSignupAccount: async ({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) => withTransaction(async ({get:tGet,run:tRun,query:tQuery}) => {
       // Serialize bootstrap across server processes without modifying existing accounts.
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       const count=Number((await tGet('SELECT COUNT(*) AS count FROM users')).count);
       if(count>0&&(environmentPaused||(await tGet("SELECT value FROM settings WHERE key='signups_paused'"))?.value==='true'||(!automatic&&(await tGet("SELECT value FROM settings WHERE key='registration_open'"))?.value!=='true')))throw new Error('Registration unavailable');
+      const apple=appleProofHash?await tGet('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject',appleProofHash,appleEmailHash,timestamp()):null;
+      if(appleProofHash&&!apple)throw new Error('Apple proof expired');
       if(verificationHash && !(await tRun('UPDATE signup_verification_tokens SET used_at=? WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?',timestamp(),verificationHash,emailHash,timestamp())).changes)throw new Error('Verification expired');
       const id=randomUUID(),now=timestamp();
-      await tRun('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,created_at,updated_at,email_verified_at) VALUES(?,?,?,?,?,?,?,?,?)',id,email,displayName,passwordHash,passwordSalt,count===0?'owner':'member',now,now,verificationHash?now:null);
+      await tRun('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,created_at,updated_at,email_verified_at) VALUES(?,?,?,?,?,?,?,?,?)',id,email,displayName,passwordHash,passwordSalt,count===0?'owner':'member',now,now,(verificationHash||apple)?now:null);
+      if(apple)await tRun('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)','apple',apple.subject,id,now,now);
       return tGet('SELECT * FROM users WHERE id=?',id);
     }),
+    async addAppleSignupProof(hash,subject,emailHash,expiresAt) {
+      await run('DELETE FROM apple_signup_proofs WHERE expires_at<=?',timestamp());
+      await run('INSERT INTO apple_signup_proofs VALUES(?,?,?,?)',hash,subject,emailHash,expiresAt);
+    },
+    getAppleSignupProof: async (hash,emailHash) => get('SELECT subject FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>?',hash,emailHash,timestamp()),
     async addSignupChallenge(hash,purpose,binding,expiresAt) {
       await run('DELETE FROM signup_challenges WHERE expires_at<=?',timestamp());
       await run('INSERT INTO signup_challenges VALUES(?,?,?,?,?)',hash,purpose,binding,expiresAt,timestamp());

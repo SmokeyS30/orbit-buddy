@@ -647,3 +647,7 @@ CREATE TABLE IF NOT EXISTS signup_appeals (
     id TEXT PRIMARY KEY, email TEXT NOT NULL, note TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   );
+
+CREATE TABLE IF NOT EXISTS apple_signup_proofs (
+    token_hash TEXT PRIMARY KEY, subject TEXT NOT NULL, email_hash TEXT NOT NULL, expires_at TEXT NOT NULL
+  );

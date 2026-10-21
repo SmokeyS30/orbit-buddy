@@ -90,6 +90,10 @@ test('additive SQLite restart preserves identities and passwords; reset consumpt
   db.setSetting('registration_open','true');db.addSignupVerificationToken('token','email-hash',new Date(Date.now()+60_000).toISOString());
   assert.throws(()=>db.createSignupAccount({email:'old@example.com',displayName:'Collision',passwordHash:'new',passwordSalt:'new',verificationHash:'token',emailHash:'email-hash'}));
   assert.ok(db.getSignupVerificationToken('token','email-hash'));
+  db.addAppleSignupProof('apple-proof','subject','apple-email',new Date(Date.now()+60_000).toISOString());
+  assert.throws(()=>db.createSignupAccount({email:'collision@example.com',displayName:'Collision',passwordHash:'new',passwordSalt:'salt',appleProofHash:'apple-proof',appleEmailHash:'apple-email'}));
+  assert.equal(db.getUserByEmail('collision@example.com'),undefined);
+  assert.ok(db.getAppleSignupProof('apple-proof','apple-email'),'identity collision rolls back proof and new account');
   db.addPasswordResetToken(hashToken('reset'),user.id,new Date(Date.now()+60_000).toISOString());
   db.addPasswordResetToken(hashToken('sibling'),user.id,new Date(Date.now()+60_000).toISOString());
   assert.equal(db.finishPasswordReset(hashToken('reset'),'new','salt'),true);assert.equal(db.finishPasswordReset(hashToken('reset'),'attacker','salt'),false);
@@ -100,11 +104,11 @@ test('additive SQLite restart preserves identities and passwords; reset consumpt
 test('Apple HTTP flow requires authenticated explicit linking and cannot replay or link a colliding subject',async t=>{
   const rsa=await generateKeyPair('RS256'),ec=await generateKeyPair('ES256',{extractable:true});
   const keys=createLocalJWKSet({keys:[{...await exportJWK(rsa.publicKey),kid:'test'}]});
-  const env={APPLE_CLIENT_ID:'com.test',APPLE_TEAM_ID:'TEAM',APPLE_KEY_ID:'test',APPLE_PRIVATE_KEY:await exportPKCS8(ec.privateKey)};
+  const env={APPLE_CLIENT_ID:'com.test',APPLE_TEAM_ID:'TEAM',APPLE_KEY_ID:'test',APPLE_PRIVATE_KEY:await exportPKCS8(ec.privateKey),SIGNUP_AUDIT_KEY:'test-only-binding-key'};
   let exchangedToken;
   const {app,request,owner}=await fixture(t,env,{appleVerification:{keys,fetchImpl:async()=>Response.json({id_token:exchangedToken})}});
-  const credentials=async(nonce,sub='shared-subject')=>{
-    exchangedToken=await new SignJWT({sub,nonce,email:'owner@example.com',email_verified:true}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://appleid.apple.com').setAudience('com.test').setIssuedAt().setExpirationTime('5m').sign(rsa.privateKey);
+  const credentials=async(nonce,sub='shared-subject',email='owner@example.com')=>{
+    exchangedToken=await new SignJWT({sub,nonce,email,email_verified:true}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://appleid.apple.com').setAudience('com.test').setIssuedAt().setExpirationTime('5m').sign(rsa.privateKey);
     return {identityToken:exchangedToken,authorizationCode:'mock-code',nonce};
   };
   assert.equal((await request('/api/auth/apple/challenge',{purpose:'link'})).status,401);
@@ -122,6 +126,22 @@ test('Apple HTTP flow requires authenticated explicit linking and cannot replay 
   assert.equal(app.db.getAuthIdentity('apple','shared-subject').user_id,owner.body.user.id);
   const login=(await request('/api/auth/apple/challenge',{purpose:'login'})).body;
   assert.equal((await request('/api/auth/apple/complete',{purpose:'login',...await credentials(login.nonce)})).status,200);
+  const signupChallenge=(await request('/api/auth/apple/challenge',{purpose:'signup'})).body;
+  const proof=await request('/api/auth/apple/complete',{purpose:'signup',...await credentials(signupChallenge.nonce,'new-apple-subject','new-apple@example.com')});
+  assert.equal(proof.status,200);assert.ok(proof.body.appleSignupProof);
+  assert.equal((await request('/api/auth/register',{email:'wrong@example.com',displayName:'Wrong',appleSignupProof:proof.body.appleSignupProof})).status,401);
+  await request('/api/admin/signup-pause',{paused:true},owner);
+  assert.equal((await request('/api/auth/register',{email:proof.body.email,displayName:'Apple',appleSignupProof:proof.body.appleSignupProof})).status,503);
+  await request('/api/admin/signup-pause',{paused:false},owner);
+  const created=await request('/api/auth/register',{email:proof.body.email,displayName:'Apple',appleSignupProof:proof.body.appleSignupProof});
+  assert.equal(created.status,201);assert.ok(created.body.recoveryCodes.length);
+  assert.equal(app.db.getAuthIdentity('apple','new-apple-subject').user_id,created.body.user.id);
+  assert.ok(app.db.getUserById(created.body.user.id).email_verified_at);
+  assert.equal((await request('/api/auth/register',{email:proof.body.email,displayName:'Replay',appleSignupProof:proof.body.appleSignupProof})).status,409);
+  const appleLogin=(await request('/api/auth/apple/challenge',{purpose:'login'})).body;
+  assert.equal((await request('/api/auth/apple/complete',{purpose:'login',...await credentials(appleLogin.nonce,'new-apple-subject','new-apple@example.com')})).body.user.id,created.body.user.id);
+  const duplicate=(await request('/api/auth/apple/challenge',{purpose:'signup'})).body;
+  assert.equal((await request('/api/auth/apple/complete',{purpose:'signup',...await credentials(duplicate.nonce,'different-subject','owner@example.com')})).status,409);
   app.db.setUserDisabled(owner.body.user.id,true);
   const disabled=(await request('/api/auth/apple/challenge',{purpose:'login'})).body;
   assert.equal((await request('/api/auth/apple/complete',{purpose:'login',...await credentials(disabled.nonce)})).status,401);
@@ -161,4 +181,41 @@ test('attestation API binds assertion to signup email, rejects replay, and ignor
   const signup=await request('/api/auth/register',{email,displayName:'Proof',password,attestationProof:complete.body.proof});assert.equal(signup.status,201);
   assert.equal(app.db.consumeSignupChallenge(hashToken(complete.body.proof),'signup-attested',hashToken(email)),false);
   assert.equal((await request('/api/auth/register',{email:'fallback@example.com',displayName:'Fallback',password,attested:true,attestationProof:'fake'})).status,201,'observe mode preserves fallback');
+});
+
+test('paused access request resumes through owner approval and secure email claim without reserving an account',async t=>{
+  const sent=[];
+  const {app,request,owner}=await fixture(t,{PUBLIC_BASE_URL:'https://test.orbit.example'},{sendEmail:async(_env,message)=>{sent.push(message);return true;}});
+  await request('/api/admin/signup-pause',{paused:true},owner);
+  const queued=await request('/api/registration-request',{email:'queued@example.com',name:'Queued'});
+  assert.equal(queued.status,201);assert.equal(app.db.getUserByEmail('queued@example.com'),undefined);
+  const route='/api/admin/access-requests/'+queued.body.id+'/approve';
+  assert.equal((await request(route,{},owner)).status,503);
+  assert.equal(app.db.getAccessRequest(queued.body.id).handled_at,null);
+  await request('/api/admin/signup-pause',{paused:false},owner);
+  assert.equal((await request(route,{},owner)).body.approved,true);
+  assert.equal((await request('/api/access-status?email=queued%40example.com')).body.status,'approved');
+  assert.equal((await request('/api/access-claim',{email:'queued@example.com',password})).status,410);
+  await request('/api/auth/forgot-password',{email:'queued@example.com'});
+  const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);assert.equal(resetUrl.origin,'https://test.orbit.example');
+  assert.equal((await request('/api/auth/reset-password',{token:resetUrl.searchParams.get('token'),newPassword:password})).status,200);
+  assert.equal((await request('/api/auth/login',{email:'queued@example.com',password})).status,200);
+  assert.equal((await request('/api/auth/reset-password',{token:resetUrl.searchParams.get('token'),newPassword:password})).status,400);
+});
+
+test('failed owner reset delivery invalidates its token and uses configured origin',async t=>{
+  const sent=[];const {app,request,owner}=await fixture(t,{PUBLIC_BASE_URL:'https://test.orbit.example'},{sendEmail:async(_env,message)=>{sent.push(message);return false;}});
+  const response=await request('/api/admin/reset-password',{email:'owner@example.com'},owner);assert.equal(response.body.emailed,false);
+  const url=new URL(sent[0].text.match(/https?:\/\/\S+/)[0]);assert.equal(url.origin,'https://test.orbit.example');
+  assert.equal(app.db.getPasswordResetToken(hashToken(url.searchParams.get('token'))),undefined);
+});
+
+test('pause activated after approval password hashing still prevents account creation and keeps request pending',async t=>{
+  const {app,request,owner}=await fixture(t);
+  const queued=await request('/api/registration-request',{email:'race@example.com',name:'Race'});
+  const create=app.db.createSignupAccount;
+  app.db.createSignupAccount=(input)=>{app.db.setSetting('signups_paused','true');return create(input);};
+  const response=await request('/api/admin/access-requests/'+queued.body.id+'/approve',{},owner);
+  assert.equal(response.status,409);assert.equal(app.db.getUserByEmail('race@example.com'),undefined);
+  assert.equal(app.db.getAccessRequest(queued.body.id).handled_at,null);
 });
