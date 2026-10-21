@@ -38,7 +38,7 @@ test('native branch never reports "not supported" before checking the plugin', (
   const body = updatePushButtonBody();
   const nativeSection = body.slice(0, body.indexOf("if(!('serviceWorker'in navigator)"));
   assert.doesNotMatch(nativeSection, /Not supported on this device/);
-  assert.match(nativeSection, /Send test notification/);
+  assert.match(nativeSection, /showNotificationSettings\(\)/);
   assert.match(nativeSection, /Enable on this device/);
 });
 
@@ -125,10 +125,10 @@ test('native setup waits for the bridge and starts only after authenticated conn
   assert.doesNotMatch(appJs, /updatePushButton\(\);\s*if\(isNativeRuntime\(window\)\)setupNativePush\(\);/);
 });
 
-test('an enabled native device can always request a verified test push', () => {
+test('an enabled native device replaces the test control with notification settings text', () => {
   const body = updatePushButtonBody();
-  assert.match(body, /permission==='granted'&&apnsRegistered\(\)[\s\S]*?btn\.disabled=false/);
-  assert.match(body, /Send test notification/);
+  assert.match(body, /permission==='granted'&&apnsRegistered\(\)\)\{showNotificationSettings\(\)/);
+  assert.match(body, /showNotificationSettings\(\)/);
 });
 
 test('foreground native pushes surface visibly instead of logging only', () => {

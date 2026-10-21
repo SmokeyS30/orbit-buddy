@@ -1748,21 +1748,25 @@ async function setupNativePush(){
     if(perm&&perm.receive==='granted')await cap.nativePromise('PushNotifications','register',{});
   }catch(error){toast('Notification setup needs attention: '+(error&&error.message||error));updatePushButton();}
 }
-async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;try{
+function showNotificationSettings(){const btn=$('#enable-push');btn.disabled=true;btn.classList.add('hidden');$('#notification-settings').classList.remove('hidden');}
+async function updatePushButton(){const btn=$('#enable-push');if(!btn)return;$('#notification-settings').classList.add('hidden');btn.classList.remove('hidden');try{
 if(isNativeRuntime(window)){
 const cap=await waitForNativePushPlugin(1500);
 if(!cap){btn.disabled=false;btn.textContent='Retry notification setup';btn.classList.add('primary');return;}
 let permission='prompt';
 try{const perm=await cap.nativePromise('PushNotifications','checkPermissions',{});permission=(perm&&perm.receive)||'prompt';}catch(_){}
-if(permission==='granted'&&apnsRegistered()){btn.disabled=false;btn.textContent='Send test notification';btn.classList.add('primary');}
+if(permission==='granted'&&apnsRegistered()){showNotificationSettings();}
 else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}
 return;
 }
-if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){btn.disabled=true;btn.textContent='Notifications enabled';btn.classList.remove('primary');}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
-$('#enable-push').addEventListener('click',async()=>{try{
+if(!('serviceWorker'in navigator)||!('PushManager'in window)){btn.disabled=true;btn.textContent='Not supported on this device';return;}const registration=await navigator.serviceWorker.ready;const subscription=await registration.pushManager.getSubscription();if(subscription){showNotificationSettings();}else{btn.disabled=false;btn.textContent='Enable on this device';btn.classList.add('primary');}}catch{}}
+$('#enable-push').addEventListener('click',async()=>{if($('#enable-push').disabled)return;try{
 if(isNativeRuntime(window)){
 const cap=await waitForNativePushPlugin();
 if(!cap)throw new Error('The iPhone notification bridge did not load. Close and reopen Orbit, then try again.');
+// Recheck after bridge readiness so a stale enabled button cannot send a test.
+const currentPermission=await cap.nativePromise('PushNotifications','checkPermissions',{});
+if(currentPermission&&currentPermission.receive==='granted'&&apnsRegistered()){await updatePushButton();return;}
 attachNativePushListeners();
 const perm=await cap.nativePromise('PushNotifications','requestPermissions',{});
 if(!perm||perm.receive!=='granted')throw new Error('Notification permission was not granted.');
