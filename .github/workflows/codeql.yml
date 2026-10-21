@@ -18,12 +18,14 @@ jobs:
           languages: javascript-typescript
           queries: security-and-quality
       - uses: github/codeql-action/analyze@v4
+        with:
+          output: codeql-results
       - name: Summarize CodeQL findings
         if: always()
         run: |
           node --input-type=module <<'NODE'
           import fs from 'node:fs';
-          const file = 'results/javascript.sarif';
+          const file = 'codeql-results/javascript.sarif';
           if (fs.existsSync(file)) {
             for (const run of JSON.parse(fs.readFileSync(file, 'utf8')).runs || []) {
               for (const result of run.results || []) {
