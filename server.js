@@ -33,7 +33,7 @@ import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
 import { buildStudyNudgeLine, findStudyEvents, findFreeStudySlots, getLastStudyActivity, normalizeStudyExam } from './src/study-coach.js';
 import { buildCatchupDigest, isAwayEnough, clampSinceMs } from './src/catchup.js';
-import { evaluateSignupRisk, shouldBlockSignup, signupAuditSubject, signupRiskMode, signupsPaused } from './src/signup-risk.js';
+import { evaluateSignupRisk, signupAdmission, signupAuditSubject, signupRiskMode, signupsPaused } from './src/signup-risk.js';
 import {
   clearSessionCookie, decryptPortable, encryptPortable, hashPassword, hashToken,
   makeRecoveryCodes, parseCookies, randomToken, readEncryptionKey, sessionCookie, verifyPassword
@@ -2328,7 +2328,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }
 
     try {
-      if(req.method==='GET'&&url.pathname==='/api/auth/setup-status')return json(res,200,{needsOwner:db.countUsers()===0,registrationOpen:registrationOpen()});
+      if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
+        const needsOwner=db.countUsers()===0;
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'});
+      }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
         try{cleanupExpiredDemos(db);}catch{}
@@ -2639,9 +2642,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           subjectHash:signupAuditSubject(email,env.SIGNUP_AUDIT_KEY),mode:riskMode,
           decision:risk.decision,score:risk.score,signals:risk.signals
         });
-        if(shouldBlockSignup(riskMode,risk))throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
+        const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen()});
+        if(admission.action==='deny')throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
+        if(admission.action==='verify')throw Object.assign(new Error('Please verify your email to finish creating your Orbit account.'),{status:403});
         const password=await hashPassword(body.password);
-        if(count>0&&!registrationOpen())throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
+        if(admission.action==='closed')throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
         if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');

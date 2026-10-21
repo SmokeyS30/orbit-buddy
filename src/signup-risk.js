@@ -41,3 +41,20 @@ export function signupAuditSubject(email, key) {
 export function shouldBlockSignup(mode, result) {
   return mode === 'enforce' && result?.decision === 'deny';
 }
+
+// Preserve the current owner-controlled door while a rollout is off or only
+// observing. Enforcement is the explicit cutover: low-risk applicants are
+// admitted automatically, ambiguous applicants take the verification path,
+// and only strong abuse signals are denied. Initial owner creation is always
+// allowed so a configuration mistake cannot lock a fresh installation.
+export function signupAdmission({ mode, result, hasOwner, registrationOpen = false } = {}) {
+  if (!hasOwner) return { action: 'allow', reason: 'initial_owner' };
+  if (mode !== 'enforce') {
+    return registrationOpen
+      ? { action: 'allow', reason: 'legacy_door_open' }
+      : { action: 'closed', reason: 'legacy_door_closed' };
+  }
+  if (result?.decision === 'deny') return { action: 'deny', reason: 'strong_abuse_signal' };
+  if (result?.decision === 'verify') return { action: 'verify', reason: 'step_up_required' };
+  return { action: 'allow', reason: 'low_risk' };
+}
