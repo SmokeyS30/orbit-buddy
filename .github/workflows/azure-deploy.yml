@@ -48,7 +48,7 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://orbit_test:orbit_test_pw@localhost:5432/orbit_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -68,7 +68,7 @@ jobs:
       new_revision: ${{ steps.deploy.outputs.new_revision }}
       prev_image: ${{ steps.deploy.outputs.prev_image }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
