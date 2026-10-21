@@ -323,3 +323,31 @@ test('PostgreSQL: account deletion removes user-scoped rows', async () => {
     if (db) { try { db.close(); } catch {} }
   }
 });
+
+test('signup security PostgreSQL upgrades, concurrent claims and rollback preserve accounts', async () => {
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must be set');
+  await ensureSchema();
+  const { openPostgres } = await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  const suffix=Date.now()+'-'+Math.random();
+  try {
+    const user=await db.createUser({email:`security-${suffix}@example.com`,displayName:'Existing',passwordHash:'old',passwordSalt:'salt',role:'member'});
+    const other=await db.createUser({email:`other-${suffix}@example.com`,displayName:'Other',passwordHash:'old',passwordSalt:'salt',role:'member'});
+    const expiry=new Date(Date.now()+60_000).toISOString();
+    await db.addSignupChallenge(suffix,'link',user.id,expiry);
+    assert.equal(await db.consumeSignupChallenge(suffix,'link',other.id),false);
+    assert.deepEqual((await Promise.all([db.consumeSignupChallenge(suffix,'link',user.id),db.consumeSignupChallenge(suffix,'link',user.id)])).sort(),[false,true]);
+    const links=await Promise.allSettled([db.linkAuthIdentity('apple',suffix,user.id),db.linkAuthIdentity('apple',suffix,other.id)]);
+    assert.equal(links.filter(r=>r.status==='fulfilled').length,1);
+    await db.addAppAttestKey(suffix,'public','production');
+    assert.deepEqual((await Promise.all([db.advanceAppAttestCounter(suffix,0,1),db.advanceAppAttestCounter(suffix,0,2)])).sort(),[false,true]);
+    await db.addSignupVerificationToken(suffix,suffix,expiry);
+    await assert.rejects(db.createSignupAccount({email:user.email,displayName:'Collision',passwordHash:'new',passwordSalt:'salt',verificationHash:suffix,emailHash:suffix,automatic:true}));
+    assert.ok(await db.getSignupVerificationToken(suffix,suffix),'failed insert rolls back consumption');
+    await db.addPasswordResetToken(suffix,user.id,expiry);
+    assert.deepEqual((await Promise.all([db.finishPasswordReset(suffix,'first','salt'),db.finishPasswordReset(suffix,'second','salt')])).sort(),[false,true]);
+    assert.ok(['first','second'].includes((await db.getUserById(user.id)).password_hash));
+    assert.equal((await db.getUserById(other.id)).password_hash,'old');
+    await db.deleteUserAccount(user.id);await db.deleteUserAccount(other.id);
+  } finally { await db.close(); }
+});

@@ -1,3 +1,5 @@
+import { appleAuthReady, validateAppleAuthorization } from './src/apple-auth.js';
+import { appAttestReady, verifyAppAttestation, verifyAppAssertion } from './src/app-attest.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -586,6 +588,7 @@ export function createOrbitServer(options={}) {
   function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
   const paused=()=>db.getSetting('system_paused','false')==='true';
   const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
+  const signupPause=()=>signupsPaused(env)||db.getSetting('signups_paused','false')==='true';
   const registrationOpen=()=>db.getSetting('registration_open','false')==='true';
   async function checkDoorLeftOpen(){
     db.pruneDoorTokens();
@@ -2342,7 +2345,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured});
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured,appleSignInReady:appleAuthReady(env),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
@@ -2359,7 +2362,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const saved=db.addAccessRequest({name,email,note});
         // Create a disabled placeholder account now so approval is seamless (no duplication)
         let existing=db.getUserByEmail(email);
-        if(!existing){
+        if(!existing&&!signupPause()){
           const tempPass=await hashPassword(randomToken(32));
           existing=db.createUser({email,displayName:name,passwordHash:tempPass.hash,passwordSalt:tempPass.salt,role:'member'});
           db.setUserDisabled(existing.id,true);
@@ -2451,15 +2454,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/access-claim'){
         if(hourlyLimited(req,5,'access-claim'))throw Object.assign(new Error('Too many attempts. Try again later.'),{status:429});
-        const body=await readJson(req);const email=safeEmail(body.email);const password=String(body.password||'');
-        if(password.length<8)throw Object.assign(new Error('Password must be at least 8 characters.'),{status:400});
-        const user=db.getUserByEmail(email);
-        if(!user||user.disabled)throw Object.assign(new Error('Access not approved yet.'),{status:403});
-        const hashed=await hashPassword(password);
-        db.updatePassword(user.id,hashed.hash,hashed.salt);
-        const{csrf}=createSession(user,req,res);
-        db.addEvent(user.id,'account_claimed','Claimed Orbit account after approval.');
-        return json(res,200,{user:publicUser(user),csrf});
+        return json(res,410,{error:'For your security, use Forgot password to claim approved access through a verified email link.'});
       }
       if(req.method==='POST'&&url.pathname==='/api/registration/door-token'){
         if(hourlyLimited(req,10,'door-token'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
@@ -2642,14 +2637,82 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         });
         return json(res,200,{ok:true});
       }
+      if(url.pathname.startsWith('/api/auth/apple/')||url.pathname.startsWith('/api/auth/attest/')||url.pathname==='/api/auth/signup-appeal'){
+        res.setHeader('Cache-Control','no-store');
+        if(req.method==='POST'&&!/^application\/json(?:;|$)/i.test(String(req.headers['content-type']||'')))return json(res,415,{error:'JSON content type is required.'});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/apple/challenge'){
+        if(rateLimited(req,20,'apple-challenge'))return json(res,429,{error:'Try again later.'});
+        if(!appleAuthReady(env))return json(res,503,{error:'Apple sign-in is not configured.'});
+        const body=await readJson(req);const purpose=body.purpose==='link'?'link':'login';
+        let binding='login';
+        if(purpose==='link'){const user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;}
+        const nonce=randomToken(32);db.addSignupChallenge(hashToken(nonce),'apple-'+purpose,binding,new Date(Date.now()+5*60_000).toISOString());
+        return json(res,200,{nonce,purpose});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/apple/complete'){
+        if(rateLimited(req,20,'apple-complete'))return json(res,429,{error:'Try again later.'});
+        const body=await readJson(req);const purpose=body.purpose==='link'?'link':'login';let user=null,binding='login';
+        if(purpose==='link'){
+          user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;
+          const account=db.getUserById(binding);
+          if(!await verifyPassword(body.password,account.password_hash,account.password_salt))return json(res,401,{error:'Current password is required to link Apple.'});
+        }
+        if(!db.consumeSignupChallenge(hashToken(String(body.nonce||'')),'apple-'+purpose,binding))return json(res,401,{error:'Start Apple sign-in again.'});
+        const identity=await validateAppleAuthorization(body,env,options.appleVerification||{});
+        const linked=db.getAuthIdentity('apple',identity.subject);
+        if(purpose==='link'){
+          if(!authenticate(req))return json(res,401,{error:'Sign in again to link Apple.'});
+          if(linked&&linked.user_id!==binding)return json(res,409,{error:'This Apple identity is already linked.'});
+          if(!linked){try{db.linkAuthIdentity('apple',identity.subject,binding);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}}
+          db.addEvent(binding,'apple_linked','Linked Sign in with Apple.');return json(res,200,{ok:true});
+        }
+        // Never link by email, even if Apple says that email is verified.
+        if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
+        user=db.getUserById(linked.user_id);if(!user||user.disabled)return json(res,401,{error:'Sign-in was not accepted.'});
+        const {csrf,token:sessionToken}=createSession(user,req,res);
+        return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/attest/challenge'){
+        if(hourlyLimited(req,20,'attest-challenge'))return json(res,429,{error:'Try again later.'});
+        if(!appAttestReady(env))return json(res,503,{error:'Attestation is unavailable.'});
+        const body=await readJson(req),email=safeEmail(body.email),purpose=body.purpose==='assert'?'assert':'attest';
+        const keyId=String(body.keyId||'');if(!/^[A-Za-z0-9+/]{43}=$/.test(keyId))return json(res,400,{error:'Invalid key identifier.'});
+        const binding=hashToken(JSON.stringify([email,keyId]));const challenge=randomToken(32);
+        db.addSignupChallenge(hashToken(challenge),purpose,binding,new Date(Date.now()+5*60_000).toISOString());
+        return json(res,200,{challenge,payload:JSON.stringify({challenge,email,keyId,purpose})});
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/attest/complete'){
+        if(hourlyLimited(req,20,'attest-complete'))return json(res,429,{error:'Try again later.'});
+        const body=await readJson(req),email=safeEmail(body.email),keyId=String(body.keyId||''),challenge=String(body.challenge||'');
+        const purpose=body.purpose==='assert'?'assert':'attest',binding=hashToken(JSON.stringify([email,keyId]));
+        if(!db.consumeSignupChallenge(hashToken(challenge),purpose,binding))return json(res,401,{error:'Start attestation again.'});
+        try{
+          if(purpose==='attest'){
+            const result=verifyAppAttestation({attestation:body.attestation,keyId,challenge},env);
+            db.addAppAttestKey(keyId,result.publicKey,result.environment);return json(res,200,{ok:true});
+          }
+          const key=db.getAppAttestKey(keyId);if(!key)throw new Error('Unknown key');
+          if(env.NODE_ENV==='production'&&key.environment!=='production')throw new Error('Development key');
+          const next=verifyAppAssertion({assertion:body.assertion,key,payload:JSON.stringify({challenge,email,keyId,purpose})},env);
+          if(!db.advanceAppAttestCounter(keyId,Number(key.sign_count),next))throw new Error('Replay');
+          const proof=randomToken(32);db.addSignupChallenge(hashToken(proof),'signup-attested',hashToken(email),new Date(Date.now()+5*60_000).toISOString());
+          return json(res,200,{proof});
+        }catch{return json(res,401,{error:'Attestation could not be verified. Password and email signup remain available.'});}
+      }
+      if(req.method==='POST'&&url.pathname==='/api/auth/signup-appeal'){
+        if(hourlyLimited(req,3,'signup-appeal'))return json(res,429,{error:'Try again later.'});
+        const body=await readJson(req);db.addSignupAppeal(safeEmail(body.email),cleanText(body.note,500,'note'));
+        return json(res,202,{ok:true,message:'Your request was recorded for owner review. This does not grant account access.'});
+      }
       if(req.method==='POST'&&url.pathname==='/api/auth/register'){
         if(rateLimited(req,30,'register'))throw Object.assign(new Error('Too many registration attempts.'),{status:429});
         const body=await readJson(req);const email=safeEmail(body.email);const displayName=cleanText(body.displayName,80,'displayName');
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const count=db.countUsers();
-        if(count>0&&signupsPaused(env))throw Object.assign(new Error('New signups are temporarily paused. Please try again later.'),{status:503});
+        if(count>0&&signupPause())throw Object.assign(new Error('New signups are temporarily paused. Please try again later.'),{status:503});
         const riskMode=signupRiskMode(env);
-        const risk=evaluateSignupRisk({email,userAgent:req.headers['user-agent'],native:isNativeRequest(req),attested:false});
+        const risk=evaluateSignupRisk({email,userAgent:req.headers['user-agent'],native:isNativeRequest(req),attested:!!body.attestationProof&&db.consumeSignupChallenge(hashToken(String(body.attestationProof)),'signup-attested',hashToken(email))});
         if(riskMode!=='off')db.recordSignupRiskDecision({
           subjectHash:signupAuditSubject(email,env.SIGNUP_AUDIT_KEY),mode:riskMode,
           decision:risk.decision,score:risk.score,signals:risk.signals
@@ -2675,11 +2738,15 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         const password=await hashPassword(body.password);
         if(admission.action==='closed')throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
-        if(admission.reason==='verified_email'&&!db.consumeSignupVerificationToken(verificationTokenHash,emailHash))throw Object.assign(new Error('This verification link is invalid or expired. Please request a new one.'),{status:403,verificationRequired:true,verificationSent:false});
-        if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
-        const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
-        if(admission.reason==='verified_email')db.markUserEmailVerified(user.id);
-        if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
+        // Password hashing yields: recheck pause and the registration door afterward.
+        const currentCount=db.countUsers();
+        if(currentCount>0&&signupPause())return json(res,503,{error:'New signups are temporarily paused.'});
+        if(currentCount>0&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow')return json(res,403,{error:'Registration is not currently available.'});
+        let user;
+        try{user=db.createSignupAccount({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,
+          verificationHash:admission.reason==='verified_email'?verificationTokenHash:null,emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
+        catch{return json(res,409,{error:'Account creation could not complete. Sign in or request a fresh verification link.'});}
+        if(user.role==='owner')db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
         // L3: simpler onboarding — seed the default conversation with a warm welcome
         // message (covers the name ask conversationally) and store the name from
         // registration as an approved memory, so no extra "what should I call you" modal.
@@ -2695,8 +2762,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
         if(rateLimited(req,25,'recover'))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const recovered=user&&db.consumeRecoveryCode(hashToken(String(body.recoveryCode||'').trim().toUpperCase()));
-        if(!recovered||recovered.user_id!==user.id)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});const password=await hashPassword(body.newPassword);db.updatePassword(user.id,password.hash,password.salt);db.deleteUserSessions(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const password=await hashPassword(body.newPassword);const codes=makeRecoveryCodes();
+        const recovered=user&&!user.disabled&&db.finishRecovery(user.id,hashToken(String(body.recoveryCode||'').trim().toUpperCase()),password.hash,password.salt,codes.map(hashToken));
+        if(!recovered)throw Object.assign(new Error('Recovery information was not accepted.'),{status:401});
+        db.addEvent(user.id,'account_recovered','Recovered the account and revoked existing sessions.');return json(res,200,{ok:true,recoveryCodes:codes});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/forgot-password'){
         if(hourlyLimited(req,5,'forgot-pw'))throw Object.assign(new Error('Too many requests. Try again later.'),{status:429});
@@ -2709,10 +2778,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             db.cleanExpiredPasswordResetTokens();
             const resetUrl=`https://orbitbuddy.app/reset-password?token=${token}`;
             const emailed=await sendPasswordResetEmail({to:email,resetUrl});
-            if(!emailed){
-              const owner=db.listUsers().find((u)=>u.role==='owner');
-              if(owner){await push.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});await apns.notify(owner.id,'Password reset requested',`${user.display_name||user.email} requested a password reset. Share this link: ${resetUrl}`,{view:'safety'});}
-            }
+            // A failed email never sends a bearer reset link through push notifications.
+            if(!emailed)db.markPasswordResetTokenUsed(hashToken(token));
           }
         }
         return json(res,200,{ok:true});
@@ -2725,9 +2792,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(!record)throw Object.assign(new Error('This reset link is invalid or has expired.'),{status:400});
         const newPassword=String(body.newPassword||'');
         let hashed;try{ hashed=await hashPassword(newPassword); }catch(e){ throw Object.assign(new Error(e.message||'Password was not accepted.'),{status:400}); }
-        db.updatePassword(record.user_id,hashed.hash,hashed.salt);
-        db.markPasswordResetTokenUsed(hashToken(token));
-        db.deleteUserSessions(record.user_id);
+        if(!db.finishPasswordReset(hashToken(token),hashed.hash,hashed.salt))return json(res,400,{error:'This reset link is invalid or has expired.'});
         db.addEvent(record.user_id,'password_reset','Password was reset via email link.');
         db.cleanExpiredPasswordResetTokens();
         return json(res,200,{ok:true});
@@ -3299,7 +3364,17 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
         if(req.method==='POST'&&url.pathname==='/api/admin/registration'){requireOwner(user);const body=await readJson(req);const open=body.open===true;db.setSetting('registration_open',open?'true':'false');db.setSetting('registration_opened_at',open?new Date().toISOString():'');db.addEvent(userId,open?'registration_opened':'registration_closed',open?'Opened registration.':'Closed registration.');return json(res,200,{open});}
-        if(req.method==='GET'&&url.pathname==='/api/admin/signup-risk'){requireOwner(user);return json(res,200,summarizeSignupRiskEvents(db.listSignupRiskEvents(100)));}
+        if(req.method==='GET'&&url.pathname==='/api/admin/signup-risk'){requireOwner(user);return json(res,200,{...summarizeSignupRiskEvents(db.listSignupRiskEvents(100)),mode:signupRiskMode(env),paused:signupPause(),environmentPaused:signupsPaused(env)});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/signup-pause'){
+          requireOwner(user);const body=await readJson(req);if(typeof body.paused!=='boolean')return json(res,400,{error:'paused must be boolean.'});
+          db.setSetting('signups_paused',String(body.paused));db.addEvent(userId,'signup_pause_changed',body.paused?'Paused new signups.':'Released owner signup pause.');
+          return json(res,200,{paused:signupPause(),environmentPaused:signupsPaused(env)});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/admin/signup-appeals'){requireOwner(user);return json(res,200,{appeals:db.listSignupAppeals()});}
+        if(req.method==='POST'&&url.pathname==='/api/admin/signup-appeals'){
+          requireOwner(user);const body=await readJson(req);if(!['reviewed','closed'].includes(body.status))return json(res,400,{error:'Invalid status.'});
+          return json(res,200,{ok:db.resolveSignupAppeal(String(body.id),body.status)});
+        }
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
         if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}

@@ -1,3 +1,4 @@
+import { signupSecuritySchema } from './signup-security-schema.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -56,6 +57,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     db.exec('PRAGMA journal_mode = DELETE;');
   }
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  for (const sql of signupSecuritySchema) db.exec(sql);
   const protectSecret = (value) => {
     const text = String(value || '');
     if (!text || text.startsWith('enc:v1:') || !encryptionKey) return text;
@@ -887,6 +889,61 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false}) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        if(verificationHash && !s.useSignupVerificationToken.run(timestamp(),verificationHash,emailHash,timestamp()).changes) throw new Error('Verification expired');
+        const count=s.countUsers.get().count;
+        if(count>0&&(environmentPaused||s.setting.get('signups_paused')?.value==='true'||(!automatic&&s.setting.get('registration_open')?.value!=='true')))throw new Error('Registration unavailable');
+        const role=count===0?'owner':'member';
+        const id=randomUUID(),now=timestamp();s.createUser.run(id,email,displayName,passwordHash,passwordSalt,role,now,now);
+        if(verificationHash)s.markUserEmailVerified.run(now,now,id);
+        db.exec('COMMIT');return s.userById.get(id);
+      } catch(error) {db.exec('ROLLBACK');throw error;}
+    },
+    addSignupChallenge(hash, purpose, binding, expiresAt) {
+      db.prepare('DELETE FROM signup_challenges WHERE expires_at<=?').run(timestamp());
+      db.prepare('INSERT INTO signup_challenges VALUES(?,?,?,?,?)').run(hash,purpose,binding,expiresAt,timestamp());
+    },
+    consumeSignupChallenge(hash,purpose,binding) {
+      return db.prepare('DELETE FROM signup_challenges WHERE token_hash=? AND purpose=? AND binding=? AND expires_at>? RETURNING token_hash').get(hash,purpose,binding,timestamp()) != null;
+    },
+    getAppAttestKey: (id) => db.prepare('SELECT * FROM app_attest_keys WHERE key_id=?').get(id),
+    addAppAttestKey(id,key,environment) { db.prepare('INSERT INTO app_attest_keys VALUES(?,?,?,0,?)').run(id,key,environment,timestamp()); },
+    advanceAppAttestCounter(id,previous,next) {
+      return next>previous && db.prepare('UPDATE app_attest_keys SET sign_count=? WHERE key_id=? AND sign_count=?').run(next,id,previous).changes>0;
+    },
+    addSignupAppeal(email,note) {
+      const id=randomUUID(),now=timestamp();
+      db.prepare('DELETE FROM signup_appeals WHERE created_at<?').run(new Date(Date.now()-30*86400_000).toISOString());
+      db.prepare("INSERT INTO signup_appeals VALUES(?,?,?,'pending',?,?)").run(id,email,note,now,now);
+      return id;
+    },
+    listSignupAppeals: () => db.prepare('SELECT * FROM signup_appeals ORDER BY created_at DESC LIMIT 100').all(),
+    resolveSignupAppeal(id,status) { return db.prepare('UPDATE signup_appeals SET status=?,updated_at=? WHERE id=?').run(status,timestamp(),id).changes>0; },
+    finishRecovery(userId,codeHash,passwordHash,passwordSalt,newCodes) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const user=s.userById.get(userId),row=s.recovery.get(codeHash);
+        if(!user||user.disabled||!row||row.user_id!==userId||!s.useRecovery.run(timestamp(),row.id).changes){db.exec('ROLLBACK');return false;}
+        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),userId);s.deleteUserSessions.run(userId);s.clearRecovery.run(userId);
+        db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(userId);
+        for(const hash of newCodes)s.addRecovery.run(randomUUID(),userId,hash,timestamp());
+        db.exec('COMMIT');return true;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
+    finishPasswordReset(hash,passwordHash,passwordSalt) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row=s.getPwResetToken.get(hash,timestamp());
+        if(!row || !s.userById.get(row.user_id) || s.userById.get(row.user_id).disabled) { db.exec('ROLLBACK');return false; }
+        if(!s.usePwResetToken.run(hash).changes) { db.exec('ROLLBACK');return false; }
+        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),row.user_id);
+        s.deleteUserSessions.run(row.user_id);
+        db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(row.user_id);
+        db.exec('COMMIT');return true;
+      } catch(error) { db.exec('ROLLBACK');throw error; }
+    },
     getAuthIdentity: (provider, subject) => s.authIdentity.get(provider, subject),
     linkAuthIdentity(provider, subject, userId) {
       const now = timestamp();
@@ -952,7 +1009,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         throw error;
       }
     },
-    consumeRecoveryCode(hash) { const row=s.recovery.get(hash); if(!row) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
+    consumeRecoveryCode(hash,userId) { const row=s.recovery.get(hash); if(!row || (userId && row.user_id!==userId)) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
     getSetting: (key, fallback=null) => s.setting.get(key)?.value ?? fallback,
     setSetting(key,value) { s.setSetting.run(key,String(value),timestamp()); },
     ensureDefaultConversation(userId) { const existing=s.listConversations.get(userId); if(existing){adoptOrphanMessages(db,userId);return existing;}

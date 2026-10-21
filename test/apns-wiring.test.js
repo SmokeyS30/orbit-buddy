@@ -73,10 +73,11 @@ test('task completion and failure notify both web push and APNs', () => {
   assert.match(serverJs, /apns\.notify\(task\.user_id,.*needs attention/);
 });
 
-test('access request, waitlist, password reset, and emergency pause notify APNs', () => {
+test('access request, waitlist and emergency pause notify APNs without reset credentials', () => {
   assert.match(serverJs, /apns\.notify\(owner\.id,'Access request'/);
   assert.match(serverJs, /apns\.notify\(owner\.id,'New waitlist signup'/);
-  assert.match(serverJs, /apns\.notify\(owner\.id,'Password reset requested'/);
+  assert.doesNotMatch(serverJs, /apns\.notify\([^\n]*resetUrl/);
+  assert.doesNotMatch(serverJs, /push\.notify\([^\n]*resetUrl/);
   assert.match(serverJs, /apns\.notify\(account\.id,.*paused/);
 });
 
