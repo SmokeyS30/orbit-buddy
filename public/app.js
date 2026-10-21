@@ -119,10 +119,18 @@ function settlePendingReplies(messages,convoId){const set=pendingReplies.get(con
 function syncTypingBubble(){const set=pendingReplies.get(activeConversationId);const want=!!set&&set.size>0;if(want&&!typingActive)showTyping(false);else if(!want&&typingActive)hideTyping();}
 let lastMessageFingerprint='';
 let renderedConversationId=null;
-async function renderMessages(items){const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;lastMessageFingerprint=fingerprint;// W7: the canvas chunk is fetched on first use — detection runs per
+let messageRenderRequest=0;
+async function renderMessages(items){const request=++messageRenderRequest;const root=document.getElementById('messages');const conversationId=state.snapshot?.activeConversation?.id||activeConversationId||'';const fingerprint=conversationId+'|'+(items||[]).map((m)=>m.id+':'+(m.content||'').length).join('|');const conversationChanged=conversationId!==renderedConversationId;if(fingerprint===lastMessageFingerprint&&!typingActive)return;// W7: the canvas chunk is fetched on first use — detection runs per
 // assistant message, so the render waits for the (memoized) module here and
 // never drops or mis-detects. Offline-first-use falls back to plain bubbles.
-const canvasApi=await loadCanvas().catch(()=>null);const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'This is where you talk with Orbit — ask anything, any time.','Say hello and tell me a little about yourself');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(canvasApi&&canvasApi.isCanvasWorthy(item.content))renderCanvasDoc(el,item.id,item.content,canvasApi);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
+const canvasApi=await loadCanvas().catch(()=>null);
+// Loading a chunk yields: the user may start typing, switch threads, or a
+// newer snapshot may arrive before it resolves. Never commit stale history
+// or rebuild the message DOM under an active composer. Leave the fingerprint
+// uncommitted so the next idle refresh can retry the deferred history.
+if(request!==messageRenderRequest||isComposing()||conversationId!==(state.snapshot?.activeConversation?.id||activeConversationId||''))return;
+lastMessageFingerprint=fingerprint;
+const wasNearBottom=isNearBottom(root);root.replaceChildren();if(!items.length)empty(root,'This is where you talk with Orbit — ask anything, any time.','Say hello and tell me a little about yourself');for(const item of items){const el=document.createElement('div');el.className='message '+item.role;if(item.id){el.id='msg-'+item.id;el.dataset.messageId=item.id;el.dataset.role=item.role;}if(item.role==='assistant'){if(canvasApi&&canvasApi.isCanvasWorthy(item.content))renderCanvasDoc(el,item.id,item.content,canvasApi);else if(!renderAssistantMarkdown(el,item.content))el.textContent=item.content;}else{el.textContent=item.content;}if(el.dataset.messageId)buildMessageActionRow(el);root.append(el);}if(typingActive)appendTypingBubble();renderedConversationId=conversationId;if(shouldSettleAtBottom({conversationChanged,hasMessages:items.length>0,wasNearBottom}))settleAtBottom(root);}
 
 // --- W1: per-message actions (regenerate / copy / delete) ---
 // Assistant messages: long-press (touch) or hover (desktop) reveals a small
