@@ -23,7 +23,7 @@ import { buildTodayBriefing, resolveBriefingCoords } from './src/briefing.js';
 import { extractMessages, chunkMessages, parseMultipartFile } from './src/import.js';
 import { seedDemoData, isDemoUser, demoCapReached, cleanupExpiredDemos, DEMO_MESSAGE_CAP } from './src/demo.js';
 import { sendEmail, trashEmail } from './src/gmail.js';
-import { sendEmail as sendResendEmail } from './src/email.js';
+import { sendEmail as sendResendEmail, emailConfigured } from './src/email.js';
 import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from './src/writing-voice.js';
 import { handleSoulCommand, handleAdaptationCommand, resolveAdaptiveSoulDirective } from './src/soul.js';
 import { handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
@@ -517,17 +517,29 @@ export function createOrbitServer(options={}) {
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
   const connectors=createConnectorService(env,db,encryptionKey);
+  const transactionalEmail=options.sendEmail||sendResendEmail;
+  const transactionalEmailConfigured=Boolean(options.sendEmail)||emailConfigured(env);
 
   // Send a password reset email via Resend. Returns true if sent, false otherwise (never throws).
   async function sendPasswordResetEmail({to,resetUrl}){
     try{
-      return await sendResendEmail(env,{
+      return await transactionalEmail(env,{
         to,
         subject:'Reset your Orbit password',
         text:`Someone requested a password reset for your Orbit account.\n\nReset your password here (expires in 1 hour):\n${resetUrl}\n\nIf you didn't request this, you can safely ignore this email.`,
         html:`<p>Someone requested a password reset for your Orbit account.</p><p><a href="${resetUrl}">Reset your password</a> (expires in 1 hour).</p><p style="color:#666;font-size:.9em;">If you didn't request this, you can safely ignore this email.</p>`
       });
     }catch(e){ console.warn('Password reset email failed:',e.message); return false; }
+  }
+  async function sendSignupVerificationEmail({to,verifyUrl}){
+    try{
+      return await transactionalEmail(env,{
+        to,
+        subject:'Verify your email for Orbit',
+        text:`Finish creating your Orbit account by verifying this email address:\n\n${verifyUrl}\n\nThis one-time link expires in 15 minutes. If you didn't try to create an account, you can safely ignore this email.`,
+        html:`<p>Finish creating your Orbit account by verifying this email address.</p><p><a href="${verifyUrl}">Verify email and continue</a></p><p style="color:#666;font-size:.9em;">This one-time link expires in 15 minutes. If you didn't try to create an account, you can safely ignore this email.</p>`
+      });
+    }catch(e){ console.warn('Signup verification email failed:',e.message); return false; }
   }
   const production=env.NODE_ENV==='production';
   const maintenanceOn = (MAINTENANCE_MODE || env.MAINTENANCE_MODE === '1') && env.MAINTENANCE_MODE !== '0' && env.NODE_ENV !== 'test';
@@ -2330,7 +2342,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'});
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
@@ -2642,13 +2654,31 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           subjectHash:signupAuditSubject(email,env.SIGNUP_AUDIT_KEY),mode:riskMode,
           decision:risk.decision,score:risk.score,signals:risk.signals
         });
-        const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen()});
+        const verificationToken=String(body.verificationToken||'').trim();
+        const verificationKey=env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY;
+        const emailHash=signupAuditSubject(email,verificationKey);
+        const verificationTokenHash=verificationToken?hashToken(verificationToken):null;
+        const verifiedEmail=Boolean(emailHash&&verificationTokenHash&&db.getSignupVerificationToken(verificationTokenHash,emailHash));
+        const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen(),verifiedEmail});
         if(admission.action==='deny')throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
-        if(admission.action==='verify')throw Object.assign(new Error('Please verify your email to finish creating your Orbit account.'),{status:403});
+        if(admission.action==='verify'){
+          if(!transactionalEmailConfigured||!emailHash)throw Object.assign(new Error('Email verification is temporarily unavailable. Please try again later.'),{status:503});
+          if(db.getPendingSignupVerificationForEmail(emailHash))throw Object.assign(new Error('Check your email to verify your address and finish creating your Orbit account.'),{status:403,verificationRequired:true,verificationSent:true});
+          if(hourlyLimited(req,5,'signup-verify'))throw Object.assign(new Error('Too many verification emails. Please try again later.'),{status:429});
+          db.cleanSignupVerificationTokens();
+          const rawToken=randomToken(32);const expiresAt=new Date(Date.now()+15*60_000).toISOString();
+          db.addSignupVerificationToken(hashToken(rawToken),emailHash,expiresAt);
+          const verifyUrl=`${originFor(req)}/index.html#signup-verify=${encodeURIComponent(rawToken)}`;
+          const sent=await sendSignupVerificationEmail({to:email,verifyUrl});
+          if(!sent){db.deleteSignupVerificationToken(hashToken(rawToken));throw Object.assign(new Error('Email verification is temporarily unavailable. Please try again later.'),{status:503});}
+          throw Object.assign(new Error('Check your email to verify your address and finish creating your Orbit account.'),{status:403,verificationRequired:true,verificationSent:true});
+        }
         const password=await hashPassword(body.password);
         if(admission.action==='closed')throw Object.assign(new Error('Registration is closed. Ask the owner for access.'),{status:403});
+        if(admission.reason==='verified_email'&&!db.consumeSignupVerificationToken(verificationTokenHash,emailHash))throw Object.assign(new Error('This verification link is invalid or expired. Please request a new one.'),{status:403,verificationRequired:true,verificationSent:false});
         if(db.getUserByEmail(email))throw Object.assign(new Error('Account already exists.'),{status:409});
         const user=db.createUser({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,role:count===0?'owner':'member'});
+        if(admission.reason==='verified_email')db.markUserEmailVerified(user.id);
         if(count===0)db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
         // L3: simpler onboarding — seed the default conversation with a warm welcome
         // message (covers the name ask conversationally) and store the name from
@@ -3278,7 +3308,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const accessDeny=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/deny$/);if(req.method==='POST'&&accessDeny){requireOwner(user);const req2=db.getAccessRequest(accessDeny[1]);if(!req2)throw Object.assign(new Error('Request not found.'),{status:404});const targetUser=req2.email?db.getUserByEmail(req2.email):null;if(targetUser){db.setUserDisabled(targetUser.id,true);db.deleteUserSessions(targetUser.id);}db.dismissAccessRequest(accessDeny[1]);db.addEvent(user.id,'access_denied',`Denied Orbit access for ${req2.name} (${req2.email}).`);return json(res,200,{ok:true,denied:true});}
         return json(res,404,{error:'API route not found.'});
       }
-    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true,quota:error.quota||null}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag)); }
+    } catch(error) { console.error('request failed',req.method,url.pathname,error&&error.message);const modelIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);const message=error.status?error.message:modelIssue?'The AI model connection needs attention. Open Safety and run Check connection.':'Orbit encountered an internal server error. Please retry once.';const paywallFlag=error&&error.paywall===true?{paywall:true,quota:error.quota||null}:{};const verificationFlag=error&&error.verificationRequired===true?{verificationRequired:true,verificationSent:error.verificationSent===true}:{};return json(res,error.status||500,Object.assign({error:message},paywallFlag,verificationFlag)); }
 
     if(url.pathname==='/reset-password'&&['GET','HEAD'].includes(req.method)){const resolved=path.resolve(publicRoot,'./index.html');res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-cache'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);return;}
     if(!['GET','HEAD'].includes(req.method))return json(res,405,{error:'Method not allowed.'});

@@ -24,6 +24,13 @@ export function evaluateSignupRisk({ email, userAgent, native = false, attested 
     signals.push('automation_user_agent');
     score += 80;
   }
+  // Command-line HTTP clients are not malicious by themselves. They are an
+  // explainable ambiguity signal, so enforcement asks for email verification
+  // instead of denying access.
+  if (/\b(curl|wget|python-requests|go-http-client)\b/i.test(agent)) {
+    signals.push('non_browser_client');
+    score += 30;
+  }
   // App Attest is not yet required during registration. Recording this signal
   // in observation mode lets us measure real-device coverage before enforcing it.
   if (native && !attested) signals.push('native_attestation_unavailable');
@@ -47,7 +54,7 @@ export function shouldBlockSignup(mode, result) {
 // admitted automatically, ambiguous applicants take the verification path,
 // and only strong abuse signals are denied. Initial owner creation is always
 // allowed so a configuration mistake cannot lock a fresh installation.
-export function signupAdmission({ mode, result, hasOwner, registrationOpen = false } = {}) {
+export function signupAdmission({ mode, result, hasOwner, registrationOpen = false, verifiedEmail = false } = {}) {
   if (!hasOwner) return { action: 'allow', reason: 'initial_owner' };
   if (mode !== 'enforce') {
     return registrationOpen
@@ -55,7 +62,11 @@ export function signupAdmission({ mode, result, hasOwner, registrationOpen = fal
       : { action: 'closed', reason: 'legacy_door_closed' };
   }
   if (result?.decision === 'deny') return { action: 'deny', reason: 'strong_abuse_signal' };
-  if (result?.decision === 'verify') return { action: 'verify', reason: 'step_up_required' };
+  if (result?.decision === 'verify') {
+    return verifiedEmail
+      ? { action: 'allow', reason: 'verified_email' }
+      : { action: 'verify', reason: 'step_up_required' };
+  }
   return { action: 'allow', reason: 'low_risk' };
 }
 
