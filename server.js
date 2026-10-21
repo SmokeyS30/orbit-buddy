@@ -3394,12 +3394,12 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           requireOwner(user);const request=db.getAccessRequest(accessApprove[1]);
           if(!request||request.handled_at)return json(res,404,{error:'Pending request not found.'});
           if(signupPause())return json(res,503,{error:'Resume new signups before approving this request.'});
-          let target=db.getUserByEmail(request.email);
+          const target=db.getUserByEmail(request.email);
           if(!target){
             const password=await hashPassword(randomToken(48));
             const currentOwner=authenticate(req);if(!currentOwner)return json(res,401,{error:'Sign in again to approve access.'});requireOwner(currentOwner);
             if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
-            try{target=db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
+            try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
             catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
           }else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
           db.dismissAccessRequest(request.id);

@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nativeBackend,nativeConfigSource,syncIos } from '../scripts/sync-ios.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { nativeBackend,nativeConfigSource,syncIos,writeNativeConfig } from '../scripts/sync-ios.mjs';
 
 test('native build configuration defaults to production and accepts HTTPS test origins',()=>{
   assert.equal(nativeBackend(),'https://orbitbuddy.app');
@@ -16,4 +19,13 @@ test('sync writes only ignored generated bundle configuration after successful C
   assert.throws(()=>syncIos(['--api-base','http://test.example'],{run:()=>assert.fail('must validate before sync')}));
   assert.throws(()=>syncIos([],{run:()=>({status:1}),write:()=>assert.fail('must not write after failed sync')}));
   assert.throws(()=>syncIos(['--unexpected'],{run:()=>assert.fail('invalid arguments')}));
+});
+
+test('native config writes refuse symlinks and missing outputs and replace the entire opened file',t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-native-config-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const file=path.join(dir,'config.js'),link=path.join(dir,'symlink.js');
+  fs.writeFileSync(file,'old configuration with trailing bytes');fs.symlinkSync(file,link);
+  assert.throws(()=>writeNativeConfig(link,'unsafe'));assert.equal(fs.readFileSync(file,'utf8'),'old configuration with trailing bytes');
+  assert.throws(()=>writeNativeConfig(path.join(dir,'missing.js'),'unsafe'));
+  writeNativeConfig(file,'new');assert.equal(fs.readFileSync(file,'utf8'),'new');
 });
