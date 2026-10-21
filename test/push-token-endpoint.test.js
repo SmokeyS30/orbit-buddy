@@ -41,7 +41,7 @@ test('push token: 401 unauthenticated, 400 malformed, 201 stores', async (t) => 
   const token = 'ab'.repeat(32);
   const ok = await postToken(base, headers, token);
   assert.equal(ok.status, 201);
-  assert.deepEqual(await ok.json(), { ok: true, verified: false });
+  assert.deepEqual(await ok.json(), { ok: true, verified: false, configured: false });
   const rows = app.db.listApnsTokens(auth.userId);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].device_token, token);

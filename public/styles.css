@@ -337,3 +337,5 @@ body.membership-open{overflow:hidden}
 .intro-card li{color:var(--muted);line-height:1.5;padding-left:26px;position:relative}
 .intro-card li:before{content:"✦";position:absolute;left:4px;color:var(--lime)}
 .empty-suggest{display:block;margin:0 auto 30px;max-width:100%}
+
+#enable-push:disabled{background:var(--panel2);color:var(--muted);border:1px solid var(--line);opacity:.45;cursor:not-allowed}
