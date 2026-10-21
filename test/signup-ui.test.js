@@ -29,3 +29,14 @@ test('setAuthMode integrates renderer into real DOM transitions and clears stale
   sandbox.setAuthMode('register');assert.equal(document.getElementById('apple-signup').classList.contains('hidden'),false);
   state.setup.signupsPaused=true;sandbox.setAuthMode('register');assert.equal(document.getElementById('apple-signup').classList.contains('hidden'),true);
 });
+
+test('native welcome waitlist uses the same bundled test backend as authentication',async()=>{
+  const source=fs.readFileSync(new URL('../public/welcome.html',import.meta.url),'utf8');
+  const {document}=parseHTML(source);let submit;const calls=[];
+  document.getElementById('waitlist-form').addEventListener=(_event,handler)=>{submit=handler;};
+  const script=source.match(/<script type="module">([\s\S]*?)<\/script>/)[1].replace(/^import .*;$/m,'');
+  const context={document,window:{Capacitor:{isNativePlatform:()=>true}},NATIVE_API_BASE:'https://approved-test.example',fetch:async(url)=>{calls.push(url);return Response.json({ok:true});}};
+  vm.createContext(context);vm.runInContext(script,context);
+  await submit({preventDefault(){},target:document.getElementById('waitlist-form')});
+  assert.deepEqual(calls,['https://approved-test.example/api/waitlist']);
+});

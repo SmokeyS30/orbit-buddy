@@ -144,7 +144,8 @@ footer a{color:var(--accent);margin:0 10px;text-decoration:none}
   <span style="margin-top:8px;display:inline-block">© 2026 Edward Bloomfield. All rights reserved.</span>
 </footer>
 
-<script>
+<script type="module">
+import { NATIVE_API_BASE } from './native-config.js';
 document.getElementById('waitlist-form').addEventListener('submit',async(e)=>{
   e.preventDefault();
   const status=document.getElementById('wl-status');
@@ -152,7 +153,7 @@ document.getElementById('waitlist-form').addEventListener('submit',async(e)=>{
   status.style.color='#a7aecf';status.textContent='Joining…';btn.disabled=true;
   try{
     // Native (Capacitor iOS) runs on capacitor://localhost: API calls need the absolute origin.
-    const apiBase=window.Capacitor?.isNativePlatform?.()===true?'https://orbitbuddy.app':'';
+    const apiBase=window.Capacitor?.isNativePlatform?.()===true?NATIVE_API_BASE:'';
     const r=await fetch(apiBase+'/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({name:document.getElementById('wl-name').value,email:document.getElementById('wl-email').value})});
     const b=await r.json().catch(()=>({}));
