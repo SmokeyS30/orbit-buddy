@@ -28,6 +28,17 @@ import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
+const SUPPORT_RETURN_KEY='orbit-support-return-view';
+function consumeSupportReturnView(){
+  let view=window.__orbitSupportReturnView||null;
+  try{
+    view=sessionStorage.getItem(SUPPORT_RETURN_KEY)||view;
+    sessionStorage.removeItem(SUPPORT_RETURN_KEY);
+  }catch(_){}
+  window.__orbitSupportReturnView=null;
+  document.documentElement.classList.remove('orbit-support-returning');
+  return view==='safety'?'safety':null;
+}
 try{
   const signupMatch=location.hash.match(/^#signup-verify=([A-Za-z0-9_-]{20,})$/);
   if(signupMatch){
@@ -2318,11 +2329,17 @@ async function pollAccessStatus(email){
 }
 $('#registration-toggle').addEventListener('click',async()=>{try{const open=!state.setup?.registrationOpen;await api('/api/admin/registration',{method:'POST',body:JSON.stringify({open})});await refresh();toast(open?'Registration is open.':'Registration is closed.');}catch(error){toast(error.message);}});$('#resume-button').addEventListener('click',async()=>{if(prompt('Type RESUME to restart Orbit work:')!=='RESUME')return;try{await api('/api/admin/resume',{method:'POST',body:JSON.stringify({confirm:'RESUME'})});await refresh();toast('Orbit resumed.');}catch(error){toast(error.message);}});
 $('#auth-dialog')?.addEventListener('close',()=>{if(accessPollTimer){clearInterval(accessPollTimer);accessPollTimer=null;}});
-// Launch always lands on the welcome screen (Today view with the Orbit hero),
-// ignoring any stale hash from a previous session. In-app hash navigation still works.
+// A fresh launch always lands on Today. Returning from the separate Support
+// document is the one exception: restore Safety without replaying the splash.
 state.launchSignin=location.hash==='#signin'||Boolean(state.signupVerificationToken);
+const supportReturnView=consumeSupportReturnView();
 if(location.hash)history.replaceState(null,'',location.pathname+location.search);
-activateView('today',{updateHash:false});
+if(supportReturnView)activateView(supportReturnView,{updateHash:false});
+else activateView('today',{updateHash:false});
+window.addEventListener('pageshow',()=>{
+  const returnView=consumeSupportReturnView();
+  if(returnView)activateView(returnView,{updateHash:false});
+});
 if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addEventListener('controllerchange',()=>{if(reloading)return;reloading=true;location.reload();});navigator.serviceWorker.register('/sw.js',{updateViaCache:'none'}).catch(()=>{});
   // Auto-reload when a new app version activates
   navigator.serviceWorker.addEventListener('message',(event)=>{

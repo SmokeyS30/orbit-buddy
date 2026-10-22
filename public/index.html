@@ -26,9 +26,20 @@
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
     <title>Orbit Buddy</title>
+    <script>
+      // Returning from Support is in-app navigation, not a fresh launch. Mark
+      // it before first paint so a defensive reload never flashes the splash.
+      try {
+        if (sessionStorage.getItem('orbit-support-return-view') === 'safety') {
+          window.__orbitSupportReturnView = 'safety';
+          document.documentElement.classList.add('orbit-support-returning');
+        }
+      } catch (_) {}
+    </script>
     <style>
       /* Splash screen — inline for instant paint, no external assets */
       #orbit-splash{position:fixed;inset:0;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;background:radial-gradient(1200px 600px at 50% -10%,#232a5e 0%,#0b0d17 60%);overflow:hidden;transition:opacity .8s ease}
+      .orbit-support-returning #orbit-splash{display:none}
       #orbit-splash.splash-hide{opacity:0;pointer-events:none}
       #orbit-splash .splash-stars{position:absolute;inset:0}
       #orbit-splash .splash-star{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:0;animation:splash-twinkle 4s ease-in-out infinite}

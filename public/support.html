@@ -2,14 +2,14 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="description" content="Help and support for Orbit Buddy.">
 <title>Support — Orbit Buddy</title>
 <link rel="stylesheet" href="/support.css">
 </head>
 <body>
 <main>
-  <a id="support-back" class="support-back" href="/#safety" aria-label="Back to Orbit Buddy Safety center">
+  <a id="support-back" class="support-back" href="/#safety" data-support-back aria-label="Back to Orbit Buddy Safety center">
     <span aria-hidden="true">←</span>
     Back to Orbit Buddy
   </a>
@@ -43,10 +43,11 @@
   </section>
 
   <nav aria-label="Legal and product links">
-    <a href="/#safety">Back to Orbit Buddy</a>
+    <a href="/#safety" data-support-back>Back to Orbit Buddy</a>
     <a href="/privacy">Privacy Policy</a>
     <a href="/terms">Terms of Service</a>
   </nav>
 </main>
+<script type="module" src="/support-navigation.js"></script>
 </body>
 </html>

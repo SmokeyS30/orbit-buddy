@@ -6,6 +6,7 @@ const mobile = fs.readFileSync(new URL('../public/mobile.css', import.meta.url),
 const styles = fs.readFileSync(new URL('../public/styles.css', import.meta.url), 'utf8');
 const index = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
 const welcome = fs.readFileSync(new URL('../public/welcome.html', import.meta.url), 'utf8');
+const support = fs.readFileSync(new URL('../public/support.css', import.meta.url), 'utf8');
 const project = fs.readFileSync(new URL('../ios/App/App.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
 
 test('mobile layout prevents WebKit text inflation and horizontal viewport drift', () => {
@@ -43,8 +44,13 @@ test('welcome screen keeps compact iPhone controls and 16px form inputs', () => 
   assert.match(welcome, /\.cta-row\{display:grid;grid-template-columns:1fr 1fr/);
 });
 
+test('support back control clears the iPhone safe area with a full-size target', () => {
+  assert.match(support, /body\{[^}]*padding:calc\(env\(safe-area-inset-top,0px\) \+ 32px\)/);
+  assert.match(support, /\.support-back\{[^}]*top:calc\(env\(safe-area-inset-top,0px\) \+ 24px\)[^}]*min-height:48px/);
+});
+
 test('native bundle uses the polished CSS revision and replacement 1.1 build', () => {
   assert.match(index, /mobile\.css\?v=20261022c/);
-  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261029;/g) || []).length, 2);
+  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261030;/g) || []).length, 2);
   assert.equal((project.match(/MARKETING_VERSION = 1\.1;/g) || []).length, 2);
 });
