@@ -29,6 +29,11 @@ import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
 const SUPPORT_RETURN_KEY='orbit-support-return-view';
+function dismissSplashForSupportReturn(){
+  const splash=document.getElementById('orbit-splash');
+  if(splash?.parentNode)splash.parentNode.removeChild(splash);
+  window.__orbitSplashComplete=true;
+}
 function consumeSupportReturnView(){
   let view=window.__orbitSupportReturnView||null;
   try{
@@ -36,6 +41,7 @@ function consumeSupportReturnView(){
     sessionStorage.removeItem(SUPPORT_RETURN_KEY);
   }catch(_){}
   window.__orbitSupportReturnView=null;
+  if(view==='safety')dismissSplashForSupportReturn();
   document.documentElement.classList.remove('orbit-support-returning');
   return view==='safety'?'safety':null;
 }
