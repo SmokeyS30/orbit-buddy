@@ -46,6 +46,17 @@ test('preview excludes chat by default, requires consent, and cancellation sends
   assert.match(reportPreview({kind:'problem',reason:'bug',description:'Typing froze',includeMessage:false,messageExcerpt:'',email:'member@example.com'}),/Chat history: none attached/);
 });
 
+test('opening Report a Problem leaves the reason picker closed until tapped',()=>{
+  const f=fixture();
+  let titleFocuses=0,reasonFocuses=0;
+  f.$('report-title').focus=()=>{titleFocuses++;};
+  f.$('report-reason').focus=()=>{reasonFocuses++;};
+  f.fire('report-problem-button','click');
+  assert.equal(f.dialog.open,true);
+  assert.equal(titleFocuses,1);
+  assert.equal(reasonFocuses,0);
+});
+
 test('edited excerpt is the only chat content sent; repeated clicks submit once',async()=>{
   const calls=[];let release;
   const f=fixture((url,options)=>{calls.push({url,body:JSON.parse(options.body)});return new Promise((resolve)=>{release=resolve;});});
