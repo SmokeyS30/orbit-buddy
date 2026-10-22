@@ -4,6 +4,7 @@ data/
 node_modules/
 npm-debug.log*
 coverage/
+build/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
