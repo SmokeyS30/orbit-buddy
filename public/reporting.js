@@ -49,7 +49,9 @@ export function createReportingUI({document,api,getAccount,getConversationId,get
     messageControls.classList.toggle('hidden',kind!=='response');
     updatePreview();
     dialog.showModal();
-    reason.focus();
+    // Focus the dialog heading instead of the select. On iOS, focusing a
+    // select as the modal opens immediately presents its choice picker.
+    title.focus({preventScroll:true});
     return true;
   }
   // Keep an in-flight draft visible until the outcome is known, so a failed
