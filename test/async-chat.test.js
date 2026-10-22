@@ -4,10 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
+import { createModelClient } from '../src/model.js';
 
-async function fixture(extraEnv = {}) {
+async function fixture(extraEnv = {}, extraOptions = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-asyncchat-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv }, ...extraOptions });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
@@ -34,6 +35,38 @@ async function waitFor(fn, timeoutMs = 8000) {
   }
   return false;
 }
+
+test('high-confidence abusive AI output is filtered before storage and delivery',async(t)=>{
+  const model=createModelClient({NODE_ENV:'test'});
+  let release;
+  const unsafeReply='A walk can help. '.repeat(80)+'I will kill you. More text follows. [SUGGEST_MEMORY: unsafe memory] [FOLLOWUP: unsafe task on 2026-12-01]';
+  model.respond=async({onTurn,onToken})=>{
+    onTurn?.(0);
+    onToken?.('A walk can help. '.repeat(80));
+    onToken?.('I will kill');
+    onToken?.(' you.');
+    onToken?.(' More text follows.');
+    await new Promise(resolve=>{release=resolve;});
+    return{text:unsafeReply,toolCalls:[]};
+  };
+  const{app,base}=await fixture({}, {modelClient:model});t.after(()=>app.close());
+  const auth=await register(base);
+  const response=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Help me plan a walk.'})});
+  assert.equal(response.status,202);
+  const sent=await response.json();
+  assert.ok(await waitFor(()=>!!release));
+  const streaming=await(await fetch(`${base}/api/chat/stream-state?conversationId=${sent.conversationId}`,{headers:{Cookie:auth.cookie}})).json();
+  assert.match(streaming.text,/Orbit hid this response/);
+  release();
+  assert.ok(await waitFor(()=>app.db.listConversationMessages(auth.userId,sent.conversationId,10)
+    .some((message)=>message.role==='assistant'&&message.content.includes('Orbit hid this response'))));
+  const messages=app.db.listConversationMessages(auth.userId,sent.conversationId,10);
+  assert.equal(messages.filter((message)=>message.role==='assistant'&&message.content.includes('I will kill you.')).length,0);
+  const snapshot=await(await fetch(`${base}/api/snapshot?conversation=${sent.conversationId}`,{headers:{Cookie:auth.cookie}})).json();
+  assert.equal(snapshot.messages.filter((message)=>message.role==='assistant'&&message.content.includes('I will kill you.')).length,0);
+  assert.equal(app.db.listMemorySuggestions(auth.userId).some((row)=>row.content==='unsafe memory'),false);
+  assert.equal(app.db.listFollowUps(auth.userId).some((row)=>row.description==='unsafe task'),false);
+});
 
 test('POST /api/chat returns 202 instantly and the reply lands in the background', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());

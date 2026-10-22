@@ -122,6 +122,19 @@ test('pre-thread messages are adopted into a General conversation on open', () =
   db.close();
 });
 
+test('SQLite reports survive reopen and disappear when the reporter account is deleted', () => {
+  const { db, user, filePath } = fixture();
+  const first=db.addReport(user.id,{submissionId:'first',kind:'problem',reason:'bug',description:'Issue',messageId:null,messageExcerpt:null});
+  assert.equal(first.created,true);
+  assert.equal(db.addReport(user.id,{submissionId:'first',kind:'problem',reason:'bug',description:'Issue'}).created,false);
+  db.close();
+  const reopened=openDatabase(filePath);
+  assert.equal(reopened.getReportSubmission(user.id,'first').id,first.report.id);
+  reopened.deleteUserAccount(user.id);
+  assert.equal(reopened.listReports().length,0);
+  reopened.close();
+});
+
 test('stores typed memory and ranks relevant details ahead of unrelated ones', () => {
   const { db, user } = fixture();
   db.addMemory(user.id, 'Prefers aisle seats on flights.', { kind: 'preference' });

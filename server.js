@@ -9,6 +9,7 @@ import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
+import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
@@ -516,7 +517,7 @@ export function createOrbitServer(options={}) {
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
-  const model=createModelClient(env);
+  const model=options.modelClient||createModelClient(env);
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
@@ -613,7 +614,7 @@ export function createOrbitServer(options={}) {
   // server secret (no new credential); requires PUBLIC_BASE_URL in production.
   function whatsappMediaUrlFor(mediaId){return buildWhatsAppMediaUrl(publicBase,mediaId,deriveMediaSigningKey(encryptionKey));}
   function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(!token)return null;return db.getSession(hashToken(token));}
-  function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled)return session;return null;}
+  function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled&&!session.moderation_blocked)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
   function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
@@ -654,9 +655,19 @@ export function createOrbitServer(options={}) {
     // Membership is resolved from the server-side, Apple-verified entitlement.
     // The client cannot opt itself into stronger model routing.
     const membershipTier=subscriptions.tier(userId,user);
-    const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
+    const streamState={turn:-1,text:'',rawText:'',filtered:false,done:false};pendingStreams.set(conversation.id,streamState);
+    const onStreamTurn=(turn)=>{streamState.turn=turn;streamState.text='';streamState.rawText='';streamState.filtered=false;};
+    const onStreamToken=(delta)=>{
+      if(streamState.filtered)return;
+      streamState.rawText+=delta;
+      // Every rule is shorter than this window. Scan the tail on small token
+      // updates so a long reply does not require a full regex pass per token.
+      const checked=filterAssistantContent(String(delta).length>512?streamState.rawText:streamState.rawText.slice(-512));
+      if(checked.filtered){streamState.filtered=true;streamState.rawText='';streamState.text=checked.text;}
+      else streamState.text=streamState.rawText;
+    };
     let answer=null;
-    const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
+    const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
     try{
       const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
       const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
@@ -742,8 +753,8 @@ export function createOrbitServer(options={}) {
             // its default personality for chitchat instead.
             soulDirective:null,
             userTimeZone:preferences.time_zone,
-            onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},
-            onToken:(delta)=>{streamState.text+=delta;}
+            onTurn:onStreamTurn,
+            onToken:onStreamToken
           });
           answer=chitchatText;
           storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
@@ -807,11 +818,16 @@ export function createOrbitServer(options={}) {
         memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
-        onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
+        onTurn:onStreamTurn,onToken:onStreamToken});
+      // Legacy follow-up and memory markers can persist their text outside the
+      // chat message. Filter before reading them as well as before delivery.
+      const checkedRaw=filterAssistantContent(rawAnswer);
+      const safeRawAnswer=checkedRaw.text;
+      if(checkedRaw.filtered)db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');
       for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
       // Backward compatibility for replies from older/custom models that still emit legacy markers.
-      for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
-      for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
+      for(const followUp of parseFollowUpMarkers(safeRawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
+      for(const suggestion of parseSuggestMarkers(safeRawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
       // Memory v2: auto-recall ON by default — suggestions older than the review
       // window persist automatically (contradictory ones stay pending; the owner
       // reviews/deletes anything in chat). The 2/reply suggestion cap is unchanged.
@@ -823,11 +839,11 @@ export function createOrbitServer(options={}) {
       // rewritten to drop the false claim instead of letting Orbit lie.
       let schedulingResult=null;
       try{
-        schedulingResult=enforceSchedulingHonesty({answer:rawAnswer,toolCalls,db,userId,timeZone:preferences.time_zone||'America/New_York',sourceMessageId:userMsg.id,userMessage:message});
+        schedulingResult=enforceSchedulingHonesty({answer:safeRawAnswer,toolCalls,db,userId,timeZone:preferences.time_zone||'America/New_York',sourceMessageId:userMsg.id,userMessage:message});
         if(schedulingResult.created)db.addEvent(userId,'scheduling_honesty',`Auto-created follow-up the model promised: "${schedulingResult.created.description}" on ${schedulingResult.created.due_date||schedulingResult.created.dueDate}.`);
         if(schedulingResult.corrected)db.addEvent(userId,'scheduling_honesty',`Rewrote an unparseable scheduling claim instead of letting it through.`);
       }catch(e){console.error('scheduling honesty failed',e&&e.message);}
-      answer=stripModelMarkers(schedulingResult?schedulingResult.answer:rawAnswer)||'Noted — I’ll check in about that afterwards.';
+      answer=stripModelMarkers(schedulingResult?schedulingResult.answer:safeRawAnswer)||'Noted — I’ll check in about that afterwards.';
       storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       // Proactive memory bookkeeping: if a memory was volunteered this turn
       // and the model wasn't mid-task (no tool calls), record it so it's
@@ -2677,7 +2693,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         // Never link by email, even if Apple says that email is verified.
         if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
-        user=db.getUserById(linked.user_id);if(!user||user.disabled)return json(res,401,{error:'Sign-in was not accepted.'});
+        user=db.getUserById(linked.user_id);if(!user||user.disabled||user.moderation_blocked)return json(res,401,{error:'Sign-in was not accepted.'});
         const {csrf,token:sessionToken}=createSession(user,req,res);
         return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
@@ -2768,7 +2784,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
         if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&await verifyPassword(body.password,user.password_hash,user.password_salt);
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyPassword(body.password,user.password_hash,user.password_salt);
         if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
@@ -2822,6 +2838,53 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 // so the Today-tab card can tell a genuine 6h+ absence from a refresh.
 let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
         const userId=user.user_id||user.id;
+        // Reports contain only details the reporter previewed and consented to.
+        // A submission ID makes retries safe even if the first response is lost.
+        if(req.method==='GET'&&url.pathname==='/api/reports/mine'){
+          res.setHeader('Cache-Control','no-store');
+          return json(res,200,{reports:db.listOwnReports(userId,50)});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/reports'){
+          const body=await readJson(req,16*1024);
+          if(!body||typeof body!=='object'||Array.isArray(body))return json(res,400,{error:'A report object is required.'});
+          const submissionId=body.submissionId;
+          if(typeof submissionId!=='string'||!/^[0-9a-f-]{36}$/i.test(submissionId))return json(res,400,{error:'A valid submission ID is required.'});
+          if(body.consent!==true)return json(res,400,{error:'Preview and consent are required.'});
+          const prior=db.getReportSubmission(userId,submissionId);
+          if(prior)return json(res,200,{id:prior.id,status:prior.status,duplicate:true});
+          const kind=body.kind,reason=body.reason;
+          if(!['response','problem'].includes(kind)||!['unsafe','incorrect','bug','other'].includes(reason))return json(res,400,{error:'Choose a valid report type and reason.'});
+          const descriptionInput=body.description??'';
+          if(typeof descriptionInput!=='string'||descriptionInput.length>1000)return json(res,400,{error:'Description must be at most 1000 characters.'});
+          const description=descriptionInput.trim();
+          let messageId=null,messageExcerpt=null;
+          if(kind==='response'){
+            if(typeof body.messageId!=='string'||!/^[0-9a-f-]{36}$/i.test(body.messageId))return json(res,400,{error:'Choose an Orbit response.'});
+            const message=db.getMessage(userId,body.messageId);
+            if(!message)return json(res,404,{error:'Response not found.'});
+            if(message.role!=='assistant')return json(res,400,{error:'Only Orbit responses can be reported here.'});
+            if(body.includeMessage===true){
+              if(typeof body.messageExcerpt!=='string'||!body.messageExcerpt.trim()||body.messageExcerpt.length>2000)return json(res,400,{error:'The included excerpt must be 1 to 2000 characters.'});
+              messageId=message.id;messageExcerpt=body.messageExcerpt;
+            }else if(body.includeMessage!==false||body.messageExcerpt!=null)return json(res,400,{error:'Choose whether to include an excerpt.'});
+          }else if(body.messageId!=null||body.messageExcerpt!=null||body.includeMessage!=null)return json(res,400,{error:'Problem reports cannot attach chat messages.'});
+          if(hourlyLimited(req,20,'report')||db.countRecentReports(userId,new Date(Date.now()-60*60_000).toISOString())>=5||userRateLimited(userId,'report',8,60*60_000))return json(res,429,{error:'Report limit reached. Try again later.'});
+          const saved=db.addReport(userId,{submissionId,kind,reason,description,messageId,messageExcerpt});
+          return json(res,saved.created?201:200,{id:saved.report.id,status:saved.report.status,duplicate:!saved.created});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/admin/reports'){
+          requireOwner(user);res.setHeader('Cache-Control','no-store');
+          return json(res,200,{reports:db.listReports(100),summary:db.reportQueueSummary()});
+        }
+        const reportStatusMatch=url.pathname.match(/^\/api\/admin\/reports\/([0-9a-f-]{36})$/);
+        if(req.method==='PATCH'&&reportStatusMatch){
+          requireOwner(user);const body=await readJson(req,2048);
+          if(!body||typeof body!=='object'||!['new','reviewing','resolved','dismissed'].includes(body.status))return json(res,400,{error:'Choose a valid report status.'});
+          if(body.ownerNote!==undefined&&(typeof body.ownerNote!=='string'||body.ownerNote.length>500))return json(res,400,{error:'The response must be at most 500 characters.'});
+          const report=db.updateReportStatus(reportStatusMatch[1],body.status,body.ownerNote===undefined?null:body.ownerNote.trim());
+          if(!report)return json(res,404,{error:'Report not found.'});
+          return json(res,200,{id:report.id,status:report.status,ownerNote:report.owner_note});
+        }
         // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
         // the 15s frontend refresh doesn't refetch weather/calendar each time.
         if(req.method==='GET'&&url.pathname==='/api/today-briefing'){
@@ -3387,7 +3450,23 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{ok:db.resolveSignupAppeal(String(body.id),body.status)});
         }
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
-        if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,moderationBlocked:!!u.moderation_blocked,createdAt:u.created_at}))});}
+        const moderationBlock=url.pathname.match(/^\/api\/admin\/users\/([0-9a-f-]{36})\/moderation-block$/);
+        if(req.method==='POST'&&moderationBlock){
+          requireOwner(user);
+          if(userRateLimited(userId,'moderation-block',20,60*60_000))return json(res,429,{error:'Too many account actions. Try again later.'});
+          const body=await readJson(req,1024);
+          if(!body||typeof body!=='object'||typeof body.blocked!=='boolean')return json(res,400,{error:'Choose whether to block this account.'});
+          const target=db.getUserById(moderationBlock[1]);
+          if(!target)return json(res,404,{error:'Account not found.'});
+          if(target.role!=='member'||target.id===userId||target.is_demo)return json(res,403,{error:'This account cannot be blocked here.'});
+          if(body.blocked===!!target.moderation_blocked)return json(res,200,{blocked:!!target.moderation_blocked,unchanged:true});
+          if(body.blocked&&target.disabled)return json(res,409,{error:'This account is disabled for another reason.'});
+          if(!db.setModerationBlocked(target.id,body.blocked))return json(res,409,{error:'Account state changed. Refresh and retry.'});
+          if(body.blocked)db.deleteUserSessions(target.id);
+          db.addEvent(userId,body.blocked?'moderation_account_blocked':'moderation_account_restored',body.blocked?'Owner blocked a member account.':'Owner restored a member account.');
+          return json(res,200,{blocked:body.blocked});
+        }
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
         const accessApprove=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/approve$/);
         if(req.method==='POST'&&accessApprove){
@@ -3401,7 +3480,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
             try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
             catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
-          }else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
+          }else if(target.moderation_blocked)return json(res,409,{error:'This account is blocked. Restore it from Users before approving access.'});
+          else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
           db.dismissAccessRequest(request.id);
           db.addEvent(userId,'access_approved','Approved a requested account; secure email recovery is required.');
           return json(res,200,{ok:true,approved:true,requiresEmailRecovery:true});

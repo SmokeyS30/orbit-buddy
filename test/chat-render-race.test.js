@@ -16,7 +16,7 @@ function harness() {
     document: { getElementById: () => root, createElement: () => ({ dataset: {} }) },
     loadCanvas: () => new Promise(resolve => loads.push(resolve)), isComposing: () => composing,
     isNearBottom: () => false, shouldSettleAtBottom: () => false,
-    buildMessageActionRow() {}, empty() {},
+    buildMessageActionRow() {}, empty() {}, appendTypingBubble() {},
   });
   vm.runInContext(renderSource, context);
   return { context, root, loads, composing(value) { composing=value; }, render: items => context.renderMessages(items) };
@@ -61,4 +61,29 @@ test('unchanged idle history avoids another chunk load or DOM rebuild', async ()
   await h.render([message('1')]);
   assert.equal(h.loads.length, 0);
   assert.equal(h.root.rebuilds, 1);
+});
+
+test('an edit of the same length still updates the visible message',async()=>{
+  const h=harness();
+  const first=h.render([message('1','old')]);h.loads.shift()(null);await first;
+  const edited=h.render([message('1','new')]);h.loads.shift()(null);await edited;
+  assert.equal(h.root.rebuilds,2);
+  assert.equal(h.root.children[0].textContent,'new');
+});
+
+test('an active typing indicator does not rebuild unchanged long history',async()=>{
+  const h=harness();h.context.typingActive=true;
+  const items=Array.from({length:60},(_,i)=>message(String(i),'text'.repeat(100)));
+  const first=h.render(items);h.loads.shift()(null);await first;
+  for(let i=0;i<5;i++)await h.render(items);
+  assert.equal(h.root.rebuilds,1);
+  assert.equal(h.loads.length,0);
+});
+
+test('explicit navigation may render the chosen thread while keeping a draft',async()=>{
+  const h=harness();h.composing(true);
+  h.context.activeConversationId='b';h.context.state.snapshot.activeConversation.id='b';
+  const loading=h.context.renderMessages([message('2','new thread')],{allowWhileComposing:true});
+  h.loads.shift()(null);await loading;
+  assert.equal(h.root.children[0].textContent,'new thread');
 });

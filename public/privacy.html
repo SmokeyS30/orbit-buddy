@@ -13,7 +13,7 @@ li{margin-bottom:.4em}
 </head>
 <body>
 <h1>Privacy Policy — Orbit Buddy</h1>
-<p class="muted">Last updated: October 19, 2026</p>
+<p class="muted">Last updated: October 22, 2026</p>
 
 <p>Orbit Buddy ("the app," "we") is a personal AI companion application. Your privacy matters to us. This policy describes in detail what information we collect, why we collect it, how we use and protect it, and the choices you have.</p>
 
@@ -23,6 +23,7 @@ li{margin-bottom:.4em}
 <ul>
 <li><strong>Account credentials:</strong> When you register, we collect your email address, a display name, and a password. Passwords are hashed using scrypt with a unique salt per user; plain-text passwords are never stored.</li>
 <li><strong>Conversations:</strong> Every message you send to Orbit Buddy and every reply it generates is stored in our database. This enables the app to maintain context across sessions and provide personalized responses.</li>
+<li><strong>Reports:</strong> If you send a response or app-problem report, we store its reason, optional description, your account identity, and only the response excerpt you explicitly choose to include. The preview lets you edit that excerpt before you consent. We do not attach chat history automatically. The app owner can review reports, track their status, and leave a response visible in your account.</li>
 <li><strong>Memories:</strong> Facts, preferences, and observations you ask the app to remember (or that you approve from its suggestions) are stored as structured memories linked to your account.</li>
 <li><strong>Goals, tasks, routines, and projects:</strong> Any goals you set, tasks you create, routines you schedule, and projects you track — including titles, descriptions, due dates, progress, and completion status — are stored.</li>
 <li><strong>Follow-ups:</strong> Reminders you schedule, including their descriptions and due dates.</li>
@@ -55,6 +56,9 @@ li{margin-bottom:.4em}
 <li><strong>Core functionality:</strong> To operate the AI companion — generating replies, maintaining conversation context, tracking your goals and tasks, and delivering reminders and briefings.</li>
 <li><strong>Personalization:</strong> Memories and past conversations are used to tailor responses to your preferences, habits, and history.</li>
 <li><strong>Connected-service actions:</strong> Gmail and calendar data is used solely to perform the specific actions you request. For example, searching your inbox when you ask "find that email from John," or including today's events in your morning briefing.</li>
+<li><strong>Report review:</strong> The app owner uses submitted reports to investigate unsafe or incorrect replies and app problems. Reports are not sent to an external reporting service.</li>
+<li><strong>Content safety:</strong> Orbit applies a local output filter to certain high-confidence abusive AI replies before storing or delivering them. The filter does not reject your message when you ask for help about a difficult topic.</li>
+<li><strong>Account moderation:</strong> The owner can block and later restore a member account. Orbit stores that access status and an owner action event; blocking revokes active sessions.</li>
 <li><strong>Service improvement (aggregate only):</strong> We may review anonymized, aggregate usage patterns (e.g., which features are popular) to improve the app. Individual conversation content is never used for this purpose.</li>
 </ul>
 
@@ -98,6 +102,7 @@ li{margin-bottom:.4em}
 <h2>6. Data Retention</h2>
 <ul>
 <li>Conversations, memories, goals, tasks, and other user data are retained until you delete them.</li>
+<li>Submitted reports remain in the owner's review inbox while your account exists. Deleting your account also deletes its reports.</li>
 <li>You can delete individual items at any time from within the app (Memories tab, Goals tab, chat history, etc.).</li>
 <li>Disconnecting a connected service (e.g., Gmail) in the Connections tab immediately and permanently deletes the associated OAuth tokens from our database.</li>
 <li>Push notification subscriptions are deleted when you disable notifications or remove the app.</li>

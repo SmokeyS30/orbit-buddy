@@ -73,7 +73,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
       password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','member')),
-      disabled INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -94,6 +94,22 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       id TEXT PRIMARY KEY, user_id TEXT, role TEXT NOT NULL CHECK(role IN ('user','assistant')),
       content TEXT NOT NULL, created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      reporter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      submission_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('response','problem')),
+      reason TEXT NOT NULL CHECK(reason IN ('unsafe','incorrect','bug','other')),
+      description TEXT NOT NULL DEFAULT '',
+      message_id TEXT,
+      message_excerpt TEXT,
+      status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','reviewing','resolved','dismissed')),
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reviewed_at TEXT,
+      owner_note TEXT NOT NULL DEFAULT '',
+      UNIQUE(reporter_user_id,submission_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_reports_reporter_created ON reports(reporter_user_id,created_at DESC);
     CREATE TABLE IF NOT EXISTS memories (
       id TEXT PRIMARY KEY, user_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
@@ -422,6 +438,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   `);
 
   // Upgrade v0.1 databases in place without discarding user data.
+  ensureColumn(db, 'reports', 'owner_note', "TEXT NOT NULL DEFAULT ''");
+  ensureColumn(db, 'users', 'moderation_blocked', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'users', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'users', 'email_verified_at', 'TEXT');
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
@@ -508,10 +526,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
 
   const s = {
     countUsers: db.prepare('SELECT COUNT(*) AS count FROM users'),
-    listUsers: db.prepare('SELECT id,email,display_name,role,disabled,created_at,updated_at FROM users ORDER BY created_at'),
+    listUsers: db.prepare('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
     createUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)'),
     createDemoUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,is_demo,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)'),
-    listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<?"),
+    listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<=?"),
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
@@ -519,14 +537,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     authIdentityForUser: db.prepare('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1'),
     linkAuthIdentity: db.prepare('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)'),
     updatePassword: db.prepare('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?'),
-    setUserDisabled: db.prepare('UPDATE users SET disabled=?, updated_at=? WHERE id=?'),
+    setUserDisabled: db.prepare('UPDATE users SET disabled=?, updated_at=? WHERE id=? AND (?=1 OR moderation_blocked=0)'),
+    setModerationBlocked: db.prepare("UPDATE users SET disabled=?,moderation_blocked=?,updated_at=? WHERE id=? AND role='member' AND disabled=? AND moderation_blocked=?"),
     markUserEmailVerified: db.prepare('UPDATE users SET email_verified_at=?, updated_at=? WHERE id=? AND email_verified_at IS NULL'),
     claimMessages: db.prepare('UPDATE messages SET user_id=? WHERE user_id IS NULL'),
     claimMemories: db.prepare('UPDATE memories SET user_id=? WHERE user_id IS NULL'),
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled
+    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -550,6 +569,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    getReportSubmission: db.prepare('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?'),
+    countRecentReports: db.prepare('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?'),
+    addReport: db.prepare(`INSERT INTO reports(id,reporter_user_id,submission_id,kind,reason,description,message_id,message_excerpt,status,created_at,updated_at,reviewed_at)
+      VALUES(?,?,?,?,?,?,?,?,'new',?,?,NULL) ON CONFLICT(reporter_user_id,submission_id) DO NOTHING`),
+    listReports: db.prepare(`SELECT reports.*, users.display_name AS reporter_name FROM reports
+      JOIN users ON users.id=reports.reporter_user_id ORDER BY CASE WHEN reports.status IN ('new','reviewing') THEN 0 ELSE 1 END, CASE WHEN reports.status IN ('new','reviewing') THEN reports.created_at END ASC, reports.created_at DESC,reports.rowid DESC LIMIT ?`),
+    listOwnReports: db.prepare('SELECT id,kind,reason,status,created_at,updated_at,reviewed_at,owner_note FROM reports WHERE reporter_user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    reportQueueSummary: db.prepare("SELECT status,COUNT(*) AS count,MIN(created_at) AS oldest_at FROM reports GROUP BY status"),
+    updateReportStatus: db.prepare('UPDATE reports SET status=?,owner_note=COALESCE(?,owner_note),updated_at=?,reviewed_at=COALESCE(reviewed_at,?) WHERE id=?'),
+    getReport: db.prepare('SELECT * FROM reports WHERE id=?'),
     // W1: per-message actions.
     getMessage: db.prepare('SELECT * FROM messages WHERE id=? AND user_id=?'),
     getMessageAny: db.prepare('SELECT * FROM messages WHERE id=?'),
@@ -962,7 +991,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return s.authIdentity.get(provider, subject);
     },
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
-    setUserDisabled(id, disabled) { s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id); },
+    setUserDisabled(id, disabled) { return s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id, disabled?1:0).changes>0; },
+    setModerationBlocked(id,blocked){return s.setModerationBlocked.run(blocked?1:0,blocked?1:0,timestamp(),id,blocked?0:1,blocked?0:1).changes>0;},
     markUserEmailVerified(id) { const now=timestamp();return s.markUserEmailVerified.run(now,now,id).changes>0; },
     deleteUserAccount(userId) {
       const account = s.userById.get(userId);
@@ -1035,6 +1065,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
+    getReportSubmission:(userId,submissionId)=>s.getReportSubmission.get(userId,submissionId),
+    countRecentReports:(userId,since)=>s.countRecentReports.get(userId,since).count,
+    addReport(userId,report){const now=timestamp();const row={id:randomUUID(),reporter_user_id:userId,submission_id:report.submissionId,kind:report.kind,reason:report.reason,description:report.description,message_id:report.messageId||null,message_excerpt:report.messageExcerpt||null,status:'new',created_at:now,updated_at:now,reviewed_at:null};const result=s.addReport.run(row.id,row.reporter_user_id,row.submission_id,row.kind,row.reason,row.description,row.message_id,row.message_excerpt,now,now);return{report:s.getReportSubmission.get(userId,report.submissionId),created:result.changes>0};},
+    listReports:(limit=100)=>s.listReports.all(Math.min(Math.max(limit,1),100)),
+    listOwnReports:(userId,limit=50)=>s.listOwnReports.all(userId,Math.min(Math.max(limit,1),50)),
+    reportQueueSummary:()=>s.reportQueueSummary.all(),
+    updateReportStatus(id,status,ownerNote=null){const now=timestamp();if(!s.updateReportStatus.run(status,ownerNote,now,status==='new'?null:now,id).changes)return null;return s.getReport.get(id);},
     // W1: per-message actions.
     getMessage:(userId,id)=>s.getMessage.get(id,userId),
     messageExists:(id)=>!!s.getMessageAny.get(id),
