@@ -27,7 +27,8 @@ const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csr
 // twice" flake was the weekly review, not the quiet nudge).
 function midweekFuture() {
   const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', weekday: 'short' });
-  let t = Date.now() + 3 * 24 * 3600_000;
+  const future = new Date(Date.now() + 3 * 24 * 3600_000);
+  let t = Date.UTC(future.getUTCFullYear(), future.getUTCMonth(), future.getUTCDate(), 15, 0, 0);
   for (let i = 0; i < 10 && !['Wed', 'Thu', 'Fri'].includes(fmt.format(new Date(t))); i++) t += 24 * 3600_000;
   return t;
 }
@@ -64,7 +65,7 @@ test('follow-up sweep checks in on due events only', async (t) => {
   app.db.addFollowUp(auth.userId, { description: 'dentist appointment', dueDate: '2000-01-01' });
   app.db.addFollowUp(auth.userId, { description: 'future trip', dueDate: '2999-01-01' });
   app.db.addMemory(auth.userId, 'Just a regular memory');
-  await app.runProactiveChecks();
+  await app.runProactiveChecks(Date.parse('2026-10-22T15:00:00Z'));
   const remaining = app.db.listFollowUps(auth.userId).map((item) => item.description);
   assert.ok(!remaining.includes('dentist appointment'), 'due follow-up is completed');
   assert.ok(remaining.includes('future trip'), 'future follow-up stays');

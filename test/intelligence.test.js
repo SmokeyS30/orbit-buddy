@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { extractPersonNames, isQuietHours, isoWeekKey, normalizeMemoryKind, normalizePreferences, rankMemories, todayInZone, validTimeZone } from '../src/intelligence.js';
+import { checkinDeliveryTime, extractPersonNames, isQuietHours, isoWeekKey, normalizeMemoryKind, normalizePreferences, rankMemories, smartCheckinWindow, todayInZone, validTimeZone } from '../src/intelligence.js';
 
 test('normalizes memory kinds and timezone preferences', () => {
   assert.equal(normalizeMemoryKind('GOAL'), 'goal');
@@ -39,6 +39,23 @@ test('resolves local dates and overnight quiet hours', () => {
   assert.equal(isQuietHours(prefs, Date.parse('2026-10-03T23:00:00Z')), true);
   assert.equal(isQuietHours(prefs, Date.parse('2026-10-03T12:00:00Z')), false);
   assert.equal(isQuietHours({ ...prefs, proactive_enabled: 0 }, Date.parse('2026-10-03T12:00:00Z')), true);
+});
+
+test('smart check-ins stay inside narrow local-time windows', () => {
+  const zone = 'America/New_York';
+  const at = (hour, minute = 0) => Date.UTC(2026, 9, 22, hour + 4, minute);
+  assert.equal(smartCheckinWindow(zone, at(7, 59)), null);
+  assert.equal(smartCheckinWindow(zone, at(8, 0)), 'morning');
+  assert.equal(smartCheckinWindow(zone, at(10, 29)), 'morning');
+  assert.equal(smartCheckinWindow(zone, at(10, 30)), null);
+  assert.equal(smartCheckinWindow(zone, at(12, 30)), 'afternoon');
+  assert.equal(smartCheckinWindow(zone, at(15, 30)), null);
+  assert.equal(smartCheckinWindow(zone, at(18, 0)), 'evening');
+  assert.equal(smartCheckinWindow(zone, at(20, 30)), null);
+  assert.equal(checkinDeliveryTime(zone, at(8, 29)), false);
+  assert.equal(checkinDeliveryTime(zone, at(8, 30)), true);
+  assert.equal(checkinDeliveryTime(zone, at(20, 29)), true);
+  assert.equal(checkinDeliveryTime(zone, at(20, 30)), false);
 });
 
 test('memory ranking prioritizes lexical relevance and omits expired entries', () => {

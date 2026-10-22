@@ -217,7 +217,27 @@ test('respond() still includes TOOL_DEFINITIONS when tools:true', async () => {
     assert.equal(text, 'Hey there!');
     assert.ok(Array.isArray(capturedBody.tools) && capturedBody.tools.length > 0, 'tools present');
     assert.ok(capturedBody.tools.some((t) => t.function?.name === 'web_search' || t.name === 'web_search' || JSON.stringify(t).includes('web_search')), 'web_search tool defined');
+    assert.ok(!capturedBody.tools.some((t) => ['gmail_send','gmail_search','gmail_read','gmail_delete','learn_writing_voice'].includes(t.name)), 'owner-only Gmail tools are omitted without owner context');
     assert.ok(JSON.stringify(capturedBody.input).length > 10000, 'full developer prompt still attached');
+  } finally {
+    restore();
+  }
+});
+
+test('respond() includes Gmail tools only with an authorized owner context', async () => {
+  let capturedBody = null;
+  const restore = stubFetch(async (_url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return jsonResponse(okOutput);
+  });
+  try {
+    const client = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'gpt-6.1-sol' });
+    await client.respond({
+      buddyName: 'Orbit', message: 'check my email', tools: true,
+      toolContext: { gmail: { getToken: async () => 'test' } }
+    });
+    assert.ok(capturedBody.tools.some((tool) => tool.name === 'gmail_search'));
+    assert.ok(capturedBody.tools.some((tool) => tool.name === 'gmail_send'));
   } finally {
     restore();
   }

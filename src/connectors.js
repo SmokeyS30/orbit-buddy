@@ -21,16 +21,27 @@ const providers = {
 const challenge = (value) => createHash('sha256').update(value).digest('base64url');
 
 export function createConnectorService(env, db, encryptionKey) {
-  function available() {
-    return Object.entries(providers).map(([id, provider]) => ({
+  function requireProviderAccess(userId, providerId) {
+    if (providerId !== 'gmail') return;
+    const user = db.getUserById(userId);
+    if (!user || user.role !== 'owner') {
+      throw Object.assign(new Error('Owner access is required.'), { status: 403 });
+    }
+  }
+
+  function available(userId = null) {
+    return Object.entries(providers)
+      .filter(([id]) => id !== 'gmail' || (userId && db.getUserById(userId)?.role === 'owner'))
+      .map(([id, provider]) => ({
       id, label: provider.label,
       configured: Boolean(encryptionKey && env[provider.clientId] && env[provider.clientSecret])
-    }));
+      }));
   }
 
   function begin(userId, providerId, origin) {
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
+    requireProviderAccess(userId, providerId);
     if (!encryptionKey || !env[provider.clientId] || !env[provider.clientSecret]) throw Object.assign(new Error(`${provider.label} OAuth is not configured.`), { status: 503 });
     const state = randomToken(32); const verifier = provider.pkce ? randomToken(48) : null;
     const redirectUri = `${origin}/api/connectors/${providerId}/callback`;
@@ -48,6 +59,7 @@ export function createConnectorService(env, db, encryptionKey) {
     const provider = providers[providerId];
     const oauthState = db.consumeOauthState(hashToken(state));
     if (!provider || !oauthState || oauthState.provider !== providerId) throw Object.assign(new Error('OAuth state is invalid or expired.'), { status: 400 });
+    requireProviderAccess(oauthState.user_id, providerId);
     const params = new URLSearchParams({ code, client_id: env[provider.clientId], client_secret: env[provider.clientSecret], redirect_uri: oauthState.redirect_uri, grant_type: 'authorization_code' });
     if (oauthState.code_verifier) params.set('code_verifier', oauthState.code_verifier);
     const tokenResponse = await fetch(provider.token, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(30_000) });
@@ -67,6 +79,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function preview(userId, providerId) {
+    requireProviderAccess(userId, providerId);
     const token = await getValidToken(userId, providerId);
     let url; let transform = (value) => value;
     if (providerId === 'github') { url='https://api.github.com/user/repos?per_page=20&sort=updated'; transform=(items)=>items.map((item)=>({name:item.full_name,private:item.private,url:item.html_url,updatedAt:item.updated_at})); }
@@ -82,6 +95,7 @@ export function createConnectorService(env, db, encryptionKey) {
   async function getValidToken(userId, providerId) {
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
+    requireProviderAccess(userId, providerId);
     const row = db.getConnector(userId, providerId);
     if (!row) throw Object.assign(new Error(`${provider.label} is not connected.`), { status: 404 });
     // If token isn't expiring soon (5 min buffer), use it as-is
