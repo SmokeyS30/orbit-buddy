@@ -60,6 +60,10 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.ok(user.id, 'user created with id');
     assert.equal(user.email, email);
     userId = user.id;
+    assert.equal(db.hasAuthIdentityForUser('apple',userId),false);
+    db.linkAuthIdentity('apple',`pgtest-${Date.now()}`,userId);
+    assert.equal(db.hasAuthIdentityForUser('apple',userId),true);
+    assert.equal(db.hasAuthIdentityForUser('other',userId),false);
 
     // 3. Read: fetch the user back. DB returns snake_case fields.
     const fetched = db.getUserByEmail(email);
@@ -90,6 +94,28 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     messageId = msg.id;
     const messages = db.listMessages(userId, 100);
     assert.ok(messages.some(m => m.id === messageId), 'message found');
+
+    // Privacy report parity: additive schema, idempotent submission, review
+    // status, and persistence across worker restart.
+    const submissionId=`report-${userId}`;
+    const reportInput={submissionId,kind:'response',reason:'incorrect',description:'Edited note',messageId:null,messageExcerpt:null};
+    const reported=db.addReport(userId,reportInput);
+    assert.equal(reported.created,true);
+    assert.equal(db.addReport(userId,reportInput).created,false);
+    assert.equal(db.countRecentReports(userId,new Date(Date.now()-60_000).toISOString()),1);
+    assert.equal(db.getReportSubmission(userId,submissionId).id,reported.report.id);
+    assert.equal(db.listReports().find((r)=>r.id===reported.report.id).reporter_name,'PG Test User');
+    assert.equal(db.reportQueueSummary().find((r)=>r.status==='new').count>=1,true);
+    assert.deepEqual(db.listOwnReports(userId).map((r)=>r.id),[reported.report.id]);
+    assert.equal(db.updateReportStatus(reported.report.id,'reviewing','Looking into this.').status,'reviewing');
+    assert.equal(db.listOwnReports(userId)[0].owner_note,'Looking into this.');
+    assert.equal(db.setModerationBlocked(userId,true),true,'member moderation block works on PostgreSQL');
+    assert.equal(db.getUserById(userId).disabled,1);
+    assert.equal(db.getUserById(userId).moderation_blocked,1);
+    assert.equal(db.setUserDisabled(userId,false),false,'generic access approval cannot clear PostgreSQL moderation block');
+    assert.equal(db.getUserById(userId).disabled,1);
+    assert.equal(db.setModerationBlocked(userId,false),true);
+    assert.equal(db.getUserById(userId).disabled,0,'restoration keeps the password account usable');
 
     // 7b. W1 parity: messageExists / retimeMessage / deleteMessageTurn must
     // exist on the Postgres adapter (they were missing; regenerate and
@@ -150,6 +176,8 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.ok(rememories.some(m => m.id === memoryId), 'memory persists after close/reopen');
     const remsgs = db2.listMessages(userId, 100);
     assert.ok(remsgs.some(m => m.id === messageId), 'message persists after close/reopen');
+    assert.equal(db2.getReportSubmission(userId,submissionId).status,'reviewing','report persists after close/reopen');
+    assert.equal(db2.listOwnReports(userId)[0].owner_note,'Looking into this.','review response persists after close/reopen');
   } finally {
     // Reliable cleanup: a failed assertion must not leave workers running
     // or test records behind.
@@ -339,6 +367,9 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     assert.deepEqual((await Promise.all([db.consumeSignupChallenge(suffix,'link',user.id),db.consumeSignupChallenge(suffix,'link',user.id)])).sort(),[false,true]);
     const links=await Promise.allSettled([db.linkAuthIdentity('apple',suffix,user.id),db.linkAuthIdentity('apple',suffix,other.id)]);
     assert.equal(links.filter(r=>r.status==='fulfilled').length,1);
+    const linkedUserId=(await db.getAuthIdentity('apple',suffix)).user_id;
+    assert.equal(await db.hasAuthIdentityForUser('apple',user.id),linkedUserId===user.id);
+    assert.equal(await db.hasAuthIdentityForUser('apple',other.id),linkedUserId===other.id);
     await db.addAppAttestKey(suffix,'public','production');
     assert.deepEqual((await Promise.all([db.advanceAppAttestCounter(suffix,0,1),db.advanceAppAttestCounter(suffix,0,2)])).sort(),[false,true]);
     await db.addSignupVerificationToken(suffix,suffix,expiry);

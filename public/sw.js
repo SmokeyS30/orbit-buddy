@@ -11,8 +11,8 @@
 // Bump CACHE + STATIC_VERSION together whenever shipped static assets change,
 // so existing clients drop the old cache cleanly on next visit.
 
-const CACHE = 'orbit-buddy-v59';
-const STATIC_VERSION = '20261021e'; // keep in sync with the ?v= in public/index.html
+const CACHE = 'orbit-buddy-v64';
+const STATIC_VERSION = '20261022c'; // keep in sync with the ?v= in public/index.html
 
 // Every static asset the app shell needs on first paint / offline.
 // The list is generated from these entries (see buildPrecacheManifest) so it
@@ -25,10 +25,11 @@ const STATIC_VERSION = '20261021e'; // keep in sync with the ?v= in public/index
 const STATIC_ASSETS = [
   { url: '/', versioned: false },
   { url: '/styles.css', versioned: true },
-  { url: '/mobile.css', versioned: false },
+  { url: '/mobile.css', versioned: true },
   { url: '/desktop.css', versioned: false },
   { url: '/smooth.css', versioned: false },
   { url: '/app.js', versioned: true },
+  { url: '/reporting.js', versioned: false },
   { url: '/briefing-layout.js', versioned: false },
   { url: '/chat-scroll.js', versioned: false },
   { url: '/chat-markdown.js', versioned: false },

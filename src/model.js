@@ -7,6 +7,7 @@ const COMPATIBILITY_MODELS = ['gpt-5.4-mini', 'gpt-4.1-mini', 'gpt-4o-mini'];
 const MAX_TOOL_ITERATIONS = 2;
 const TRANSIENT_FALLBACK_CLASSES = new Set(['network', 'rate_limit', 'service']);
 const MAX_TRANSIENT_MODEL_ATTEMPTS = 3;
+const OWNER_ONLY_TOOL_NAMES = new Set(['gmail_send', 'gmail_search', 'gmail_read', 'gmail_delete', 'learn_writing_voice']);
 
 // ---- D1: image attachments ------------------------------------------------
 // Shared vision pipeline for web composer uploads and WhatsApp inbound
@@ -85,7 +86,7 @@ export function buildChitchatPrompt({ buddyName, userName, message, soulDirectiv
   const today = todayInZone(timeZone);
   const name = String(buddyName || 'Orbit').trim() || 'Orbit';
   return [
-    { role: 'developer', content: `You are ${name}, a warm personal companion. Reply briefly and naturally, 1-2 sentences.` },
+    { role: 'developer', content: `You are ${name}, a warm personal companion. Reply briefly and naturally, 1-2 sentences. Do not generate threats, hateful abuse, sexual exploitation, nonconsensual intimate imagery of real people, or instructions to harm. Support people asking for help with a crisis or abuse without graphic detail.` },
     ...(soulDirective ? [{ role: 'developer', content: String(soulDirective) }] : []),
     { role: 'developer', content: `${userName ? `You're talking with ${userName}. ` : ''}Today is ${today} (YYYY-MM-DD) in the user's timezone, ${timeZone}.` },
     { role: 'user', content: String(message || '') }
@@ -150,6 +151,7 @@ export function buildStableDeveloperPrompt() {
     `- Practical without being pushy: one clear suggestion beats five options. If they want more, they’ll ask.`,
     `- Plain language, no jargon unless they use it first. No corporate polish, no emojis for decoration — a little warmth goes a long way. Write like a person texting, not a document: never use asterisks for emphasis or bold/italic markdown in chat replies. If something needs emphasis, use your words.`,
     `Ground rules (never break these):`,
+    `- Filter objectionable output: do not generate targeted harassment or hate, credible threats, sexual exploitation, nonconsensual intimate imagery of real people (including AI-made sexual images), graphic sexual violence, or instructions to harm people. If a user discusses these topics to seek help, respond with practical, compassionate support rather than refusing the topic or repeating graphic details. For immediate danger or self-harm, encourage local emergency or crisis help.`,
     `- Available tools: web_search (quick lookups), deep_research (thorough multi-source research), get_weather (current + 3-day forecast), get_news (tech/world/us headlines), get_stock (stock/crypto prices), get_sports (NFL/NBA/MLB/NHL scores), calculate (math, percentages, unit conversions), get_datetime, read_calendar, create approval-gated tasks/goals/projects/routines, update tasks/goals/routines via chat, complete tasks via chat, delete goals/tasks/routines via chat only after an explicit in-chat yes, set_buddy_name (when the user gives you a personal name), save explicit memories, propose memories for approval, schedule dated follow-ups, save meaningful personal dates, and Gmail (send/search/read/delete emails via gmail_send, gmail_search, gmail_read, gmail_delete tools), and study coach (study_quiz_start, study_quiz_answer, study_quiz_stop, study_weak_spots, study_add_question), and catch-up digest (catch_me_up).`,
     `- For "remind me in X minutes/hours" requests, use create_task with scheduleAt set to the future time (ISO 8601). These are one-shot timers, not recurring routines.`,
     `- If the user says "via WhatsApp" / "text me" / "on WhatsApp" with a reminder or scheduled message, set create_task's deliveryChannel to "whatsapp" so the reminder arrives as a WhatsApp text. Only do this when they explicitly mention WhatsApp — otherwise reminders use push notifications.`,
@@ -457,11 +459,12 @@ export function createModelClient(env = process.env) {
   // fallback chain instead of duplicating them.
   const requestPayload = (modelInput, modelName, { tools = false, ...extra } = {}) => {
     const modernCache = supportsModernPromptCache(modelName);
+    const toolDefinitions = Array.isArray(tools) ? tools : (tools ? TOOL_DEFINITIONS : []);
     return {
       model: modelName,
       store: false,
       max_output_tokens: 600,
-      ...(tools ? { tools: TOOL_DEFINITIONS } : {}),
+      ...(toolDefinitions.length ? { tools: toolDefinitions } : {}),
       ...(modernCache ? { prompt_cache_options: { mode: 'implicit', ttl: '30m' } } : {}),
       input: modernCache ? modelInput : withoutCacheBreakpoints(modelInput),
       ...extra
@@ -748,6 +751,9 @@ export function createModelClient(env = process.env) {
         : 'No projects are being tracked.';
       const timeZone = validTimeZone(userTimeZone);
       const today = todayInZone(timeZone);
+      const localNow = new Intl.DateTimeFormat('en-US', {
+        timeZone, dateStyle: 'full', timeStyle: 'short'
+      }).format(new Date());
       const dynamicDeveloper = [
         ...(userName ? [`You're talking with ${userName}.`] : []),
         ...(needsBuddyName
@@ -756,7 +762,10 @@ export function createModelClient(env = process.env) {
         ...(needsAmbientAsk
           ? [`One gentle ask, woven naturally into this conversation (never a formal setup question): may you note the setting of your chats — the time of day and any place labels the user mentions themselves, like "at the cabin" — so you can notice their rhythms (e.g. Sunday-morning hike planning)? Be explicit and honest: it's only with their permission; everything is stored as ordinary memories they can see and delete in the Memory tab; nothing leaves this server; you never track precise location, only labels they give you. If they say yes, call the set_ambient_context tool with "granted" right away. If they decline, call it with "declined". If they dodge or ignore the question, drop it completely and don't bring it up again.`]
           : []),
-        `Today is ${today} (YYYY-MM-DD) in the user's timezone, ${timeZone}. Use it to resolve relative dates like "Thursday", "tomorrow", or "next week".`,
+        ...(tools && !toolContext?.gmail
+          ? ['Gmail tools are not available for this account. Do not offer Gmail connection, inbox access, email sending, or writing-voice learning.']
+          : []),
+        `The current local date and time is ${localNow} (${today} in YYYY-MM-DD) in the user's timezone, ${timeZone}. Use it to resolve relative dates and times like "Thursday", "tomorrow", "in two hours", or "next week".`,
         // Soul core ("how Orbit is" — the user's own tuned personality, or the
         // neutral default in demo mode). Prompt-only layer: no extra API calls.
         // Stays separate from writingVoice ("how the user writes" — drafting only).
@@ -824,11 +833,14 @@ export function createModelClient(env = process.env) {
           selectedModel = used;
           return output;
         });
+      const availableToolDefinitions = toolContext?.gmail
+        ? TOOL_DEFINITIONS
+        : TOOL_DEFINITIONS.filter((definition) => !OWNER_ONLY_TOOL_NAMES.has(definition.name));
       const requestOutput = async (input, stream) => {
         const extra = membershipTier === 'unlimited' ? { max_output_tokens: 1000 } : {};
         const requestFn = stream
-          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools, extra })
-          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools, extra });
+          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools: tools ? availableToolDefinitions : false, extra })
+          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra });
         let failure;
         try {
           const output = await callModelWithFallback(requestFn, input);
@@ -845,7 +857,7 @@ export function createModelClient(env = process.env) {
         let classification = failure?.classification || classifyModelError(failure);
         if (stream && ['request', 'stream'].includes(classification)) {
           try {
-            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools, extra }), input);
+            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra }), input);
           } catch (error) {
             failure = error;
             classification = error?.classification || classifyModelError(error);

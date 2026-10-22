@@ -9,6 +9,7 @@ import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
+import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
@@ -17,7 +18,7 @@ import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
-import { extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
+import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems, parseSearchFilterParams } from './src/conversation-search.js';
 import { ambientSnapshot, ambientMemoryContent, parseAmbientMemory, detectRhythms, rhythmSentence, rhythmKey, dayInZone, detectActivityRhythms, activityRhythmSentence, activityRhythmKey } from './src/ambient.js';
@@ -516,7 +517,7 @@ export function createOrbitServer(options={}) {
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
-  const model=createModelClient(env);
+  const model=options.modelClient||createModelClient(env);
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
@@ -613,7 +614,7 @@ export function createOrbitServer(options={}) {
   // server secret (no new credential); requires PUBLIC_BASE_URL in production.
   function whatsappMediaUrlFor(mediaId){return buildWhatsAppMediaUrl(publicBase,mediaId,deriveMediaSigningKey(encryptionKey));}
   function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(!token)return null;return db.getSession(hashToken(token));}
-  function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled)return session;return null;}
+  function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled&&!session.moderation_blocked)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
   function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
@@ -654,9 +655,19 @@ export function createOrbitServer(options={}) {
     // Membership is resolved from the server-side, Apple-verified entitlement.
     // The client cannot opt itself into stronger model routing.
     const membershipTier=subscriptions.tier(userId,user);
-    const streamState={turn:-1,text:'',done:false};pendingStreams.set(conversation.id,streamState);
+    const streamState={turn:-1,text:'',rawText:'',filtered:false,done:false};pendingStreams.set(conversation.id,streamState);
+    const onStreamTurn=(turn)=>{streamState.turn=turn;streamState.text='';streamState.rawText='';streamState.filtered=false;};
+    const onStreamToken=(delta)=>{
+      if(streamState.filtered)return;
+      streamState.rawText+=delta;
+      // Every rule is shorter than this window. Scan the tail on small token
+      // updates so a long reply does not require a full regex pass per token.
+      const checked=filterAssistantContent(String(delta).length>512?streamState.rawText:streamState.rawText.slice(-512));
+      if(checked.filtered){streamState.filtered=true;streamState.rawText='';streamState.text=checked.text;}
+      else streamState.text=streamState.rawText;
+    };
     let answer=null;
-    const storeAssistantMessage=(content)=>{const stored=db.addMessage(userId,conversation.id,'assistant',content);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
+    const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
     try{
       const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
       const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
@@ -742,8 +753,8 @@ export function createOrbitServer(options={}) {
             // its default personality for chitchat instead.
             soulDirective:null,
             userTimeZone:preferences.time_zone,
-            onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},
-            onToken:(delta)=>{streamState.text+=delta;}
+            onTurn:onStreamTurn,
+            onToken:onStreamToken
           });
           answer=chitchatText;
           storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
@@ -806,12 +817,17 @@ export function createOrbitServer(options={}) {
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
-          gmail:{ getToken: () => connectors.getValidToken(userId,'gmail') }},
-        onTurn:(turn)=>{streamState.turn=turn;streamState.text='';},onToken:(delta)=>{streamState.text+=delta;}});
+          gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
+        onTurn:onStreamTurn,onToken:onStreamToken});
+      // Legacy follow-up and memory markers can persist their text outside the
+      // chat message. Filter before reading them as well as before delivery.
+      const checkedRaw=filterAssistantContent(rawAnswer);
+      const safeRawAnswer=checkedRaw.text;
+      if(checkedRaw.filtered)db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');
       for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
       // Backward compatibility for replies from older/custom models that still emit legacy markers.
-      for(const followUp of parseFollowUpMarkers(rawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
-      for(const suggestion of parseSuggestMarkers(rawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
+      for(const followUp of parseFollowUpMarkers(safeRawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
+      for(const suggestion of parseSuggestMarkers(safeRawAnswer)){db.addMemorySuggestion(userId,suggestion,{kind:'fact'});db.addEvent(userId,'memory_suggested',`Suggested a memory: “${suggestion}”.`);}
       // Memory v2: auto-recall ON by default — suggestions older than the review
       // window persist automatically (contradictory ones stay pending; the owner
       // reviews/deletes anything in chat). The 2/reply suggestion cap is unchanged.
@@ -823,11 +839,11 @@ export function createOrbitServer(options={}) {
       // rewritten to drop the false claim instead of letting Orbit lie.
       let schedulingResult=null;
       try{
-        schedulingResult=enforceSchedulingHonesty({answer:rawAnswer,toolCalls,db,userId,timeZone:preferences.time_zone||'America/New_York',sourceMessageId:userMsg.id,userMessage:message});
+        schedulingResult=enforceSchedulingHonesty({answer:safeRawAnswer,toolCalls,db,userId,timeZone:preferences.time_zone||'America/New_York',sourceMessageId:userMsg.id,userMessage:message});
         if(schedulingResult.created)db.addEvent(userId,'scheduling_honesty',`Auto-created follow-up the model promised: "${schedulingResult.created.description}" on ${schedulingResult.created.due_date||schedulingResult.created.dueDate}.`);
         if(schedulingResult.corrected)db.addEvent(userId,'scheduling_honesty',`Rewrote an unparseable scheduling claim instead of letting it through.`);
       }catch(e){console.error('scheduling honesty failed',e&&e.message);}
-      answer=stripModelMarkers(schedulingResult?schedulingResult.answer:rawAnswer)||'Noted — I’ll check in about that afterwards.';
+      answer=stripModelMarkers(schedulingResult?schedulingResult.answer:safeRawAnswer)||'Noted — I’ll check in about that afterwards.';
       storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
       // Proactive memory bookkeeping: if a memory was volunteered this turn
       // and the model wasn't mid-task (no tool calls), record it so it's
@@ -994,7 +1010,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
-      const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
+      const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       const today=todayInZone(preferences.time_zone,nowMs);
       for(const followUp of db.dueFollowUps(user.id,today)){
         if(!db.claimProactiveSlot(user.id,today))break;
@@ -1580,6 +1596,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
       const timeZone=preferences.time_zone||'America/New_York';
       const today=todayInZone(timeZone,nowMs);
       const localTime=new Date(nowMs).toLocaleString('en-US',{timeZone,hour:'numeric',minute:'2-digit',hour12:true,weekday:'long'});
+      const checkinWindow=smartCheckinWindow(timeZone,nowMs);
 
       // Safety rails: max 2 smart check-ins per day, min 6 hours apart
       const checkinCount=parseInt(db.getSetting(`smart_checkin_count_${user.id}_${today}`)||'0',10);
@@ -1592,8 +1609,6 @@ Only include what's clearly supported — skip one-off questions, transient topi
       const lastUserMsg=db.lastUserMessageAt(user.id);
       const lastActive=Math.max(lastOutreach?new Date(lastOutreach).valueOf():0,lastUserMsg?new Date(lastUserMsg).valueOf():0);
       if(lastActive&&nowMs-lastActive<4*3600_000)continue;
-
-      if(!db.claimProactiveSlot(user.id,today))continue;
 
       // Meeting prep: check for upcoming events in the next 90 minutes
       let meetingCandidate=null;
@@ -1613,8 +1628,20 @@ Only include what's clearly supported — skip one-off questions, transient topi
         }
       }catch(e){}
 
+      // Friendly check-ins only run in narrow, predictable local windows.
+      // Meeting prep may still run outside them when an actual event is near.
+      if(!checkinWindow&&!meetingCandidate)continue;
+      if(!db.claimProactiveSlot(user.id,today))continue;
+
       // Let the AI decide: is now a good time? What kind of check-in?
       const meetingLine=meetingCandidate?`- "MEETING_PREP" if "${meetingCandidate.title}" starting at ${new Date(meetingCandidate.startMs).toLocaleTimeString('en-US',{timeZone,hour:'numeric',minute:'2-digit'})} could use a prep briefing (only if prep would genuinely help — skip for routine/generic blocks)\n`:'';
+      const windowLine=checkinWindow==='morning'
+        ? '- "MORNING" if a morning briefing is genuinely useful (weather, today\'s calendar, goal momentum, one suggestion)\n'
+        : checkinWindow==='afternoon'
+          ? '- "CHECKIN" if a brief friendly afternoon check-in is genuinely useful\n'
+          : checkinWindow==='evening'
+            ? '- "EVENING" if an evening wind-down is genuinely useful (day recap, tomorrow preview, encouragement)\n'
+            : '';
       const decidePrompt=`It is currently ${localTime} (${timeZone}). You are deciding whether to send a proactive check-in to ${user.display_name||'the user'}.
 
 Consider:
@@ -1623,10 +1650,7 @@ Consider:
 - Whether a check-in would genuinely be welcome right now
 
 Respond with ONLY one of:
-- "MORNING" if a morning briefing is appropriate (weather, today's calendar, goal momentum, one suggestion)
-- "EVENING" if an evening wind-down is appropriate (day recap, tomorrow preview, encouragement)
-- "CHECKIN" if a brief friendly check-in is appropriate (1-2 sentences, reference something from their life if natural)
-${meetingLine}- "SKIP" if now is not a good time for any proactive message
+${windowLine}${meetingLine}- "SKIP" if now is not a good time for any proactive message
 
 Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
 
@@ -1634,12 +1658,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const { text: decision }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const decisionClean=decision.trim().toUpperCase();
 
-        if(decisionClean==='SKIP'||!['MORNING','EVENING','CHECKIN','MEETING_PREP'].includes(decisionClean)){
-          db.releaseProactiveSlot(user.id,today);
-          continue;
-        }
-        // If AI chose MEETING_PREP but we have no candidate (edge case), treat as SKIP
-        if(decisionClean==='MEETING_PREP'&&!meetingCandidate){
+        const expectedDecision={morning:'MORNING',afternoon:'CHECKIN',evening:'EVENING'}[checkinWindow]||null;
+        const allowedDecision=decisionClean==='MEETING_PREP'?Boolean(meetingCandidate):decisionClean===expectedDecision;
+        if(decisionClean==='SKIP'||!allowedDecision){
           db.releaseProactiveSlot(user.id,today);
           continue;
         }
@@ -1805,8 +1826,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             for(const t of tasks){
               if(['completed','cancelled','failed'].includes(t.status))continue;
               if(!t.schedule_at)continue;
-              // schedule_at is ISO; compare date parts in user's timezone
-              const dueDate=String(t.schedule_at).slice(0,10);
+              // schedule_at is UTC; compare its date in the user's timezone.
+              // Slicing the ISO timestamp could shift an evening deadline to
+              // the following day (or an early one to the previous day).
+              const dueDate=localDateTimeParts(timeZone,new Date(t.schedule_at).valueOf()).date;
               if(!/^\d{4}-\d{2}-\d{2}$/.test(dueDate))continue;
               const todayD=new Date(today+'T12:00:00Z');
               const dueD=new Date(dueDate+'T12:00:00Z');
@@ -1887,7 +1910,6 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           if(attendeeCtx)ctxParts.push(attendeeCtx);
           if(emailCtx)ctxParts.push(emailCtx);
           genPrompt=`Write a concise meeting prep briefing (3-4 sentences, plain text). Include: who they're meeting and any relevant context you have, related recent emails or notes if any, and one practical suggestion for the meeting. Sound like a helpful assistant giving a quick heads-up, not a calendar alert. Do not mention that this is automated.\n\n${ctxParts.join('\n\n')}`;
-          db.setSetting(mc.prepKey,'1');
         }else{
           // Gentle nudge about someone they haven't mentioned in 2+ weeks (with relationship context)
           let nudgeCtx='';
@@ -1928,6 +1950,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
         db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
+        if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
         if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
         if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
         if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
@@ -1942,7 +1965,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runQuietNudges(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
-      const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
+      const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
       const lastOutreach=db.getLastOutreachAt(user.id);if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<24*3600_000)continue;
       const today=todayInZone(preferences.time_zone,nowMs);if(!db.claimProactiveSlot(user.id,today))continue;
@@ -2001,7 +2024,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     // Urgent email pushes: conservative, max 1 per 4 hours per user
     const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||user.role!=='owner')continue;
       let gmailRow=null;
       try{gmailRow=db.getConnector(user.id,'gmail');}catch(e){}
       if(!gmailRow)continue;
@@ -2055,6 +2078,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   // Shared helper: fetch a light email digest for the morning briefing (no AI call here — the briefing prompt weaves it in)
   async function getMorningEmailDigest(userId){
     try{
+      if(db.getUserById(userId)?.role!=='owner')return '';
       if(!db.getConnector(userId,'gmail'))return '';
       const {searchEmails}=await import('./src/gmail.js');
       const res=await searchEmails(()=>connectors.getValidToken(userId,'gmail'),{query:'is:unread newer_than:24h',max:10});
@@ -2677,7 +2701,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         // Never link by email, even if Apple says that email is verified.
         if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
-        user=db.getUserById(linked.user_id);if(!user||user.disabled)return json(res,401,{error:'Sign-in was not accepted.'});
+        user=db.getUserById(linked.user_id);if(!user||user.disabled||user.moderation_blocked)return json(res,401,{error:'Sign-in was not accepted.'});
         const {csrf,token:sessionToken}=createSession(user,req,res);
         return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
@@ -2768,7 +2792,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
         if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&await verifyPassword(body.password,user.password_hash,user.password_salt);
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyPassword(body.password,user.password_hash,user.password_salt);
         if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
@@ -2816,12 +2840,59 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
         if(req.method==='GET'&&url.pathname==='/api/auth/me')return json(res,200,{user:publicUser(user),csrf:user.csrf_token||null});
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return json(res,200,{ok:true});}
-        if(req.method==='GET'&&url.pathname==='/api/status')return json(res,200,{buddyName:buddyNameFor(user.user_id||user.id),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(),role:user.role});
+        if(req.method==='GET'&&url.pathname==='/api/status'){const me=user.user_id||user.id;return json(res,200,{buddyName:buddyNameFor(me),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(me),role:user.role,appleLinked:await db.hasAuthIdentityForUser('apple',me)});}
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
         if(req.method==='GET'&&url.pathname==='/api/snapshot'){const me=user.user_id||user.id;const requested=url.searchParams.get('conversation');let active=requested?db.getConversation(me,requested):null;if(!active)active=db.ensureDefaultConversation(me);const summary=db.getConversationSummary(me,active.id);const prefs=db.getPreferences(me);const snapToday=todayInZone(prefs.time_zone||'America/New_York');let streaks={};try{streaks={routines:Object.fromEntries(db.listRoutines(me).map((r)=>[r.id,db.getStreak(me,'routine',r.id,snapToday)])),goals:Object.fromEntries(db.listGoals(me).map((g)=>[g.id,db.getGoalStreak(me,g.id,snapToday)]))};}catch(e){}// "Catch me up": capture the previous app-open before stamping this one,
 // so the Today-tab card can tell a genuine 6h+ absence from a refresh.
-let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
+let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.setLastAppOpen(me,new Date().toISOString());}catch(_){}return json(res,200,{conversations:db.listConversations(me),activeConversation:active,messages:sanitizeAssistantMessages(db.listConversationMessages(me,active.id)),memories:db.listMemories(me),memorySuggestions:db.listMemorySuggestions(me),followUps:db.listFollowUps(me),personalDates:db.listPersonalDates(me),goals:db.listGoals(me),routines:db.listRoutines(me),streaks,projects:db.listProjects(me),approvals:db.listApprovals(me),reliability:reliabilityFor(me),preferences:prefs,contextSummaryUpdatedAt:summary?.updated_at||null,tasks:db.listTasks(me),events:db.listEvents(me),artifacts:db.listArtifacts(me),connectors:db.listConnectors(me).filter((item)=>item.provider!=='gmail'||user.role==='owner'),calendarFeeds:db.listCalendarFeeds(me).map(publicFeed),lastAppOpenAt:prevAppOpen});}
         const userId=user.user_id||user.id;
+        // Reports contain only details the reporter previewed and consented to.
+        // A submission ID makes retries safe even if the first response is lost.
+        if(req.method==='GET'&&url.pathname==='/api/reports/mine'){
+          res.setHeader('Cache-Control','no-store');
+          return json(res,200,{reports:db.listOwnReports(userId,50)});
+        }
+        if(req.method==='POST'&&url.pathname==='/api/reports'){
+          const body=await readJson(req,16*1024);
+          if(!body||typeof body!=='object'||Array.isArray(body))return json(res,400,{error:'A report object is required.'});
+          const submissionId=body.submissionId;
+          if(typeof submissionId!=='string'||!/^[0-9a-f-]{36}$/i.test(submissionId))return json(res,400,{error:'A valid submission ID is required.'});
+          if(body.consent!==true)return json(res,400,{error:'Preview and consent are required.'});
+          const prior=db.getReportSubmission(userId,submissionId);
+          if(prior)return json(res,200,{id:prior.id,status:prior.status,duplicate:true});
+          const kind=body.kind,reason=body.reason;
+          if(!['response','problem'].includes(kind)||!['unsafe','incorrect','bug','other'].includes(reason))return json(res,400,{error:'Choose a valid report type and reason.'});
+          const descriptionInput=body.description??'';
+          if(typeof descriptionInput!=='string'||descriptionInput.length>1000)return json(res,400,{error:'Description must be at most 1000 characters.'});
+          const description=descriptionInput.trim();
+          let messageId=null,messageExcerpt=null;
+          if(kind==='response'){
+            if(typeof body.messageId!=='string'||!/^[0-9a-f-]{36}$/i.test(body.messageId))return json(res,400,{error:'Choose an Orbit response.'});
+            const message=db.getMessage(userId,body.messageId);
+            if(!message)return json(res,404,{error:'Response not found.'});
+            if(message.role!=='assistant')return json(res,400,{error:'Only Orbit responses can be reported here.'});
+            if(body.includeMessage===true){
+              if(typeof body.messageExcerpt!=='string'||!body.messageExcerpt.trim()||body.messageExcerpt.length>2000)return json(res,400,{error:'The included excerpt must be 1 to 2000 characters.'});
+              messageId=message.id;messageExcerpt=body.messageExcerpt;
+            }else if(body.includeMessage!==false||body.messageExcerpt!=null)return json(res,400,{error:'Choose whether to include an excerpt.'});
+          }else if(body.messageId!=null||body.messageExcerpt!=null||body.includeMessage!=null)return json(res,400,{error:'Problem reports cannot attach chat messages.'});
+          if(hourlyLimited(req,20,'report')||db.countRecentReports(userId,new Date(Date.now()-60*60_000).toISOString())>=5||userRateLimited(userId,'report',8,60*60_000))return json(res,429,{error:'Report limit reached. Try again later.'});
+          const saved=db.addReport(userId,{submissionId,kind,reason,description,messageId,messageExcerpt});
+          return json(res,saved.created?201:200,{id:saved.report.id,status:saved.report.status,duplicate:!saved.created});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/admin/reports'){
+          requireOwner(user);res.setHeader('Cache-Control','no-store');
+          return json(res,200,{reports:db.listReports(100),summary:db.reportQueueSummary()});
+        }
+        const reportStatusMatch=url.pathname.match(/^\/api\/admin\/reports\/([0-9a-f-]{36})$/);
+        if(req.method==='PATCH'&&reportStatusMatch){
+          requireOwner(user);const body=await readJson(req,2048);
+          if(!body||typeof body!=='object'||!['new','reviewing','resolved','dismissed'].includes(body.status))return json(res,400,{error:'Choose a valid report status.'});
+          if(body.ownerNote!==undefined&&(typeof body.ownerNote!=='string'||body.ownerNote.length>500))return json(res,400,{error:'The response must be at most 500 characters.'});
+          const report=db.updateReportStatus(reportStatusMatch[1],body.status,body.ownerNote===undefined?null:body.ownerNote.trim());
+          if(!report)return json(res,404,{error:'Report not found.'});
+          return json(res,200,{id:report.id,status:report.status,ownerNote:report.owner_note});
+        }
         // B1: Today-tab morning briefing. Cached per user+day for 10 minutes so
         // the 15s frontend refresh doesn't refetch weather/calendar each time.
         if(req.method==='GET'&&url.pathname==='/api/today-briefing'){
@@ -3233,10 +3304,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/onboarding/intro-dismiss'){if(userRateLimited(userId,'intro-dismiss',30,5*60_000))throw Object.assign(new Error('Too many requests. Try again in a few minutes.'),{status:429});db.markIntroDismissed(userId);return json(res,200,{ok:true});}
         // X5 "Writes like you": per-user writing voice status/opt-in/learn/forget.
         // The distilled profile text itself never leaves the server.
-        if(req.method==='GET'&&url.pathname==='/api/writing-voice'){return json(res,200,writingVoiceStatus(db,userId));}
-        if(req.method==='POST'&&url.pathname==='/api/writing-voice/opt-in'){const body=await readJson(req);if(typeof body.optIn!=='boolean')throw Object.assign(new Error('optIn must be true or false.'),{status:400});db.setWritingVoiceOptIn(userId,body.optIn);db.addEvent(userId,body.optIn?'writing_voice_enabled':'writing_voice_disabled',body.optIn?'Turned the writing voice on for drafts.':'Turned the writing voice off (profile kept).');return json(res,200,writingVoiceStatus(db,userId));}
-        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
-        if(req.method==='DELETE'&&url.pathname==='/api/writing-voice'){db.clearWritingVoice(userId);db.addEvent(userId,'writing_voice_forgotten','Deleted the learned writing voice and opt-in.');return json(res,200,{forgotten:true});}
+        if(req.method==='GET'&&url.pathname==='/api/writing-voice'){requireOwner(user);return json(res,200,writingVoiceStatus(db,userId));}
+        if(req.method==='POST'&&url.pathname==='/api/writing-voice/opt-in'){requireOwner(user);const body=await readJson(req);if(typeof body.optIn!=='boolean')throw Object.assign(new Error('optIn must be true or false.'),{status:400});db.setWritingVoiceOptIn(userId,body.optIn);db.addEvent(userId,body.optIn?'writing_voice_enabled':'writing_voice_disabled',body.optIn?'Turned the writing voice on for drafts.':'Turned the writing voice off (profile kept).');return json(res,200,writingVoiceStatus(db,userId));}
+        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
+        if(req.method==='DELETE'&&url.pathname==='/api/writing-voice'){requireOwner(user);db.clearWritingVoice(userId);db.addEvent(userId,'writing_voice_forgotten','Deleted the learned writing voice and opt-in.');return json(res,200,{forgotten:true});}
         if(req.method==='POST'&&url.pathname==='/api/goals'){const body=await readJson(req);const targetDate=body.targetDate?validDateString(body.targetDate):null;if(body.targetDate&&!targetDate)throw Object.assign(new Error('targetDate must be YYYY-MM-DD.'),{status:400});const goal=db.addGoal(userId,{title:cleanText(body.title,120,'title'),description:optionalText(body.description,1000),priority:normalizePriority(body.priority),targetDate,nextStep:optionalText(body.nextStep,500)});db.addEvent(userId,'goal_created',`Started tracking goal “${goal.title}”.`);return json(res,201,goal);}
         const goalMatch=url.pathname.match(/^\/api\/goals\/([0-9a-f-]+)$/);if(goalMatch&&req.method==='PATCH'){const body=await readJson(req);if(body.progress!==undefined&&(!Number.isFinite(Number(body.progress))||Number(body.progress)<0||Number(body.progress)>100))throw Object.assign(new Error('progress must be from 0 to 100.'),{status:400});if(body.status!==undefined&&!['active','paused','completed'].includes(body.status))throw Object.assign(new Error('status is not valid.'),{status:400});const goal=db.updateGoal(userId,goalMatch[1],{progress:body.progress,status:body.status,nextStep:body.nextStep===undefined?undefined:optionalText(body.nextStep,500),note:optionalText(body.note,1000)});if(!goal)throw Object.assign(new Error('Goal not found.'),{status:404});db.addEvent(userId,'goal_updated',`Updated “${goal.title}” to ${goal.progress}% (${goal.status}).`);return json(res,200,goal);}
         if(goalMatch&&req.method==='DELETE'){if(!db.deleteGoal(userId,goalMatch[1]))throw Object.assign(new Error('Goal not found.'),{status:404});db.addEvent(userId,'goal_deleted','Deleted a goal and its check-ins.');return json(res,200,{ok:true});}
@@ -3262,7 +3333,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             return json(res,200,rejected);
           }
           if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
-          if((approval.kind==='gmail_send'||approval.kind==='gmail_delete')&&paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});
+          if(approval.kind==='gmail_send'||approval.kind==='gmail_delete'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});}
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
             if(approval.kind==='calendar_event'){
@@ -3350,9 +3421,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
           return json(res,200,{ok:true,entitlements});
         }
-        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
-        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
-        const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
+        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
+        const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='DELETE'&&url.pathname==='/api/account'){
           if(isDemoUser(user))throw Object.assign(new Error('Demo accounts expire automatically.'),{status:403});
@@ -3387,7 +3458,23 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{ok:db.resolveSignupAppeal(String(body.id),body.status)});
         }
         if(req.method==='GET'&&url.pathname==='/api/admin/access-requests'){requireOwner(user);return json(res,200,{requests:db.listAccessRequests()});}
-        if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,createdAt:u.created_at}))});}
+        if(req.method==='GET'&&url.pathname==='/api/admin/users'){requireOwner(user);return json(res,200,{users:db.listUsers().map((u)=>({id:u.id,email:u.email,displayName:u.display_name,role:u.role,disabled:!!u.disabled,moderationBlocked:!!u.moderation_blocked,createdAt:u.created_at}))});}
+        const moderationBlock=url.pathname.match(/^\/api\/admin\/users\/([0-9a-f-]{36})\/moderation-block$/);
+        if(req.method==='POST'&&moderationBlock){
+          requireOwner(user);
+          if(userRateLimited(userId,'moderation-block',20,60*60_000))return json(res,429,{error:'Too many account actions. Try again later.'});
+          const body=await readJson(req,1024);
+          if(!body||typeof body!=='object'||typeof body.blocked!=='boolean')return json(res,400,{error:'Choose whether to block this account.'});
+          const target=db.getUserById(moderationBlock[1]);
+          if(!target)return json(res,404,{error:'Account not found.'});
+          if(target.role!=='member'||target.id===userId||target.is_demo)return json(res,403,{error:'This account cannot be blocked here.'});
+          if(body.blocked===!!target.moderation_blocked)return json(res,200,{blocked:!!target.moderation_blocked,unchanged:true});
+          if(body.blocked&&target.disabled)return json(res,409,{error:'This account is disabled for another reason.'});
+          if(!db.setModerationBlocked(target.id,body.blocked))return json(res,409,{error:'Account state changed. Refresh and retry.'});
+          if(body.blocked)db.deleteUserSessions(target.id);
+          db.addEvent(userId,body.blocked?'moderation_account_blocked':'moderation_account_restored',body.blocked?'Owner blocked a member account.':'Owner restored a member account.');
+          return json(res,200,{blocked:body.blocked});
+        }
         const accessDismiss=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)$/);if(req.method==='POST'&&accessDismiss){requireOwner(user);db.dismissAccessRequest(accessDismiss[1]);return json(res,200,{ok:true});}
         const accessApprove=url.pathname.match(/^\/api\/admin\/access-requests\/([0-9a-f-]+)\/approve$/);
         if(req.method==='POST'&&accessApprove){
@@ -3401,7 +3488,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
             try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
             catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
-          }else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
+          }else if(target.moderation_blocked)return json(res,409,{error:'This account is blocked. Restore it from Users before approving access.'});
+          else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
           db.dismissAccessRequest(request.id);
           db.addEvent(userId,'access_approved','Approved a requested account; secure email recovery is required.');
           return json(res,200,{ok:true,approved:true,requiresEmailRecovery:true});

@@ -91,6 +91,23 @@ export function localDateTimeParts(timeZone, nowMs = Date.now()) {
   };
 }
 
+// Keep unsolicited check-ins inside predictable local-time windows. Exact
+// user-created routines and scheduled tasks are not governed by these windows.
+export function smartCheckinWindow(timeZone, nowMs = Date.now()) {
+  const { time } = localDateTimeParts(timeZone, nowMs);
+  const minutes = clockMinutes(time, -1);
+  if (minutes >= 8 * 60 && minutes < 10 * 60 + 30) return 'morning';
+  if (minutes >= 12 * 60 + 30 && minutes < 15 * 60 + 30) return 'afternoon';
+  if (minutes >= 18 * 60 && minutes < 20 * 60 + 30) return 'evening';
+  return null;
+}
+
+export function checkinDeliveryTime(timeZone, nowMs = Date.now()) {
+  const { time } = localDateTimeParts(timeZone, nowMs);
+  const minutes = clockMinutes(time, -1);
+  return minutes >= 8 * 60 + 30 && minutes < 20 * 60 + 30;
+}
+
 export function routineDue(routine, timeZone, nowMs = Date.now()) {
   if (!routine || routine.enabled === 0 || routine.enabled === false) return false;
   const local = localDateTimeParts(timeZone, nowMs);

@@ -270,6 +270,24 @@ body.voice-open{overflow:hidden}
 .msg-action.msg-delete:hover{border-color:var(--coral)}
 .msg-confirm-label{font-size:12px;color:var(--muted)}
 .msg-actions.busy{opacity:.5;pointer-events:none}
+#report-dialog{overflow:auto;overscroll-behavior:contain;scroll-padding-block:24px calc(96px + env(safe-area-inset-bottom))}
+.report-card{width:min(580px,calc(100vw - 30px));max-height:none;overflow:visible;text-align:left;margin:auto}
+.report-card label{display:block;margin-top:14px;color:var(--muted);font-size:13px}
+.report-card label.check{display:flex;align-items:flex-start;gap:9px;line-height:1.45}
+.report-card label.check input{flex:none;margin-top:3px}
+.report-card textarea,.report-card select{margin-top:7px}
+.report-card textarea,.report-card select,.report-card button,.report-card input{scroll-margin-block:24px calc(110px + env(safe-area-inset-bottom))}
+.report-preview{background:#111319;border:1px solid var(--line);border-radius:13px;padding:12px;margin-top:14px}
+.report-preview h3{font-size:14px;margin:0 0 8px}
+.report-preview pre,.report-inbox-detail{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;line-height:1.5;margin:0}
+.report-card .actions{position:sticky;bottom:0;z-index:1;margin-top:10px;padding:10px 0 calc(4px + env(safe-area-inset-bottom));flex-wrap:wrap;background:var(--panel)}
+#report-problem-panel a{color:var(--cyan)}
+#report-problem-panel a:focus-visible{outline:2px solid var(--lime);outline-offset:3px}
+#reports-inbox-panel{grid-column:1/-1}
+.report-inbox-item{min-width:0}
+.report-inbox-item .report-inbox-detail{margin-top:10px}
+.report-inbox-item .mini-actions{align-items:center;flex-wrap:wrap}
+.report-inbox-item select{max-width:200px;min-width:0}
 .goal-arc{display:flex;align-items:center;gap:14px;margin:14px 0 8px}.goal-arc svg{flex:0 0 auto}.arc-caption .arc-status{font-size:12px;color:var(--muted);text-transform:capitalize}.view-toggle{display:inline-flex;gap:4px;padding:4px;background:#15171e;border:1px solid var(--line);border-radius:12px;margin-bottom:14px}.view-toggle button{background:transparent;border:0;color:var(--muted);font:inherit;font-size:12.5px;padding:7px 13px;border-radius:8px;cursor:pointer;white-space:nowrap}.view-toggle button.active{background:var(--panel2);color:var(--text)}.view-toggle button:focus-visible{outline:2px solid var(--lime);outline-offset:2px}.kanban{display:grid;grid-template-columns:repeat(4,minmax(190px,1fr));gap:10px;margin-top:16px;overflow-x:auto;scroll-snap-type:x mandatory;padding-bottom:6px}.kanban-col{background:#12141a;border:1px solid var(--line);border-radius:12px;padding:10px;scroll-snap-align:start;min-width:0}.kanban-col-head{display:flex;justify-content:space-between;align-items:center;font-size:11.5px;font-weight:750;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}.kanban-col .project-step{flex-direction:column;align-items:flex-start;gap:8px;margin-bottom:8px}.kanban-col .project-step:last-child{margin-bottom:0}.kanban-empty{color:var(--muted);font-size:12px;margin:0;padding:6px 2px}.project-timeline{margin-top:16px}.timeline-points{display:flex;gap:12px;overflow-x:auto;padding:18px 2px 14px;border-top:2px solid var(--line);scroll-snap-type:x mandatory}.timeline-point{flex:0 0 200px;scroll-snap-align:start;background:#12141a;border:1px solid var(--line);border-radius:12px;padding:12px;position:relative;min-width:0}.timeline-point:before{content:"";position:absolute;top:-24px;left:18px;width:9px;height:9px;border-radius:50%;background:var(--point-color,var(--violet))}.timeline-point time{display:block;color:var(--muted);font-size:11.5px;margin-bottom:6px}.timeline-point strong{display:block;font-size:13.5px;margin-bottom:6px;line-height:1.4}.timeline-point .badge{text-transform:capitalize;margin-bottom:6px}.timeline-point .mini-actions{flex-wrap:wrap;margin-top:8px}.unscheduled-lane>h4{font-size:11.5px;font-weight:750;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:12px 0 8px}.unscheduled-lane .project-steps{margin-top:0}
 .subscription-plans{display:flex;flex-direction:column;align-items:stretch}.subscription-plans>button{width:100%;min-height:46px}.subscription-disclosure{border-top:1px solid var(--line);margin-top:5px;padding-top:10px;color:var(--muted);font-size:11px;line-height:1.45}.subscription-disclosure p{margin:0 0 7px}.subscription-disclosure a{color:var(--cyan);text-decoration:none}.subscription-disclosure a:focus-visible{outline:2px solid var(--lime);outline-offset:2px}
 /* Full-screen paid membership experience. This intentionally lives outside
@@ -339,3 +357,21 @@ body.membership-open{overflow:hidden}
 .empty-suggest{display:block;margin:0 auto 30px;max-width:100%}
 
 #enable-push:disabled{background:var(--panel2);color:var(--muted);border:1px solid var(--line);opacity:.45;cursor:not-allowed}
+#apple-link:disabled{background:var(--panel2);color:var(--muted);border:1px solid var(--line);opacity:.65;cursor:not-allowed}
+
+/* Keep native iOS time pickers inside the Safety card at narrow widths. */
+.settings-grid>.panel{min-width:0}
+#preferences-form{min-width:0}
+#preferences-form>label{display:block;min-width:0;margin-top:14px}
+#preferences-form .form-grid>label{min-width:0;margin:0}
+#preferences-form .form-grid:not(.quiet-hours-fields){margin-top:14px}
+#preferences-form .quiet-hours-fields{min-width:0;margin:16px 0 4px;padding:14px;border:1px solid var(--line);border-radius:16px;background:rgba(255,255,255,.025);gap:12px}
+#preferences-form input:not([type="checkbox"]){display:block;min-width:0;max-width:100%;min-height:46px;margin-top:7px}
+#preferences-form select{display:block;min-width:0;max-width:100%;height:46px;margin-top:7px;-webkit-appearance:none;appearance:none;padding-right:38px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%23a6a6b1' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4 6 4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-size:16px;background-position:right 14px center}
+#preferences-form input[type="time"]{width:100%;overflow:hidden}
+#preferences-form .check{margin-top:16px}
+#preferences-form>button{margin-top:18px}
+.report-owner-note{display:block;margin-top:14px;color:var(--muted);font-size:13px}
+.report-owner-note textarea{margin-top:7px;max-width:100%;resize:vertical}
+.report-inbox-item{min-width:0;overflow-wrap:anywhere}
+.report-inbox-item .mini-actions{flex-wrap:wrap}

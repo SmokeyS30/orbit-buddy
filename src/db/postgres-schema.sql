@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   password_salt TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('owner','member')),
-  disabled INTEGER NOT NULL DEFAULT 0,
+  disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0,
   is_demo INTEGER NOT NULL DEFAULT 0,
   email_verified_at TEXT,
   created_at TEXT NOT NULL,
@@ -63,6 +63,23 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reports (
+  id TEXT PRIMARY KEY,
+  reporter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  submission_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('response','problem')),
+  reason TEXT NOT NULL CHECK(reason IN ('unsafe','incorrect','bug','other')),
+  description TEXT NOT NULL DEFAULT '',
+  message_id TEXT,
+  message_excerpt TEXT,
+  status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','reviewing','resolved','dismissed')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reviewed_at TEXT,
+  owner_note TEXT NOT NULL DEFAULT '',
+  UNIQUE(reporter_user_id,submission_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_reporter_created ON reports(reporter_user_id,created_at DESC);
 
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,

@@ -21,8 +21,8 @@
     />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261021e" />
-    <link rel="stylesheet" href="/mobile.css?v=20261019c" />
+    <link rel="stylesheet" href="/styles.css?v=20261022c" />
+    <link rel="stylesheet" href="/mobile.css?v=20261022c" />
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
     <title>Orbit Buddy</title>
@@ -713,6 +713,23 @@
               Check connection
             </button>
           </section>
+          <section class="panel" id="report-problem-panel">
+            <h2>Report a Problem</h2>
+            <p class="muted">Tell the owner about an app issue. No chat messages or history are attached.</p>
+            <button id="report-problem-button" type="button" class="ghost block-top">Report a Problem</button>
+            <p class="muted block-top">Need account help? <a href="/support.html">Contact Orbit Buddy Support</a>.</p>
+          </section>
+          <section class="panel" id="reports-mine-panel">
+            <h2>Your reports</h2>
+            <p class="muted">Check the status here. The owner can leave a response without exposing your private chat history.</p>
+            <div id="reports-mine" class="card-list block-top"></div>
+          </section>
+          <section class="panel hidden" id="reports-inbox-panel">
+            <h2>Reports inbox</h2>
+            <p class="muted">Review new and older open reports regularly. Update status and respond after investigating; a status change alone does not contact the reporter.</p>
+            <p id="reports-summary" class="muted" aria-live="polite"></p>
+            <div id="reports-inbox" class="card-list block-top"></div>
+          </section>
           <section class="panel">
             <h2>Time & check-ins</h2>
             <p class="muted">
@@ -736,7 +753,7 @@
                 <option value="Asia/Tokyo"></option>
                 <option value="Australia/Sydney"></option>
               </datalist>
-              <div class="form-grid two">
+              <div class="form-grid two quiet-hours-fields" role="group" aria-label="Quiet hours">
                 <label
                   >Quiet from<input
                     id="preference-quiet-start"
@@ -767,7 +784,7 @@
               <button class="primary block-top">Save preferences</button>
             </form>
           </section>
-          <section class="panel">
+          <section class="panel" id="writing-voice-panel">
             <h2>Writing voice</h2>
             <p class="muted">
               Orbit can learn how you write from your sent emails and draft in
@@ -851,8 +868,8 @@
             <div id="signup-appeals" class="card-list"></div>
           </section>
           <section class="panel hidden" id="apple-link-panel">
-            <h2>Sign in with Apple</h2><p class="muted">Link Apple to this account while keeping your password and recovery codes.</p>
-            <label>Current password<input id="apple-link-password" type="password" autocomplete="current-password" /></label>
+            <h2>Sign in with Apple</h2><p class="muted" id="apple-link-description">Link Apple to this account while keeping your password and recovery codes.</p>
+            <label id="apple-link-password-label">Current password<input id="apple-link-password" type="password" autocomplete="current-password" /></label>
             <button id="apple-link" type="button" class="primary">Link Apple</button>
           </section>
           <section class="panel hidden" id="access-panel">
@@ -1015,6 +1032,41 @@
         </button>
       </section>
     </dialog>
+    <dialog id="report-dialog" aria-labelledby="report-title">
+      <form id="report-form" class="login-card report-card">
+        <p class="eyebrow">SEND TO ORBIT OWNER</p>
+        <h2 id="report-title">Report a Problem</h2>
+        <p class="muted">Your signed-in account identifies the report. Review the details and remove any secrets before sending.</p>
+        <label>Reason
+          <select id="report-reason" required>
+            <option value="" selected disabled>Choose a reason</option>
+            <option value="unsafe">Unsafe response</option>
+            <option value="incorrect">Incorrect response</option>
+            <option value="bug">App bug</option>
+            <option value="other">Other</option>
+          </select>
+        </label>
+        <label>Optional description
+          <textarea id="report-description" rows="3" maxlength="1000" placeholder="What happened? Leave out passwords and private details."></textarea>
+        </label>
+        <div id="report-message-controls" class="hidden">
+          <label class="check"><input id="report-include-message" type="checkbox" /> Include an editable excerpt of this Orbit response</label>
+          <label id="report-excerpt-field" class="hidden">Response excerpt to send
+            <textarea id="report-excerpt" rows="4" maxlength="2000"></textarea>
+          </label>
+        </div>
+        <div class="report-preview" aria-live="polite">
+          <h3>Preview sent to owner</h3>
+          <pre id="report-preview-text"></pre>
+        </div>
+        <label class="check"><input id="report-consent" type="checkbox" required /> I agree to send only the details shown in this preview.</label>
+        <p id="report-error" class="error" role="alert"></p>
+        <div class="actions">
+          <button id="report-cancel" type="button" class="ghost">Cancel</button>
+          <button id="report-submit" type="submit" class="primary">Send report</button>
+        </div>
+      </form>
+    </dialog>
     <div id="offline-banner" class="offline-banner hidden" role="status">You're offline — Orbit will reconnect when you're back.</div><div id="toast" class="toast" role="status"></div>
     <!-- Voice conversation mode ("call Orbit"): full-screen spoken chat. Entered by
          long-pressing the mic button or typing "call Orbit" — no extra buttons. -->
@@ -1034,6 +1086,6 @@
     <script src="/vendor/marked.min.js" defer></script>
     <script src="/vendor/purify.min.js" defer></script>
     <script src="/pwa-install.js" defer></script>
-    <script type="module" src="/app.js?v=20261021e"></script>
+    <script type="module" src="/app.js?v=20261022c"></script>
   </body>
 </html>

@@ -104,6 +104,20 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       )`,
+      `CREATE TABLE IF NOT EXISTS reports (
+        id TEXT PRIMARY KEY,
+        reporter_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        submission_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('response','problem')),
+        reason TEXT NOT NULL CHECK(reason IN ('unsafe','incorrect','bug','other')),
+        description TEXT NOT NULL DEFAULT '',
+        message_id TEXT, message_excerpt TEXT,
+        status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','reviewing','resolved','dismissed')),
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, reviewed_at TEXT,
+        owner_note TEXT NOT NULL DEFAULT '',
+        UNIQUE(reporter_user_id,submission_id)
+      )`,
+      "ALTER TABLE reports ADD COLUMN IF NOT EXISTS owner_note TEXT NOT NULL DEFAULT ''",
       'CREATE INDEX IF NOT EXISTS idx_waitlist_status ON waitlist(status, created_at)',
       `CREATE TABLE IF NOT EXISTS signup_risk_events (
         id TEXT PRIMARY KEY, subject_hash TEXT, mode TEXT NOT NULL, decision TEXT NOT NULL,
@@ -141,6 +155,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 2',
       'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS next_attempt_at TEXT',
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS moderation_blocked INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS last_error TEXT',
       'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0',
@@ -339,10 +354,15 @@ const indexMigrations = [
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_purchase_intents_transaction_unique ON subscription_purchase_intents(transaction_id) WHERE transaction_id IS NOT NULL',
       'CREATE INDEX IF NOT EXISTS idx_purchase_intents_user_pending ON subscription_purchase_intents(user_id,status,expires_at)',
       'CREATE INDEX IF NOT EXISTS idx_signup_risk_created ON signup_risk_events(created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_reports_reporter_created ON reports(reporter_user_id,created_at DESC)',
     ];
     for (const sql of [...migrations, ...indexMigrations]) {
       try { await client.query(sql); } catch (e) { /* may already exist */ }
     }
+    // Reports are required by the reporting routes. Surface a failed table
+    // migration at startup instead of leaving those routes to fail later.
+    await client.query('SELECT 1 FROM reports LIMIT 0');
   } finally {
     client.release();
   }
@@ -417,7 +437,7 @@ const indexMigrations = [
 
     // --- Users ---
     countUsers: async () => Number((await get('SELECT COUNT(*) AS count FROM users')).count),
-    listUsers: async () => all('SELECT id,email,display_name,role,disabled,created_at,updated_at FROM users ORDER BY created_at'),
+    listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
     async createUser({ email, displayName, passwordHash, passwordSalt, role }) {
       const now = timestamp(); const id = randomUUID();
       await run('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)', id, email, displayName, passwordHash, passwordSalt, role, now, now);
@@ -431,7 +451,7 @@ const indexMigrations = [
     },
     async listExpiredDemoUsers(maxAgeMs) {
       const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-      return all('SELECT id FROM users WHERE is_demo=1 AND created_at<?', cutoff);
+      return all('SELECT id FROM users WHERE is_demo=1 AND created_at<=?', cutoff);
     },
     countUserMessages: async (userId) => Number((await get("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'", userId)).count),
     async deleteDemoUser(id) {
@@ -501,13 +521,16 @@ const indexMigrations = [
       await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);return true;
     }),
     getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
+    hasAuthIdentityForUser: async (provider, userId) => !!(await get('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1', provider, userId)),
     async linkAuthIdentity(provider, subject, userId) {
       const now = timestamp();
       await run('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)', provider, subject, userId, now, now);
       return get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject);
     },
     updatePassword: async (id, passwordHash, passwordSalt) => { await run('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?', passwordHash, passwordSalt, timestamp(), id); },
-    setUserDisabled: async (id, disabled) => { await run('UPDATE users SET disabled=?, updated_at=? WHERE id=?', disabled ? 1 : 0, timestamp(), id); },
+    setUserDisabled: async (id, disabled) => (await run('UPDATE users SET disabled=?, updated_at=? WHERE id=? AND (?=1 OR moderation_blocked=0)', disabled ? 1 : 0, timestamp(), id,disabled?1:0)).changes>0,
+    setModerationBlocked: async (id,blocked) => (await run("UPDATE users SET disabled=?,moderation_blocked=?,updated_at=? WHERE id=? AND role='member' AND disabled=? AND moderation_blocked=?",blocked?1:0,blocked?1:0,timestamp(),id,blocked?0:1,blocked?0:1)).changes>0,
+
     markUserEmailVerified: async (id) => { const now=timestamp();return (await run('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=? AND email_verified_at IS NULL',now,now,id)).changes>0; },
     async deleteUserAccount(userId) {
       return withTransaction(async ({ get: tGet, all: tAll, run: tRun }) => {
@@ -550,7 +573,7 @@ const indexMigrations = [
 
     // --- Sessions ---
     createSession: async ({ tokenHash, userId, csrfToken, expiresAt, userAgent }) => { await run('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)', tokenHash, userId, csrfToken, expiresAt, timestamp(), userAgent || null); },
-    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled
+    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`, tokenHash, timestamp()),
     deleteSession: async (tokenHash) => { await run('DELETE FROM sessions WHERE token_hash=?', tokenHash); },
     deleteUserSessions: async (userId) => { await run('DELETE FROM sessions WHERE user_id=?', userId); },
@@ -614,6 +637,20 @@ const indexMigrations = [
     async listMessages(userId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
+    getReportSubmission: async (userId, submissionId) => get('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?', userId, submissionId),
+    countRecentReports: async (userId, since) => Number((await get('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?', userId, since)).count),
+    async addReport(userId, report) {
+      const now=timestamp();const id=randomUUID();
+      const result=await run(`INSERT INTO reports(id,reporter_user_id,submission_id,kind,reason,description,message_id,message_excerpt,status,created_at,updated_at,reviewed_at)
+        VALUES(?,?,?,?,?,?,?,?,'new',?,?,NULL) ON CONFLICT(reporter_user_id,submission_id) DO NOTHING`,
+        id,userId,report.submissionId,report.kind,report.reason,report.description,report.messageId||null,report.messageExcerpt||null,now,now);
+      return{report:await get('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?',userId,report.submissionId),created:result.changes>0};
+    },
+    listReports: async (limit=100) => all(`SELECT reports.*,users.display_name AS reporter_name FROM reports
+      JOIN users ON users.id=reports.reporter_user_id ORDER BY CASE WHEN reports.status IN ('new','reviewing') THEN 0 ELSE 1 END, CASE WHEN reports.status IN ('new','reviewing') THEN reports.created_at END ASC, reports.created_at DESC,reports.id DESC LIMIT ?`,Math.min(Math.max(limit,1),100)),
+    listOwnReports: async (userId,limit=50) => all('SELECT id,kind,reason,status,created_at,updated_at,reviewed_at,owner_note FROM reports WHERE reporter_user_id=? ORDER BY created_at DESC,id DESC LIMIT ?',userId,Math.min(Math.max(limit,1),50)),
+    reportQueueSummary: async () => all('SELECT status,COUNT(*) AS count,MIN(created_at) AS oldest_at FROM reports GROUP BY status'),
+    async updateReportStatus(id,status,ownerNote=null){const now=timestamp();return get('UPDATE reports SET status=?,owner_note=COALESCE(?,owner_note),updated_at=?,reviewed_at=COALESCE(reviewed_at,?) WHERE id=? RETURNING *',status,ownerNote,now,status==='new'?null:now,id);},
     // W1 parity: user-scoped single-message fetch (mirrors SQLite getMessage).
     getMessage: async (userId, id) => get('SELECT * FROM messages WHERE id=? AND user_id=?', id, userId),
     // W1 parity: these three mirror their SQLite counterparts. They were

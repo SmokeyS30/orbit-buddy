@@ -107,6 +107,8 @@ test('Apple HTTP flow requires authenticated explicit linking and cannot replay 
   const env={APPLE_CLIENT_ID:'com.test',APPLE_TEAM_ID:'TEAM',APPLE_KEY_ID:'test',APPLE_PRIVATE_KEY:await exportPKCS8(ec.privateKey),SIGNUP_AUDIT_KEY:'test-only-binding-key'};
   let exchangedToken;
   const {app,request,owner}=await fixture(t,env,{appleVerification:{keys,fetchImpl:async()=>Response.json({id_token:exchangedToken})}});
+  assert.equal((await request('/api/status')).status,401);
+  assert.equal((await request('/api/status',undefined,owner)).body.appleLinked,false);
   const credentials=async(nonce,sub='shared-subject',email='owner@example.com')=>{
     exchangedToken=await new SignJWT({sub,nonce,email,email_verified:true}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://appleid.apple.com').setAudience('com.test').setIssuedAt().setExpirationTime('5m').sign(rsa.privateKey);
     return {identityToken:exchangedToken,authorizationCode:'mock-code',nonce};
@@ -118,9 +120,11 @@ test('Apple HTTP flow requires authenticated explicit linking and cannot replay 
   const input={purpose:'link',password,...await credentials(challenge.nonce)};
   assert.equal((await request('/api/auth/apple/complete',{...input,password:'wrong'},owner)).status,401);
   assert.equal((await request('/api/auth/apple/complete',input,owner)).status,200);
+  assert.equal((await request('/api/status',undefined,owner)).body.appleLinked,true);
   assert.equal((await request('/api/auth/apple/complete',input,owner)).status,401,'consumed nonce cannot replay');
   await request('/api/admin/registration',{open:true},owner);
   const member=await request('/api/auth/register',{email:'member@example.com',displayName:'Member',password});member.csrf=member.body.csrf;
+  assert.equal((await request('/api/status',undefined,member)).body.appleLinked,false,'link status belongs only to the signed-in account');
   const collision=(await request('/api/auth/apple/challenge',{purpose:'link'},member)).body;
   assert.equal((await request('/api/auth/apple/complete',{purpose:'link',password,...await credentials(collision.nonce)},member)).status,409);
   assert.equal(app.db.getAuthIdentity('apple','shared-subject').user_id,owner.body.user.id);
