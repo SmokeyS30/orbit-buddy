@@ -49,8 +49,15 @@ test('support back control clears the iPhone safe area with a full-size target',
   assert.match(support, /\.support-back\{[^}]*top:calc\(env\(safe-area-inset-top,0px\) \+ 24px\)[^}]*min-height:48px/);
 });
 
+test('native iOS time pickers stay inside the quiet-hours border', () => {
+  assert.equal((index.match(/class="time-input-frame"/g) || []).length, 2);
+  assert.match(styles, /\.time-input-frame\{[^}]*position:relative[^}]*width:100%[^}]*overflow:hidden/);
+  assert.match(styles, /\.time-input-frame>input\[type="time"\]\{[^}]*position:absolute[^}]*inset:0[^}]*box-sizing:border-box[^}]*width:100%[^}]*max-width:100%/);
+});
+
 test('native bundle uses the polished CSS revision and replacement 1.1 build', () => {
-  assert.match(index, /mobile\.css\?v=20261022c/);
+  assert.match(index, /styles\.css\?v=20261022d/);
+  assert.match(index, /mobile\.css\?v=20261022d/);
   assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261030;/g) || []).length, 2);
   assert.equal((project.match(/MARKETING_VERSION = 1\.1;/g) || []).length, 2);
 });
