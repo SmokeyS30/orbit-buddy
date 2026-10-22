@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -64,6 +65,31 @@ test('splash respects reduced-motion preferences', () => {
 test('splash exposes an early-dismiss hook for the app', () => {
   const html = readPublic('index.html');
   assert.ok(html.includes('__orbitSplashDone'), 'app can dismiss splash early when ready');
+});
+
+test('Support return removes the splash synchronously before app modules load', () => {
+  const html = readPublic('index.html');
+  const supportGuard = html.indexOf("if(window.__orbitSupportReturnView==='safety')");
+  const appModule = html.indexOf('<script type="module" src="/app.js?v=20261022d"></script>');
+  assert.ok(supportGuard > -1, 'inline Support-return guard exists');
+  assert.ok(appModule > supportGuard, 'guard runs before app.js');
+  assert.match(html, /__orbitSupportReturnView==='safety'[\s\S]*?removeChild\(splash\)[\s\S]*?__orbitSplashComplete=true[\s\S]*?return;/);
+
+  const appJs = readPublic('app.js');
+  assert.match(appJs, /function dismissSplashForSupportReturn\(\)[\s\S]*?removeChild\(splash\)[\s\S]*?__orbitSplashComplete=true/);
+  assert.match(appJs, /if\(view==='safety'\)dismissSplashForSupportReturn\(\);[\s\S]*?classList\.remove\('orbit-support-returning'\)/);
+
+  const controller = html.match(/<script>\s*(\/\/ Splash screen: stars \+ timed fade-out\.[\s\S]*?)<\/script>/)?.[1];
+  assert.ok(controller, 'inline splash controller is extractable');
+  let removed = false;
+  const splash = { parentNode: { removeChild(node) { removed = node === splash; } } };
+  const window = { __orbitSupportReturnView: 'safety' };
+  vm.runInNewContext(controller, {
+    window,
+    document: { getElementById: (id) => id === 'orbit-splash' ? splash : null },
+  });
+  assert.equal(removed, true, 'Support return removes the splash immediately');
+  assert.equal(window.__orbitSplashComplete, true, 'Support return marks launch animation complete');
 });
 
 test('iOS launch screen uses dark background (no white flash)', () => {
