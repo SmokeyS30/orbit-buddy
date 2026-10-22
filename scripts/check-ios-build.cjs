@@ -24,6 +24,7 @@ const APP_JS = path.join(PUBLIC_DIR, 'app.js');
 const VOICE_JS = path.join(PUBLIC_DIR, 'voice-mode.js');
 const NATIVE_RUNTIME_JS = path.join(PUBLIC_DIR, 'native-runtime.js');
 const INDEX_HTML = path.join(PUBLIC_DIR, 'index.html');
+const SYNCED_NATIVE_CONFIG = path.join(SYNCED_DIR, 'native-config.js');
 
 let failures = 0;
 function fail(msg) {
@@ -60,6 +61,10 @@ if (!fs.existsSync(SYNCED_DIR)) {
   const missing = srcFiles.filter(f => !syncedFiles.has(f));
   const stale = [];
   for (const f of srcFiles) {
+    // The sync command intentionally overwrites this placeholder after
+    // Capacitor copies public/. It is generated per archive so test builds can
+    // use an approved test origin without changing the checked-in web bundle.
+    if (f === 'native-config.js') continue;
     if (syncedFiles.has(f)) {
       try {
         if (hashFile(path.join(PUBLIC_DIR, f)) !== hashFile(path.join(SYNCED_DIR, f))) stale.push(f);
@@ -77,13 +82,17 @@ if (!fs.existsSync(APP_JS)) {
   fail('public/app.js not found.');
 } else {
   const js = fs.readFileSync(APP_JS, 'utf8');
-  const m = js.match(/const API_BASE\s*=\s*IS_NATIVE\s*\?\s*['"]([^'"]+)['"]/);
-  if (!m) {
-    fail('API_BASE is not set from IS_NATIVE — native calls may use relative URLs and fail.');
-  } else if (!/^https:\/\//.test(m[1])) {
-    fail(`API_BASE for native is "${m[1]}" — must be an absolute https URL.`);
+  const importsGeneratedConfig = /import\s*\{\s*NATIVE_API_BASE\s*\}\s*from\s*['"]\.\/native-config\.js['"]/.test(js);
+  const selectsGeneratedConfig = /const API_BASE\s*=\s*IS_NATIVE\s*\?\s*NATIVE_API_BASE\s*:\s*['"]['"]/.test(js);
+  if (!importsGeneratedConfig || !selectsGeneratedConfig) {
+    fail('app.js does not select the generated NATIVE_API_BASE for native requests.');
+  } else if (!fs.existsSync(SYNCED_NATIVE_CONFIG)) {
+    fail('generated ios/App/App/public/native-config.js is missing — run `npm run ios:sync -- --api-base <approved-origin>`.');
   } else {
-    pass(`native API base is absolute: ${m[1]}`);
+    const generated = fs.readFileSync(SYNCED_NATIVE_CONFIG, 'utf8');
+    const m = generated.match(/export const NATIVE_API_BASE\s*=\s*(["'])(https:\/\/[^"']+)\1/);
+    if (!m) fail('generated native-config.js does not contain an absolute HTTPS origin.');
+    else pass(`native API base is absolute: ${m[2]}`);
   }
   // Every fetch of a /api path must go through API_BASE or the api() helper.
   const bareApiCalls = [...js.matchAll(/fetch\(\s*['"]\/api\//g)];
