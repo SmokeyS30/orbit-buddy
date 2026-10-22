@@ -40,9 +40,15 @@ test('mobile tab bar scrolls cleanly without clipping', () => {
 test('launch always lands on the welcome (today) screen', () => {
   assert.match(
     appJs,
-    /Launch always lands on the welcome screen[\s\S]*?activateView\('today',\{updateHash:false\}\)/,
+    /fresh launch always lands on Today[\s\S]*?activateView\('today',\{updateHash:false\}\)/i,
     'app.js must activate the today view on launch'
   );
+});
+
+test('returning from Support restores Safety without a fresh launch', () => {
+  assert.match(appJs, /const supportReturnView=consumeSupportReturnView\(\)/);
+  assert.match(appJs, /if\(supportReturnView\)activateView\(supportReturnView,\{updateHash:false\}\)/);
+  assert.match(appJs, /addEventListener\('pageshow',[\s\S]*?consumeSupportReturnView/);
 });
 
 test('launch clears any stale hash', () => {

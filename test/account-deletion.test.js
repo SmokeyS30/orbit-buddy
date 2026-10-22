@@ -65,6 +65,8 @@ test('public support page explains subscriptions and account deletion',async(t)=
   const html=await response.text();
   assert.match(html,/Apple subscription settings/);
   assert.match(html,/Safety → Delete account/);
-  assert.match(html,/id="support-back"[^>]*href="\/#safety"/);
+  assert.match(html,/viewport-fit=cover/);
+  assert.match(html,/id="support-back"[^>]*href="\/#safety"[^>]*data-support-back/);
+  assert.match(html,/support-navigation\.js/);
   assert.match(html,/Back to Orbit Buddy/);
 });
