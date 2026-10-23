@@ -23,6 +23,7 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
+import { assertMemorySafe } from '../relational-intelligence.js';
 
 const { Pool } = pg;
 const timestamp = () => new Date().toISOString();
@@ -150,6 +151,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS superseded_by TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding TEXT',
+      'ALTER TABLE memories ADD COLUMN IF NOT EXISTS proactive_allowed INTEGER NOT NULL DEFAULT 1',
       'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
       'ALTER TABLE memory_suggestions ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION NOT NULL DEFAULT 0.7',
       'ALTER TABLE follow_ups ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 2',
@@ -689,14 +691,15 @@ const indexMigrations = [
 
     // --- Memories ---
     async addMemory(userId, content, options={}) {
+      content = assertMemorySafe(content);
       const now = timestamp();
       const row = { id: randomUUID(), user_id: userId, content, created_at: now, updated_at: now,
         kind: normalizeMemoryKind(options.kind), source: String(options.source||'user').slice(0, 40), status: 'approved',
         confidence: Math.max(0, Math.min(Number(options.confidence ?? 1), 1)), expires_at: options.expiresAt || null, last_confirmed_at: now,
-        embedding: options.embedding || null };
-      await run(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, NULL, 1.0, NULL, ?)`,
-        row.id, row.user_id, row.content, row.created_at, row.updated_at, row.kind, row.source, row.confidence, row.expires_at, row.last_confirmed_at, row.embedding);
+        embedding: options.embedding || null, proactive_allowed: options.proactiveAllowed === false ? 0 : 1 };
+      await run(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, NULL, 1.0, NULL, ?, ?)`,
+        row.id, row.user_id, row.content, row.created_at, row.updated_at, row.kind, row.source, row.confidence, row.expires_at, row.last_confirmed_at, row.embedding, row.proactive_allowed);
       // Contradiction detection: mark the old memory as superseded (kept for history, excluded from context).
       try {
         const contradiction = detectContradiction(content, await all("SELECT * FROM memories WHERE user_id=? AND status='approved'", userId));
@@ -708,12 +711,24 @@ const indexMigrations = [
       return row;
     },
     listMemories: async (userId) => all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
+    getMemory: async (userId, id) => get("SELECT * FROM memories WHERE id=? AND user_id=? AND status='approved'", id, userId),
+    async updateMemory(userId, id, { content, kind, proactiveAllowed }={}) {
+      const current = await this.getMemory(userId, id);
+      if (!current) return null;
+      const nextContent = content === undefined ? current.content : assertMemorySafe(content);
+      const nextKind = kind === undefined ? current.kind : normalizeMemoryKind(kind);
+      const nextProactive = proactiveAllowed === undefined ? (current.proactive_allowed === 0 ? 0 : 1) : (proactiveAllowed ? 1 : 0);
+      const now = timestamp();
+      await run("UPDATE memories SET content=?,kind=?,proactive_allowed=?,last_confirmed_at=?,relevance_score=1.0,updated_at=? WHERE id=? AND user_id=? AND status='approved'", nextContent, nextKind, nextProactive, now, now, id, userId);
+      return this.getMemory(userId, id);
+    },
     async listRelevantMemories(userId, query, limit=8) {
       const ranked = rankMemories(await all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId), query, limit);
       // Episodic recall: stamp last_mentioned_at whenever a memory is used in context.
       if (ranked.length) {
         const now = timestamp();
-        for (const memory of ranked) await run('UPDATE memories SET last_mentioned_at=? WHERE id=? AND user_id=?', now, memory.id, userId);
+        const ids = ranked.map((memory) => memory.id);
+        await run(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(() => '?').join(',')})`, now, userId, ...ids);
       }
       return ranked;
     },
@@ -735,6 +750,7 @@ const indexMigrations = [
     },
     deleteMemory: async (userId, id) => (await run('DELETE FROM memories WHERE id=? AND user_id=?', id, userId)).changes > 0,
     async addMemorySuggestion(userId, content, options={}) {
+      content = assertMemorySafe(content);
       const now = timestamp();
       const row = { id: randomUUID(), user_id: userId, content, created_at: now, kind: normalizeMemoryKind(options.kind), confidence: Math.max(0, Math.min(Number(options.confidence ?? 0.7), 1)) };
       await run('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES (?,?,?,?,?,?)', row.id, row.user_id, row.content, row.created_at, row.kind, row.confidence);
@@ -933,9 +949,14 @@ const indexMigrations = [
     },
     async listProjects(userId) {
       const rows = await all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId);
-      const out = [];
-      for (const row of rows) out.push({ ...row, steps: await all('SELECT * FROM project_steps WHERE project_id=? AND user_id=? ORDER BY position,created_at', row.id, userId) });
-      return out;
+      if (!rows.length) return [];
+      const grouped = new Map();
+      for (const step of await all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId)) {
+        const steps = grouped.get(step.project_id) || [];
+        steps.push(step);
+        grouped.set(step.project_id, steps);
+      }
+      return rows.map((row) => ({ ...row, steps: grouped.get(row.id) || [] }));
     },
     async updateProject(userId, id, patch={}) {
       const current = await get('SELECT * FROM projects WHERE id=? AND user_id=?', id, userId);
@@ -1623,9 +1644,9 @@ const indexMigrations = [
       await withTransaction(async ({ run: tRun, get: tGet }) => {
         for (const row of bundle.conversations || []) await tRun('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.created_at, row.updated_at);
         for (const row of bundle.messages || []) await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.conversation_id || null, row.role, row.content, row.created_at);
-        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, row.content, row.created_at, row.updated_at, normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null, row.last_confirmed_at || row.updated_at);
-        for (const row of bundle.memorySuggestions || []) await tRun('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.content, row.created_at, normalizeMemoryKind(row.kind), row.confidence ?? 0.7);
+        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at, normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null, row.last_confirmed_at || row.updated_at, row.proactive_allowed === 0 ? 0 : 1);
+        for (const row of bundle.memorySuggestions || []) await tRun('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, assertMemorySafe(row.content), row.created_at, normalizeMemoryKind(row.kind), row.confidence ?? 0.7);
         for (const row of bundle.followUps || []) await tRun('INSERT INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.description, row.due_date, row.status || 'scheduled', normalizePriority(row.priority), row.source_message_id || null, row.created_at, row.completed_at || null);
         for (const row of bundle.goals || []) await tRun('INSERT INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.description || null, row.status || 'active', normalizePriority(row.priority), Math.max(0, Math.min(Number(row.progress) || 0, 100)), row.target_date || null, row.next_step || null, row.created_at, row.updated_at, row.completed_at || null);
         for (const row of bundle.goalCheckins || []) await tRun('INSERT INTO goal_checkins(id,goal_id,user_id,progress,note,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, row.goal_id, userId, row.progress, row.note || null, row.created_at);

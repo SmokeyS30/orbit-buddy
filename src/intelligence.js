@@ -210,13 +210,18 @@ export function rankMemories(memories, query, limit = 8, nowMs = Date.now()) {
       const tokens = tokenize(memory.content);
       const overlap = tokens.reduce((count, token) => count + (wanted.has(token) ? 1 : 0), 0);
       const exact = wanted.size && String(memory.content).toLowerCase().includes(String(query).trim().toLowerCase()) ? 4 : 0;
+      // A user can mark a memory manual-only. It remains available when the
+      // current message clearly calls for it, but it cannot drift into an
+      // unrelated turn merely because it is recent or high-confidence.
+      if ((memory.proactive_allowed === 0 || memory.proactive_allowed === false) && !exact && overlap < 2) return null;
       const ageDays = Math.max(0, (nowMs - new Date(memory.last_confirmed_at || memory.updated_at || memory.created_at).valueOf()) / 86400_000);
       const recency = Math.max(0, 2 - Math.log10(ageDays + 1));
       const confidence = Number.isFinite(Number(memory.confidence)) ? Number(memory.confidence) : 1;
-      const kindBoost = ['preference', 'goal', 'project', 'decision'].includes(memory.kind) ? 0.5 : 0;
+      const kindBoost = memory.kind === 'relationship' ? 0.7 : ['preference', 'goal', 'project', 'decision'].includes(memory.kind) ? 0.5 : 0;
       const relevance = Number.isFinite(Number(memory.relevance_score)) ? Number(memory.relevance_score) : 1;
       return { memory, score: exact + overlap * 3 + recency + confidence + kindBoost + relevance - index * 0.001 };
     })
+    .filter(Boolean)
     .sort((a, b) => b.score - a.score)
     .slice(0, Math.max(1, Math.min(Number(limit) || 8, 20)))
     .map(({ memory }) => memory);
