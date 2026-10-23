@@ -32,6 +32,7 @@ import { learnWritingVoice, buildVoiceStyleDirective, writingVoiceStatus } from 
 import { handleSoulCommand, handleAdaptationCommand, resolveAdaptiveSoulDirective } from './src/soul.js';
 import { handleProactiveMemoryWhy, runProactiveMemoryPush } from './src/proactive-memory.js';
 import { buildUnifiedHint, chooseChatSurfacingWithPatterns, detectEmotionalTone, trackEmotionalTone, loadEmotionalTrack, summarizeEmotionalPattern, buildEmotionalContext, handleEmotionHonesty, recordConnectionSurfacing, runMemoryConnectionPush } from './src/memory-connections.js';
+import { auditRelationalResponse, buildRelationalDirective, classifyRelationalTurn, isProactiveMemoryAllowed, shouldLoadEmotionalHistory, shouldLoadPlanningContext } from './src/relational-intelligence.js';
 import { enforceSchedulingHonesty } from './src/scheduling-honesty.js';
 import { runRadarPoll, deliverRadarFindings } from './src/radar.js';
 import { seedStudyBank } from './src/study-seed.js';
@@ -770,19 +771,28 @@ export function createOrbitServer(options={}) {
       // anchor, with learnings accumulated from conversation signals. The
       // adaptive layer is emotionally grounded via the detected tone.
       const soulDirective=resolveAdaptiveSoulDirective({db,userId,isDemo:isDemoUser(user),userName:user?.display_name,message,timeZone:preferences.time_zone});
+      const relationalPlan=classifyRelationalTurn(message);
+      const loadPlanningContext=shouldLoadPlanningContext({message,plan:relationalPlan});
       // Emotional context: grounds the LLM's own reading of the
       // conversation in tracked emotional patterns. States the honesty
-      // contract verbatim — Orbit MODELS emotions, never feels them. Demo:
-      // skipped entirely.
+      // contract verbatim — Orbit MODELS emotions, never feels them. Historical
+      // pattern reads are reserved for emotionally meaningful/reflection turns;
+      // the current turn still receives its deterministic tone every time.
       let emotionContext=null;let emotionTrack=[];
       if(!isDemoUser(user)){
         try{
-          emotionTrack=loadEmotionalTrack(db,userId);
-          const emotionPattern=summarizeEmotionalPattern({track:emotionTrack,nowMs:Date.now(),timeZone:preferences.time_zone});
+          if(shouldLoadEmotionalHistory({message,plan:relationalPlan}))emotionTrack=loadEmotionalTrack(db,userId);
+          const emotionPattern=emotionTrack.length?summarizeEmotionalPattern({track:emotionTrack,nowMs:Date.now(),timeZone:preferences.time_zone}):null;
           emotionContext=buildEmotionalContext({userName:user?.display_name,tone:emotionTone,emotionPhrase:emotionPattern&&emotionPattern.phrase});
         }catch(error){console.error('emotional context failed',error&&error.message);emotionContext=null;}
       }
       const recalledMemories=db.listRelevantMemories(userId,message);
+      // Planning context is comparatively expensive: projects also load their
+      // steps. Only fetch it for turns where it can affect the answer.
+      const openCommitments=loadPlanningContext?db.listFollowUps(userId).slice(0,8):[];
+      const activeGoals=loadPlanningContext?db.listActiveGoals(userId):[];
+      const activeProjects=loadPlanningContext?db.listProjects(userId).filter((project)=>project.status!=='completed'):[];
+      const relationalContext=buildRelationalDirective({message,memories:recalledMemories,commitments:openCommitments,plan:relationalPlan});
       // Proactive memory (2026-10-16): volunteer at most ONE timely memory
       // (a due date from memories, or an open loop the topic calls for) as a
       // natural aside — graceful by design: the model gets a hint it may use
@@ -813,9 +823,9 @@ export function createOrbitServer(options={}) {
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,membershipTier,
+      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
-        memories:recalledMemories,goals:db.listActiveGoals(userId),projects:db.listProjects(userId).filter((project)=>project.status!=='completed'),history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
+        memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
         onTurn:onStreamTurn,onToken:onStreamToken});
@@ -824,6 +834,8 @@ export function createOrbitServer(options={}) {
       const checkedRaw=filterAssistantContent(rawAnswer);
       const safeRawAnswer=checkedRaw.text;
       if(checkedRaw.filtered)db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');
+      const relationalAudit=auditRelationalResponse({response:safeRawAnswer,history});
+      if(!relationalAudit.passed)db.addEvent(userId,'relational_quality_flag','A response quality check found an issue for review.',relationalAudit.flags.join(','));
       for(const toolCall of toolCalls)db.addEvent(userId,'tool_use',`Used ${toolCall.name}${toolCall.detail?` (${toolCall.detail})`:''}.`);
       // Backward compatibility for replies from older/custom models that still emit legacy markers.
       for(const followUp of parseFollowUpMarkers(safeRawAnswer)){db.addFollowUp(userId,{description:followUp.description,dueDate:followUp.date,sourceMessageId:userMsg.id});db.addEvent(userId,'followup_noted',`Will check in about “${followUp.description}” after ${followUp.date}.`);}
@@ -1047,6 +1059,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       if(user.disabled)continue;
       const preferences=db.getPreferences(user.id);
       const timeZone=preferences.time_zone||'America/New_York';
+      const learningMemories=()=>db.listMemories(user.id).filter(isProactiveMemoryAllowed);
       // Run once per day per user
       const today=todayInZone(timeZone,nowMs);
       const lastLearned=db.getSetting(`last_learning_${user.id}`);
@@ -1147,7 +1160,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       try{
         const monthKey=today.slice(0,7);
         if(db.getSetting(`deep_mining_last_${user.id}`)!==monthKey){
-          const allMemories=db.listMemories(user.id).slice(0,100);
+          const allMemories=learningMemories().slice(0,100);
           if(allMemories.length>=10){
             const memText=allMemories.map((m)=>`- (${String(m.created_at||'').slice(0,4)}) ${String(m.content||'').slice(0,200)}`).join('\n');
             const deepPrompt=`Analyze this user's full history — all their saved memories. Identify long-term patterns, not recent events.
@@ -1255,7 +1268,7 @@ Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough
       try{
         const monthKey=today.slice(0,7);
         if(db.getSetting(`energy_map_last_${user.id}`)!==monthKey){
-          const memSample=db.listMemories(user.id).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+          const memSample=learningMemories().slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
           const msgSample=db.listMessages(user.id,40).filter((m)=>m.role==='user').slice(-15).map((m)=>`- ${String(m.content||'').slice(0,200)}`).join('\n');
           if(memSample||msgSample){
             const energyPrompt=`Based on this person's memories and recent messages, identify what seems to energize them vs drain them. Ground each in specific observed behavior — things they light up talking about, complain about, avoid, or seem wiped out by. Never use clinical or diagnostic language.
@@ -1335,7 +1348,7 @@ Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"
       try{
         const monthKey=today.slice(0,7);
         if(db.getSetting(`consolidation_last_${user.id}`)!==monthKey){
-          const autoMems=db.listMemories(user.id).filter((m)=>String(m.source||'').startsWith('auto'));
+          const autoMems=learningMemories().filter((m)=>String(m.source||'').startsWith('auto'));
           if(autoMems.length>=15){
             const memList=autoMems.slice(0,60).map((m)=>`[${m.id.slice(0,8)}] (${m.source}) ${String(m.content||'').slice(0,180)}`).join('\n');
             const conPrompt=`Review these auto-learned memories about the user. Clean them up.
@@ -1391,7 +1404,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
         if(db.getSetting(`deep_learning_last_${user.id}`)!==weekKey){
           // 1. Proactive curiosity: what don't we know yet?
           try{
-            const memSample=db.listMemories(user.id).slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
+            const memSample=learningMemories().slice(0,40).map((m)=>`- ${String(m.content||'').slice(0,150)}`).join('\n');
             const curPrompt=`Based on this user's memories, what are 2-3 genuine gaps in your understanding — things a close friend would know but you don't yet? Focus on what would help you be a better companion, not trivia.
 
 Memories:
@@ -3284,8 +3297,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));
           return json(res,202,{job:{id:job.id,status:job.status},messages:extracted.messages.length,format:extracted.format});
         }
-        if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user'});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
-        const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/memories'){const body=await readJson(req);const memory=db.addMemory(userId,cleanText(body.content,2000,'content'),{kind:normalizeMemoryKind(body.kind),source:'user',proactiveAllowed:body.proactiveAllowed!==false});db.addEvent(userId,'memory_added',`Saved a user-approved ${memory.kind} memory.`);return json(res,201,memory);}
+        const memoryMatch=url.pathname.match(/^\/api\/memories\/([0-9a-f-]+)$/);
+        if(req.method==='PATCH'&&memoryMatch){const body=await readJson(req);const patch={};if(body.content!==undefined)patch.content=cleanText(body.content,2000,'content');if(body.kind!==undefined)patch.kind=normalizeMemoryKind(body.kind);if(body.proactiveAllowed!==undefined)patch.proactiveAllowed=body.proactiveAllowed===true;if(!Object.keys(patch).length)throw Object.assign(new Error('No memory changes supplied.'),{status:400});const updated=db.updateMemory(userId,memoryMatch[1],patch);if(!updated)throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_updated',updated.proactive_allowed===0?'Updated a memory and made it manual-only.':'Updated a memory.');return json(res,200,updated);}
+        if(req.method==='DELETE'&&memoryMatch){if(!db.deleteMemory(userId,memoryMatch[1]))throw Object.assign(new Error('Memory not found.'),{status:404});db.addEvent(userId,'memory_deleted','Deleted a memory.');return json(res,200,{ok:true});}
         // L4: search filters apply before scoring. Note: db.listMessages clamps to
         // the 200 most recent messages, so filtered search covers the recent corpus.
         if(req.method==='GET'&&url.pathname==='/api/search/messages'){const q=String(url.searchParams.get('q')||'').trim();if(!q)throw Object.assign(new Error('Query required.'),{status:400});const filters=parseSearchFilterParams(url.searchParams,{conversationExists:(id)=>!!db.getConversation(userId,id)});const messages=db.listMessages(userId,500);const results=searchMessages(messages,q,20,Object.keys(filters).length?filters:null);return json(res,200,{results:formatSearchResults(results),items:formatSearchItems(results)});}

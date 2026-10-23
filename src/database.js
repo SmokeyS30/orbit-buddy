@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
+import { assertMemorySafe } from './relational-intelligence.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -457,6 +458,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'memories', 'relevance_score', 'REAL NOT NULL DEFAULT 1.0');
   ensureColumn(db, 'memories', 'superseded_by', 'TEXT');
   ensureColumn(db, 'memories', 'embedding', 'TEXT');
+  ensureColumn(db, 'memories', 'proactive_allowed', 'INTEGER NOT NULL DEFAULT 1');
   // L3 multi-user polish: server-side dismissal of the "what can Orbit do" intro card.
   ensureColumn(db, 'user_preferences', 'intro_dismissed', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'memory_suggestions', 'kind', "TEXT NOT NULL DEFAULT 'fact'");
@@ -589,9 +591,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listCanvasRevisions: db.prepare('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? ORDER BY version DESC LIMIT 50'),
     getCanvasRevision: db.prepare('SELECT * FROM canvas_revisions WHERE user_id=? AND message_id=? AND version=?'),
     retimeMessageRow: db.prepare('UPDATE messages SET created_at=? WHERE id=? AND user_id=?'),
-    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?, 1.0, NULL, ?)`),
+    addMemory: db.prepare(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, NULL, 1.0, NULL, ?, ?)`),
     listMemories: db.prepare("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,rowid DESC LIMIT 100"),
+    getMemory: db.prepare("SELECT * FROM memories WHERE id=? AND user_id=? AND status='approved'"),
+    updateMemory: db.prepare("UPDATE memories SET content=?,kind=?,proactive_allowed=?,last_confirmed_at=?,relevance_score=1.0,updated_at=? WHERE id=? AND user_id=? AND status='approved'"),
     deleteMemory: db.prepare('DELETE FROM memories WHERE id=? AND user_id=?'),
     addMemorySuggestion: db.prepare('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES (?,?,?,?,?,?)'),
     getMemorySuggestion: db.prepare('SELECT * FROM memory_suggestions WHERE id=? AND user_id=?'),
@@ -643,6 +647,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,'planned',?,?,?, ?,NULL)`),
     getProjectStep: db.prepare('SELECT * FROM project_steps WHERE id=? AND user_id=?'),
     listProjectSteps: db.prepare('SELECT * FROM project_steps WHERE project_id=? AND user_id=? ORDER BY position,created_at'),
+    listUserProjectSteps: db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at'),
     updateProjectStep: db.prepare('UPDATE project_steps SET title=?,details=?,status=?,position=?,due_date=?,updated_at=?,completed_at=? WHERE id=? AND user_id=?'),
     deleteProjectStep: db.prepare('DELETE FROM project_steps WHERE id=? AND user_id=?'),
     addApproval: db.prepare(`INSERT INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at)
@@ -1105,12 +1110,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return ids;
     },
     addMemory(userId, content, options={}) {
+      content=assertMemorySafe(content);
       const now=timestamp();
       const row={id:randomUUID(),user_id:userId,content,created_at:now,updated_at:now,
         kind:normalizeMemoryKind(options.kind),source:String(options.source||'user').slice(0,40),status:'approved',
         confidence:Math.max(0,Math.min(Number(options.confidence??1),1)),expires_at:options.expiresAt||null,last_confirmed_at:now,
-        embedding:options.embedding||null};
-      s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at,row.embedding);
+        embedding:options.embedding||null,proactive_allowed:options.proactiveAllowed===false?0:1};
+      s.addMemory.run(row.id,row.user_id,row.content,row.created_at,row.updated_at,row.kind,row.source,row.confidence,row.expires_at,row.last_confirmed_at,row.embedding,row.proactive_allowed);
       // Contradiction detection: if the new memory conflicts with an existing one,
       // mark the old one as superseded (kept for history, excluded from context).
       try {
@@ -1123,13 +1129,23 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return row;
     },
     listMemories: (userId) => s.listMemories.all(userId),
+    getMemory: (userId,id) => s.getMemory.get(id,userId)||null,
+    updateMemory(userId,id,{content,kind,proactiveAllowed}={}){
+      const current=s.getMemory.get(id,userId);if(!current)return null;
+      const nextContent=content===undefined?current.content:assertMemorySafe(content);
+      const nextKind=kind===undefined?current.kind:normalizeMemoryKind(kind);
+      const nextProactive=proactiveAllowed===undefined?(current.proactive_allowed===0?0:1):(proactiveAllowed?1:0);
+      const now=timestamp();
+      s.updateMemory.run(nextContent,nextKind,nextProactive,now,now,id,userId);
+      return s.getMemory.get(id,userId)||null;
+    },
     listRelevantMemories(userId,query,limit=8){
       const ranked=rankMemories(s.listMemories.all(userId),query,limit);
       // Episodic recall: stamp last_mentioned_at whenever a memory is used in context.
       if(ranked.length){
         const now=timestamp();
-        const touch=db.prepare("UPDATE memories SET last_mentioned_at=? WHERE id=? AND user_id=?");
-        for(const memory of ranked) touch.run(now,memory.id,userId);
+        const ids=ranked.map((memory)=>memory.id);
+        db.prepare(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(()=>'?').join(',')})`).run(now,userId,...ids);
       }
       return ranked;
     },
@@ -1147,7 +1163,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return updated;
     },
     deleteMemory: (userId,id) => s.deleteMemory.run(id,userId).changes>0,
-    addMemorySuggestion(userId,content,options={}){const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
+    addMemorySuggestion(userId,content,options={}){content=assertMemorySafe(content);const now=timestamp();const row={id:randomUUID(),user_id:userId,content,created_at:now,kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);return row;},
     listMemorySuggestions: (userId) => s.listMemorySuggestions.all(userId),
     dismissMemorySuggestion: (userId,id) => s.deleteMemorySuggestion.run(id,userId).changes>0,
     approveMemorySuggestion(userId,id,options={}){const row=s.getMemorySuggestion.get(id,userId);if(!row)return null;const saved=this.addMemory(userId,row.content,{kind:row.kind,source:options.source||'suggestion',confidence:row.confidence});s.deleteMemorySuggestion.run(id,userId);return {...row,memory_id:saved.id};},
@@ -1245,7 +1261,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return {...row,steps:s.listProjectSteps.all(row.id,userId)};
     },
     getProject(userId,id){const row=s.getProject.get(id,userId);return row?{...row,steps:s.listProjectSteps.all(id,userId)}:null;},
-    listProjects(userId){return s.listProjects.all(userId).map((row)=>({...row,steps:s.listProjectSteps.all(row.id,userId)}));},
+    listProjects(userId){
+      const rows=s.listProjects.all(userId);const grouped=new Map();
+      for(const step of s.listUserProjectSteps.all(userId)){const steps=grouped.get(step.project_id)||[];steps.push(step);grouped.set(step.project_id,steps);}
+      return rows.map((row)=>({...row,steps:grouped.get(row.id)||[]}));
+    },
     updateProject(userId,id,patch={}){const current=s.getProject.get(id,userId);if(!current)return null;const status=patch.status===undefined?current.status:(['active','paused','completed'].includes(patch.status)?patch.status:current.status);const title=patch.title===undefined?current.title:String(patch.title||'').trim().slice(0,120)||current.title;const description=patch.description===undefined?current.description:(String(patch.description||'').trim().slice(0,1000)||null);const priority=patch.priority===undefined?current.priority:normalizePriority(patch.priority);const targetDate=patch.targetDate===undefined?current.target_date:(patch.targetDate?validDateString(patch.targetDate):null);const now=timestamp();const completedAt=status==='completed'?(current.completed_at||now):null;s.updateProject.run(title,description,status,priority,targetDate,now,completedAt,id,userId);return this.getProject(userId,id);},
     deleteProject:(userId,id)=>s.deleteProject.run(id,userId).changes>0,
     addProjectStep(userId,projectId,{title,details=null,dueDate=null}){if(!s.getProject.get(projectId,userId))return null;const existing=s.listProjectSteps.all(projectId,userId);const now=timestamp();const row={id:randomUUID(),project_id:projectId,user_id:userId,title,details:details||null,status:'planned',position:existing.length,due_date:dueDate?validDateString(dueDate):null,created_at:now,updated_at:now,completed_at:null};s.addProjectStep.run(row.id,row.project_id,row.user_id,row.title,row.details,row.position,row.due_date,row.created_at,row.updated_at);return row;},
@@ -1511,8 +1531,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
-        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?)`),
+        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`),
         suggestion: db.prepare('INSERT OR IGNORE INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)'),
         followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)'),
         goal: db.prepare('INSERT OR IGNORE INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'),
@@ -1532,8 +1552,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       try {
         for (const row of bundle.conversations || []) inserts.conversation.run(row.id,userId,row.title,row.created_at,row.updated_at);
         for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
-        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,row.content,row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at);
-        for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,row.content,row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
+        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,assertMemorySafe(row.content),row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at,row.proactive_allowed===0?0:1);
+        for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,assertMemorySafe(row.content),row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
         for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',normalizePriority(row.priority),row.source_message_id||null,row.created_at,row.completed_at||null);
         for (const row of bundle.goals || []) inserts.goal.run(row.id,userId,row.title,row.description||null,row.status||'active',normalizePriority(row.priority),Math.max(0,Math.min(Number(row.progress)||0,100)),row.target_date||null,row.next_step||null,row.created_at,row.updated_at,row.completed_at||null);
         for (const row of bundle.goalCheckins || []) inserts.goalCheckin.run(row.id,row.goal_id,userId,row.progress,row.note||null,row.created_at);

@@ -4,6 +4,7 @@ import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone
 import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
 import { startQuizSession, answerQuizQuestion, stopQuizSession, getStudyWeakSpots, getStudyStreak, normalizeStudyExam, STUDY_EXAMS } from './study-coach.js';
 import { buildCatchupDigest } from './catchup.js';
+import { assertMemorySafe } from './relational-intelligence.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -420,18 +421,57 @@ export function toolCreateTask(args = {}, ctx = null) {
 
 export function toolSaveMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'save_memory');
-  const content = cleanArg(args.content, 2000, 'content');
-  const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit' });
+  const content = assertMemorySafe(cleanArg(args.content, 2000, 'content'));
+  const memory = db.addMemory(userId, content, { kind: normalizeMemoryKind(args.kind), source: 'explicit', proactiveAllowed: args.proactiveAllowed !== false });
   try { for (const name of extractPersonNames(content)) db.trackPersonMention(userId, name); } catch (e) {}
-  return { id: memory.id, content: memory.content, note: 'Saved successfully. The user can delete it in the Memories tab.' };
+  return { id: memory.id, content: memory.content, proactiveAllowed: memory.proactive_allowed !== 0, note: memory.proactive_allowed === 0 ? 'Saved as manual-only. Orbit will use it only when directly relevant and will not surface or analyze it proactively.' : 'Saved successfully. The user can edit, make manual-only, or delete it.' };
 }
 
 export function toolProposeMemory(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'propose_memory');
-  const content = cleanArg(args.content, 500, 'content');
+  const content = assertMemorySafe(cleanArg(args.content, 500, 'content'));
   const kind = normalizeMemoryKind(args.kind);
   const suggestion = db.addMemorySuggestion(userId, content, { kind, confidence: 0.7 });
   return { id: suggestion.id, content, kind, note: 'Proposed for the user to approve or dismiss.' };
+}
+
+function memoryMatches(memories, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!q) return [];
+  const exact = (memories || []).filter((memory) => String(memory.content || '').trim().toLowerCase() === q);
+  if (exact.length) return exact;
+  const contains = (memories || []).filter((memory) => String(memory.content || '').toLowerCase().includes(q));
+  if (contains.length) return contains;
+  const tokens = new Set(q.match(/[a-z0-9][a-z0-9'-]{1,}/g) || []);
+  return (memories || []).map((memory) => {
+    const words = String(memory.content || '').toLowerCase().match(/[a-z0-9][a-z0-9'-]{1,}/g) || [];
+    const overlap = words.filter((word) => tokens.has(word)).length;
+    return { memory, overlap };
+  }).filter((item) => item.overlap > 0).sort((a, b) => b.overlap - a.overlap).filter((item, _, rows) => item.overlap === rows[0].overlap).map((item) => item.memory);
+}
+
+export function toolUpdateMemory(args = {}, ctx = null) {
+  const { db, userId } = writeContext(ctx, 'update_memory');
+  const query = cleanArg(args.query, 240, 'query');
+  const matches = memoryMatches(db.listMemories(userId), query);
+  if (!matches.length) throw new Error(`I couldn't find a memory matching “${query}”.`);
+  if (matches.length > 1) return { ambiguous: true, candidates: matches.slice(0, 5).map((memory) => ({ id: memory.id, content: memory.content })) };
+  const patch = {};
+  if (args.content !== undefined) patch.content = assertMemorySafe(cleanArg(args.content, 2000, 'content'));
+  if (args.kind !== undefined) patch.kind = normalizeMemoryKind(args.kind);
+  if (args.proactiveAllowed !== undefined) patch.proactiveAllowed = args.proactiveAllowed === true;
+  if (!Object.keys(patch).length) throw new Error('Tell me what to change about that memory.');
+  const updated = db.updateMemory(userId, matches[0].id, patch);
+  if (!updated) throw new Error('That memory no longer exists.');
+  return {
+    id: updated.id,
+    content: updated.content,
+    kind: updated.kind,
+    proactiveAllowed: updated.proactive_allowed !== 0,
+    note: updated.proactive_allowed === 0
+      ? 'Updated and made manual-only. Orbit will not surface or analyze it proactively.'
+      : 'Memory updated successfully.'
+  };
 }
 
 export function toolSavePersonalDate(args = {}, ctx = null) {
@@ -1302,9 +1342,26 @@ export const TOOL_DEFINITIONS = [
       type: 'object',
       properties: {
         content: { type: 'string', description: 'The memory to save (max 2000 characters).' },
-        kind: { type: 'string', enum: ['fact', 'preference', 'goal', 'project', 'decision', 'relationship'] }
+        kind: { type: 'string', enum: ['fact', 'preference', 'goal', 'project', 'decision', 'relationship'] },
+        proactiveAllowed: { type: 'boolean', description: 'Set false only when the user explicitly asks to keep this manual-only or not bring it up proactively.' }
       },
       required: ['content'],
+      additionalProperties: false
+    }
+  },
+  {
+    type: 'function',
+    name: 'update_memory',
+    description: 'Edit an existing memory or change whether Orbit may surface/analyze it proactively. Use only when the user explicitly asks to correct, edit, make manual-only/private, or re-enable a memory. If the result is ambiguous, ask which candidate they mean and do not claim a change.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Distinctive words from the existing memory to find.' },
+        content: { type: 'string', description: 'Replacement memory text, only when the user asked to correct/edit it.' },
+        kind: { type: 'string', enum: ['fact', 'preference', 'goal', 'project', 'decision', 'relationship'] },
+        proactiveAllowed: { type: 'boolean', description: 'False makes it manual-only; true allows normal recall and proactive use.' }
+      },
+      required: ['query'],
       additionalProperties: false
     }
   },
@@ -1785,6 +1842,7 @@ const TOOL_SUMMARIES = {
   get_sports: (args) => String(args.league || 'nfl').slice(0, 80),
   create_task: (args) => String(args.title || '').slice(0, 80),
   save_memory: (args) => String(args.content || '').slice(0, 80),
+  update_memory: (args) => String(args.query || '').slice(0, 80),
   save_personal_date: (args) => `${String(args.label || '').slice(0, 60)} (${args.month}/${args.day})`,
   mark_gift_done: (args) => `Gift done: ${String(args.label || '').slice(0, 60)}`,
   complete_task: (args) => `Task done: ${String(args.title || '').slice(0, 60)}`,
@@ -1866,6 +1924,10 @@ export async function executeTool(name, args = {}, env = process.env, ctx = null
     case 'save_memory': {
       const result = toolSaveMemory(clean, ctx);
       return { result, summary: String(clean.content || '').slice(0, 80) };
+    }
+    case 'update_memory': {
+      const result = toolUpdateMemory(clean, ctx);
+      return { result, summary: String(clean.query || '').slice(0, 80) };
     }
     case 'save_personal_date': {
       const result = toolSavePersonalDate(clean, ctx);

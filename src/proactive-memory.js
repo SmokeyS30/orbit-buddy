@@ -172,6 +172,7 @@ function memoryEligible(memory, todayStr) {
   if (!memory || typeof memory.content !== 'string' || !memory.content.trim()) return false;
   if (memory.status && memory.status !== 'approved') return false;
   if (memory.superseded_by) return false;
+  if (memory.proactive_allowed === 0 || memory.proactive_allowed === false) return false;
   const confidence = Number(memory.confidence ?? 1);
   if (!Number.isFinite(confidence)) return false;
   const relevance = Number(memory.relevance_score ?? 1);

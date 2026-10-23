@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS memories (
   relevance_score DOUBLE PRECISION NOT NULL DEFAULT 1.0,
   superseded_by TEXT,
   embedding TEXT,
+  proactive_allowed INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
