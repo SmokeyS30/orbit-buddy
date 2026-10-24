@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 import { assertMemorySafe } from '../relational-intelligence.js';
+import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from '../portable-recovery.js';
 
 const { Pool } = pg;
 const timestamp = () => new Date().toISOString();
@@ -393,14 +394,14 @@ const indexMigrations = [
 
   // Transaction helper: runs fn with transaction-scoped get/all/run.
   // Commits on success, rolls back on error.
-  const withTransaction = async (fn) => {
+  const withTransaction = async (fn, readOnlySnapshot = false) => {
     const txClient = await pool.connect();
     const tQuery = async (sql, params = []) => txClient.query(toPgPlaceholders(sql), params);
     const tGet = async (sql, ...params) => (await tQuery(sql, params)).rows[0] || null;
     const tAll = async (sql, ...params) => (await tQuery(sql, params)).rows;
     const tRun = async (sql, ...params) => ({ changes: (await tQuery(sql, params)).rowCount || 0 });
     try {
-      await txClient.query('BEGIN');
+      await txClient.query(readOnlySnapshot?'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY':'BEGIN');
       const result = await fn({ query: tQuery, get: tGet, all: tAll, run: tRun });
       await txClient.query('COMMIT');
       return result;
@@ -1700,38 +1701,51 @@ const indexMigrations = [
 
     // --- Export / restore ---
     async exportUser(userId) {
-      const artifactIds = await all('SELECT id FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200', userId);
-      const artifacts = [];
-      for (const a of artifactIds) artifacts.push(await get('SELECT * FROM artifacts WHERE id=? AND user_id=?', a.id, userId));
-      return {
-        version: 5, exportedAt: timestamp(),
-        user: await get('SELECT * FROM users WHERE id = ?', userId),
-        conversations: await all('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,id DESC', userId),
-        messages: (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, 20000)).reverse(),
-        memories: await all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
-        memorySuggestions: await all('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 50', userId),
-        followUps: await all("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY priority DESC,due_date,created_at", userId),
-        goals: await all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
-        goalCheckins: await all('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at', userId),
-        routines: await all('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,LOWER(title)', userId),
-        projects: await all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
-        projectSteps: await all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
-        approvals: await all("SELECT * FROM approvals WHERE user_id=? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,created_at DESC,id DESC LIMIT 200", userId),
-        preferences: await this.getPreferences(userId),
-        conversationSummaries: await all('SELECT * FROM conversation_summaries WHERE user_id=?', userId),
-        calendarFeeds: await this.listCalendarFeeds(userId),
-        tasks: await all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),
-        events: await all('SELECT * FROM events WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, 20000),
-        artifacts,
-      };
+      await this.getPreferences(userId); // Create defaults before the read-only snapshot.
+      return withTransaction(async ({get,all})=>{
+        const user=await get('SELECT id,email,display_name FROM users WHERE id=?',userId);
+        if(!user)throw new Error('Backup user not found.');
+        const hasInsertOrder=(await get(`SELECT EXISTS(SELECT 1 FROM information_schema.columns
+          WHERE table_schema=current_schema() AND table_name='messages' AND column_name='insert_order') AS present`))?.present;
+        const messageOrder=hasInsertOrder?'created_at,insert_order NULLS FIRST,id':'created_at,id';
+        const bundle={
+          version: 6, exportedAt: timestamp(), user,
+          conversations: await all('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,id DESC', userId),
+          messages: await all(`SELECT * FROM messages WHERE user_id=? ORDER BY ${messageOrder}`, userId),
+          memories: await all('SELECT * FROM memories WHERE user_id=? ORDER BY created_at,id', userId),
+          memorySuggestions: await all('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at,id', userId),
+          followUps: await all('SELECT * FROM follow_ups WHERE user_id=? ORDER BY created_at,id', userId),
+          goals: await all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+          goalCheckins: await all('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at', userId),
+          routines: await all('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,LOWER(title)', userId),
+          projects: await all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+          projectSteps: await all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
+          approvals: await all('SELECT * FROM approvals WHERE user_id=? ORDER BY created_at,id', userId),
+          preferences: await get('SELECT * FROM user_preferences WHERE user_id=?',userId),
+          conversationSummaries: await all('SELECT * FROM conversation_summaries WHERE user_id=?', userId),
+          calendarFeeds: (await all('SELECT * FROM calendar_feeds WHERE user_id=? ORDER BY LOWER(label)',userId))
+            .map((row)=>({...row,url:revealSecret(row.url)})),
+          tasks: await all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at,id', userId),
+          events: await all('SELECT * FROM events WHERE user_id=? ORDER BY created_at,id', userId),
+          artifacts: await all('SELECT * FROM artifacts WHERE user_id=? ORDER BY created_at,id', userId),
+        };
+        for(const entry of PORTABLE_USER_TABLES){
+          bundle[entry.key]=await all(`SELECT ${entry.columns.join(',')} FROM ${entry.table} WHERE user_id=?`,userId);
+        }
+        return bundle;
+      },true);
     },
     async restoreUser(userId, bundle) {
-      if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4,5,6].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       await withTransaction(async ({ run: tRun, get: tGet }) => {
         for (const row of bundle.conversations || []) await tRun('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.created_at, row.updated_at);
         for (const row of bundle.messages || []) await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.conversation_id || null, row.role, row.content, row.created_at);
-        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at, normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null, row.last_confirmed_at || row.updated_at, row.proactive_allowed === 0 ? 0 : 1);
+        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,
+          last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at,
+          normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null,
+          row.last_confirmed_at || row.updated_at, row.last_mentioned_at || null, row.relevance_score ?? 1,
+          row.superseded_by || null, row.embedding || null, row.proactive_allowed === 0 ? 0 : 1);
         for (const row of bundle.memorySuggestions || []) await tRun('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, assertMemorySafe(row.content), row.created_at, normalizeMemoryKind(row.kind), row.confidence ?? 0.7);
         for (const row of bundle.followUps || []) await tRun('INSERT INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.description, row.due_date, row.status || 'scheduled', normalizePriority(row.priority), row.source_message_id || null, row.created_at, row.completed_at || null);
         for (const row of bundle.goals || []) await tRun('INSERT INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.description || null, row.status || 'active', normalizePriority(row.priority), Math.max(0, Math.min(Number(row.progress) || 0, 100)), row.target_date || null, row.next_step || null, row.created_at, row.updated_at, row.completed_at || null);
@@ -1742,15 +1756,31 @@ const indexMigrations = [
         for (const row of bundle.approvals || []) await tRun('INSERT INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.kind, row.title, row.summary, row.payload_json || '{}', ['pending','executed','rejected','failed'].includes(row.status) ? row.status : 'pending', row.source_message_id || null, row.result_json || null, row.last_error || null, row.created_at, row.updated_at, row.reviewed_at || null);
         for (const row of bundle.conversationSummaries || []) await tRun('INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.conversation_id, userId, row.summary, row.message_count, row.updated_at);
         for (const row of bundle.calendarFeeds || []) await tRun('INSERT INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.label, protectSecret(row.url), row.created_at, row.updated_at);
-        for (const row of bundle.tasks || []) await tRun(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.result, row.created_at, row.updated_at, row.attempt_count || 0, row.lease_expires_at || null, row.last_error || null);
+        for (const row of bundle.tasks || []) await tRun(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,
+          created_at,updated_at,attempt_count,lease_expires_at,last_error)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, row.title, row.prompt, row.status, row.risk,
+          row.schedule_at, row.recurrence, row.delivery_channel==='whatsapp'?'whatsapp':'push', row.result, row.created_at,
+          row.updated_at, row.attempt_count || 0, null, row.last_error || null);
         for (const row of bundle.events || []) await tRun('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.type, row.message, row.detail, row.created_at);
         for (const row of bundle.artifacts || []) await tRun('INSERT INTO artifacts(id,user_id,task_id,name,mime_type,content,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.task_id, row.name, row.mime_type, row.content, row.size_bytes, row.created_at);
+        if(bundle.version===6){
+          for(const entry of PORTABLE_USER_TABLES){
+            const sql=portableInsertSql(entry,true);
+            for(const row of bundle[entry.key]||[])await tRun(sql,...portableRowValues(entry,row,userId));
+          }
+        }
         if (bundle.preferences) {
           const p = normalizePreferences(bundle.preferences);
           const current = await tGet('SELECT * FROM user_preferences WHERE user_id=?', userId);
           const created = current?.created_at || timestamp();
           await tRun(upsertPreferencesSql, userId, p.timeZone, p.quietStart, p.quietEnd, p.proactiveEnabled ? 1 : 0, p.briefingTone, p.briefingLength, created, timestamp());
+          if(bundle.version===6){
+            const old=bundle.preferences;
+            await tRun(`UPDATE user_preferences SET buddy_name=?,writing_voice_opt_in=?,writing_voice_profile=?,writing_voice_updated_at=?,
+              writing_voice_offered=?,intro_dismissed=? WHERE user_id=?`,old.buddy_name||null,old.writing_voice_opt_in===1?1:0,
+              old.writing_voice_profile||null,old.writing_voice_updated_at||null,old.writing_voice_offered===1?1:0,
+              old.intro_dismissed===1?1:0,userId);
+          }
         }
       });
     },

@@ -224,14 +224,14 @@ test('tracks goal progress and recurring routine leases', () => {
   db.close();
 });
 
-test('backup version 5 preserves goals, routines, projects, and approvals', () => {
+test('backup version 6 preserves goals, routines, projects, and approvals', () => {
   const source = fixture();
   source.db.addGoal(source.user.id, { title: 'Run a 10K', priority: 2 });
   source.db.addRoutine(source.user.id, { title: 'Evening reflection', prompt: 'Reflect', kind: 'reflection', cadence: 'daily', timeLocal: '20:00' });
   source.db.addProject(source.user.id, { title: 'Move house', steps: [{ title: 'Book movers', dueDate: '2026-11-01' }] });
   source.db.addApproval(source.user.id, { kind: 'calendar_event', title: 'Add moving day', summary: 'Calendar proposal', payload: { title: 'Moving day', startAt: '2026-11-10T14:00:00.000Z', endAt: '2026-11-10T16:00:00.000Z' } });
   const bundle = source.db.exportUser(source.user.id);
-  assert.equal(bundle.version, 5);
+  assert.equal(bundle.version, 6);
   source.db.close();
   const target = fixture();
   target.db.restoreUser(target.user.id, bundle);
