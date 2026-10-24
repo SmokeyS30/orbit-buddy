@@ -447,6 +447,19 @@ test('/readyz returns 200 when DB is ready', async (t) => {
   assert.equal(body.database.state, 'ready');
 });
 
+test('health endpoints expose the exact baked release without changing existing fields', async (t) => {
+  const release = 'a'.repeat(40);
+  const { app, base } = await fixture({ ORBIT_RELEASE_SHA: release }); t.after(() => app.close());
+  for (const endpoint of ['/livez', '/readyz', '/healthz']) {
+    const response = await fetch(`${base}${endpoint}`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.release, release);
+    assert.equal(body.ok, true);
+    assert.equal(body.service, 'orbit-buddy');
+  }
+});
+
 test('/healthz ok reflects DB state', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const res = await fetch(`${base}/healthz`);

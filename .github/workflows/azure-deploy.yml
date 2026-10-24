@@ -6,10 +6,8 @@
 # Container images are pushed to GHCR using the built-in GITHUB_TOKEN
 # (requires packages: write permission on the build-and-deploy job).
 #
-# Deployment safety (single-revision mode): before pushing the new image, this
-# workflow captures the currently-deployed image. After deployment it waits for
-# the new revision to become healthy and tests the public /healthz endpoint.
-# If verification fails, it rolls back by redeploying the previous image.
+# Deployment safety is implemented and tested in scripts/deploy-containerapp.mjs.
+# The deploy job fails if either release verification or rollback fails.
 
 name: Deploy to Azure
 
@@ -64,9 +62,6 @@ jobs:
       id-token: write
       contents: read
       packages: write
-    outputs:
-      new_revision: ${{ steps.deploy.outputs.new_revision }}
-      prev_image: ${{ steps.deploy.outputs.prev_image }}
     steps:
       - uses: actions/checkout@v4
 
@@ -89,9 +84,8 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: |
-            ghcr.io/smokeys30/orbit-buddy:latest
-            ghcr.io/smokeys30/orbit-buddy:${{ github.sha }}
+          tags: ghcr.io/smokeys30/orbit-buddy:${{ github.sha }}
+          build-args: RELEASE_SHA=${{ github.sha }}
 
       - name: Log in to Azure
         uses: azure/login@v2
@@ -100,86 +94,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Deploy new image
-        id: deploy
-        run: |
-          # Capture the currently-deployed image for rollback.
-          # In single-revision mode there is only one active revision;
-          # rollback means redeploying this image, not shifting traffic weights.
-          PREV_IMAGE=$(az containerapp show \
-            -g orbit-buddy-rg -n orbit-buddy \
-            --query "properties.template.containers[0].image" -o tsv)
-          echo "prev_image=$PREV_IMAGE" >> $GITHUB_OUTPUT
-          echo "Previous image: $PREV_IMAGE"
-
-          # Deploy the new image. Container Apps creates a new revision
-          # and replaces the old one (single-revision mode).
-          az containerapp update \
-            -g orbit-buddy-rg \
-            -n orbit-buddy \
-            --image ghcr.io/smokeys30/orbit-buddy:${{ github.sha }} \
-            --output none
-
-          # Find the new revision (most recently created)
-          sleep 10
-          NEW=$(az containerapp revision list \
-            -g orbit-buddy-rg -n orbit-buddy \
-            --query "sort_by([?properties.active], &properties.createdTime)[-1].name" -o tsv)
-          echo "new_revision=$NEW" >> $GITHUB_OUTPUT
-          echo "New revision: $NEW"
-
-  verify:
-    needs: build-and-deploy
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Wait for new revision healthy
-        id: health
-        run: |
-          NEW="${{ needs.build-and-deploy.outputs.new_revision }}"
-          echo "Waiting for $NEW to become healthy..."
-          for i in $(seq 1 30); do
-            STATE=$(az containerapp revision show -g orbit-buddy-rg -n orbit-buddy --revision "$NEW" --query "properties.healthState" -o tsv 2>/dev/null || echo "Unknown")
-            echo "Attempt $i: healthState=$STATE"
-            if [ "$STATE" = "Healthy" ]; then
-              echo "healthy=true" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            if [ "$STATE" = "Unhealthy" ]; then
-              echo "healthy=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-            sleep 20
-          done
-          echo "healthy=false" >> $GITHUB_OUTPUT
-
-      - name: Test production health endpoint
-        id: public
-        if: steps.health.outputs.healthy == 'true'
-        run: |
-          # Azure RBAC intentionally rejects requests to the generated
-          # *.azurecontainerapps.io hostname. Exercise the same public custom
-          # domain that web and native clients use instead.
-          APP_URL="orbitbuddy.app"
-          echo "Testing https://$APP_URL/healthz"
-          for i in $(seq 1 8); do
-            CODE=$(curl -s -m 15 -o /dev/null -w "%{http_code}" https://$APP_URL/healthz || echo "000")
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "public_ok=true" >> $GITHUB_OUTPUT
-              echo "Health check passed"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "public_ok=false" >> $GITHUB_OUTPUT
-          exit 1
+      - name: Deploy, verify and roll back on failure
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: node scripts/deploy-containerapp.mjs
