@@ -74,9 +74,7 @@ export async function deployRelease({ sha, az, fetchJson, sleep = pause, log = c
     throw new Error('Public health or release identity verification failed.');
   }
 
-  let updateAttempted = false;
   try {
-    updateAttempted = true;
     await az('update', desiredImage);
     const deployed = await verifyRevision(desiredImage, previous.name);
     await verifyPublic(sha);
@@ -88,7 +86,6 @@ export async function deployRelease({ sha, az, fetchJson, sleep = pause, log = c
     }
     return { revision: deployed, image: desiredImage };
   } catch (error) {
-    if (!updateAttempted) throw error;
     log(`Deployment failed: ${error.message} Starting rollback to ${previous.image}.`);
     try {
       await az('update', previous.image);

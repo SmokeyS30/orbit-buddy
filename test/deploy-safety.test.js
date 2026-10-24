@@ -59,6 +59,20 @@ test('failed rollback remains a failed deployment with an explicit error', async
   assert.deepEqual(f.updates, [next, prior]);
 });
 
+test('an Azure update error still attempts rollback because the update may have partially applied', async () => {
+  const f = fixture();
+  const original = f.az;
+  f.az = async (operation, value) => {
+    if (operation === 'update' && value === next) {
+      await original(operation, value);
+      throw new Error('update timed out after creating revision');
+    }
+    return original(operation, value);
+  };
+  await assert.rejects(deployRelease({ sha, ...f }), /rollback verified/);
+  assert.deepEqual(f.updates, [next, prior]);
+});
+
 test('preflight refuses to change an unhealthy existing revision', async () => {
   const f = fixture();
   const original = f.az;
