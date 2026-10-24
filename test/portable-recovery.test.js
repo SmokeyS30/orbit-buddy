@@ -149,6 +149,9 @@ test('PostgreSQL portable recovery restores a full synthetic bundle into an isol
     target=await openPostgres(url.toString());
     const prefix=randomUUID();
     sourceUser=await source.createUser({email:`${prefix}@example.com`,displayName:'Synthetic',passwordHash:'source-hash',passwordSalt:'salt',role:'member'});
+    // Other integration suites may run server workers against the shared test
+    // database. Keep this large synthetic fixture out of proactive model work.
+    await source.setUserDisabled(sourceUser.id,true);
     const targetUser=await target.createUser({email:`${prefix}@example.com`,displayName:'Synthetic',passwordHash:'target-hash',passwordSalt:'salt',role:'member'});
     const conversation=await source.ensureDefaultConversation(sourceUser.id);
     await source.getPreferences(sourceUser.id);
