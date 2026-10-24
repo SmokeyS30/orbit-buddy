@@ -5,6 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
@@ -18,6 +19,7 @@ import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
+import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems, parseSearchFilterParams } from './src/conversation-search.js';
@@ -519,6 +521,7 @@ export function createOrbitServer(options={}) {
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=options.modelClient||createModelClient(env);
+  const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
@@ -624,7 +627,20 @@ export function createOrbitServer(options={}) {
   let workerBusy=false;
   const chatQueues=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
-  function enqueueChatReply(conversationId,job){const prev=chatQueues.get(conversationId)||Promise.resolve();const next=prev.then(async()=>{try{await job();}catch(error){console.error('chat job failed',conversationId,error&&error.message);}});chatQueues.set(conversationId,next);next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});return next;}
+  function enqueueChatReply(conversationId,job){
+    const queuedAt=performance.now();
+    const prev=chatQueues.get(conversationId)||Promise.resolve();
+    const next=prev.then(async()=>{
+      const queueMs=performance.now()-queuedAt;
+      try{await job(queueMs);}catch(error){
+        chatMetrics.record({queueMs,error:true});
+        console.error('chat job failed',conversationId,error&&error.message);
+      }
+    });
+    chatQueues.set(conversationId,next);
+    next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});
+    return next;
+  }
   // R3 ambient context ("Orbit remembers the room"). With the user's explicit
   // permission, note the setting of a conversation: weekday, time of day, and
   // a self-declared place label. One memory per day max; repeats of the same
@@ -651,18 +667,28 @@ export function createOrbitServer(options={}) {
   // `insertCreatedAt` re-inserts the new assistant message at an explicit
   // position in conversation order (regenerate replaces the old answer
   // in place instead of appending it at the end).
-  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null}){
+  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null,queueMs=0}){
+    const startedAt=performance.now();
+    let databaseMs=0,contextMs=null,modelFirstTokenMs=null,modelCompletionMs=0,modelStartedAt=null;
+    let replyFailed=false,modelFallback=false;
+    const timedDb=(read)=>{const at=performance.now();try{return read();}finally{databaseMs+=performance.now()-at;}};
+    const timedModel=async(call)=>{
+      const at=performance.now();
+      if(modelStartedAt===null){modelStartedAt=at;contextMs=at-startedAt;}
+      try{return await call();}finally{modelCompletionMs+=performance.now()-at;}
+    };
     // The PostgreSQL sync adapter otherwise blocks the main thread once per
     // read. Load the independent history/preferences/summary/settings reads in
     // one worker call so the model can start sooner without dropping context.
-    const replyContext=db.getChatReplyContext(userId,conversation.id,historyOverride?0:24);
-    if(!replyContext.conversation)return null;
+    const replyContext=timedDb(()=>db.getChatReplyContext(userId,conversation.id,historyOverride?0:24));
+    if(!replyContext.conversation){chatMetrics.record({queueMs,databaseMs,contextMs:performance.now()-startedAt,completionMs:queueMs+performance.now()-startedAt,error:true});return null;}
     // Membership is resolved from the server-side, Apple-verified entitlement.
     // The client cannot opt itself into stronger model routing.
-    const membershipTier=subscriptions.tier(userId,user);
+    const membershipTier=timedDb(()=>subscriptions.tier(userId,user));
     const streamState={turn:-1,text:'',rawText:'',filtered:false,done:false};pendingStreams.set(conversation.id,streamState);
     const onStreamTurn=(turn)=>{streamState.turn=turn;streamState.text='';streamState.rawText='';streamState.filtered=false;};
     const onStreamToken=(delta)=>{
+      if(modelFirstTokenMs===null&&modelStartedAt!==null)modelFirstTokenMs=performance.now()-modelStartedAt;
       if(streamState.filtered)return;
       streamState.rawText+=delta;
       // Every rule is shorter than this window. Scan the tail on small token
@@ -697,7 +723,7 @@ export function createOrbitServer(options={}) {
           // so it keeps the original full-conversation read.
           let userTurns=baseHistory.filter((m)=>m.role==='user').length;
           if(historyOverride||needsFullAmbientHistoryRead(baseHistory)){
-            userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
+            userTurns=timedDb(()=>db.listConversationMessages(userId,conversation.id,50)).filter((m)=>m.role==='user').length;
           }
           if(userTurns>=4){needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));}
         }
@@ -750,7 +776,7 @@ export function createOrbitServer(options={}) {
       let chitchatAnswered=false;
       if(membershipTier!=='unlimited'&&images.length===0&&isChitchatMessage(message)){
         try{
-          const { text: chitchatText }=await model.respondChitchat({
+          const { text: chitchatText }=await timedModel(()=>model.respondChitchat({
             buddyName:customBuddyName||defaultBuddyName,
             userName:user?.display_name,
             message,
@@ -760,11 +786,12 @@ export function createOrbitServer(options={}) {
             userTimeZone:preferences.time_zone,
             onTurn:onStreamTurn,
             onToken:onStreamToken
-          });
+          }));
           answer=chitchatText;
           storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
           chitchatAnswered=true;
         }catch(chitchatError){
+          modelFallback=true;
           console.error('chitchat fast-path failed, falling back to full path',chitchatError&&chitchatError.message);
         }
       }
@@ -793,7 +820,7 @@ export function createOrbitServer(options={}) {
       // Memory + optional planning reads are independent. PostgreSQL executes
       // them concurrently behind one worker crossing; SQLite keeps identical
       // results locally. Episodic last-mentioned stamps remain intact.
-      const modelContext=db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8});
+      const modelContext=timedDb(()=>db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8}));
       const recalledMemories=modelContext.memories;
       const openCommitments=modelContext.followUps;
       const activeGoals=modelContext.goals;
@@ -811,7 +838,7 @@ export function createOrbitServer(options={}) {
       // receives the same data shape when the reads do run.
       if(!isDemoUser(user)&&!shouldDeferProactiveSurfacing({recalledMemories,message})){
         try{
-          const proactiveContext=db.getChatProactiveContext(userId);
+          const proactiveContext=timedDb(()=>db.getChatProactiveContext(userId));
           const surfacedRows=proactiveContext.surfacedRows;
           // Memory connections (2026-10-16): unified chooser — date triggers
           // first (time-sensitive), then memory patterns / emotional
@@ -830,12 +857,12 @@ export function createOrbitServer(options={}) {
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
+      const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
-        onTurn:onStreamTurn,onToken:onStreamToken});
+        onTurn:onStreamTurn,onToken:onStreamToken}));
       // Legacy follow-up and memory markers can persist their text outside the
       // chat message. Filter before reading them as well as before delivery.
       const checkedRaw=filterAssistantContent(rawAnswer);
@@ -891,8 +918,11 @@ export function createOrbitServer(options={}) {
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
       }
-    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';storeAssistantMessage(answer);}
+    }catch(error){replyFailed=true;console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';storeAssistantMessage(answer);}
     streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
+    chatMetrics.record({queueMs,databaseMs,contextMs:contextMs??performance.now()-startedAt,modelFirstTokenMs,
+      modelCompletionMs:modelStartedAt===null?null:modelCompletionMs,completionMs:queueMs+performance.now()-startedAt,
+      error:replyFailed,modelFallback});
     await maybeRefreshConversationSummary(user,conversation);
     if(isCorrectionMessage(message)){
       // Learn from the correction without blocking: figure out what was wrong and save the fix
@@ -2363,7 +2393,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
       const backup=backupStatus();
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
     }
     // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
     // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
@@ -2591,8 +2621,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(sharedLocation){
           const locationMessage=formatLocationMessage(sharedLocation,body);
           const userMsg=db.addMessage(waUserId,conversation.id,'user',LOCATION_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-          enqueueChatReply(conversation.id,async()=>{
-            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg});
+          enqueueChatReply(conversation.id,async(queueMs)=>{
+            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg,queueMs});
             if(answer&&from){
               try{await twilioSend(from,answer);}
               catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
@@ -2624,8 +2654,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
             const userMsg=db.addMessage(waUserId,conversation.id,'user',voiceMessage);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async()=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg});
+            enqueueChatReply(conversation.id,async(queueMs)=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg,queueMs});
               if(answer&&from){
                 try{await twilioSend(from,answer);}
                 catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
@@ -2653,8 +2683,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
             const userMsg=db.addMessage(waUserId,conversation.id,'user',WHATSAPP_IMAGE_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async()=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:caption||'Look at this.',userMsg,images:[imageBlock]});
+            enqueueChatReply(conversation.id,async(queueMs)=>{
+              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:caption||'Look at this.',userMsg,images:[imageBlock],queueMs});
               if(answer&&from){
                 try{await twilioSend(from,answer);}
                 catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
@@ -2669,8 +2699,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
         const userMsg=db.addMessage(waUserId,conversation.id,'user',body.slice(0,6000));db.touchConversation(waUserId,conversation.id);
-        enqueueChatReply(conversation.id,async()=>{
-          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg});
+        enqueueChatReply(conversation.id,async(queueMs)=>{
+          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg,queueMs});
           if(answer&&from){
             try{await twilioSend(from,answer);}
             catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
@@ -3085,7 +3115,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const quota=subscriptions.consumeQuota(userId,user);
           if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
           const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
-          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
+          enqueueChatReply(conversation.id,(queueMs)=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks,queueMs}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
         // W1: per-message actions.
@@ -3121,7 +3151,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           db.deleteMessage(userId,target.id); // replace the turn
           db.touchConversation(userId,conversation.id);
           const historyOverride=ordered.slice(Math.max(0,targetIdx-24),targetIdx);
-          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:userMsg.content,userMsg,images:[],historyOverride,insertCreatedAt}));
+          enqueueChatReply(conversation.id,(queueMs)=>runChatReplyJob({userId,user,conversation,message:userMsg.content,userMsg,images:[],historyOverride,insertCreatedAt,queueMs}));
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
         }
         // W1: delete a message turn (own conversations only; getMessage is
@@ -3464,6 +3494,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           requireOwner(user);
           return json(res,200,{ok:true,backupDir:backupDir||null,...backupStatus()});
         }
+        if(req.method==='GET'&&url.pathname==='/api/admin/chat-latency'){
+          requireOwner(user);res.setHeader('Cache-Control','no-store');
+          return json(res,200,chatMetrics.snapshot());
+        }
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});await apns.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
         if(req.method==='GET'&&url.pathname==='/api/admin/registration'){requireOwner(user);return json(res,200,{open:registrationOpen()});}
@@ -3532,10 +3566,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
     try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();const shellAsset=['index.html','app.js','sw.js'].includes(path.basename(resolved));const isWelcome=path.basename(resolved)==='welcome.html';if(isWelcome)res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':shellAsset||isWelcome?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
   });
 
-  const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,push,pendingStreams,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
-    async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
+  const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
+  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(metricsTimer)clearInterval(metricsTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
   };
 }
 
