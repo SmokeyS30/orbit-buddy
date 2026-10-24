@@ -2348,13 +2348,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
     }
     // Shallow liveness: Node process is alive (no DB check to avoid restart loops)
-    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy'});}
+    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown'});}
     // Readiness: PostgreSQL must be reachable
     if(url.pathname==='/readyz'){
       let dbState='ready';const dbDriver=db.driver||'unknown';
       try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
       const ok=dbState==='ready';
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',database:{driver:dbDriver,state:dbState}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',database:{driver:dbDriver,state:dbState}});
     }
     if(url.pathname==='/healthz'){
       const modelStatus=model.diagnostics();
@@ -2363,7 +2363,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
       const backup=backupStatus();
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
     }
     // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
     // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
