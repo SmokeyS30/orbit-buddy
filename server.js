@@ -652,7 +652,11 @@ export function createOrbitServer(options={}) {
   // position in conversation order (regenerate replaces the old answer
   // in place instead of appending it at the end).
   async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null}){
-    if(!db.getConversation(userId,conversation.id))return null;
+    // The PostgreSQL sync adapter otherwise blocks the main thread once per
+    // read. Load the independent history/preferences/summary/settings reads in
+    // one worker call so the model can start sooner without dropping context.
+    const replyContext=db.getChatReplyContext(userId,conversation.id,historyOverride?0:24);
+    if(!replyContext.conversation)return null;
     // Membership is resolved from the server-side, Apple-verified entitlement.
     // The client cannot opt itself into stronger model routing.
     const membershipTier=subscriptions.tier(userId,user);
@@ -670,21 +674,21 @@ export function createOrbitServer(options={}) {
     let answer=null;
     const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
     try{
-      const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
+      const baseHistory=historyOverride||replyContext.history;
       const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
-      const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
+      const preferences=replyContext.preferences;const summary=replyContext.summary;
       const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
       let needsBuddyName=false;
       if(!customBuddyName){
-        const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
+        const askedAt=Number(replyContext.settings[`buddy_name_asked_${userId}`]||0);
         if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
       }
       // R3 ambient context: one gentle permission ask in chat, never a toggle.
       // Declined = never ask again; dodged = re-ask after 90 days at most.
       // Only asked once the user has actually chatted a little (>=4 turns).
       let needsAmbientAsk=false;
-      if(!db.getSetting(`ambient_context_${userId}`)){
-        const ambientAskedAt=Number(db.getSetting(`ambient_asked_${userId}`)||0);
+      if(!replyContext.settings[`ambient_context_${userId}`]){
+        const ambientAskedAt=Number(replyContext.settings[`ambient_asked_${userId}`]||0);
         if(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000){
           // baseHistory (24 msgs, already loaded above) usually settles the
           // >=4 user-turn gate on its own — the extra 50-message read only
@@ -702,7 +706,7 @@ export function createOrbitServer(options={}) {
       // instruction when opted in. Never in normal chat, never without opt-in.
       // One-time offer: if the user hasn't opted in and hasn't been offered yet,
       // let the model offer it on this writing task, then mark offered so we ask once.
-      const voiceState=db.getWritingVoice(userId);
+      const voiceState=replyContext.writingVoice;
       const writingVoice=(voiceState?.optIn&&voiceState?.profile)?buildVoiceStyleDirective(voiceState.profile,user?.display_name):null;
       let offerWritingVoice=false;
       if(!voiceState?.optIn&&!voiceState?.offered){
@@ -786,12 +790,14 @@ export function createOrbitServer(options={}) {
           emotionContext=buildEmotionalContext({userName:user?.display_name,tone:emotionTone,emotionPhrase:emotionPattern&&emotionPattern.phrase});
         }catch(error){console.error('emotional context failed',error&&error.message);emotionContext=null;}
       }
-      const recalledMemories=db.listRelevantMemories(userId,message);
-      // Planning context is comparatively expensive: projects also load their
-      // steps. Only fetch it for turns where it can affect the answer.
-      const openCommitments=loadPlanningContext?db.listFollowUps(userId).slice(0,8):[];
-      const activeGoals=loadPlanningContext?db.listActiveGoals(userId):[];
-      const activeProjects=loadPlanningContext?db.listProjects(userId).filter((project)=>project.status!=='completed'):[];
+      // Memory + optional planning reads are independent. PostgreSQL executes
+      // them concurrently behind one worker crossing; SQLite keeps identical
+      // results locally. Episodic last-mentioned stamps remain intact.
+      const modelContext=db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8});
+      const recalledMemories=modelContext.memories;
+      const openCommitments=modelContext.followUps;
+      const activeGoals=modelContext.goals;
+      const activeProjects=modelContext.projects;
       const relationalContext=buildRelationalDirective({message,memories:recalledMemories,commitments:openCommitments,plan:relationalPlan});
       // Proactive memory (2026-10-16): volunteer at most ONE timely memory
       // (a due date from memories, or an open loop the topic calls for) as a
@@ -805,14 +811,15 @@ export function createOrbitServer(options={}) {
       // receives the same data shape when the reads do run.
       if(!isDemoUser(user)&&!shouldDeferProactiveSurfacing({recalledMemories,message})){
         try{
-          const surfacedRows=db.listMemorySurfacings(userId,200);
+          const proactiveContext=db.getChatProactiveContext(userId);
+          const surfacedRows=proactiveContext.surfacedRows;
           // Memory connections (2026-10-16): unified chooser — date triggers
           // first (time-sensitive), then memory patterns / emotional
           // patterns, then open loops. At most one aside per turn.
           proactiveSurfacing=chooseChatSurfacingWithPatterns({
-            allMemories:db.listMemories(userId),
+            allMemories:modelContext.allMemories,
             recalledMemories,
-            personalDates:db.listPersonalDates(userId),
+            personalDates:proactiveContext.personalDates,
             historyMessages:history,
             userMessage:message,
             surfacedKeys:new Set(surfacedRows.map((r)=>r.occurrence_key)),
