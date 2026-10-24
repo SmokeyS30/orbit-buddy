@@ -10,6 +10,7 @@ import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
+import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
@@ -517,6 +518,7 @@ export function createOrbitServer(options={}) {
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
   const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey,databaseUrl:env.DATABASE_URL});
+  const replyInstanceId=randomUUID();
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
@@ -625,22 +627,104 @@ export function createOrbitServer(options={}) {
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
-  const chatQueues=new Map();
+  const activeReplyJobs=new Map();
+  const ephemeralReplyPayloads=new Map();
+  let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
   const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
-  function enqueueChatReply(conversationId,job){
-    const queuedAt=performance.now();
-    const prev=chatQueues.get(conversationId)||Promise.resolve();
-    const next=prev.then(async()=>{
-      const queueMs=performance.now()-queuedAt;
-      try{await job(queueMs);}catch(error){
-        chatMetrics.record({queueMs,error:true});
-        console.error('chat job failed',conversationId,error&&error.message);
+  const replyDb=async(method,...args)=>db.async?db.async[method](...args):db[method](...args);
+  function scheduleReplyPump(){
+    if(closing||replyPumpScheduled)return;
+    replyPumpScheduled=true;
+    setImmediate(()=>{replyPumpScheduled=false;pumpReplyJobs();});
+  }
+  function pumpReplyJobs(){
+    if(closing)return Promise.resolve();
+    if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
+    replyPumpRunning=true;
+    replyPumpTask=(async()=>{
+      try{
+        await replyDb('renewQueuedEphemeralReplyJobs',replyInstanceId);
+        if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
+        await replyDb('recoverExpiredReplyJobs');
+        scheduleWhatsAppDeliveries();
+        while(!closing&&activeReplyJobs.size<4){
+          const job=await replyDb('claimNextReplyJob',replyInstanceId,REPLY_LEASE_MS);
+          if(!job)break;
+          const task=executeReplyJob(job).catch((error)=>{
+            chatMetrics.record({queueMs:Math.max(0,Date.now()-Date.parse(job.queued_at)),error:true});
+            console.error('chat job failed',job.id,error&&error.message);
+          }).finally(()=>{
+            activeReplyJobs.delete(job.id);
+            ephemeralReplyPayloads.delete(job.id);
+            scheduleReplyPump();
+          });
+          activeReplyJobs.set(job.id,task);
+        }
+      }catch(error){console.error('reply pump failed',error&&error.message);}
+      finally{
+        replyPumpRunning=false;
+        replyPumpTask=null;
+        if(replyPumpAgain){replyPumpAgain=false;scheduleReplyPump();}
       }
-    });
-    chatQueues.set(conversationId,next);
-    next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});
-    return next;
+    })();
+    return replyPumpTask;
+  }
+  function scheduleWhatsAppDeliveries(){
+    if(deliveryTask)return deliveryTask;
+    deliveryTask=deliverPendingWhatsAppReplies()
+      .catch((error)=>console.error('WhatsApp reply delivery failed',error&&error.message))
+      .finally(()=>{deliveryTask=null;});
+    return deliveryTask;
+  }
+  async function deliverPendingWhatsAppReplies(){
+    for(const job of await replyDb('listPendingReplyDeliveries',10)){
+      if(!await replyDb('markReplyDeliveryAttempted',job.id))continue;
+      try{
+        const link=await replyDb('getWhatsAppLink',job.user_id);
+        const reply=job.reply_message_id?await replyDb('getMessage',job.user_id,job.reply_message_id):null;
+        if(!link?.phone_e164||!isWindowOpen(link.last_inbound_at)||!reply)continue;
+        await sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,
+          fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone:link.phone_e164,body:reply.content});
+      }catch(error){
+        console.error('whatsapp send failed',error&&error.message);
+        try{db.addEvent(job.user_id,'whatsapp_send_failed','Could not send WhatsApp reply.',String(error?.message||error).slice(0,200));}catch{}
+      }
+    }
+  }
+  async function executeReplyJob(job){
+    let leaseAlive=true;
+    let renewing=false;
+    const heartbeat=setInterval(()=>{
+      if(renewing)return;
+      renewing=true;
+      replyDb('renewReplyJobLease',job.id,job.lease_token,REPLY_LEASE_MS)
+        .then((renewed)=>{if(!renewed)leaseAlive=false;})
+        .catch(()=>{leaseAlive=false;})
+        .finally(()=>{renewing=false;});
+    },30_000);
+    heartbeat.unref();
+    try{
+      const [user,conversation,userMsg]=await Promise.all([
+        replyDb('getUserById',job.user_id),replyDb('getConversation',job.user_id,job.conversation_id),replyDb('getMessage',job.user_id,job.user_message_id)]);
+      if(!user||!conversation||!userMsg)return;
+      const fresh=await replyDb('getReplyJob',job.id);
+      if(!fresh||fresh.status!=='running'||fresh.lease_token!==job.lease_token)return;
+      const ephemeral=ephemeralReplyPayloads.get(job.id);
+      if(job.requires_ephemeral&&!ephemeral){
+        await replyDb('completeReplyJob',job.id,job.lease_token,REPLY_INTERRUPTED_TEXT,job.insert_created_at);
+        return;
+      }
+      const message=job.requires_ephemeral?ephemeral?.message:userMsg.content;
+      const images=ephemeral?.images||[];
+      const historyOverride=job.kind==='regenerate'
+        ?(await replyDb('listConversationMessagesThrough',job.user_id,job.conversation_id,userMsg.id,24)).filter((m)=>m.id!==userMsg.id)
+        :null;
+      const answer=await runChatReplyJob({userId:job.user_id,user,conversation,message:message||REPLY_INTERRUPTED_TEXT,
+        userMsg,images,historyOverride,insertCreatedAt:job.insert_created_at,
+        queueMs:Math.max(0,Date.now()-Date.parse(job.queued_at)),replyJob:job,leaseAlive:()=>leaseAlive});
+      if(answer&&job.channel==='whatsapp')await scheduleWhatsAppDeliveries();
+    }finally{clearInterval(heartbeat);}
   }
   // R3 ambient context ("Orbit remembers the room"). With the user's explicit
   // permission, note the setting of a conversation: weekday, time of day, and
@@ -668,7 +752,7 @@ export function createOrbitServer(options={}) {
   // `insertCreatedAt` re-inserts the new assistant message at an explicit
   // position in conversation order (regenerate replaces the old answer
   // in place instead of appending it at the end).
-  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null,queueMs=0}){
+  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null,queueMs=0,replyJob=null,leaseAlive=()=>true}){
     const startedAt=performance.now();
     let databaseMs=0,contextMs=null,modelFirstTokenMs=null,modelCompletionMs=0,modelStartedAt=null;
     let replyFailed=false,modelFallback=false;
@@ -699,8 +783,20 @@ export function createOrbitServer(options={}) {
       if(checked.filtered){streamState.filtered=true;streamState.rawText='';streamState.text=checked.text;}
       else streamState.text=streamState.rawText;
     };
-    let answer=null;
-    const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
+    let answer=null,replyStored=false;
+    const storeAssistantMessage=(content)=>{
+      const checked=filterAssistantContent(content);
+      if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}
+      if(!leaseAlive())throw Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+      const stored=replyJob
+        ?db.completeReplyJob(replyJob.id,replyJob.lease_token,checked.text,insertCreatedAt)
+        :db.addMessage(userId,conversation.id,'assistant',checked.text);
+      if(!stored)throw Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+      replyStored=true;
+      if(insertCreatedAt&&!replyJob)db.retimeMessage(userId,stored.id,insertCreatedAt);
+      captureCanvasRevision(db,userId,conversation.id,stored);
+      return stored;
+    };
     try{
       // A summary covers messages before its final 12. Until a newer summary
       // lands, include the uncovered interval so a queued reply cannot lose
@@ -931,7 +1027,16 @@ export function createOrbitServer(options={}) {
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
       }
-    }catch(error){replyFailed=true;console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';storeAssistantMessage(answer);}
+    }catch(error){
+      if(error?.code==='REPLY_LEASE_LOST'){streamState.done=true;return null;}
+      replyFailed=true;console.error('chat reply failed',conversation.id,error&&error.message);
+      try{db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);}catch{}
+      if(!replyStored){
+        const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);
+        answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';
+        storeAssistantMessage(answer);
+      }
+    }
     streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
     chatMetrics.record({queueMs,databaseMs,contextMs:contextMs??performance.now()-startedAt,modelFirstTokenMs,
       modelCompletionMs:modelStartedAt===null?null:modelCompletionMs,completionMs:queueMs+performance.now()-startedAt,
@@ -2640,14 +2745,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const sharedLocation=parseWhatsAppLocation(params);
         if(sharedLocation){
           const locationMessage=formatLocationMessage(sharedLocation,body);
-          const userMsg=db.addMessage(waUserId,conversation.id,'user',LOCATION_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-          enqueueChatReply(conversation.id,async(queueMs)=>{
-            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg,queueMs});
-            if(answer&&from){
-              try{await twilioSend(from,answer);}
-              catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-            }
-          });
+          const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
+            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true});
+          ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
+          scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
         }
         if(numMedia>0){
@@ -2673,14 +2774,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
-            const userMsg=db.addMessage(waUserId,conversation.id,'user',voiceMessage);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async(queueMs)=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg,queueMs});
-              if(answer&&from){
-                try{await twilioSend(from,answer);}
-                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-              }
-            });
+            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp'});
+            scheduleReplyPump();
             return json(res,200,{ok:true,voiceNote:true});
           }
           // Image attachments: download from Twilio, run through the SAME
@@ -2702,14 +2797,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,image:false});
             }
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            const userMsg=db.addMessage(waUserId,conversation.id,'user',WHATSAPP_IMAGE_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async(queueMs)=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:caption||'Look at this.',userMsg,images:[imageBlock],queueMs});
-              if(answer&&from){
-                try{await twilioSend(from,answer);}
-                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-              }
-            });
+            const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
+              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true});
+            ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
+            scheduleReplyPump();
             return json(res,200,{ok:true,image:true});
           }
           // Other media types (video, documents) are not supported yet.
@@ -2718,14 +2809,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
-        const userMsg=db.addMessage(waUserId,conversation.id,'user',body.slice(0,6000));db.touchConversation(waUserId,conversation.id);
-        enqueueChatReply(conversation.id,async(queueMs)=>{
-          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg,queueMs});
-          if(answer&&from){
-            try{await twilioSend(from,answer);}
-            catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-          }
-        });
+        db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),{channel:'whatsapp'});
+        scheduleReplyPump();
         return json(res,200,{ok:true});
       }
       if(url.pathname.startsWith('/api/auth/apple/')||url.pathname.startsWith('/api/auth/attest/')||url.pathname==='/api/auth/signup-appeal'){
@@ -3044,12 +3129,25 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           }
           return json(res,200,{months:out});
         }
-        if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
+        if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){
+          if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const conversationId=url.searchParams.get('conversationId');
+          if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});
+          const stream=conversationId?pendingStreams.get(conversationId):null;
+          const job=conversationId?await(db.async?db.async.getConversationReplyJobState(userId,conversationId):db.getConversationReplyJobState(userId,conversationId)):null;
+          if(job&&['queued','running'].includes(job.status)&&(!stream||stream.done))return json(res,200,{state:'streaming',turn:-1,text:''});
+          if(!stream){
+            const recentCompletion=job?.completed_at&&Date.now()-new Date(job.completed_at).valueOf()<60_000;
+            return json(res,200,{state:recentCompletion?'done':'idle'});
+          }
+          if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}
+          return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});
+        }
         // True SSE chat streaming: one long-lived connection per reply pushes
         // token deltas as they arrive (~100ms granularity) instead of 1s
         // polling. Same auth, ownership, and rate-limit checks as
-        // /api/chat/stream-state (that endpoint is left untouched — the
-        // WhatsApp flow and the polling fallback keep using it).
+        // /api/chat/stream-state (WhatsApp and the polling fallback still use
+        // that endpoint, including cross-replica job status).
         if(req.method==='GET'&&url.pathname==='/api/chat/stream'){
           if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
           const conversationId=url.searchParams.get('conversationId');
@@ -3057,12 +3155,23 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
           res.write(': connected\n\n');
           let closed=false;
-          let lastTurn=-2,lastSentText='',lastBeat=Date.now();
+          let lastTurn=-2,lastSentText='',lastBeat=Date.now(),lastJobCheck=0,lastJob=null;
           const sseSend=(event,payload)=>{if(!closed)res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);};
           const tick=()=>{
             if(closed)return;
             const stream=pendingStreams.get(conversationId);
-            if(!stream){sseSend('done',{turn:-1});clearInterval(timer);res.end();return;}
+            if(!stream||stream.done){
+              if(Date.now()-lastJobCheck>=1000){
+                lastJobCheck=Date.now();
+                try{lastJob=db.getConversationReplyJobState(userId,conversationId);}catch{return;}
+              }
+              if(lastJob&&['queued','running'].includes(lastJob.status)){
+                if(lastTurn!==-1){lastTurn=-1;lastSentText='';sseSend('sync',{turn:-1,text:''});}
+                if(Date.now()-lastBeat>=15000){lastBeat=Date.now();res.write(': heartbeat\n\n');}
+                return;
+              }
+              sseSend('done',{turn:stream?.turn??-1});clearInterval(timer);res.end();return;
+            }
             const turn=stream.turn,text=stripModelMarkers(stream.text||'');
             if(turn!==lastTurn){
               lastTurn=turn;lastSentText=text;sseSend('sync',{turn,text});
@@ -3075,7 +3184,6 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               lastSentText=text;sseSend('sync',{turn,text});
             }
             if(Date.now()-lastBeat>=15000){lastBeat=Date.now();if(!closed)res.write(': heartbeat\n\n');}
-            if(stream.done){sseSend('done',{turn});clearInterval(timer);res.end();}
           };
           const timer=setInterval(tick,100);
           timer.unref();
@@ -3134,8 +3242,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // allowance, so simultaneous requests cannot send message 26.
           const quota=subscriptions.consumeQuota(userId,user);
           if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
-          enqueueChatReply(conversation.id,(queueMs)=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks,queueMs}));
+          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+          const userMsg=accepted.userMessage;
+          if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
+          scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
         // W1: per-message actions.
@@ -3168,10 +3279,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
-          db.deleteMessage(userId,target.id); // replace the turn
-          db.touchConversation(userId,conversation.id);
-          const historyOverride=ordered.slice(Math.max(0,targetIdx-24),targetIdx);
-          enqueueChatReply(conversation.id,(queueMs)=>runChatReplyJob({userId,user,conversation,message:userMsg.content,userMsg,images:[],historyOverride,insertCreatedAt,queueMs}));
+          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt);
+          if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
+          scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
         }
         // W1: delete a message turn (own conversations only; getMessage is
@@ -3587,10 +3697,33 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
-  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
-    async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(metricsTimer)clearInterval(metricsTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
+  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    async close(){
+      closing=true;
+      if(workerTimer)clearInterval(workerTimer);
+      if(replyPollTimer)clearInterval(replyPollTimer);
+      if(backupTimer)clearInterval(backupTimer);
+      if(metricsTimer)clearInterval(metricsTimer);
+      const serverClosed=server.listening?new Promise((resolve)=>server.close(resolve)):Promise.resolve();
+      if(replyPumpTask)await replyPumpTask;
+      const pending=Promise.allSettled([...activeReplyJobs.values(),...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
+      let timeout;
+      const settled=await Promise.race([
+        Promise.all([serverClosed,pending]).then(()=>true),
+        new Promise((resolve)=>{timeout=setTimeout(()=>resolve(false),25_000);})
+      ]);
+      clearTimeout(timeout);
+      if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();await serverClosed;}
+      db.close();
+    }
   };
 }
 
-if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createOrbitServer();const port=Number(process.env.PORT)||3000;const host=process.env.HOST||'127.0.0.1';app.server.listen(port,host,()=>{app.startWorker();console.log(`Orbit Buddy is ready at http://${host}:${port}`);});}
+if(process.argv[1]===fileURLToPath(import.meta.url)){
+  const app=createOrbitServer();const port=Number(process.env.PORT)||3000;const host=process.env.HOST||'127.0.0.1';
+  app.server.listen(port,host,()=>{app.startWorker();console.log(`Orbit Buddy is ready at http://${host}:${port}`);});
+  let stopping=false;
+  const stop=()=>{if(stopping)return;stopping=true;app.close().then(()=>process.exit(0)).catch((error)=>{console.error('shutdown failed',error&&error.message);process.exit(1);});};
+  process.once('SIGTERM',stop);process.once('SIGINT',stop);
+}
