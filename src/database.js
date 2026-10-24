@@ -1153,6 +1153,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     });},
     renewReplyJobLease(id,token,leaseMs=REPLY_LEASE_MS){return db.prepare(`UPDATE reply_jobs SET lease_expires_at=? WHERE id=? AND lease_token=? AND status='running' AND lease_expires_at>?`)
       .run(new Date(Date.now()+leaseMs).toISOString(),id,token,timestamp()).changes>0;},
+    releaseReplyJob(id,token){return db.prepare(`UPDATE reply_jobs SET status='queued',claimed_at=NULL,lease_expires_at=CASE
+      WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
+      WHERE id=? AND lease_token=? AND status='running'`).run(new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token).changes>0;},
     completeReplyJob(id,token,content,insertCreatedAt=null){return withImmediate(()=>{
       const job=db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id);
       if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;

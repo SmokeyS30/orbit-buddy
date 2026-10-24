@@ -739,6 +739,9 @@ const indexMigrations = [
     }),
     renewReplyJobLease: async (id,token,leaseMs=REPLY_LEASE_MS)=>(await run(`UPDATE reply_jobs SET lease_expires_at=?
       WHERE id=? AND lease_token=? AND status='running' AND lease_expires_at>?`,new Date(Date.now()+leaseMs).toISOString(),id,token,timestamp())).changes>0,
+    releaseReplyJob: async (id,token)=>(await run(`UPDATE reply_jobs SET status='queued',claimed_at=NULL,
+      lease_expires_at=CASE WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
+      WHERE id=? AND lease_token=? AND status='running'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token)).changes>0,
     completeReplyJob: async (id,token,content,insertCreatedAt=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
       const job=await tGet('SELECT * FROM reply_jobs WHERE id=? FOR UPDATE',id);
       if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;

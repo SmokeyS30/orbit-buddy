@@ -649,10 +649,15 @@ export function createOrbitServer(options={}) {
         await replyDb('cancelDisallowedReplyJobs');
         if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
         await replyDb('recoverExpiredReplyJobs');
+        if(closing)return;
         scheduleWhatsAppDeliveries();
         while(!closing&&activeReplyJobs.size<4){
           const job=await replyDb('claimNextReplyJob',replyInstanceId,REPLY_LEASE_MS);
           if(!job)break;
+          // close() can begin while the claim is awaiting PostgreSQL. Do not
+          // start work after its active-job snapshot; return the lease so a
+          // surviving replica or restarted worker can take the queued turn.
+          if(closing){await replyDb('releaseReplyJob',job.id,job.lease_token);break;}
           const task=executeReplyJob(job).catch((error)=>{
             chatMetrics.record({queueMs:Math.max(0,Date.now()-Date.parse(job.queued_at)),error:true});
             console.error('chat job failed',job.id,error&&error.message);
@@ -673,6 +678,7 @@ export function createOrbitServer(options={}) {
     return replyPumpTask;
   }
   function scheduleWhatsAppDeliveries(){
+    if(closing)return Promise.resolve();
     if(deliveryTask)return deliveryTask;
     deliveryTask=deliverPendingWhatsAppReplies()
       .catch((error)=>console.error('WhatsApp reply delivery failed',error&&error.message))
@@ -681,6 +687,7 @@ export function createOrbitServer(options={}) {
   }
   async function deliverPendingWhatsAppReplies(){
     for(const job of await replyDb('listPendingReplyDeliveries',10)){
+      if(closing)break;
       if(!await replyDb('markReplyDeliveryAttempted',job.id))continue;
       try{
         const [link,user]=await Promise.all([replyDb('getWhatsAppLink',job.user_id),replyDb('getUserById',job.user_id)]);

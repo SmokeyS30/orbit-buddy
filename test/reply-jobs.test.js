@@ -108,6 +108,12 @@ test('PostgreSQL claims one conversation turn across replicas and migrations are
     const removed=one.acceptReplyJob(user.id,conversation.id,'Delete PG pending turn');
     assert.ok(one.deleteMessageTurn(user.id,removed.userMessage.id).includes(removed.userMessage.id));
     assert.equal(one.getReplyJob(removed.job.id).status,'cancelled');
+    const late=one.acceptReplyJob(user.id,conversation.id,'Claim released during shutdown');
+    const lateClaim=one.claimNextReplyJob('closing-replica');
+    assert.equal(lateClaim.id,late.job.id);
+    assert.equal(one.releaseReplyJob(lateClaim.id,lateClaim.lease_token),true);
+    assert.equal(one.getReplyJob(late.job.id).status,'queued');
+    assert.equal(two.claimNextReplyJob('surviving-replica').id,late.job.id);
   }finally{
     try{if(userId)one.deleteUserAccount(userId);}catch{}
     one.close();two.close();
@@ -386,4 +392,55 @@ test('shutdown grace includes a stalled reply pump',async()=>{
     await app.close();
     assert.ok(Date.now()-at<500,'shutdown returned within its grace even while the pump is stalled');
   }finally{release?.();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('shutdown returns a claim that resolves after closing and the next worker resumes it',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-claim-close-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  let calls=0;
+  model.respond=async()=>{calls++;return{text:'Recovered after shutdown.',toolCalls:[]};};
+  const app=createOrbitServer({env:{NODE_ENV:'test'},dataDir:dir,modelClient:model,replyShutdownGraceMs:500});
+  let next=null,releaseClaim=null;
+  try{
+    const {user,conversation}=seed(app.db);
+    const accepted=app.db.acceptReplyJob(user.id,conversation.id,'Accepted before shutdown');
+    const originalClaim=app.db.claimNextReplyJob.bind(app.db);
+    const claimEntered=new Promise((resolve)=>{next=resolve;});
+    app.db.claimNextReplyJob=(...args)=>new Promise((resolve)=>{
+      let released=false;
+      releaseClaim=()=>{if(released)return;released=true;resolve(originalClaim(...args));};next();
+    });
+    app.runReplyJobs();
+    await claimEntered;
+    const shutdown=app.close();
+    releaseClaim();
+    await shutdown;
+    assert.equal(calls,0,'no model begins after shutdown starts');
+    const saved=openDatabase(path.join(dir,'orbit.sqlite'));
+    try{assert.equal(saved.getReplyJob(accepted.job.id).status,'queued','the late claim is returned for recovery');}
+    finally{saved.close();}
+    const restarted=createOrbitServer({env:{NODE_ENV:'test'},dataDir:dir,modelClient:model});
+    try{
+      await restarted.runReplyJobs();
+      assert.ok(await waitFor(()=>restarted.db.getReplyJob(accepted.job.id).status==='completed'));
+      assert.equal(calls,1);
+    }finally{await restarted.close();}
+  }finally{releaseClaim?.();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('shutdown does not schedule delivery after a stalled recovery query',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-recover-close-'));
+  const app=createOrbitServer({env:{NODE_ENV:'test'},dataDir:dir,replyShutdownGraceMs:500});
+  let release,entered,deliveries=0;
+  const recovering=new Promise((resolve)=>{entered=resolve;});
+  app.db.recoverExpiredReplyJobs=()=>{entered();return new Promise((resolve)=>{release=resolve;});};
+  app.db.listPendingReplyDeliveries=()=>{deliveries++;return [];};
+  try{
+    app.runReplyJobs();
+    await recovering;
+    const shutdown=app.close();
+    release(0);
+    await shutdown;
+    assert.equal(deliveries,0,'no delivery task starts after shutdown begins');
+  }finally{release?.(0);fs.rmSync(dir,{recursive:true,force:true});}
 });
