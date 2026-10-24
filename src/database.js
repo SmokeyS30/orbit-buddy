@@ -60,12 +60,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   }
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   const withImmediate=(fn)=>{db.exec('BEGIN IMMEDIATE');try{const value=fn();db.exec('COMMIT');return value;}catch(error){db.exec('ROLLBACK');throw error;}};
-  const insertReplyJob=({userId,conversationId,userMessageId,kind='chat',channel='web',originInstance=null,requiresEphemeral=false,insertCreatedAt=null})=>{
+  const insertReplyJob=({userId,conversationId,userMessageId,kind='chat',channel='web',originInstance=null,requiresEphemeral=false,insertCreatedAt=null,deliveryToPhone=null,deliveryLinkVerifiedAt=null})=>{
     if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
     const id=randomUUID(),queuedAt=timestamp();
-    db.prepare(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,origin_instance,requires_ephemeral,queued_at,lease_expires_at,insert_created_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?)`).run(id,userId,conversationId,userMessageId,kind,channel,originInstance,requiresEphemeral?1:0,queuedAt,
-      requiresEphemeral?new Date(Date.now()+REPLY_LEASE_MS).toISOString():null,insertCreatedAt);
+    db.prepare(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,origin_instance,requires_ephemeral,queued_at,lease_expires_at,insert_created_at,delivery_to_phone,delivery_link_verified_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,userId,conversationId,userMessageId,kind,channel,originInstance,requiresEphemeral?1:0,queuedAt,
+      requiresEphemeral?new Date(Date.now()+REPLY_LEASE_MS).toISOString():null,insertCreatedAt,deliveryToPhone,deliveryLinkVerifiedAt);
     return db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id);
   };
   for (const sql of signupSecuritySchema) db.exec(sql);
@@ -274,7 +274,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       completed_at TEXT,
       reply_message_id TEXT,
       insert_created_at TEXT,
-      delivery_attempted_at TEXT
+      delivery_attempted_at TEXT,
+      delivery_to_phone TEXT,
+      delivery_link_verified_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq);
     CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq);
@@ -522,6 +524,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
+  ensureColumn(db, 'reply_jobs', 'delivery_to_phone', 'TEXT');
+  ensureColumn(db, 'reply_jobs', 'delivery_link_verified_at', 'TEXT');
   // X5 "Writes like you": opt-in flag + distilled style profile (additive only).
   ensureColumn(db, 'user_preferences', 'writing_voice_opt_in', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'user_preferences', 'writing_voice_profile', 'TEXT');
@@ -1127,11 +1131,17 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     });},
     getReplyJob:(id)=>db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id)||null,
     getConversationReplyJobState:(userId,conversationId)=>db.prepare('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1').get(userId,conversationId)||null,
+    cancelDisallowedReplyJobs(){return db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE status IN ('queued','running') AND EXISTS(SELECT 1 FROM users u WHERE u.id=reply_jobs.user_id
+        AND (u.disabled=1 OR u.moderation_blocked=1))`).run(timestamp()).changes;},
+    cancelReplyJob(id,token){return db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE id=? AND status='running' AND lease_token=?`).run(timestamp(),id,token).changes>0;},
     renewQueuedEphemeralReplyJobs(instanceId){return db.prepare(`UPDATE reply_jobs SET lease_expires_at=? WHERE origin_instance=? AND requires_ephemeral=1 AND status='queued'`)
       .run(new Date(Date.now()+REPLY_LEASE_MS).toISOString(),instanceId).changes;},
     claimNextReplyJob(instanceId,leaseMs=REPLY_LEASE_MS){return withImmediate(()=>{
       const job=db.prepare(`SELECT j.* FROM reply_jobs j WHERE j.status='queued'
         AND (j.requires_ephemeral=0 OR j.origin_instance=?)
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs active WHERE active.conversation_id=j.conversation_id AND active.status='running')
         AND NOT EXISTS(SELECT 1 FROM reply_jobs prior WHERE prior.conversation_id=j.conversation_id
           AND prior.seq<j.seq AND prior.status IN ('queued','running'))
         ORDER BY j.seq LIMIT 1`).get(instanceId);
@@ -1146,6 +1156,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeReplyJob(id,token,content,insertCreatedAt=null){return withImmediate(()=>{
       const job=db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id);
       if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
+      const account=db.prepare('SELECT disabled,moderation_blocked FROM users WHERE id=?').get(job.user_id);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        db.prepare("UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL WHERE id=?").run(timestamp(),id);
+        return null;
+      }
       const message={id:randomUUID(),user_id:job.user_id,conversation_id:job.conversation_id,role:'assistant',content,
         created_at:insertCreatedAt||timestamp(),reply_job_id:id};
       db.prepare('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id) VALUES(?,?,?,?,?,?,?)')

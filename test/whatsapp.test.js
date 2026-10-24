@@ -266,6 +266,43 @@ test('linked user text gets a WhatsApp reply through the chat pipeline', async (
   }
 });
 
+test('deferred WhatsApp replies stay bound to the accepting link and enabled account', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app, base);
+  const sent = []; const restore = stubTwilio(sent); t.after(restore);
+  const conversation = app.db.ensureDefaultConversation(userId);
+  const queueCompleted = (content) => {
+    const link = app.db.getWhatsAppLink(userId);
+    const accepted = app.db.acceptReplyJob(userId, conversation.id, content, {
+      channel: 'whatsapp', deliveryToPhone: link.phone_e164, deliveryLinkVerifiedAt: link.verified_at
+    });
+    const claimed = app.db.claimNextReplyJob('test');
+    assert.equal(claimed.id, accepted.job.id);
+    assert.ok(app.db.completeReplyJob(claimed.id, claimed.lease_token, `Reply to ${content}`));
+    return accepted.job.id;
+  };
+  const flush = async (id) => {
+    await app.runReplyJobs();
+    const deadline = Date.now() + 3000;
+    while (!app.db.getReplyJob(id).delivery_attempted_at && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(app.db.getReplyJob(id).delivery_attempted_at);
+  };
+  const relinked = queueCompleted('before relink');
+  app.db.linkWhatsApp(userId, '+15085559999');
+  await flush(relinked);
+  assert.equal(sent.length, 0, 'no reply goes to a replacement number');
+  const unlinked = queueCompleted('before unlink');
+  app.db.unlinkWhatsApp(userId);
+  await flush(unlinked);
+  assert.equal(sent.length, 0, 'no reply goes out after unlink');
+  app.db.linkWhatsApp(userId, '+15085551234');
+  const disabled = queueCompleted('before disable');
+  app.db.setUserDisabled(userId, true);
+  await flush(disabled);
+  assert.equal(sent.length, 0, 'no reply goes out after account disable');
+});
+
 test('link/start requires Twilio configuration', async (t) => {
   const { app, base } = await serverFixture({ TWILIO_ACCOUNT_SID: '', TWILIO_AUTH_TOKEN: '', TWILIO_WHATSAPP_NUMBER: '' });
   t.after(() => app.close());

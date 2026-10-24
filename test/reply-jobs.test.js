@@ -114,6 +114,55 @@ test('PostgreSQL claims one conversation turn across replicas and migrations are
   }
 });
 
+test('PostgreSQL serializes acceptance before sequence allocation across replicas',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensurePostgresSchema(url);
+  const suffix=randomUUID().replaceAll('-','');
+  const appA=`reply_accept_a_${suffix}`,appB=`reply_accept_b_${suffix}`;
+  const namedUrl=(name)=>{const value=new URL(url);value.searchParams.set('application_name',name);return value.toString();};
+  const one=createSyncPgAdapter(namedUrl(appA)),two=createSyncPgAdapter(namedUrl(appB));
+  const pool=new pg.Pool({connectionString:url,ssl:false});
+  const gate=BigInt(`0x${suffix.slice(0,12)}`).toString();
+  const fn=`orbit_reply_gate_${suffix}`,trigger=`orbit_reply_trigger_${suffix}`;
+  let userId=null,conversationId=null,control=null,triggerCreated=false;
+  try{
+    const {user,conversation}=seed(one);userId=user.id;conversationId=conversation.id;
+    two.getSetting('system_paused','false'); // ensure the second worker is ready before the controlled interleave
+    await pool.query(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.id='${conversationId}' AND current_setting('application_name',true)='${appA}'
+        THEN PERFORM pg_advisory_xact_lock(${gate}); END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER ${trigger} BEFORE UPDATE ON conversations FOR EACH ROW EXECUTE FUNCTION ${fn}()`);
+    triggerCreated=true;
+    control=await pool.connect();
+    await control.query('BEGIN');
+    await control.query('SELECT pg_advisory_xact_lock($1::bigint)',[gate]);
+    let secondFinished=false;
+    const firstPending=one.async.acceptReplyJob(userId,conversationId,'first held accept');
+    assert.ok(await waitFor(async()=>Number((await pool.query(`SELECT COUNT(*) AS n FROM pg_stat_activity
+      WHERE application_name=$1 AND wait_event_type='Lock'`,[appA])).rows[0].n)>0),
+    'first accept reaches the trigger after obtaining its conversation lock');
+    const secondPending=two.async.acceptReplyJob(userId,conversationId,'second overlapping accept')
+      .then((value)=>{secondFinished=true;return value;});
+    await new Promise((resolve)=>setTimeout(resolve,200));
+    assert.equal(secondFinished,false,'second accept cannot commit while the earlier accept is stalled');
+    await control.query('COMMIT');control.release();control=null;
+    const [first,second]=await Promise.all([firstPending,secondPending]);
+    assert.ok(Number(first.job.seq)<Number(second.job.seq),'committed order matches durable job sequence');
+    const claimed=one.claimNextReplyJob('replica-A');
+    assert.equal(claimed.id,first.job.id);
+    assert.equal(two.claimNextReplyJob('replica-B'),null,'no concurrent job runs in the same conversation');
+    assert.ok(one.completeReplyJob(first.job.id,claimed.lease_token,'first complete'));
+    assert.equal(two.claimNextReplyJob('replica-B').id,second.job.id);
+  }finally{
+    if(control){try{await control.query('ROLLBACK');}finally{control.release();}}
+    if(triggerCreated)await pool.query(`DROP TRIGGER IF EXISTS ${trigger} ON conversations`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${fn}()`);
+    try{if(userId)one.deleteUserAccount(userId);}catch{}
+    one.close();two.close();await pool.end();
+  }
+});
+
 test('PostgreSQL reply survives another replica and queued work recovers on restart',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
@@ -260,4 +309,81 @@ test('emergency pause holds recovered jobs until resume',async()=>{
     assert.ok(await waitFor(()=>app.db.getReplyJob(accepted.job.id).status==='completed'));
     assert.equal(calls,1);
   }finally{await app.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('queued replies for disabled and moderation blocked accounts cancel after restart',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-account-'));
+  const file=path.join(dir,'orbit.sqlite');
+  const original=openDatabase(file);
+  let app;
+  try{
+    const disabled=seed(original),blocked=seed(original);
+    const queuedDisabled=original.acceptReplyJob(disabled.user.id,disabled.conversation.id,'Do not run while disabled');
+    const queuedBlocked=original.acceptReplyJob(blocked.user.id,blocked.conversation.id,'Do not run while blocked');
+    assert.equal(original.setUserDisabled(disabled.user.id,true),true);
+    assert.equal(original.setModerationBlocked(blocked.user.id,true),true);
+    original.close();
+    let calls=0;
+    const model=createModelClient({NODE_ENV:'test'});
+    model.respond=async()=>{calls++;return{text:'Should not be written',toolCalls:[]};};
+    app=createOrbitServer({env:{NODE_ENV:'test'},dataDir:dir,modelClient:model});
+    await app.runReplyJobs();
+    for(const accepted of [queuedDisabled,queuedBlocked]){
+      assert.equal(app.db.getReplyJob(accepted.job.id).status,'cancelled');
+      assert.equal(app.db.listConversationMessages(accepted.job.user_id,accepted.job.conversation_id,10)
+        .some((m)=>m.role==='assistant'),false);
+    }
+    assert.equal(calls,0,'no model or tool loop starts for a disallowed account');
+  }finally{
+    if(app)await app.close();else try{original.close();}catch{}
+    fs.rmSync(dir,{recursive:true,force:true});
+  }
+});
+
+test('PostgreSQL restart cancels queued replies for disabled and moderation blocked accounts',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensurePostgresSchema(url);
+  const original=createSyncPgAdapter(url);
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-pg-account-'));
+  let app=null,ids=[];
+  try{
+    const disabled=seed(original),blocked=seed(original);
+    ids=[disabled.user.id,blocked.user.id];
+    const queuedDisabled=original.acceptReplyJob(disabled.user.id,disabled.conversation.id,'Do not run while disabled');
+    const queuedBlocked=original.acceptReplyJob(blocked.user.id,blocked.conversation.id,'Do not run while blocked');
+    assert.equal(original.setUserDisabled(disabled.user.id,true),true);
+    assert.equal(original.setModerationBlocked(blocked.user.id,true),true);
+    original.close();
+    let calls=0;
+    const model=createModelClient({NODE_ENV:'test'});
+    model.respond=async()=>{calls++;return{text:'Should not be written',toolCalls:[]};};
+    app=createOrbitServer({env:{NODE_ENV:'test',DATABASE_URL:url},dataDir:dir,modelClient:model});
+    await app.runReplyJobs();
+    for(const accepted of [queuedDisabled,queuedBlocked]){
+      assert.equal(app.db.getReplyJob(accepted.job.id).status,'cancelled');
+      assert.equal(app.db.listConversationMessages(accepted.job.user_id,accepted.job.conversation_id,10)
+        .some((m)=>m.role==='assistant'),false);
+    }
+    assert.equal(calls,0);
+  }finally{
+    if(app){for(const id of ids)try{app.db.deleteUserAccount(id);}catch{}await app.close();}
+    else{for(const id of ids)try{original.deleteUserAccount(id);}catch{}try{original.close();}catch{}}
+    fs.rmSync(dir,{recursive:true,force:true});
+  }
+});
+
+test('shutdown grace includes a stalled reply pump',async()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-pump-'));
+  const app=createOrbitServer({env:{NODE_ENV:'test'},dataDir:dir,replyShutdownGraceMs:60});
+  let release,started;
+  const entered=new Promise((resolve)=>{started=resolve;});
+  app.db.renewQueuedEphemeralReplyJobs=()=>{started();return new Promise((resolve)=>{release=resolve;});};
+  try{
+    app.runReplyJobs();
+    await entered;
+    const at=Date.now();
+    await app.close();
+    assert.ok(Date.now()-at<500,'shutdown returned within its grace even while the pump is stalled');
+  }finally{release?.();fs.rmSync(dir,{recursive:true,force:true});}
 });

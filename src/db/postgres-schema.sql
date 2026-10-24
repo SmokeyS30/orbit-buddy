@@ -408,7 +408,9 @@ CREATE TABLE IF NOT EXISTS reply_jobs (
   completed_at TEXT,
   reply_message_id TEXT,
   insert_created_at TEXT,
-  delivery_attempted_at TEXT
+  delivery_attempted_at TEXT,
+  delivery_to_phone TEXT,
+  delivery_link_verified_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq);
 CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq);

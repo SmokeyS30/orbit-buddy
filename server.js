@@ -645,6 +645,8 @@ export function createOrbitServer(options={}) {
     replyPumpTask=(async()=>{
       try{
         await replyDb('renewQueuedEphemeralReplyJobs',replyInstanceId);
+        if(closing)return;
+        await replyDb('cancelDisallowedReplyJobs');
         if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
         await replyDb('recoverExpiredReplyJobs');
         scheduleWhatsAppDeliveries();
@@ -661,7 +663,7 @@ export function createOrbitServer(options={}) {
           });
           activeReplyJobs.set(job.id,task);
         }
-      }catch(error){console.error('reply pump failed',error&&error.message);}
+      }catch(error){if(!closing)console.error('reply pump failed',error&&error.message);}
       finally{
         replyPumpRunning=false;
         replyPumpTask=null;
@@ -681,11 +683,16 @@ export function createOrbitServer(options={}) {
     for(const job of await replyDb('listPendingReplyDeliveries',10)){
       if(!await replyDb('markReplyDeliveryAttempted',job.id))continue;
       try{
-        const link=await replyDb('getWhatsAppLink',job.user_id);
+        const [link,user]=await Promise.all([replyDb('getWhatsAppLink',job.user_id),replyDb('getUserById',job.user_id)]);
         const reply=job.reply_message_id?await replyDb('getMessage',job.user_id,job.reply_message_id):null;
-        if(!link?.phone_e164||!isWindowOpen(link.last_inbound_at)||!reply)continue;
+        // A queued reply belongs only to the verified link that accepted its
+        // inbound turn. Old jobs without this binding fail closed.
+        if(!user||user.disabled===1||user.moderation_blocked===1||
+          !job.delivery_to_phone||!job.delivery_link_verified_at||
+          link?.phone_e164!==job.delivery_to_phone||link?.verified_at!==job.delivery_link_verified_at||
+          !isWindowOpen(link.last_inbound_at)||!reply)continue;
         await sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,
-          fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone:link.phone_e164,body:reply.content});
+          fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone:job.delivery_to_phone,body:reply.content});
       }catch(error){
         console.error('whatsapp send failed',error&&error.message);
         try{db.addEvent(job.user_id,'whatsapp_send_failed','Could not send WhatsApp reply.',String(error?.message||error).slice(0,200));}catch{}
@@ -707,7 +714,10 @@ export function createOrbitServer(options={}) {
     try{
       const [user,conversation,userMsg]=await Promise.all([
         replyDb('getUserById',job.user_id),replyDb('getConversation',job.user_id,job.conversation_id),replyDb('getMessage',job.user_id,job.user_message_id)]);
-      if(!user||!conversation||!userMsg)return;
+      if(!user||user.disabled===1||user.moderation_blocked===1||!conversation||!userMsg){
+        await replyDb('cancelReplyJob',job.id,job.lease_token);
+        return;
+      }
       const fresh=await replyDb('getReplyJob',job.id);
       if(!fresh||fresh.status!=='running'||fresh.lease_token!==job.lease_token)return;
       const ephemeral=ephemeralReplyPayloads.get(job.id);
@@ -772,6 +782,9 @@ export function createOrbitServer(options={}) {
     // The client cannot opt itself into stronger model routing.
     const membershipTier=timedDb(()=>subscriptions.tier(userId,user));
     const streamState={turn:-1,text:'',rawText:'',filtered:false,done:false};pendingStreams.set(conversation.id,streamState);
+    const finishStream=()=>{streamState.done=true;const cleanup=setTimeout(()=>{
+      if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);
+    },60_000);cleanup.unref();};
     const onStreamTurn=(turn)=>{streamState.turn=turn;streamState.text='';streamState.rawText='';streamState.filtered=false;};
     const onStreamToken=(delta)=>{
       if(modelFirstTokenMs===null&&modelStartedAt!==null)modelFirstTokenMs=performance.now()-modelStartedAt;
@@ -783,21 +796,34 @@ export function createOrbitServer(options={}) {
       if(checked.filtered){streamState.filtered=true;streamState.rawText='';streamState.text=checked.text;}
       else streamState.text=streamState.rawText;
     };
+    const leaseLost=()=>Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+    const assertReplyLease=async()=>{
+      if(!leaseAlive())throw leaseLost();
+      if(!replyJob)return;
+      const [current,account]=await Promise.all([replyDb('getReplyJob',replyJob.id),replyDb('getUserById',userId)]);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        await replyDb('cancelReplyJob',replyJob.id,replyJob.lease_token);
+        throw leaseLost();
+      }
+      if(!current||current.status!=='running'||current.lease_token!==replyJob.lease_token||
+        !current.lease_expires_at||Date.parse(current.lease_expires_at)<=Date.now())throw leaseLost();
+    };
     let answer=null,replyStored=false;
     const storeAssistantMessage=(content)=>{
       const checked=filterAssistantContent(content);
       if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}
-      if(!leaseAlive())throw Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+      if(!leaseAlive())throw leaseLost();
       const stored=replyJob
         ?db.completeReplyJob(replyJob.id,replyJob.lease_token,checked.text,insertCreatedAt)
         :db.addMessage(userId,conversation.id,'assistant',checked.text);
-      if(!stored)throw Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+      if(!stored)throw leaseLost();
       replyStored=true;
       if(insertCreatedAt&&!replyJob)db.retimeMessage(userId,stored.id,insertCreatedAt);
       captureCanvasRevision(db,userId,conversation.id,stored);
       return stored;
     };
     try{
+      await assertReplyLease();
       // A summary covers messages before its final 12. Until a newer summary
       // lands, include the uncovered interval so a queued reply cannot lose
       // older context. Cap the temporary expansion at 48 messages to keep
@@ -891,12 +917,15 @@ export function createOrbitServer(options={}) {
             soulDirective:null,
             userTimeZone:preferences.time_zone,
             onTurn:onStreamTurn,
-            onToken:onStreamToken
+            onToken:onStreamToken,
+            assertActive:assertReplyLease
           }));
+          await assertReplyLease();
           answer=chitchatText;
           storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
           chitchatAnswered=true;
         }catch(chitchatError){
+          if(chitchatError?.code==='REPLY_LEASE_LOST')throw chitchatError;
           modelFallback=true;
           console.error('chitchat fast-path failed, falling back to full path',chitchatError&&chitchatError.message);
         }
@@ -966,12 +995,14 @@ export function createOrbitServer(options={}) {
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
+      await assertReplyLease();
       const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
-        onTurn:onStreamTurn,onToken:onStreamToken}));
+        onTurn:onStreamTurn,onToken:onStreamToken,assertActive:assertReplyLease}));
+      await assertReplyLease();
       // Legacy follow-up and memory markers can persist their text outside the
       // chat message. Filter before reading them as well as before delivery.
       const checkedRaw=filterAssistantContent(rawAnswer);
@@ -1028,16 +1059,17 @@ export function createOrbitServer(options={}) {
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
       }
     }catch(error){
-      if(error?.code==='REPLY_LEASE_LOST'){streamState.done=true;return null;}
+      if(error?.code==='REPLY_LEASE_LOST'){finishStream();return null;}
       replyFailed=true;console.error('chat reply failed',conversation.id,error&&error.message);
       try{db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);}catch{}
       if(!replyStored){
+        try{await assertReplyLease();}catch(leaseError){if(leaseError?.code==='REPLY_LEASE_LOST'){finishStream();return null;}throw leaseError;}
         const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);
         answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';
         storeAssistantMessage(answer);
       }
     }
-    streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
+    finishStream();
     chatMetrics.record({queueMs,databaseMs,contextMs:contextMs??performance.now()-startedAt,modelFirstTokenMs,
       modelCompletionMs:modelStartedAt===null?null:modelCompletionMs,completionMs:queueMs+performance.now()-startedAt,
       error:replyFailed,modelFallback});
@@ -2733,12 +2765,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const link=from?db.getUserByWhatsApp(from):null;
         if(!link)return json(res,200,{ok:true,ignored:true}); // unknown sender (or status callback): ignore
         const waUserId=link.user_id;
+        const waUser=db.getUserById(waUserId);
+        if(!waUser||waUser.disabled===1||waUser.moderation_blocked===1)return json(res,200,{ok:true,ignored:true});
         if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
         if(paused())return json(res,200,{ok:true,paused:true});
         db.setWhatsAppLastInbound(waUserId);
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
-        const waUser=db.getUserById(waUserId);
         // Location share: Latitude/Longitude form fields, no media. Coordinates are
         // passed to the model turn only — the stored history row is redacted and
         // nothing is logged, so the location stays ephemeral.
@@ -2746,7 +2779,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(sharedLocation){
           const locationMessage=formatLocationMessage(sharedLocation,body);
           const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
-            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true});
+            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
           ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
           scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
@@ -2774,7 +2807,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
-            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp'});
+            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
             scheduleReplyPump();
             return json(res,200,{ok:true,voiceNote:true});
           }
@@ -2798,7 +2831,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
             const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
-              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true});
+              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
             ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
             scheduleReplyPump();
             return json(res,200,{ok:true,image:true});
@@ -2809,7 +2842,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
-        db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),{channel:'whatsapp'});
+        db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
         scheduleReplyPump();
         return json(res,200,{ok:true});
       }
@@ -3706,15 +3739,15 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       if(backupTimer)clearInterval(backupTimer);
       if(metricsTimer)clearInterval(metricsTimer);
       const serverClosed=server.listening?new Promise((resolve)=>server.close(resolve)):Promise.resolve();
-      if(replyPumpTask)await replyPumpTask;
-      const pending=Promise.allSettled([...activeReplyJobs.values(),...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
+      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...activeReplyJobs.values(),
+        ...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
       let timeout;
       const settled=await Promise.race([
         Promise.all([serverClosed,pending]).then(()=>true),
-        new Promise((resolve)=>{timeout=setTimeout(()=>resolve(false),25_000);})
+        new Promise((resolve)=>{timeout=setTimeout(()=>resolve(false),options.replyShutdownGraceMs??25_000);})
       ]);
       clearTimeout(timeout);
-      if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();await serverClosed;}
+      if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
       db.close();
     }
   };
