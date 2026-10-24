@@ -10,7 +10,9 @@ import { openDatabase } from '../src/database.js';
 import { openPostgres } from '../src/db/postgres-adapter.js';
 import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from '../src/portable-recovery.js';
 import { writeAutomatedBackup } from '../src/backups.js';
-import { decryptPortable } from '../src/security.js';
+import { decryptPortable, encryptPortable, hashToken } from '../src/security.js';
+import { createOrbitServer } from '../server.js';
+import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 
 const now='2026-10-24T12:00:00.000Z';
 function sampleRow(entry,userId,prefix){
@@ -201,5 +203,76 @@ test('PostgreSQL portable recovery restores a full synthetic bundle into an isol
     if(created)await admin.query(`DROP DATABASE ${name}`);
     await admin.end();
     fs.rmSync(backupDir,{recursive:true,force:true});
+  }
+});
+
+test('PostgreSQL manual API exports over 10 MiB and waits for a slow transactional restore',async()=>{
+  const databaseUrl=process.env.TEST_DATABASE_URL;
+  assert.ok(databaseUrl,'TEST_DATABASE_URL must point to disposable PostgreSQL');
+  const name=`orbit_backup_api_${randomUUID().replaceAll('-','').slice(0,16)}`;
+  const url=new URL(databaseUrl);
+  const admin=new pg.Pool({connectionString:databaseUrl,ssl:url.searchParams.get('sslmode')==='disable'?false:true});
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-pg-api-backup-'));
+  let app=null,sql=null,adapter=null,created=false;
+  try{
+    await admin.query(`CREATE DATABASE ${name}`);created=true;
+    url.pathname=`/${name}`;
+    sql=new pg.Pool({connectionString:url.toString(),ssl:false});
+    const schema=fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8');
+    for(const statement of schema.split(';').map((part)=>part.trim()).filter(Boolean))await sql.query(statement);
+    app=createOrbitServer({env:{NODE_ENV:'test',DATABASE_URL:url.toString()},dataDir:directory});
+    await new Promise((resolve)=>app.server.listen(0,'127.0.0.1',resolve));
+    const user=app.db.createUser({email:`${randomUUID()}@example.com`,displayName:'Synthetic owner',
+      passwordHash:'synthetic-hash',passwordSalt:'synthetic-salt',role:'owner'});
+    const conversation=app.db.createConversation(user.id,'Large synthetic backup');
+    const content=`Synthetic content: ${'x'.repeat(11*1024*1024)}`;
+    await sql.query(`INSERT INTO messages(id,user_id,conversation_id,role,content,created_at)
+      VALUES($1,$2,$3,'user',$4,$5)`,[randomUUID(),user.id,conversation.id,content,now]);
+    const token=randomUUID(),csrf=randomUUID();
+    app.db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,
+      expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic-test'});
+    const base=`http://127.0.0.1:${app.server.address().port}`;
+    const headers={Cookie:`orbit_session=${token}`,'X-Orbit-CSRF':csrf,'Content-Type':'application/json'};
+    const exported=await fetch(`${base}/api/backups/export`,{method:'POST',headers,
+      body:JSON.stringify({passphrase:'synthetic portable passphrase'})});
+    assert.equal(exported.status,200,'manual API uses the asynchronous worker for large results');
+    const payload=await exported.text();
+    assert.ok(payload.length>10*1024*1024,'the exported bundle exceeds the old shared buffer limit');
+    const bundle=await decryptPortable(payload,'synthetic portable passphrase');
+    assert.equal(bundle.messages.length,1);
+    assert.equal(bundle.messages[0].content,content);
+
+    // An intentionally delayed insert stands in for a remote PostgreSQL
+    // round trip. The short generic worker timeout must not report failure
+    // while a transactional restore continues in the worker.
+    await sql.query(`CREATE FUNCTION orbit_slow_restore() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN PERFORM pg_sleep(0.2); RETURN NEW; END $$`);
+    await sql.query(`CREATE TRIGGER orbit_slow_restore_trigger BEFORE INSERT ON messages
+      FOR EACH ROW EXECUTE FUNCTION orbit_slow_restore()`);
+    adapter=createSyncPgAdapter(url.toString(),{queryTimeoutMs:50});
+    const restoredId=randomUUID();
+    const minimal={version:6,conversations:[],messages:[{id:restoredId,conversation_id:conversation.id,
+      role:'user',content:'Delayed synthetic restore',created_at:now}]};
+    const began=Date.now();
+    await adapter.async.restoreUser(user.id,minimal);
+    assert.ok(Date.now()-began>=150,'restore waits for its SQL transaction result');
+    assert.equal((await sql.query('SELECT content FROM messages WHERE id=$1',[restoredId])).rows[0].content,
+      'Delayed synthetic restore');
+    adapter.close();adapter=null;
+    await sql.query('DROP TRIGGER orbit_slow_restore_trigger ON messages');
+    await sql.query('DROP FUNCTION orbit_slow_restore()');
+
+    const repeat=await fetch(`${base}/api/backups/restore`,{method:'POST',headers,
+      body:JSON.stringify({payload:await encryptPortable(minimal,'synthetic portable passphrase'),
+        passphrase:'synthetic portable passphrase',confirm:'RESTORE'})});
+    assert.equal(repeat.status,200);
+    assert.equal((await repeat.json()).paused,true);
+  }finally{
+    adapter?.close();
+    if(app)await app.close();
+    if(sql)await sql.end();
+    if(created)await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
+    await admin.end();
+    fs.rmSync(directory,{recursive:true,force:true});
   }
 });

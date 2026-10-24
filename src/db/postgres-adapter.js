@@ -1738,8 +1738,28 @@ const indexMigrations = [
     async restoreUser(userId, bundle) {
       if (!bundle || ![2,3,4,5,6].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       await withTransaction(async ({ run: tRun, get: tGet }) => {
+        // The worker waits for this transaction's definitive result. Bound a
+        // blocked SQL statement so a stalled remote database rolls back.
+        await tRun("SET LOCAL statement_timeout = '60s'");
+        await tRun("SET LOCAL lock_timeout = '10s'");
         for (const row of bundle.conversations || []) await tRun('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.created_at, row.updated_at);
-        for (const row of bundle.messages || []) await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.conversation_id || null, row.role, row.content, row.created_at);
+        // Batching cuts 20,000 remote round trips to about 200. Keep each
+        // parameter batch small even when an exported message is very large.
+        let messageRows=[],messageBytes=0;
+        const flushMessages=async()=>{
+          if(!messageRows.length)return;
+          const placeholders=messageRows.map(()=>'(?,?,?,?,?,?)').join(',');
+          await tRun(`INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES ${placeholders}
+            ON CONFLICT DO NOTHING`,...messageRows.flat());
+          messageRows=[];messageBytes=0;
+        };
+        for(const row of bundle.messages||[]){
+          const values=[row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at];
+          const rowBytes=Buffer.byteLength(String(row.content||''),'utf8')+256;
+          if(messageRows.length>=100||messageBytes+rowBytes>1024*1024)await flushMessages();
+          messageRows.push(values);messageBytes+=rowBytes;
+        }
+        await flushMessages();
         for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,
           last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at,

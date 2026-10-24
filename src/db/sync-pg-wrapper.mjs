@@ -22,7 +22,7 @@ const READY_OFFSET = 12;    // worker readiness flag (set once at startup)
 const DEFAULT_READY_TIMEOUT_MS = 30000;
 const QUERY_TIMEOUT_MS = 30000;
 
-export function createSyncPgAdapter(connectionString, { encryptionKey = null, readyTimeoutMs = null } = {}) {
+export function createSyncPgAdapter(connectionString, { encryptionKey = null, readyTimeoutMs = null, queryTimeoutMs = QUERY_TIMEOUT_MS } = {}) {
   // Allow fast-fail for tests: ?readyTimeoutMs=2000 in connection string
   // or readyTimeoutMs option. Defaults to 30s for production.
   let readyTimeout = readyTimeoutMs || DEFAULT_READY_TIMEOUT_MS;
@@ -100,11 +100,15 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
       return (...args) => new Promise((resolve, reject) => {
         if (closed || workerExitCode !== null) return reject(new Error('PG worker is closed.'));
         const id = nextId++;
-        const timeout = setTimeout(() => {
+        // A portable restore is one PostgreSQL transaction containing an
+        // unbounded number of user rows. Returning a 30s client timeout would
+        // leave the worker committing after the API reported failure. Wait for
+        // the transaction result; SQL statement timeouts bound stalled queries.
+        const timeout = method === 'restoreUser' ? null : setTimeout(() => {
           pendingAsync.delete(id);
           reject(new Error(`PG query timeout: ${method}`));
-        }, QUERY_TIMEOUT_MS);
-        timeout.unref();
+        }, queryTimeoutMs);
+        timeout?.unref();
         pendingAsync.set(id, { resolve, reject, timeout });
         try { worker.postMessage({ id, method, args, async: true }); }
         catch (error) { clearTimeout(timeout); pendingAsync.delete(id); reject(error); }
@@ -127,7 +131,7 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
         const id = nextId++;
         Atomics.store(sharedArray, FLAG_OFFSET / 4, 0);
         worker.postMessage({ id, method, args });
-        const result = Atomics.wait(sharedArray, FLAG_OFFSET / 4, 0, QUERY_TIMEOUT_MS);
+        const result = Atomics.wait(sharedArray, FLAG_OFFSET / 4, 0, queryTimeoutMs);
         if (result === 'timed-out') {
           throw new Error(`PG query timeout: ${method}`);
         }

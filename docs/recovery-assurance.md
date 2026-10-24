@@ -14,6 +14,13 @@ prunes older files. Versions 2 through 5 remain restorable.
 
 PostgreSQL exports use the asynchronous worker path so the server event loop
 can continue serving requests while the database snapshot is collected.
+The manual export and owner restore APIs also use that path. PostgreSQL message
+restore batches reduce round trips for large bundles, and each restore remains
+one transaction. The asynchronous worker waits for the transaction result
+instead of reporting a 30-second local timeout while writes may still commit;
+PostgreSQL enforces 60-second statement and 10-second lock timeouts so stalled
+statements roll back. A disconnected HTTP client may still be unsure of the
+result and should inspect the paused account before retrying an idempotent merge.
 Complete bundles can use more storage and memory than the former capped ones;
 the existing Azure Files quota and seven-file rotation are unchanged.
 
