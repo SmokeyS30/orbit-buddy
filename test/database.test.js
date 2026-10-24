@@ -145,6 +145,42 @@ test('stores typed memory and ranks relevant details ahead of unrelated ones', (
   db.close();
 });
 
+test('batched chat context preserves history, preferences, memory and planning data', () => {
+  const { db, user } = fixture();
+  const convo = db.ensureDefaultConversation(user.id);
+  db.addMessage(user.id, convo.id, 'user', 'Help plan my flight');
+  db.setSetting(`buddy_name_asked_${user.id}`, '123');
+  db.setWritingVoiceProfile(user.id, 'Short, friendly sentences.');
+  const memory = db.addMemory(user.id, 'Prefers aisle seats on flights.', { kind: 'preference' });
+  db.addMemory(user.id, 'The shed is blue.', { kind: 'fact' });
+  db.addFollowUp(user.id, { description: 'Book the flight', dueDate: '2026-12-01' });
+  db.addGoal(user.id, { title: 'Take the trip', priority: 3 });
+  db.addProject(user.id, { title: 'Travel plan', steps: [{ title: 'Compare fares' }] });
+  db.addPersonalDate(user.id, { label: 'Trip anniversary', month: 6, day: 15, type: 'anniversary' });
+
+  const reply = db.getChatReplyContext(user.id, convo.id, 24);
+  assert.equal(reply.conversation.id, convo.id);
+  assert.equal(reply.history.at(-1).content, 'Help plan my flight');
+  assert.equal(reply.preferences.time_zone, 'America/New_York');
+  assert.equal(reply.settings[`buddy_name_asked_${user.id}`], '123');
+  assert.equal(reply.writingVoice.optIn, true);
+  assert.equal(reply.writingVoice.profile, 'Short, friendly sentences.');
+  assert.deepEqual(db.getChatReplyContext(user.id, convo.id, 0).history, [], 'regenerate can skip the redundant history read');
+
+  const model = db.getChatModelContext(user.id, 'Help plan my flight', { includePlanning: true });
+  assert.equal(model.memories[0].id, memory.id);
+  assert.ok(model.allMemories.some((entry) => entry.id === memory.id));
+  assert.equal(model.followUps[0].description, 'Book the flight');
+  assert.equal(model.goals[0].title, 'Take the trip');
+  assert.equal(model.projects[0].steps[0].title, 'Compare fares');
+  assert.ok(db.getMemory(user.id, memory.id).last_mentioned_at, 'episodic recall stamp preserved');
+
+  const proactive = db.getChatProactiveContext(user.id);
+  assert.equal(proactive.personalDates[0].label, 'Trip anniversary');
+  assert.deepEqual(proactive.surfacedRows, []);
+  db.close();
+});
+
 test('encrypts calendar feed URLs at rest and decrypts them through the database API', () => {
   const key = Buffer.alloc(32, 7);
   const { db, user, filePath } = fixture({ encryptionKey: key });

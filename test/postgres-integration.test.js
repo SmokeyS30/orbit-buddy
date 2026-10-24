@@ -95,6 +95,28 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     const messages = db.listMessages(userId, 100);
     assert.ok(messages.some(m => m.id === messageId), 'message found');
 
+    // 7a. Production chat hot-path batches preserve the same data contract
+    // while crossing the synchronous worker only once per context stage.
+    db.setSetting(`buddy_name_asked_${userId}`, '123');
+    db.setWritingVoiceProfile(userId, 'Short, friendly sentences.');
+    const batchedReply = db.getChatReplyContext(userId, conversationId, 24);
+    assert.equal(batchedReply.conversation.id, conversationId);
+    assert.equal(batchedReply.history.at(-1).id, messageId);
+    assert.equal(batchedReply.settings[`buddy_name_asked_${userId}`], '123');
+    assert.equal(batchedReply.writingVoice.optIn, true);
+    assert.equal(batchedReply.writingVoice.profile, 'Short, friendly sentences.');
+    db.addFollowUp(userId, { description: 'Review the PostgreSQL plan', dueDate: '2026-12-01' });
+    db.addGoal(userId, { title: 'Finish PostgreSQL validation', priority: 3 });
+    db.addProject(userId, { title: 'Database speed', steps: [{ title: 'Measure context loading' }] });
+    db.addPersonalDate(userId, { label: 'Database anniversary', month: 6, day: 15, type: 'anniversary' });
+    const batchedModel = db.getChatModelContext(userId, 'PostgreSQL integration test note', { includePlanning: true });
+    assert.equal(batchedModel.memories[0].id, memoryId);
+    assert.equal(batchedModel.followUps[0].description, 'Review the PostgreSQL plan');
+    assert.equal(batchedModel.goals[0].title, 'Finish PostgreSQL validation');
+    assert.equal(batchedModel.projects[0].steps[0].title, 'Measure context loading');
+    assert.ok(db.getMemory(userId, memoryId).last_mentioned_at, 'batched recall preserves episodic stamp');
+    assert.equal(db.getChatProactiveContext(userId).personalDates[0].label, 'Database anniversary');
+
     // Privacy report parity: additive schema, idempotent submission, review
     // status, and persistence across worker restart.
     const submissionId=`report-${userId}`;

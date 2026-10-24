@@ -1069,6 +1069,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
+    // Chat hot path: keep the SQLite and PostgreSQL adapters on one contract.
+    // PostgreSQL resolves these independent reads concurrently inside its
+    // worker, collapsing several blocking worker/database round trips into one.
+    getChatReplyContext(userId,conversationId,historyLimit=24){
+      const preferences=this.getPreferences(userId);
+      const keys=[`buddy_name_asked_${userId}`,`ambient_context_${userId}`,`ambient_asked_${userId}`];
+      const settings=Object.fromEntries(keys.map((key)=>[key,s.setting.get(key)?.value??null]));
+      return{
+        conversation:s.getConversation.get(conversationId,userId)||null,
+        history:historyLimit>0?s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(historyLimit,1),200)).reverse():[],
+        preferences,
+        summary:s.getConversationSummary.get(conversationId,userId)||null,
+        settings,
+        writingVoice:{
+          optIn:preferences?.writing_voice_opt_in===1,
+          profile:preferences?.writing_voice_profile||null,
+          updatedAt:preferences?.writing_voice_updated_at||null,
+          offered:preferences?.writing_voice_offered===1,
+        },
+      };
+    },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
     getReportSubmission:(userId,submissionId)=>s.getReportSubmission.get(userId,submissionId),
     countRecentReports:(userId,since)=>s.countRecentReports.get(userId,since).count,
@@ -1148,6 +1169,33 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         db.prepare(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(()=>'?').join(',')})`).run(now,userId,...ids);
       }
       return ranked;
+    },
+    // Load the independent model-context reads as one logical operation. On
+    // SQLite this is just a compact local read; on PostgreSQL it is one sync
+    // worker crossing and the underlying selects run concurrently.
+    getChatModelContext(userId,query,{includePlanning=false,memoryLimit=8}={}){
+      const allMemories=s.listMemories.all(userId);
+      const memories=rankMemories(allMemories,query,memoryLimit);
+      if(memories.length){
+        const ids=memories.map((memory)=>memory.id);
+        db.prepare(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(()=>'?').join(',')})`).run(timestamp(),userId,...ids);
+      }
+      if(!includePlanning)return{memories,allMemories,followUps:[],goals:[],projects:[]};
+      const rows=s.listProjects.all(userId);const grouped=new Map();
+      for(const step of s.listUserProjectSteps.all(userId)){const steps=grouped.get(step.project_id)||[];steps.push(step);grouped.set(step.project_id,steps);}
+      return{
+        memories,
+        allMemories,
+        followUps:s.listFollowUps.all(userId).slice(0,8),
+        goals:rankGoals(s.listGoals.all(userId),10),
+        projects:rows.filter((project)=>project.status!=='completed').map((row)=>({...row,steps:grouped.get(row.id)||[]})),
+      };
+    },
+    getChatProactiveContext(userId){
+      return{
+        surfacedRows:s.listMemorySurfacings.all(userId,200),
+        personalDates:s.listPersonalDates.all(userId),
+      };
     },
     // Memory decay: recalculate relevance scores based on inactivity.
     // Run during the daily learning cycle.

@@ -636,6 +636,42 @@ const indexMigrations = [
     async listConversationMessages(userId, conversationId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
+    // Chat hot path: one worker crossing, with independent PostgreSQL reads in
+    // flight together. The synchronous wrapper otherwise serializes every
+    // method call and blocks the Node event loop for each database round trip.
+    async getChatReplyContext(userId, conversationId, historyLimit=24) {
+      const limit = Math.min(Math.max(historyLimit, 1), 200);
+      const keys = [`buddy_name_asked_${userId}`, `ambient_context_${userId}`, `ambient_asked_${userId}`];
+      let [conversation, history, preferences, summary, settingRows] = await Promise.all([
+        get('SELECT * FROM conversations WHERE id=? AND user_id=?', conversationId, userId),
+        historyLimit > 0
+          ? all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, limit)
+          : Promise.resolve([]),
+        get('SELECT * FROM user_preferences WHERE user_id=?', userId),
+        get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId),
+        all(`SELECT key,value FROM settings WHERE key IN (${keys.map(() => '?').join(',')})`, ...keys),
+      ]);
+      if (!preferences) {
+        const createdAt = timestamp();
+        await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', createdAt, createdAt);
+        preferences = await get('SELECT * FROM user_preferences WHERE user_id=?', userId);
+      }
+      const settings = Object.fromEntries(keys.map((key) => [key, null]));
+      for (const row of settingRows) settings[row.key] = row.value;
+      return {
+        conversation: conversation || null,
+        history: history.reverse(),
+        preferences,
+        summary: summary || null,
+        settings,
+        writingVoice: {
+          optIn: Number(preferences?.writing_voice_opt_in) === 1,
+          profile: preferences?.writing_voice_profile || null,
+          updatedAt: preferences?.writing_voice_updated_at || null,
+          offered: Number(preferences?.writing_voice_offered) === 1,
+        },
+      };
+    },
     async listMessages(userId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
@@ -731,6 +767,48 @@ const indexMigrations = [
         await run(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(() => '?').join(',')})`, now, userId, ...ids);
       }
       return ranked;
+    },
+    // Batch the independent context selects inside the PostgreSQL worker. This
+    // preserves ranking, episodic last-mentioned stamps, goal ordering, and
+    // project steps while removing serial main-thread worker waits.
+    async getChatModelContext(userId, queryText, { includePlanning=false, memoryLimit=8 }={}) {
+      const planningReads = includePlanning
+        ? [
+            all("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY priority DESC,due_date,created_at", userId),
+            all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+            all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+            all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
+          ]
+        : [Promise.resolve([]), Promise.resolve([]), Promise.resolve([]), Promise.resolve([])];
+      const [allMemories, followUps, goalRows, projectRows, projectSteps] = await Promise.all([
+        all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
+        ...planningReads,
+      ]);
+      const memories = rankMemories(allMemories, queryText, memoryLimit);
+      if (memories.length) {
+        const ids = memories.map((memory) => memory.id);
+        await run(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(() => '?').join(',')})`, timestamp(), userId, ...ids);
+      }
+      const grouped = new Map();
+      for (const step of projectSteps) {
+        const steps = grouped.get(step.project_id) || [];
+        steps.push(step);
+        grouped.set(step.project_id, steps);
+      }
+      return {
+        memories,
+        allMemories,
+        followUps: followUps.slice(0, 8),
+        goals: rankGoals(goalRows, 10),
+        projects: projectRows.filter((project) => project.status !== 'completed').map((row) => ({ ...row, steps: grouped.get(row.id) || [] })),
+      };
+    },
+    async getChatProactiveContext(userId) {
+      const [surfacedRows, personalDates] = await Promise.all([
+        all('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT ?', userId, 200),
+        all('SELECT * FROM personal_dates WHERE user_id=? ORDER BY month,day,label', userId),
+      ]);
+      return { surfacedRows, personalDates };
     },
     // Memory decay: recalculate relevance scores based on inactivity.
     // Run during the daily learning cycle.
