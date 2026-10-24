@@ -106,6 +106,62 @@ test('rapid sends are queued and answered in order', async (t) => {
   assert.ok(messages[3].content.includes('second question'), 'second reply matches second message');
 });
 
+test('slow summary does not block the next reply or hide uncovered history',async(t)=>{
+  const model=createModelClient({NODE_ENV:'test'});
+  model.configured=true;
+  let releaseSummary,summaryStarted=false;
+  let secondHistory=[];
+  model.respond=async({message,history=[],taskMode})=>{
+    if(taskMode){summaryStarted=true;await new Promise((resolve)=>{releaseSummary=resolve;});return{text:'Synthetic summary',toolCalls:[]};}
+    if(message.includes('second question'))secondHistory=history;
+    return{text:`Answered ${message}`,toolCalls:[]};
+  };
+  const {app,base}=await fixture({}, {modelClient:model});
+  t.after(async()=>{releaseSummary?.();await app.close();});
+  const auth=await register(base);
+  const conversation=app.db.ensureDefaultConversation(auth.userId);
+  for(let i=0;i<30;i++)app.db.addMessage(auth.userId,conversation.id,i%2?'assistant':'user',i===0?'Early context marker':'Synthetic earlier turn');
+  const first=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please answer the first question in detail.'})});
+  assert.equal(first.status,202);
+  assert.ok(await waitFor(()=>summaryStarted),'background summary started');
+  const second=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please answer the second question in detail.'})});
+  assert.equal(second.status,202);
+  assert.ok(await waitFor(()=>app.db.listConversationMessages(auth.userId,conversation.id,5)
+    .some((m)=>m.role==='assistant'&&m.content.includes('second question'))),
+    'second reply completed while summary model call remained pending');
+  assert.ok(secondHistory.some((m)=>m.content==='Early context marker'),'uncovered early history reached the second reply');
+  releaseSummary();
+  assert.ok(await waitFor(()=>app.db.getConversationSummary(auth.userId,conversation.id)?.summary==='Synthetic summary'));
+  app.db.setConversationSummary(auth.userId,conversation.id,'newer',100);
+  app.db.setConversationSummary(auth.userId,conversation.id,'stale',50);
+  assert.equal(app.db.getConversationSummary(auth.userId,conversation.id).summary,'newer');
+});
+
+test('queued turn history excludes later accepted user messages',async(t)=>{
+  const model=createModelClient({NODE_ENV:'test'});
+  let releaseFirst,started=false;
+  let secondHistory=[];
+  model.respond=async({message,history=[]})=>{
+    if(message==='First queued question'){started=true;await new Promise((resolve)=>{releaseFirst=resolve;});}
+    if(message==='Second queued question')secondHistory=history;
+    return{text:`Answered ${message}`,toolCalls:[]};
+  };
+  const {app,base}=await fixture({}, {modelClient:model});
+  t.after(async()=>{releaseFirst?.();await app.close();});
+  const auth=await register(base);
+  const send=(message)=>fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message})});
+  assert.equal((await send('First queued question')).status,202);
+  assert.ok(await waitFor(()=>started));
+  assert.equal((await send('Second queued question')).status,202);
+  assert.equal((await send('Third queued question')).status,202);
+  releaseFirst();
+  const conversation=app.db.ensureDefaultConversation(auth.userId);
+  assert.ok(await waitFor(()=>app.db.listConversationMessages(auth.userId,conversation.id,10)
+    .some((m)=>m.role==='assistant'&&m.content==='Answered Third queued question')));
+  assert.ok(secondHistory.some((m)=>m.content==='First queued question'));
+  assert.ok(secondHistory.every((m)=>m.content!=='Third queued question'));
+});
+
 test('owner latency diagnostics aggregate queued turns without exposing conversation data', async (t) => {
   const model=createModelClient({NODE_ENV:'test'});
   let releaseFirst,firstStarted=false,calls=0;

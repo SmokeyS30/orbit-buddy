@@ -18,10 +18,14 @@ async function main() {
   const sharedArray = new Int32Array(workerData.sharedBuffer);
   const sharedBytes = new Uint8Array(workerData.sharedBuffer);
   
-  parentPort.on('message', async ({ id, method, args }) => {
+  parentPort.on('message', async ({ id, method, args, async: asynchronous = false }) => {
     try {
       const result = await db[method](...args);
       const json = JSON.stringify({ ok: true, result });
+      if (asynchronous) {
+        parentPort.postMessage({ id, json });
+        return;
+      }
       const bytes = Buffer.from(json, 'utf8');
       
       if (bytes.length > BUFFER_SIZE - DATA_OFFSET) {
@@ -37,6 +41,10 @@ async function main() {
         ok: false, 
         error: { message: err.message, stack: err.stack } 
       });
+      if (asynchronous) {
+        parentPort.postMessage({ id, json });
+        return;
+      }
       const bytes = Buffer.from(json, 'utf8');
       sharedArray[LEN_OFFSET / 4] = bytes.length;
       sharedBytes.set(bytes, DATA_OFFSET);

@@ -102,6 +102,14 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     const batchedReply = db.getChatReplyContext(userId, conversationId, 24);
     assert.equal(batchedReply.conversation.id, conversationId);
     assert.equal(batchedReply.history.at(-1).id, messageId);
+    assert.equal(batchedReply.messageCount,1);
+    const laterMessage=db.addMessage(userId,conversationId,'user','Later PG turn');
+    db.retimeMessage(userId,laterMessage.id,new Date(Date.now()+1000).toISOString());
+    assert.deepEqual(db.listConversationMessagesThrough(userId,conversationId,messageId,24).map((m)=>m.id),[messageId]);
+    assert.equal(db.listConversationMessages(userId,conversationId,24).length,2);
+    db.setConversationSummary(userId,conversationId,'newer',100);
+    db.setConversationSummary(userId,conversationId,'stale',50);
+    assert.equal(db.getConversationSummary(userId,conversationId).summary,'newer');
     assert.equal(batchedReply.settings[`buddy_name_asked_${userId}`], '123');
     assert.equal(batchedReply.writingVoice.optIn, true);
     assert.equal(batchedReply.writingVoice.profile, 'Short, friendly sentences.');
@@ -116,6 +124,15 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.equal(batchedModel.projects[0].steps[0].title, 'Measure context loading');
     assert.ok(db.getMemory(userId, memoryId).last_mentioned_at, 'batched recall preserves episodic stamp');
     assert.equal(db.getChatProactiveContext(userId).personalDates[0].label, 'Database anniversary');
+    // Async context reads use a separate worker response channel. Interleave
+    // one with a legacy synchronous call to catch shared-buffer corruption.
+    const asyncModelPending = db.async.getChatModelContext(userId, 'PostgreSQL integration test note', { includePlanning: true });
+    assert.equal(db.getSetting(`buddy_name_asked_${userId}`), '123');
+    const asyncModel = await asyncModelPending;
+    assert.equal(asyncModel.memories[0].id, memoryId);
+    assert.equal(asyncModel.projects[0].steps[0].title, 'Measure context loading');
+    assert.equal((await db.async.getChatProactiveContext(userId)).personalDates[0].label, 'Database anniversary');
+    await assert.rejects(db.async.methodThatDoesNotExist(), /not a function/);
 
     // Privacy report parity: additive schema, idempotent submission, review
     // status, and persistence across worker restart.
@@ -189,7 +206,9 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.equal(db.claimNotification(notificationId), false, 'completed notification remains deduped');
 
     // 8. Persistence: close and reopen, data must survive.
+    const pendingOnClose=db.async.getSetting(`buddy_name_asked_${userId}`);
     db.close(); db = null;
+    await assert.rejects(pendingOnClose,/PG worker closed/,'closing the worker rejects pending async reads');
     db2 = createSyncPgAdapter(DATABASE_URL);
     const refetched = db2.getUserByEmail(email);
     assert.ok(refetched, 'user persists after close/reopen');
