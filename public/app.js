@@ -25,6 +25,7 @@ import { briefingLayoutFor } from './briefing-layout.js';
 import { parseConversationDeepLink } from './deep-link.js';
 import { geoAttemptPlan, markGeoAsked, clearGeoAsked } from './geo-prompt.js';
 import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
+import { createConnectionRecovery, canAttemptNetwork, isTransportError } from './connection-recovery.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
@@ -966,13 +967,56 @@ async function refresh(){
     if(refreshQueued)refresh().catch(()=>{});
   }
 }
-async function connect(){try{const me=await api('/api/auth/me');state.user=me.user;state.csrf=me.csrf;if(me.user.isDemo){state.isDemo=true;showDemoBanner();}$('#account-button').textContent=state.user.displayName;$('#account-button').classList.remove('hidden');$('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);$('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');await refresh();maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();if(isNativeRuntime(window))setupNativePush();else setupWebPush();}catch(error){if(error.auth){$('#status-text').textContent='Sign in required';$('#model-pill').textContent='Sign in to connect';state.setup=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS}).then((r)=>r.json());setAuthMode(state.setup.needsOwner||state.signupVerificationToken?'register':'login');if(IS_NATIVE&&!state.launchSignin){
-          const goWelcome=()=>{location.href='welcome.html';};
-          if(window.__orbitSplashComplete){goWelcome();return;}
-          let splashWaited=false;
-          const splashTimeout=setTimeout(()=>{if(!splashWaited){splashWaited=true;goWelcome();}},11000);
-          window.addEventListener('orbit-splash-done',()=>{if(!splashWaited){splashWaited=true;clearTimeout(splashTimeout);goWelcome();}},{once:true});
-          return;}if(state.launchSignin){const d=$('#auth-dialog');if(d&&!d.open)d.showModal();}else{$('#hero-signin')?.classList.remove('hidden');}}else{$('#status-text').textContent='Connection issue';$('#model-pill').textContent='Retrying connection';toast(error.message);}}}
+let connectionEstablished=false;
+let connectionIssueShown=false;
+function reportConnectionIssue(error){
+  $('#status-text').textContent='Connection issue';
+  $('#model-pill').textContent='Retrying connection';
+  if(!connectionIssueShown){toast(error.message||'Could not connect. Retrying…');connectionIssueShown=true;}
+}
+async function connect(){
+  try{
+    const me=await api('/api/auth/me');
+    state.user=me.user;state.csrf=me.csrf;
+    if(me.user.isDemo){state.isDemo=true;showDemoBanner();}
+    $('#account-button').textContent=state.user.displayName;
+    $('#account-button').classList.remove('hidden');
+    $('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);
+    $('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');
+    await refresh();
+    connectionEstablished=true;connectionIssueShown=false;
+    maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();
+    if(isNativeRuntime(window))setupNativePush();else setupWebPush();
+    if(loadChatQueue().length)flushChatQueue().catch(()=>{});
+    return 'connected';
+  }catch(error){
+    connectionEstablished=false;
+    if(error.auth){
+      $('#status-text').textContent='Sign in required';
+      $('#model-pill').textContent='Sign in to connect';
+      try{
+        const response=await nativeFetch(API_BASE+'/api/auth/setup-status',{credentials:NATIVE_CREDENTIALS});
+        if(!response.ok)throw new Error(`Request failed (${response.status}).`);
+        state.setup=await response.json();
+      }catch(setupError){reportConnectionIssue(setupError);return 'retry';}
+      connectionIssueShown=false;
+      setAuthMode(state.setup.needsOwner||state.signupVerificationToken?'register':'login');
+      if(IS_NATIVE&&!state.launchSignin){
+        const goWelcome=()=>{location.href='welcome.html';};
+        if(window.__orbitSplashComplete){goWelcome();return 'auth';}
+        let splashWaited=false;
+        const splashTimeout=setTimeout(()=>{if(!splashWaited){splashWaited=true;goWelcome();}},11000);
+        window.addEventListener('orbit-splash-done',()=>{if(!splashWaited){splashWaited=true;clearTimeout(splashTimeout);goWelcome();}},{once:true});
+        return 'auth';
+      }
+      if(state.launchSignin){const d=$('#auth-dialog');if(d&&!d.open)d.showModal();}
+      else $('#hero-signin')?.classList.remove('hidden');
+      return 'auth';
+    }
+    reportConnectionIssue(error);
+    return 'retry';
+  }
+}
 function setAuthMode(mode){if(mode!=='register')state.appleSignupProof=null;renderAppleAuthControls(document,{nativeReady:IS_NATIVE&&!!signupPlugin(),loginReady:!!state.setup?.appleSignInReady,signupReady:!!state.setup?.appleSignupReady,mode,registrationAvailable:!!state.setup?.needsOwner||(!state.setup?.signupsPaused&&(!!state.setup?.registrationOpen||!!state.setup?.automaticSignup))});$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';const forgot=mode==='forgot';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':forgot?'Reset password':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':forgot?'Enter your email and we\'ll send you a password reset link.':register&&state.signupVerificationToken?'Finish email verification by re-entering the account details you just chose.':'Private by design — your conversations stay on your server and never train AI models.';$('#name-label').classList.toggle('hidden',!register);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover||forgot);$('#forgot-row').classList.toggle('hidden',mode!=='login');$('#auth-password').required=!recover&&!forgot;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').disabled=false;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':forgot?'Send reset link':'Sign in';const doorClosed=register&&state.setup&&!state.setup.needsOwner&&!state.setup.registrationOpen&&!state.setup.automaticSignup;$('#auth-closed').classList.toggle('hidden',!doorClosed);for(const id of['#name-label','#email-label','#password-label','#auth-submit']){const field=$(id);if(field)field.classList.toggle('hidden',!!doorClosed);}if(doorClosed){$('#auth-title').textContent='Registration is closed';$('#auth-copy').textContent='Ask the owner to open registration, then try again.';}$('#auth-error').textContent='';$('#request-form').classList.add('hidden');$('#request-status').textContent='';}
 function renderAccessRequests(){const list=$('#access-list');if(!list)return;list.replaceChildren();const pending=(state.accessRequests||[]).filter((r)=>!r.handled_at);if(!pending.length)return empty(list,'Nobody is waiting for access right now.');for(const r of pending){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=r.name;const p=document.createElement('p');p.textContent=`${r.email} · asked ${formatDate(r.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve','primary',()=>approveRequest(r.id)),button('Deny','danger',()=>denyRequest(r.id)),button('Dismiss','ghost',()=>dismissRequest(r.id)));head.append(wrap);card.append(head,actions);list.append(card);}}
 async function resetUserPassword(email,displayName){if(!window.confirm(`Send a password reset email to ${displayName||email}?`))return;try{const res=await api('/api/admin/reset-password',{method:'POST',body:JSON.stringify({email})});toast(res.emailed?`Reset email sent to ${displayName||email}.`:`Reset link created for ${displayName||email} (email not sent).`);}catch(e){toast('Reset failed: '+e.message);}}
@@ -1207,10 +1251,10 @@ async function jumpToSearchResult(item){
 })();
 window.addEventListener('hashchange',()=>activateView(location.hash.slice(1),{updateHash:false}));
 $('#model-check-button')?.addEventListener('click',checkModelConnection);
-$('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await nativeFetch(API_BASE+'/api/auth/forgot-password',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await nativeFetch(API_BASE+'/api/auth/recover',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value,...(state.signupVerificationToken?{verificationToken:state.signupVerificationToken}:{})}:{email:$('#auth-email').value,password:$('#auth-password').value};if(mode==='register'){payload.attestationProof=await signupAttestation(payload.email);if(state.appleSignupProof)payload.appleSignupProof=state.appleSignupProof;}const response=await nativeFetch(API_BASE+endpoint,{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(body.verificationRequired){state.signupVerificationToken=null;$('#auth-error').textContent='';$('#auth-copy').textContent=body.error;$('#auth-submit').disabled=body.verificationSent===true;return;}if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.signupVerificationToken=null;state.appleSignupProof=null;if(body.sessionToken)setNativeToken(body.sessionToken);if(body.recoveryCodes)showCodes(body.recoveryCodes);if(mode==='register')state.justRegistered=true;await connect();}catch(error){$('#auth-error').textContent=error.message;}});
+$('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await nativeFetch(API_BASE+'/api/auth/forgot-password',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await nativeFetch(API_BASE+'/api/auth/recover',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value,...(state.signupVerificationToken?{verificationToken:state.signupVerificationToken}:{})}:{email:$('#auth-email').value,password:$('#auth-password').value};if(mode==='register'){payload.attestationProof=await signupAttestation(payload.email);if(state.appleSignupProof)payload.appleSignupProof=state.appleSignupProof;}const response=await nativeFetch(API_BASE+endpoint,{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(body.verificationRequired){state.signupVerificationToken=null;$('#auth-error').textContent='';$('#auth-copy').textContent=body.error;$('#auth-submit').disabled=body.verificationSent===true;return;}if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.signupVerificationToken=null;state.appleSignupProof=null;if(body.sessionToken)setNativeToken(body.sessionToken);if(body.recoveryCodes)showCodes(body.recoveryCodes);if(mode==='register')state.justRegistered=true;await connectionRecovery.wake();}catch(error){$('#auth-error').textContent=error.message;}});
 $('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-register').addEventListener('click',()=>setAuthMode('register'));$('#show-recover').addEventListener('click',()=>setAuthMode('recover'));$('#show-forgot')?.addEventListener('click',()=>setAuthMode('forgot'));
 $('#hero-signin')?.addEventListener('click',()=>{const d=$('#auth-dialog');if(d&&!d.open)d.showModal();});
-$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;if(body.sessionToken)setNativeToken(body.sessionToken);await connect();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
+$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;if(body.sessionToken)setNativeToken(body.sessionToken);await connectionRecovery.wake();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{try{clearGeoAsked(safeStorage());}catch(_){}try{await api('/api/auth/logout',{method:'POST'});}catch(_){}setNativeToken(null);location.reload();});
@@ -1234,7 +1278,7 @@ $('#delete-account-button')?.addEventListener('click',async()=>{
 const CHAT_QUEUE_KEY='orbit-chat-queue';
 function loadChatQueue(){try{const q=JSON.parse(localStorage.getItem(CHAT_QUEUE_KEY));return Array.isArray(q)?q:[];}catch(_){return[];}}
 function saveChatQueue(queue){try{localStorage.setItem(CHAT_QUEUE_KEY,JSON.stringify(queue));}catch(_){}}
-function isNetworkError(error){return !navigator.onLine||/failed to fetch|load failed|network error|networkerror/i.test(String(error&&error.message||''));}
+function isNetworkError(error){return isTransportError(error,IS_NATIVE,navigator.onLine);}
 function markQueued(el){if(!el||el.classList.contains('queued'))return;el.classList.add('queued');const note=document.createElement('span');note.className='queued-note';note.textContent='queued — will send when online';el.append(note);}
 function queueOfflineMessage(text,element){const queue=loadChatQueue();const entry={id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,queuedAt:new Date().toISOString()};queue.push(entry);saveChatQueue(queue);markQueued(element||appendOptimisticMessage(text));}
 let flushingQueue=false;
@@ -1243,13 +1287,13 @@ async function flushChatQueue(){
   try{
     let queue=loadChatQueue();
     while(queue.length){
-      if(!navigator.onLine)break; // still offline — stop, keep the rest queued
+      if(!canAttemptNetwork(IS_NATIVE,navigator.onLine))break; // web is still offline
       const entry=queue[0];
       try{
         const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:entry.text,conversationId:entry.conversationId||activeConversationId})});
         pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now());
       }catch(error){
-        if(isNetworkError(error))break; // connection dropped mid-flush — retry later
+        if(error.auth||isNetworkError(error))break; // keep the message until the session or connection recovers
         if(isPaywallError(error))showInlinePaywall(); // daily limit: inline nudge, never a generic toast
         else toast(`A queued message failed: ${error.message}`); // non-network error — drop this one
       }
@@ -1258,8 +1302,6 @@ async function flushChatQueue(){
     await refresh().catch(()=>{});
   }finally{flushingQueue=false;}
 }
-window.addEventListener('online',()=>{flushChatQueue().catch(()=>{});});
-
 // --- D1: image attachments ---
 // The composer attach button (file picker incl. iPhone camera roll via
 // accept="image/*"), clipboard paste, and drag-drop onto the composer all
@@ -1449,7 +1491,7 @@ async function x4ShareScreen(){
 async function postChatMessage(text,attachmentIds=[]){
   const message=String(text||'').trim();
   if(!message&&!attachmentIds.length)throw new Error('Nothing to send.');
-  if(!navigator.onLine)throw Object.assign(new Error('offline'),{offline:true});
+  if(!canAttemptNetwork(IS_NATIVE,navigator.onLine))throw Object.assign(new Error('offline'),{offline:true});
   const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message,attachmentIds,conversationId:activeConversationId})});
   const conversationId=sent.conversationId||activeConversationId;
   pendingFor(conversationId).set(sent.id,Date.now());
@@ -1749,7 +1791,7 @@ async function sendChatMessage(text){
   const shareCmd=parseShareConversationCommand(message);
   if(shareCmd){releaseSend();handleShareConversationCommand(shareCmd);return;}
   try{
-  if(!navigator.onLine){
+  if(!canAttemptNetwork(IS_NATIVE,navigator.onLine)){
     // The offline text queue can't carry staged images — keep the thumbnails
     // so the user can send once they're back online.
     if(attachmentIds.length)toast('Attachments need a connection — they’ll stay ready to send.');
@@ -2363,10 +2405,28 @@ if('serviceWorker'in navigator){let reloading=false;navigator.serviceWorker.addE
 }// PWA: launch fade + offline indicator
 (function(){
   const banner=document.getElementById('offline-banner');
-  const sync=()=>{if(banner)banner.classList.toggle('hidden',navigator.onLine);};
+  const sync=()=>{if(banner)banner.classList.toggle('hidden',canAttemptNetwork(IS_NATIVE,navigator.onLine));};
   window.addEventListener('online',sync);window.addEventListener('offline',sync);sync();
 })();
-connect();setInterval(()=>{if(state.user&&!document.hidden)refresh().catch(()=>{});},15000);
+const connectionRecovery=createConnectionRecovery(connect,{visible:()=>!document.hidden});
+function refreshConnection(){
+  if(!connectionEstablished){connectionRecovery.wake();return;}
+  refresh().then(()=>{
+    if(loadChatQueue().length)flushChatQueue().catch(()=>{});
+  }).catch((error)=>{
+    if(connectionEstablished){
+      connectionEstablished=false;
+      reportConnectionIssue(error);
+      connectionRecovery.wake();
+    }
+  });
+}
+window.addEventListener('online',refreshConnection);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshConnection();});
+window.addEventListener('pagehide',()=>connectionRecovery.stop());
+window.addEventListener('pageshow',(event)=>{if(event.persisted)refreshConnection();});
+connectionRecovery.attempt();
+setInterval(()=>{if(!document.hidden&&connectionEstablished)refreshConnection();},15000);
 
 // Password reset via email link (?token= on /reset-password)
 (function initPasswordReset(){
@@ -2432,7 +2492,7 @@ async function appleSignIn(purpose){
     const result=await signupPost('/api/auth/apple/complete',{...credentials,nonce:challenge.nonce,purpose,password});
     if(purpose==='signup'){state.appleSignupProof=result.appleSignupProof;setAuthMode('register');$('#auth-email').value=result.email;$('#auth-password').required=false;$('#auth-copy').textContent='Apple verified your email. Enter your name to finish creating your account. A password is optional; recovery codes will be provided.';return;}
     if(purpose==='link'){if(state.user?.id===linkUserId){state.status={...state.status,appleLinked:true};renderSignupSafety();}toast('Apple linked. Your password still works.');return;}
-    state.user=result.user;state.csrf=result.csrf;if(result.sessionToken)setNativeToken(result.sessionToken);await connect();
+    state.user=result.user;state.csrf=result.csrf;if(result.sessionToken)setNativeToken(result.sessionToken);await connectionRecovery.wake();
   }finally{if(purpose==='link'){state.appleLinkPending=false;$('#apple-link-password').value='';renderSignupSafety();}}
 }
 function renderSignupSafety(){
