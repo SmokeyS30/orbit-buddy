@@ -570,6 +570,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
+      (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     getReportSubmission: db.prepare('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?'),
     countRecentReports: db.prepare('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?'),
@@ -740,7 +742,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setBuddyName: db.prepare('UPDATE user_preferences SET buddy_name=?, updated_at=? WHERE user_id=?'),
     getConversationSummary: db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?'),
     upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
-      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
+      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at
+      WHERE excluded.message_count>conversation_summaries.message_count`),
     countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
     countUserMessages: db.prepare("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'"),
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
@@ -1069,6 +1072,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
+    listConversationMessagesThrough(userId,conversationId,messageId,limit=60){return s.listConversationMessagesThrough.all(userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200)).reverse();},
     // Chat hot path: keep the SQLite and PostgreSQL adapters on one contract.
     // PostgreSQL resolves these independent reads concurrently inside its
     // worker, collapsing several blocking worker/database round trips into one.
@@ -1078,6 +1082,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const settings=Object.fromEntries(keys.map((key)=>[key,s.setting.get(key)?.value??null]));
       return{
         conversation:s.getConversation.get(conversationId,userId)||null,
+        messageCount:s.countConversationMessages.get(conversationId,userId).count,
         history:historyLimit>0?s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(historyLimit,1),200)).reverse():[],
         preferences,
         summary:s.getConversationSummary.get(conversationId,userId)||null,

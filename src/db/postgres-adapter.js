@@ -636,13 +636,18 @@ const indexMigrations = [
     async listConversationMessages(userId, conversationId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
+    async listConversationMessagesThrough(userId, conversationId, messageId, limit=60) {
+      return (await all(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND (created_at,id)<=
+        (SELECT created_at,id FROM messages WHERE id=? AND user_id=? AND conversation_id=?)
+        ORDER BY created_at DESC,id DESC LIMIT ?`,userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200))).reverse();
+    },
     // Chat hot path: one worker crossing, with independent PostgreSQL reads in
     // flight together. The synchronous wrapper otherwise serializes every
     // method call and blocks the Node event loop for each database round trip.
     async getChatReplyContext(userId, conversationId, historyLimit=24) {
       const limit = Math.min(Math.max(historyLimit, 1), 200);
       const keys = [`buddy_name_asked_${userId}`, `ambient_context_${userId}`, `ambient_asked_${userId}`];
-      let [conversation, history, preferences, summary, settingRows] = await Promise.all([
+      let [conversation, history, preferences, summary, settingRows, countRow] = await Promise.all([
         get('SELECT * FROM conversations WHERE id=? AND user_id=?', conversationId, userId),
         historyLimit > 0
           ? all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, limit)
@@ -650,6 +655,7 @@ const indexMigrations = [
         get('SELECT * FROM user_preferences WHERE user_id=?', userId),
         get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId),
         all(`SELECT key,value FROM settings WHERE key IN (${keys.map(() => '?').join(',')})`, ...keys),
+        get('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?', conversationId, userId),
       ]);
       if (!preferences) {
         const createdAt = timestamp();
@@ -660,6 +666,7 @@ const indexMigrations = [
       for (const row of settingRows) settings[row.key] = row.value;
       return {
         conversation: conversation || null,
+        messageCount: Number(countRow?.count || 0),
         history: history.reverse(),
         preferences,
         summary: summary || null,
@@ -1390,7 +1397,8 @@ const indexMigrations = [
     getConversationSummary: async (userId, conversationId) => (await get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId)) || null,
     async setConversationSummary(userId, conversationId, summary, messageCount) {
       await run(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
-        VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`,
+        VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at
+        WHERE excluded.message_count>conversation_summaries.message_count`,
         conversationId, userId, summary, messageCount, timestamp());
       return get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId);
     },

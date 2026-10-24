@@ -36,11 +36,33 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
   });
 
   let workerExitCode = null;
+  let closed = false;
+  const pendingAsync = new Map();
+  function rejectPending(error) {
+    for (const pending of pendingAsync.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    pendingAsync.clear();
+  }
+  worker.on('message', ({ id, json }) => {
+    if (!pendingAsync.has(id)) return; // readiness handshake or timed-out call
+    const pending = pendingAsync.get(id);
+    pendingAsync.delete(id);
+    clearTimeout(pending.timeout);
+    try {
+      const msg = JSON.parse(json);
+      if (!msg.ok) throw new Error(msg.error.message);
+      pending.resolve(msg.result);
+    } catch (error) { pending.reject(error); }
+  });
   worker.on('error', (err) => {
     console.error('PG worker error:', err);
+    rejectPending(new Error('PG worker failed during an asynchronous query.'));
   });
   worker.on('exit', (code) => {
     workerExitCode = code;
+    rejectPending(new Error('PG worker exited during an asynchronous query.'));
     // Wake the main thread if it's waiting for readiness.
     Atomics.notify(sharedArray, READY_OFFSET / 4, 1);
     if (code !== 0 && Atomics.load(sharedArray, READY_OFFSET / 4) === 0) {
@@ -72,17 +94,36 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
   }
 
   let nextId = 1;
+  const asyncMethods = new Proxy({}, {
+    get(_target, method) {
+      if (typeof method !== 'string' || method === 'then') return undefined;
+      return (...args) => new Promise((resolve, reject) => {
+        if (closed || workerExitCode !== null) return reject(new Error('PG worker is closed.'));
+        const id = nextId++;
+        const timeout = setTimeout(() => {
+          pendingAsync.delete(id);
+          reject(new Error(`PG query timeout: ${method}`));
+        }, QUERY_TIMEOUT_MS);
+        timeout.unref();
+        pendingAsync.set(id, { resolve, reject, timeout });
+        try { worker.postMessage({ id, method, args, async: true }); }
+        catch (error) { clearTimeout(timeout); pendingAsync.delete(id); reject(error); }
+      });
+    }
+  });
 
-  return new Proxy({ driver: 'postgres' }, {
+  return new Proxy({ driver: 'postgres', async: asyncMethods }, {
     get(target, method) {
       if (method === 'close') {
-        return () => { worker.terminate(); };
+        return () => { closed = true; rejectPending(new Error('PG worker closed.')); worker.terminate(); };
       }
       // Expose the driver identifier as a plain property, not a DB method.
       if (method === 'driver') return target.driver;
+      if (method === 'async') return target.async;
       if (typeof method !== 'string') return undefined;
 
       return (...args) => {
+        if (closed || workerExitCode !== null) throw new Error('PG worker is closed.');
         const id = nextId++;
         Atomics.store(sharedArray, FLAG_OFFSET / 4, 0);
         worker.postMessage({ id, method, args });

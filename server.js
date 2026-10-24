@@ -626,6 +626,7 @@ export function createOrbitServer(options={}) {
 
   let workerBusy=false;
   const chatQueues=new Map();
+  const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
   function enqueueChatReply(conversationId,job){
     const queuedAt=performance.now();
@@ -672,14 +673,15 @@ export function createOrbitServer(options={}) {
     let databaseMs=0,contextMs=null,modelFirstTokenMs=null,modelCompletionMs=0,modelStartedAt=null;
     let replyFailed=false,modelFallback=false;
     const timedDb=(read)=>{const at=performance.now();try{return read();}finally{databaseMs+=performance.now()-at;}};
+    const timedDbAsync=async(read)=>{const at=performance.now();try{return await read();}finally{databaseMs+=performance.now()-at;}};
     const timedModel=async(call)=>{
       const at=performance.now();
       if(modelStartedAt===null){modelStartedAt=at;contextMs=at-startedAt;}
       try{return await call();}finally{modelCompletionMs+=performance.now()-at;}
     };
-    // The PostgreSQL sync adapter otherwise blocks the main thread once per
-    // read. Load the independent history/preferences/summary/settings reads in
-    // one worker call so the model can start sooner without dropping context.
+    // Capture the turn's ordered history before yielding to other requests.
+    // The later independent context reads can use the asynchronous PG worker
+    // without letting a subsequent send enter this turn's conversation history.
     const replyContext=timedDb(()=>db.getChatReplyContext(userId,conversation.id,historyOverride?0:24));
     if(!replyContext.conversation){chatMetrics.record({queueMs,databaseMs,contextMs:performance.now()-startedAt,completionMs:queueMs+performance.now()-startedAt,error:true});return null;}
     // Membership is resolved from the server-side, Apple-verified entitlement.
@@ -700,9 +702,17 @@ export function createOrbitServer(options={}) {
     let answer=null;
     const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
     try{
-      const baseHistory=historyOverride||replyContext.history;
-      const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
-      const preferences=replyContext.preferences;const summary=replyContext.summary;
+      // A summary covers messages before its final 12. Until a newer summary
+      // lands, include the uncovered interval so a queued reply cannot lose
+      // older context. Cap the temporary expansion at 48 messages to keep
+      // model input and token spending bounded while the summary is pending.
+      const covered=replyContext.summary?Math.max(0,Number(replyContext.summary.message_count)-12):0;
+      const historyLimit=Math.min(48,Math.max(24,replyContext.messageCount-covered));
+      const baseHistory=historyOverride||(historyLimit>24||replyContext.history.at(-1)?.id!==userMsg.id
+        ?timedDb(()=>db.listConversationMessagesThrough(userId,conversation.id,userMsg.id,historyLimit))
+        :replyContext.history);
+      const history=sanitizeAssistantMessages(baseHistory.filter((m)=>m.id!==userMsg.id));
+      const preferences=replyContext.preferences;const summary=historyOverride?null:replyContext.summary;
       const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
       let needsBuddyName=false;
       if(!customBuddyName){
@@ -820,7 +830,9 @@ export function createOrbitServer(options={}) {
       // Memory + optional planning reads are independent. PostgreSQL executes
       // them concurrently behind one worker crossing; SQLite keeps identical
       // results locally. Episodic last-mentioned stamps remain intact.
-      const modelContext=timedDb(()=>db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8}));
+      const modelContext=await timedDbAsync(()=>db.async
+        ?db.async.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8})
+        :db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8}));
       const recalledMemories=modelContext.memories;
       const openCommitments=modelContext.followUps;
       const activeGoals=modelContext.goals;
@@ -838,7 +850,8 @@ export function createOrbitServer(options={}) {
       // receives the same data shape when the reads do run.
       if(!isDemoUser(user)&&!shouldDeferProactiveSurfacing({recalledMemories,message})){
         try{
-          const proactiveContext=timedDb(()=>db.getChatProactiveContext(userId));
+          const proactiveContext=await timedDbAsync(()=>db.async
+            ?db.async.getChatProactiveContext(userId):db.getChatProactiveContext(userId));
           const surfacedRows=proactiveContext.surfacedRows;
           // Memory connections (2026-10-16): unified chooser — date triggers
           // first (time-sensitive), then memory patterns / emotional
@@ -923,7 +936,7 @@ export function createOrbitServer(options={}) {
     chatMetrics.record({queueMs,databaseMs,contextMs:contextMs??performance.now()-startedAt,modelFirstTokenMs,
       modelCompletionMs:modelStartedAt===null?null:modelCompletionMs,completionMs:queueMs+performance.now()-startedAt,
       error:replyFailed,modelFallback});
-    await maybeRefreshConversationSummary(user,conversation);
+    queueSummaryRefresh(user,conversation);
     if(isCorrectionMessage(message)){
       // Learn from the correction without blocking: figure out what was wrong and save the fix
       setImmediate(async()=>{
@@ -1055,6 +1068,13 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     const transcript=older.map((entry)=>`${entry.role==='user'?'User':'Orbit'}: ${entry.content}`).join('\n').slice(-24000);
     const prompt=`Summarize the earlier part of this conversation for future continuity. Preserve decisions, open questions, goals, preferences, names, dates, and commitments. Do not add facts or advice. Use concise plain text.\n\n${existing?.summary?`Previous summary:\n${existing.summary}\n\n`:''}Conversation:\n${transcript}`;
     try{const preferences=db.getPreferences(userId);const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:prompt,memories:[],history:[],userTimeZone:preferences.time_zone,taskMode:true});db.setConversationSummary(userId,conversation.id,text,messageCount);db.addEvent(userId,'conversation_summarized',`Refreshed context for “${conversation.title}”.`);}catch(error){db.addEvent(userId,'conversation_summary_failed',`Could not refresh context for “${conversation.title}”.`,error.message);}
+  }
+  function queueSummaryRefresh(user,conversation){
+    if(!model.configured||summaryJobs.has(conversation.id))return;
+    const job=Promise.resolve().then(()=>maybeRefreshConversationSummary(user,conversation))
+      .catch((error)=>console.error('conversation summary failed',error&&error.message))
+      .finally(()=>{if(summaryJobs.get(conversation.id)===job)summaryJobs.delete(conversation.id);});
+    summaryJobs.set(conversation.id,job);
   }
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
