@@ -49,14 +49,14 @@ test('claim returns its own attempt even if another worker reclaims before the c
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
   const user=app.db.createUser({email:'claim@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
-  const claim=app.db.claimTask.bind(app.db);
+  const claim=app.db.claimDueTask.bind(app.db);
   let newerAttempt;
-  app.db.claimTask=(userId,id)=>{
-    const oldAttempt=claim(userId,id,-1000);
+  app.db.claimDueTask=(userId,id)=>{
+    const oldClaim=claim(userId,id,-1000);
     assert.equal(app.db.recoverStaleTasks(),1);
-    newerAttempt=claim(userId,id);
-    assert.ok(newerAttempt>oldAttempt);
-    return oldAttempt;
+    newerAttempt=claim(userId,id).attempt_count;
+    assert.ok(newerAttempt>oldClaim.attempt_count);
+    return oldClaim;
   };
   let notifications=0;app.push.notify=async()=>{notifications++;};
   await app.runDueTasks();
@@ -64,6 +64,65 @@ test('claim returns its own attempt even if another worker reclaims before the c
   assert.equal(notifications,0);
   assert.equal(app.db.getTask(user.id,task.id).attempt_count,newerAttempt);
   assert.equal(app.db.getTask(user.id,task.id).status,'running');
+});
+
+test('a due-task batch skips work rescheduled while an earlier task runs',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-stale-batch-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  let releaseFirst,entered;
+  const firstStarted=new Promise(resolve=>{entered=resolve;});
+  const firstGate=new Promise(resolve=>{releaseFirst=resolve;});
+  const messages=[];
+  model.respond=async({message})=>{
+    messages.push(message);
+    if(messages.length===1){entered();await firstGate;}
+    return{text:'Synthetic result',toolCalls:[]};
+  };
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  t.after(async()=>{releaseFirst();await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'stale-batch@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  app.db.addTask(user.id,{title:'First',prompt:'First prompt'});
+  const second=app.db.addTask(user.id,{title:'Second',prompt:'Old second prompt'});
+  app.push.notify=async()=>({sent:0,failed:0});
+  const run=app.runDueTasks();
+  await firstStarted;
+  const future=new Date(Date.now()+60_000).toISOString();
+  app.db.updateTask(user.id,second.id,{prompt:'Future second prompt',scheduleAt:future});
+  releaseFirst();await run;
+  assert.deepEqual(messages,['First prompt'],'a stale batch must not start the newly future task');
+  const current=app.db.getTask(user.id,second.id);
+  assert.equal(current.schedule_at,future);
+  assert.equal(current.result,null);
+  assert.notEqual(current.status,'running');
+});
+
+test('a due-task batch executes the freshly edited row rather than its old prompt and recurrence',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-fresh-row-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  let releaseFirst,entered;
+  const firstStarted=new Promise(resolve=>{entered=resolve;});
+  const firstGate=new Promise(resolve=>{releaseFirst=resolve;});
+  const messages=[];
+  model.respond=async({message})=>{
+    messages.push(message);
+    if(messages.length===1){entered();await firstGate;}
+    return{text:'Synthetic result',toolCalls:[]};
+  };
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  t.after(async()=>{releaseFirst();await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'fresh-row@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  app.db.addTask(user.id,{title:'First',prompt:'First prompt'});
+  const second=app.db.addTask(user.id,{title:'Second',prompt:'Old second prompt'});
+  app.push.notify=async()=>({sent:0,failed:0});
+  const run=app.runDueTasks();
+  await firstStarted;
+  app.db.updateTask(user.id,second.id,{title:'Edited second',prompt:'Current second prompt',
+    scheduleAt:new Date(Date.now()-1000).toISOString(),recurrence:'daily'});
+  releaseFirst();await run;
+  assert.deepEqual(messages,['First prompt','Current second prompt']);
+  const current=app.db.getTask(user.id,second.id);
+  assert.equal(current.status,'scheduled','current daily recurrence controls the next run');
+  assert.ok(new Date(current.schedule_at).valueOf()>Date.now());
 });
 
 test('editing a running task invalidates its prompt and schedule snapshot',t=>{
