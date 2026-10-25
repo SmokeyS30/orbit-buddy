@@ -18,6 +18,16 @@ const session = (db, userId, tokenHash) => db.createSession({
   tokenHash, userId, csrfToken: 'synthetic', expiresAt: expiry(), userAgent: 'synthetic',
 });
 
+async function waitForNoPgSessions(admin, databaseName) {
+  const deadline = Date.now() + 2000;
+  for (;;) {
+    const active = await admin.query('SELECT pid FROM pg_stat_activity WHERE datname=$1', [databaseName]);
+    if (active.rowCount === 0) return;
+    assert.ok(Date.now() < deadline, `temporary database ${databaseName} still has open sessions`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 test('SQLite migrates old push tables without breaking positional writers; bindings follow the current session', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-push-ownership-'));
   const file = path.join(directory, 'orbit.sqlite');
@@ -195,7 +205,10 @@ test('PostgreSQL migrates old schema twice and serializes concurrent device owne
     assert.equal((await dbA.listApnsTokens(apnsWinner.id)).length, 0);
   } finally {
     await dbA?.close(); await dbB?.close();
-    if (created) await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
+    if (created) {
+      await waitForNoPgSessions(admin, name);
+      await admin.query(`DROP DATABASE ${name}`);
+    }
     await admin.end();
   }
 });
