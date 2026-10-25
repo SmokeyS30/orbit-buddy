@@ -1025,10 +1025,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const row=s.getPwResetToken.get(hash,timestamp());
-        if(!row || !s.userById.get(row.user_id) || s.userById.get(row.user_id).disabled) { db.exec('ROLLBACK');return false; }
+        const user=row&&s.userById.get(row.user_id);
+        if(!user || user.disabled) { db.exec('ROLLBACK');return false; }
         if(!s.usePwResetToken.run(hash).changes) { db.exec('ROLLBACK');return false; }
-        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),row.user_id);
+        const now=timestamp();
+        s.updatePassword.run(passwordHash,passwordSalt,now,row.user_id);
         s.deleteUserSessions.run(row.user_id);
+        // A mailbox reset supersedes all previously issued offline recovery codes.
+        s.clearRecovery.run(row.user_id);
+        if(!user.email_verified_at){
+          // A prior registrant may have claimed this address without proving it.
+          // Remove alternate access and notification channels they could retain.
+          s.markUserEmailVerified.run(now,now,row.user_id);
+          db.prepare('DELETE FROM auth_identities WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM oauth_states WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM whatsapp_links WHERE user_id=?').run(row.user_id);
+          db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${row.user_id}:%`);
+          db.prepare('DELETE FROM push_subscriptions WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM apns_device_tokens WHERE user_id=?').run(row.user_id);
+          if(user.role==='owner')db.prepare('DELETE FROM door_tokens').run();
+        }
         db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(row.user_id);
         db.exec('COMMIT');return true;
       } catch(error) { db.exec('ROLLBACK');throw error; }

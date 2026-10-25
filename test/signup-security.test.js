@@ -214,6 +214,53 @@ test('failed owner reset delivery invalidates its token and uses configured orig
   assert.equal(app.db.getPasswordResetToken(hashToken(url.searchParams.get('token'))),undefined);
 });
 
+test('email reset reclaims an unverified pre-registered account and revokes its alternate sign-in proofs',async t=>{
+  const sent=[];
+  const {app,request}=await fixture(t,{SIGNUP_RISK_MODE:'enforce',PUBLIC_BASE_URL:'https://test.orbit.example'},
+    {sendEmail:async(_env,message)=>{sent.push(message);return true;}});
+  const email='claimed@example.com';
+  const registered=await request('/api/auth/register',{email,displayName:'Pre-registered',password});
+  assert.equal(registered.status,201);
+  assert.equal(app.db.getUserByEmail(email).email_verified_at,null);
+  const userId=registered.body.user.id;
+  const oldCode=registered.body.recoveryCodes[0];
+  app.db.linkAuthIdentity('apple','pre-registration-subject',userId);
+  app.db.linkWhatsApp(userId,'+15555550001');
+  app.db.setSetting('whatsapp_link_code_123456',`${userId}:${new Date(Date.now()+60_000).toISOString()}`);
+  app.db.savePush(userId,{endpoint:'https://push.example.test/pre-registered',keys:{p256dh:'key',auth:'auth'}});
+  app.db.saveApnsToken(userId,'synthetic-pre-registration-token');
+  assert.equal((await request('/api/auth/forgot-password',{email})).status,200);
+  const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
+  assert.equal((await request('/api/auth/reset-password',{
+    token:resetUrl.searchParams.get('token'),newPassword:'new owner password 123',
+  })).status,200);
+  assert.equal((await request('/api/auth/recover',{
+    email,recoveryCode:oldCode,newPassword:'attacker replacement 123',
+  })).status,401);
+  assert.ok(app.db.getUserById(userId).email_verified_at,'mailbox owner has proved email ownership');
+  assert.equal(app.db.getAuthIdentity('apple','pre-registration-subject'),undefined);
+  assert.equal(app.db.getWhatsAppLink(userId),null);
+  assert.equal(app.db.getSetting('whatsapp_link_code_123456'),null);
+  assert.equal(app.db.listPush(userId).length,0);
+  assert.equal(app.db.listApnsTokens(userId).length,0);
+  assert.equal((await request('/api/auth/login',{email,password:'new owner password 123'})).status,200);
+});
+
+test('email reclaim of an unverified owner invalidates pending door actions',async t=>{
+  const sent=[];
+  const {app,request,owner}=await fixture(t,{PUBLIC_BASE_URL:'https://test.orbit.example'},
+    {sendEmail:async(_env,message)=>{sent.push(message);return true;}});
+  const expiry=new Date(Date.now()+60_000).toISOString();
+  app.db.addDoorToken('synthetic-door-token',expiry);
+  await request('/api/auth/forgot-password',{email:'owner@example.com'});
+  const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
+  assert.equal((await request('/api/auth/reset-password',{
+    token:resetUrl.searchParams.get('token'),newPassword:'new owner password 123',
+  })).status,200);
+  assert.equal(app.db.consumeDoorToken('synthetic-door-token'),undefined);
+  assert.ok(app.db.getUserById(owner.body.user.id).email_verified_at);
+});
+
 test('pause activated after approval password hashing still prevents account creation and keeps request pending',async t=>{
   const {app,request,owner}=await fixture(t);
   const queued=await request('/api/registration-request',{email:'race@example.com',name:'Race'});
