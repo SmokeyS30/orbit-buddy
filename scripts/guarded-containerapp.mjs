@@ -7,7 +7,6 @@ import { deployHeld, openHeld } from './guarded-cutover.mjs';
 
 const execFileAsync = promisify(execFile);
 const resource = ['-g', 'orbit-buddy-rg', '-n', 'orbit-buddy'];
-const imageFor = sha => `ghcr.io/smokeys30/orbit-buddy:${sha}`;
 
 export function azureArgs(operation, value) {
   if (operation === 'show') return ['containerapp', 'show', ...resource,
