@@ -7,19 +7,22 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
-import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { stageAttachment, takeAttachment, peekAttachment, pruneAttachments, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { reserveMediaBytes } from './src/media-memory.js';
+import { EphemeralReplyPayloads } from './src/ephemeral-reply-payloads.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
-import { writeAutomatedBackup } from './src/backups.js';
+import { writeAutomatedBackup, cleanupDeletedUserBackups } from './src/backups.js';
+import { clientIpForRateLimit } from './src/client-ip.js';
 import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
@@ -442,11 +445,11 @@ function sanitizeAssistantMessages(messages){return messages.map((message)=>mess
 // W3: conversation share/export — clean markdown for a whole thread:
 // title, roles with timestamps, code blocks preserved, no internal
 // metadata (model markers stripped, ids/sessions omitted).
-function renderConversationMarkdown(conversation,messages,buddyName,timeZone){
+function renderConversationMarkdown(conversation,messages,buddyName,timeZone,includeHeader=true){
   const title=String(conversation.title||'Conversation').trim()||'Conversation';
   const tz=timeZone||'America/New_York';
   const stamp=(iso)=>{try{return new Intl.DateTimeFormat('en-US',{dateStyle:'medium',timeStyle:'short',timeZone:tz}).format(new Date(iso));}catch(_){return String(iso||'');}};
-  const lines=[`# ${title}`,'',`Exported from Orbit on ${stamp(new Date().toISOString())}`,''];
+  const lines=includeHeader?[`# ${title}`,'',`Exported from Orbit on ${stamp(new Date().toISOString())}`,'']:[];
   for(const m of messages||[]){
     const role=m.role==='assistant'?(buddyName||'Orbit'):'You';
     const body=m.role==='assistant'?stripModelMarkers(m.content):String(m.content||'');
@@ -523,10 +526,11 @@ export function createOrbitServer(options={}) {
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=options.modelClient||createModelClient(env);
+  const verifyAccountPassword=options.passwordVerifier||verifyPassword;
   const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
-  const subscriptions=createSubscriptionService(env,db);
+  const subscriptions=createSubscriptionService(env,db,options.subscriptionDependencies);
   const connectors=createConnectorService(env,db,encryptionKey);
   const transactionalEmail=options.sendEmail||sendResendEmail;
   const transactionalEmailConfigured=Boolean(options.sendEmail)||emailConfigured(env);
@@ -575,20 +579,7 @@ export function createOrbitServer(options={}) {
 
   const requestLog=new Map();
   function getClientIp(req){
-    // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
-    // Take the leftmost (original client) IP, validate format to prevent header injection.
-    const cfIp=req.headers['cf-connecting-ip'];
-    if(cfIp){
-      const ip=String(cfIp).trim();
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
-    }
-    const fwd=req.headers['x-forwarded-for'];
-    if(fwd){
-      const ip=String(fwd).split(',')[0].trim();
-      // Basic IPv4/IPv6 validation
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
-    }
-    return req.socket.remoteAddress||'unknown';
+    return clientIpForRateLimit(req,{trustIngress:production});
   }
   function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
@@ -622,13 +613,28 @@ export function createOrbitServer(options={}) {
   function sessionUser(req){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(!token)return null;return db.getSession(hashToken(token));}
   function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled&&!session.moderation_blocked)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
+  function saveAuthenticatedPushRegistration(save){
+    try{return save();}
+    catch(error){
+      if(error?.message==='Push registration requires an active session.')
+        throw Object.assign(new Error('Sign in again before enabling push notifications.'),{status:401});
+      throw error;
+    }
+  }
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
-  function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
+  function createSession(user,req,res,{passwordProof=false,identitySubject=null}={}){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();const record={tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)};const created=passwordProof?db.createPasswordSessionIfCurrent({...record,expectedPasswordHash:user.password_hash,expectedPasswordSalt:user.password_salt}):identitySubject?db.createAppleSessionIfCurrent({...record,identitySubject}):db.createSession(record);if(created===false)return null;res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
   const activeReplyJobs=new Map();
-  const ephemeralReplyPayloads=new Map();
+  const ephemeralReplyPayloads=new EphemeralReplyPayloads();
+  const EPHEMERAL_REPLY_TTL_MS=30*60_000;
+  function dropEphemeralReplyPayload(jobId){
+    ephemeralReplyPayloads.drop(jobId);
+  }
+  function pruneEphemeralReplyPayloads(nowMs=Date.now()){
+    ephemeralReplyPayloads.prune(activeReplyJobs,nowMs,EPHEMERAL_REPLY_TTL_MS);
+  }
   let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
   const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
@@ -639,6 +645,9 @@ export function createOrbitServer(options={}) {
     setImmediate(()=>{replyPumpScheduled=false;pumpReplyJobs();});
   }
   function pumpReplyJobs(){
+    pruneEphemeralReplyPayloads();
+    pruneAttachments();
+    pruneWhatsAppMedia();
     if(closing)return Promise.resolve();
     if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
     replyPumpRunning=true;
@@ -663,7 +672,7 @@ export function createOrbitServer(options={}) {
             console.error('chat job failed',job.id,error&&error.message);
           }).finally(()=>{
             activeReplyJobs.delete(job.id);
-            ephemeralReplyPayloads.delete(job.id);
+            dropEphemeralReplyPayload(job.id);
             scheduleReplyPump();
           });
           activeReplyJobs.set(job.id,task);
@@ -1006,7 +1015,7 @@ export function createOrbitServer(options={}) {
       const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,regenerated:replyJob?.kind==='regenerate',model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
         onTurn:onStreamTurn,onToken:onStreamToken,assertActive:assertReplyLease}));
       await assertReplyLease();
@@ -1114,30 +1123,58 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     if(workerBusy||paused())return;workerBusy=true;
     try{
       db.recoverStaleTasks();
-      for(const task of db.dueTasks()){
-        if(!db.startTask(task.user_id,task.id))continue;
-        db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
+      for(const candidate of db.dueTasks()){
+        if(paused())break;
+        const task=db.claimDueTask(candidate.user_id,candidate.id);
+        if(!task)continue;
+        const attempt=task.attempt_count;
+        let leaseAlive=true;
+        const assertTaskActive=()=>{
+          if(paused()){
+            try{db.releaseClaimedTask(task.user_id,task.id,attempt);}finally{leaseAlive=false;}
+          }
+          if(!leaseAlive||!db.activeTaskClaim(task.user_id,task.id,attempt)){
+            leaseAlive=false;
+            throw Object.assign(new Error('Task claim is no longer active.'),{code:'REPLY_LEASE_LOST'});
+          }
+        };
+        const canDeliver=()=>!paused()&&db.deliverableTask(task.user_id,task.id,attempt);
+        const heartbeat=setInterval(()=>{
+          try{if(!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
+          catch{leaseAlive=false;}
+        },30_000);
+        heartbeat.unref();
         try{
+          assertTaskActive();
+          db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
           // Strip stale "check the calendar first / suppress if absent" clauses from old reminder prompts.
           // Tasks run without tool access, so these conditions can never be satisfied and only cause hedging.
           taskMessage=taskMessage.replace(/\s*check (?:today'?s|the) calendar first[^.]*\./gi,'').replace(/\s*suppress (?:this reminder )?if[^.]*\./gi,'').trim();
           if(/^\[nudge\]\s*morning briefing/i.test(task.title||'')){
-            try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
+            assertTaskActive();
+            try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone,{assertActive:assertTaskActive});if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
-          const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+          assertTaskActive();
+          const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
+          if(paused()){
+            db.releaseClaimedTask(task.user_id,task.id,attempt);
+            continue;
+          }
           const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);
-          db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
+          if(!leaseAlive||!db.completeClaimedTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
+          if(!canDeliver())continue;
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
           // Delivery channel: WhatsApp replaces push when the 24h window is open;
           // outside the window (or on send failure) fall back to push — a reminder
           // is never silently dropped.
-          if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
-          await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-          await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+          const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
+          if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+          if(!whatsappSent&&canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+        }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
+        finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}
   }
@@ -1155,25 +1192,62 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     const link = db.getWhatsAppLink(userId);
     try {
       await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: text });
-      db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');
-      return true;
     } catch (error) {
       console.error('whatsapp proactive send failed', error && error.message);
-      db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));
-      return false; // fall back to push below
+      if(canStartMoreProactiveDelivery(userId)){
+        const rejected=Number(error?.status)>=400&&Number(error?.status)<500;
+        try{db.addEvent(userId, rejected?'whatsapp_send_failed':'whatsapp_send_uncertain', rejected?'Could not send proactive WhatsApp message.':'WhatsApp send outcome is unknown; no second channel was attempted.', String(error && error.message || error).slice(0, 200));}catch{}
+      }
+      // A timeout or provider 5xx can follow acceptance. Sending push too may
+      // duplicate a private message, so fall back only on confirmed rejection.
+      return Number(error?.status)>=400&&Number(error?.status)<500?false:true;
     }
+    // A provider-accepted send must never fall through to a second channel
+    // just because local event logging failed afterward.
+    if(canStartMoreProactiveDelivery(userId)){
+      try{db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');}catch{}
+    }
+    return true;
   }
-  async function deliverProactive(user,text,eventType,eventMessage){
+  function proactiveActionAllowed(userId){
+    assertProactiveWorkerLease();
+    const current=db.getUserById(userId);
+    return !paused()&&Boolean(current&&!current.disabled&&!current.moderation_blocked);
+  }
+  function assertProactiveAction(userId){
+    if(!proactiveActionAllowed(userId))throw Object.assign(new Error('Proactive action deferred.'),{code:'PROACTIVE_DEFERRED'});
+  }
+  function isProactiveStop(error){return error?.code==='PROACTIVE_DEFERRED'||error?.code==='PROACTIVE_LEASE_LOST';}
+  async function proactiveRespond(user,options){
+    assertProactiveAction(user.id);
+    const result=await model.respond({...options,assertActive:()=>assertProactiveAction(user.id)});
+    assertProactiveAction(user.id);
+    return result;
+  }
+  function canStartMoreProactiveDelivery(userId){
+    try{return proactiveActionAllowed(userId);}catch(error){if(error.code==='PROACTIVE_LEASE_LOST')return false;throw error;}
+  }
+  async function deliverProactive(user,text,eventType,eventMessage,slot=null){
+    if(!proactiveActionAllowed(user.id))return false;
     const conversation=db.ensureDefaultConversation(user.id);
+    if(!proactiveActionAllowed(user.id))return false;
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
-    if(await tryWhatsAppProactive(user.id,text))return;
+    if(slot){db.commitProactiveSlot(user.id,slot.date,slot.token);slot.onRecorded?.();}
+    // The message is durable here. Provider failures must not refund its slot.
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
+    if(await tryWhatsAppProactive(user.id,text))return {recorded:true};
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
     // W4: notification tap deep-linking — the check-in lives in this conversation,
     // so carry its id in the push payload; the SW routes the tap straight to it.
-    await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
-    await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
+    try{await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id},()=>canStartMoreProactiveDelivery(user.id));}
+    catch(error){console.error('proactive web push outcome unknown',error?.code||error?.name||'error');return {recorded:true};}
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
+    try{await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id},()=>canStartMoreProactiveDelivery(user.id));}
+    catch(error){console.error('proactive APNs push failed',error?.code||error?.name||'error');}
+    return {recorded:true};
   }
   // WhatsApp delivery for a completed scheduled task: only when the 24h window
   // is open. Outside the window (or if sending fails) we fall back to push so
@@ -1181,24 +1255,32 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   // conversation so the web app keeps a record.
   async function tryWhatsAppTaskResult(task, result) {
     if (!tryWhatsAppDeliveryGate(task.user_id)) return false;
+    const link = db.getWhatsAppLink(task.user_id);
     try {
-      const link = db.getWhatsAppLink(task.user_id);
       await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: result });
+    } catch (error) {
+      console.error('whatsapp task delivery failed', error && error.message);
+      const rejected=Number(error?.status)>=400&&Number(error?.status)<500;
+      if(tryWhatsAppDeliveryGate(task.user_id)){
+        try{db.addEvent(task.user_id,rejected?'whatsapp_send_failed':'whatsapp_send_uncertain',rejected?'Could not send WhatsApp task result.':'WhatsApp task send outcome is unknown; no second channel was attempted.',String(error && error.message || error).slice(0,200));}catch{}
+      }
+      return !rejected;
+    }
+    // Twilio accepted the send. A later local database error must not cause
+    // fallback through web push or APNs and duplicate the task result.
+    try{
+      if(!tryWhatsAppDeliveryGate(task.user_id))return true;
       const conversation = db.ensureDefaultConversation(task.user_id);
       db.addMessage(task.user_id, conversation.id, 'assistant', result);
       db.touchConversation(task.user_id, conversation.id);
       db.addEvent(task.user_id, 'task_delivered_whatsapp', `Delivered task result via WhatsApp: “${task.title}”.`);
-      return true;
-    } catch (error) {
-      console.error('whatsapp task delivery failed', error && error.message);
-      db.addEvent(task.user_id, 'whatsapp_send_failed', 'Could not send WhatsApp task result.', String(error && error.message || error).slice(0, 200));
-      return false; // fall back to push
-    }
+    }catch(error){console.error('whatsapp task receipt recording failed',error?.code||error?.name||'error');}
+    return true;
   }
   function tryWhatsAppDeliveryGate(userId) {
     if (!whatsappConfigured(env)) return false;
     const owner = db.getUserById(userId);
-    if (!owner || owner.role !== 'owner') return false; // WhatsApp linking is owner-only
+    if (!owner || owner.role !== 'owner' || owner.disabled || owner.moderation_blocked || paused()) return false; // WhatsApp linking is owner-only
     const link = db.getWhatsAppLink(userId);
     return Boolean(link?.phone_e164) && isWindowOpen(link.last_inbound_at);
   }
@@ -1223,41 +1305,60 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       const today=todayInZone(preferences.time_zone,nowMs);
       for(const followUp of db.dueFollowUps(user.id,today)){
-        if(!db.claimProactiveSlot(user.id,today))break;
+        const token=db.reserveProactiveSlot(user.id,today);if(!token)break;
         const prompt=`Write a short, warm check-in message (1-2 sentences, plain text, no greeting header) asking how "${followUp.description}" went. Sound like a caring friend dropping by, not a notification. Do not mention that this is automated.`;
         try{
-          const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-          await deliverProactive(user,text,'followup_sent',`Checked in about “${followUp.description}”.`);
-          db.completeFollowUp(user.id,followUp.id);
-        }catch(error){db.failFollowUp(user.id,followUp.id,error.message);db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'followup_failed',`Could not check in about “${followUp.description}”.`,error.message);}
+          assertProactiveAction(user.id);
+          const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:()=>assertProactiveAction(user.id)});
+          assertProactiveAction(user.id);
+          const outcome=await deliverProactive(user,text,'followup_sent',`Checked in about “${followUp.description}”.`,{date:today,token,onRecorded:()=>db.completeFollowUp(user.id,followUp.id)});
+          if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,token);
+        }catch(error){
+          const released=db.releaseProactiveSlot(user.id,today,token);
+          if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+          if(error.code==='PROACTIVE_DEFERRED')continue;
+          if(released&&proactiveActionAllowed(user.id)){db.failFollowUp(user.id,followUp.id,error.message);db.addEvent(user.id,'followup_failed',`Could not check in about “${followUp.description}”.`,error.message);}
+        }
       }
     }
   }
   async function runRoutines(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
       const local=localDateTimeParts(preferences.time_zone,nowMs);
       for(const routine of dueRoutines(db.listRoutines(user.id),preferences.time_zone,nowMs)){
-        if(!db.claimProactiveSlot(user.id,local.date))break;
-        if(!db.claimRoutine(user.id,routine.id,local.date)){db.releaseProactiveSlot(user.id,local.date);continue;}
+        const token=db.reserveProactiveSlot(user.id,local.date);if(!token)break;
+        if(!db.claimRoutine(user.id,routine.id,local.date)){db.releaseProactiveSlot(user.id,local.date,token);continue;}
         try{
-          const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone):'';
+          assertProactiveAction(user.id);
+          const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone,{assertActive:()=>assertProactiveAction(user.id)}):'';
           const prompt=buildRoutinePrompt({routine,timeZone:preferences.time_zone,agenda,goals:db.listGoals(user.id),tasks:db.listTasks(user.id),followUps:db.listFollowUps(user.id),nowMs});
-          const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-          await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`);
-          db.completeRoutine(user.id,routine.id,local.date);
-          try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
-        }catch(error){db.failRoutine(user.id,routine.id,local.date,error.message);db.releaseProactiveSlot(user.id,local.date);db.addEvent(user.id,'routine_failed',`Could not run routine “${routine.title}”.`,error.message);}
+          const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:()=>assertProactiveAction(user.id)});
+          assertProactiveAction(user.id);
+          const outcome=await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`,{date:local.date,token,onRecorded:()=>{
+            db.completeRoutine(user.id,routine.id,local.date);
+            try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
+          }});
+          if(!outcome.recorded)db.releaseProactiveSlot(user.id,local.date,token);
+        }catch(error){
+          const released=db.releaseProactiveSlot(user.id,local.date,token);
+          if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+          if(error.code==='PROACTIVE_DEFERRED')continue; // existing routine lease expires; no new write under a paused account
+          if(released&&proactiveActionAllowed(user.id)){db.failRoutine(user.id,routine.id,local.date,error.message);db.addEvent(user.id,'routine_failed',`Could not run routine “${routine.title}”.`,error.message);}
+        }
       }
     }
   }
   async function runLearningCycle(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       const timeZone=preferences.time_zone||'America/New_York';
       const learningMemories=()=>db.listMemories(user.id).filter(isProactiveMemoryAllowed);
@@ -1267,10 +1368,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       if(lastLearned&&lastLearned.slice(0,10)===today)continue;
 
       // Memory decay: fade relevance of unused memories (runs once daily per user)
-      try{db.applyMemoryDecay(user.id);}catch(e){}
+      try{db.applyMemoryDecay(user.id);}catch(e){if(isProactiveStop(e))throw e;}
       // Memory v2 backstop: auto-save suggestions past the review window even for
       // quiet users (runs once daily per user alongside decay).
-      try{const n=db.autoApproveMemorySuggestions(user.id,MEMORY_AUTO_SAVE_MINUTES);if(n>0)db.addEvent(user.id,'memory_added',`Auto-saved ${n} suggested ${n===1?'memory':'memories'} after the review window.`);}catch(e){}
+      try{const n=db.autoApproveMemorySuggestions(user.id,MEMORY_AUTO_SAVE_MINUTES);if(n>0)db.addEvent(user.id,'memory_added',`Auto-saved ${n} suggested ${n===1?'memory':'memories'} after the review window.`);}catch(e){if(isProactiveStop(e))throw e;}
       // Get recent messages (last 24h, up to 40)
       const messages=db.listMessages(user.id,40);
       const cutoff=nowMs-24*3600_000;
@@ -1294,7 +1395,7 @@ Respond with a JSON array of insights. Each insight: {"type":"preference"|"habit
 Only include genuine insights, not obvious restatements. Max 5 insights. If nothing meaningful, respond with [].`;
 
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         // Parse JSON array from response
         const jsonMatch=text.match(/\[[\s\S]*\]/);
         if(!jsonMatch)continue;
@@ -1322,8 +1423,9 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
         db.setSetting(`last_learning_${user.id}`,new Date(nowMs).toISOString());
         if(saved>0)db.addEvent(user.id,'auto_learned',`Learned ${saved} new insight${saved>1?'s':''} about the user.`);
         // Track people mentioned in recent conversation for gentle nudges later
-        try{for(const name of extractPersonNames(convoText))db.trackPersonMention(user.id,name);}catch(e){}
+        try{for(const name of extractPersonNames(convoText))db.trackPersonMention(user.id,name);}catch(e){if(isProactiveStop(e))throw e;}
       }catch(error){
+        if(isProactiveStop(error))throw error;
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
 
@@ -1347,7 +1449,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
           }
           if(rhythmsAdded>0)db.addEvent(user.id,'ambient_rhythm',`Noticed ${rhythmsAdded} chat rhythm${rhythmsAdded>1?'s':''}.`);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
 
       // --- D4 passive rhythm detection: conversation starts and task
       // creations clustered by (day-of-week × time bucket). Same permission
@@ -1355,7 +1457,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       // any suggestion/nudge/briefing code path.
       try{
         applyActivityRhythmDetection(db,user,{nowMs,timeZone});
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect activity rhythms.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Could not detect activity rhythms.',error.message);}
 
       // --- Monthly deep dive: mine full history for long arcs ---
       try{
@@ -1377,7 +1479,7 @@ Look for:
 
 Respond with a JSON array, max 10. Each: {"type":"theme"|"evolution"|"goal"|"passion","content":"one clear sentence","confidence":0.6-0.9}
 Only include genuine insights. If nothing meaningful, respond with [].`;
-            const { text: deepText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: deepText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const dm=deepText.match(/\[[\s\S]*\]/);
             if(dm){
               const insights=JSON.parse(dm[0]);
@@ -1404,7 +1506,7 @@ ${memText}
 Examples: "says not a morning person but most productive before 9am", "says they hate planning but always feel better after organizing".
 
 Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what their behavior shows","gentleFraming":"how to lightly mention this, warmly"}. Only include genuine, well-supported contradictions. If none, respond with [].`;
-              const { text: contraText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: contraText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const cm2=contraText.match(/\[[\s\S]*\]/);
               if(cm2){
                 let contraSaved=0;
@@ -1418,11 +1520,11 @@ Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what
                 }
                 if(contraSaved>0)db.addEvent(user.id,'auto_learned',`Noticed ${contraSaved} gentle contradiction${contraSaved>1?'s':''}.`);
               }
-            }catch(e){}
+            }catch(e){if(isProactiveStop(e))throw e;}
           }
           db.setSetting(`deep_mining_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
 
       // --- Monthly: motivational profiling — what approach works best? ---
       try{
@@ -1452,7 +1554,7 @@ Recent user messages (note their style — questions? data? short? emotional?):
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough-love"|"calm"|"unknown","evidence":"one sentence on why"}. Use "unknown" if there isn't enough signal.`;
-            const { text: motText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: motText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const mm=motText.match(/\{[\s\S]*\}/);
             if(mm){
               const parsed=JSON.parse(mm[0]);
@@ -1463,7 +1565,7 @@ Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough
           }
           db.setSetting(`motivation_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
 
       // --- Monthly: energy mapping — what energizes vs drains them? ---
       try{
@@ -1481,7 +1583,7 @@ Recent messages:
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":"observed behavior"}],"drainers":[{"activity":"what","evidence":"observed behavior"}]}, max 3 each. If there is no real signal, respond with {"energizers":[],"drainers":[]}.`;
-            const { text: energyText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: energyText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const em2=energyText.match(/\{[\s\S]*\}/);
             if(em2){
               const parsed=JSON.parse(em2[0]);
@@ -1495,7 +1597,7 @@ Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":
                 const existing=db.listRelevantMemories(user.id,content,3);
                 if(!existing.some((m)=>String(m.source||'')==='auto-energy')){
                   db.addMemory(user.id,content,{kind:'fact',source:'auto-energy',confidence:0.55});
-                  try{const prof=db.getEmotionalProfile(user.id);db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){}
+                  try{const prof=db.getEmotionalProfile(user.id);db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){if(isProactiveStop(e2))throw e2;}
                   db.addEvent(user.id,'auto_learned','Mapped what energizes vs drains them.');
                 }
               }
@@ -1503,7 +1605,7 @@ Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":
           }
           db.setSetting(`energy_map_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Energy mapping failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Energy mapping failed.',error.message);}
 
       // --- Monthly: support style — what helps when they're struggling? ---
       try{
@@ -1532,7 +1634,7 @@ Support styles:
 - "space": backing off, keeping it brief
 
 Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"questions"|"humor"|"space"|"unknown","confidence":0.0-1.0,"evidence":"one sentence on why"}. Use "unknown" if the signal is weak or mixed.`;
-            const { text: supText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: supText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const sm=supText.match(/\{[\s\S]*\}/);
             if(sm){
               const parsed=JSON.parse(sm[0]);
@@ -1543,7 +1645,7 @@ Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"
           }
           db.setSetting(`support_style_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Support style learning failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Support style learning failed.',error.message);}
 
       // --- Monthly: memory consolidation — merge, prune, strengthen ---
       try{
@@ -1563,7 +1665,7 @@ Identify:
 
 Respond with a single JSON object: {"merge":[[id_prefix1, id_prefix2, "merged content"]],"remove":[id_prefix],"strengthen":[{id: id_prefix, content: "strengthened content"}]}
 Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs changing, respond with {"merge":[],"remove":[],"strengthen":[]}.`;
-            const { text: conText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: conText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm3=conText.match(/\{[\s\S]*\}/);
             if(cm3){
               const ops=JSON.parse(cm3[0]);
@@ -1597,7 +1699,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
           }
           db.setSetting(`consolidation_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Memory consolidation failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Memory consolidation failed.',error.message);}
 
       // --- Weekly: curiosity gaps, pattern detection, relationship depth ---
       try{
@@ -1612,14 +1714,14 @@ Memories:
 ${memSample||'(none yet)'}
 
 Respond with a JSON array, max 3: {"question":"the natural question you'd ask","context":"why knowing this matters","priority":1-3}`;
-            const { text: curText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: curText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm=curText.match(/\[[\s\S]*\]/);
             if(cm){
               for(const gap of (Array.isArray(JSON.parse(cm[0]))?JSON.parse(cm[0]):[]).slice(0,3)){
                 db.addCuriosityGap(user.id,gap);
               }
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 2. Pattern detection: when is the user active?
           try{
@@ -1630,7 +1732,7 @@ Respond with a JSON array, max 3: {"question":"the natural question you'd ask","
               if(existing.some((m)=>(m.source||'')==='auto-pattern'&&m.content.toLowerCase().includes(p.label.toLowerCase().slice(0,20))))continue;
               db.addMemory(user.id,content,{kind:'fact',source:'auto-pattern',confidence:0.6});
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 3. Relationship depth: enrich context for recently-mentioned people
           try{
@@ -1644,14 +1746,14 @@ Recent mentions:
 ${mentions}
 
 Respond with a single JSON object: {"summary":"one sentence on who this person is to the user and what's going on","sentiment":"positive"|"neutral"|"mixed"}`;
-              const { text: relText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: relText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const rm=relText.match(/\{[\s\S]*\}/);
               if(rm){
                 const parsed=JSON.parse(rm[0]);
                 if(parsed.summary&&typeof parsed.summary==='string')db.updatePersonContext(user.id,name,parsed.summary,parsed.sentiment);
               }
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 4. Predictive insights: what does this user likely need?
           try{
@@ -1674,7 +1776,7 @@ ${behaviorParts.join('\n\n')}
 Examples of good predictions: "tends to slow down on Thursday afternoons — lighter check-ins then", "often abandons goals after 3 weeks — extra encouragement around week 3", "most creative late at night — suggest capturing ideas then".
 
 Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence":0.4-0.8,"suggestedAction":"what Orbit should do about it"}`;
-                const { text: predText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: predText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const pm=predText.match(/\[[\s\S]*\]/);
                 if(pm){
                   let predSaved=0;
@@ -1692,7 +1794,7 @@ Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence
               }
               db.setSetting(`predictions_last_${user.id}`,weekKey);
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 5. Emotional baseline: how have they been feeling this week?
           try{
@@ -1708,7 +1810,7 @@ Recent conversation:
 ${convoSample}
 
 Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"low","confidence":0.0-1.0,"notableShifts":"brief description of any significant change from their usual, or empty string"}. Only claim a tone if the evidence is reasonable; when unsure, use "steady".`;
-                const { text: emoText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: emoText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const em=emoText.match(/\{[\s\S]*\}/);
                 if(em){
                   const parsed=JSON.parse(em[0]);
@@ -1735,11 +1837,11 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
               }
               db.setSetting(`emotion_baseline_last_${user.id}`,weekKey);
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           db.setSetting(`deep_learning_last_${user.id}`,weekKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
     }
   }
 
@@ -1751,21 +1853,27 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
     const row=db.getImportJob(userId,id);
     if(!row||row.status!=='processing')return;
     try{
+      if(!db.isImportJobActive(userId,id))throw new Error('Import stopped before starting.');
       const extracted=extractMessages(parsed);
       if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
       const chunks=chunkMessages(extracted.messages,20);
       if(!chunks.length)throw new Error('Nothing substantial to learn from in this export.');
-      // Cap chunks to bound cost on huge exports
-      const work=chunks.slice(0,60);
-      db.updateImportJob(userId,id,{total_chunks:work.length});
+      // Each user can start at most three imports a day; bound one import's
+      // model work too, even when the uploaded export is very large.
+      const work=chunks.slice(0,20);
+      if(!db.updateImportJobIfCurrent(userId,id,{total_chunks:work.length}))throw new Error('Import stopped before starting model work.');
       const prefs=db.getPreferences(userId);
       const timeZone=prefs.time_zone||'America/New_York';
       const user=db.getUserById(userId);
       let added=0;
       for(let i=0;i<work.length;i++){
+        const currentUser=db.getUserById(userId);
+        if(paused()||!currentUser||currentUser.disabled||isDemoUser(currentUser))throw new Error('Import stopped because AI work is paused or this account is unavailable.');
+        if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw Object.assign(new Error('Import job is no longer authorized.'),{code:'REPLY_LEASE_LOST'});},
             message:`Extract durable facts about this user from these past AI conversations.
 
 Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
@@ -1775,6 +1883,8 @@ ${convoText}
 
 Respond with a JSON array of insights, max 6: [{"content":"brief clear fact","kind":"fact"|"preference"|"goal"|"relationship"|"decision","confidence":0.0-1.0}]
 Only include what's clearly supported — skip one-off questions, transient topics, and anything uncertain. If nothing durable, respond with [].`});
+          const activeUser=db.getUserById(userId);
+          if(paused()||!activeUser||activeUser.disabled||isDemoUser(activeUser)||db.getImportJob(userId,id)?.status!=='processing')throw new Error('Import stopped before applying this model result.');
           const jm=text.match(/\[[\s\S]*\]/);
           if(jm){
             const insights=JSON.parse(jm[0]);
@@ -1787,24 +1897,29 @@ Only include what's clearly supported — skip one-off questions, transient topi
                 if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 const sug=db.listMemorySuggestions(userId);
                 if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
-                db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
+                if(!db.addImportSuggestionIfCurrent(userId,id,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))}))throw new Error('Import stopped before saving a suggestion.');
                 added++;
               }
             }
           }
-        }catch(e){/* one bad chunk shouldn't kill the job */}
-        db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
+        }catch(e){
+          const latestUser=db.getUserById(userId);
+          if(paused()||!latestUser||latestUser.disabled||isDemoUser(latestUser))throw e;
+          // One malformed or failed chunk should not discard the whole import.
+        }
+        if(!db.updateImportJobIfCurrent(userId,id,{done_chunks:i+1,suggestions_added:added}))throw new Error('Import stopped before recording progress.');
       }
-      db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
+      if(!db.updateImportJobIfCurrent(userId,id,{status:'done',suggestions_added:added}))throw new Error('Import stopped before completion.');
       db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
-      db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+      if(db.updateImportJobIfCurrent(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)},true)&&db.getUserById(userId))
+        db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -1827,7 +1942,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
       // Meeting prep: check for upcoming events in the next 90 minutes
       let meetingCandidate=null;
       try{
-        const {events}=await getEventsForRange(db,user.id,nowMs,nowMs+90*60_000,timeZone);
+        const {events}=await getEventsForRange(db,user.id,nowMs,nowMs+90*60_000,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
         const genericTitle=/^(lunch|break|focus|focus time|ooo|out of office|busy|personal|dentist|appointment)$/i;
         for(const e of events){
           if(e.allDay)continue;
@@ -1845,7 +1960,8 @@ Only include what's clearly supported — skip one-off questions, transient topi
       // Friendly check-ins only run in narrow, predictable local windows.
       // Meeting prep may still run outside them when an actual event is near.
       if(!checkinWindow&&!meetingCandidate)continue;
-      if(!db.claimProactiveSlot(user.id,today))continue;
+      if(!proactiveActionAllowed(user.id))continue;
+      const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
 
       // Let the AI decide: is now a good time? What kind of check-in?
       const meetingLine=meetingCandidate?`- "MEETING_PREP" if "${meetingCandidate.title}" starting at ${new Date(meetingCandidate.startMs).toLocaleTimeString('en-US',{timeZone,hour:'numeric',minute:'2-digit'})} could use a prep briefing (only if prep would genuinely help — skip for routine/generic blocks)\n`:'';
@@ -1869,13 +1985,13 @@ ${windowLine}${meetingLine}- "SKIP" if now is not a good time for any proactive 
 Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
 
       try{
-        const { text: decision }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text: decision }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const decisionClean=decision.trim().toUpperCase();
 
         const expectedDecision={morning:'MORNING',afternoon:'CHECKIN',evening:'EVENING'}[checkinWindow]||null;
         const allowedDecision=decisionClean==='MEETING_PREP'?Boolean(meetingCandidate):decisionClean===expectedDecision;
         if(decisionClean==='SKIP'||!allowedDecision){
-          db.releaseProactiveSlot(user.id,today);
+          db.releaseProactiveSlot(user.id,today,slotToken);
           continue;
         }
 
@@ -1912,6 +2028,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Fetch real weather and calendar data so the briefing has actual details
           let weatherCtx='';
           try{
+            assertProactiveAction(user.id);
             const wxRes=await fetch('https://api.open-meteo.com/v1/forecast?latitude=41.76&longitude=-70.08&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=auto&forecast_days=1',{signal:AbortSignal.timeout(10000)});
             const wx=await wxRes.json();
             const cur=wx.current||{};
@@ -1924,7 +2041,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           }catch(e){weatherCtx='';}
           let calCtx='';
           try{
-            const agenda=await getBriefingAgenda(db,user.id,1,timeZone);
+            const agenda=await getBriefingAgenda(db,user.id,1,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
             if(agenda)calCtx=`Today's calendar:\n${agenda}`;
           }catch(e){calCtx='';}
           const contextParts=[];
@@ -2091,7 +2208,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
-            const agenda=await getBriefingAgenda(db,user.id,2,timeZone);
+            const agenda=await getBriefingAgenda(db,user.id,2,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
             if(agenda)tomorrowCtx=`\n\nCalendar data (today + tomorrow):\n${agenda}\nUse this for the tomorrow preview if anything is scheduled.`;
           }catch(e){}
           genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}${emoGuide}`;
@@ -2116,6 +2233,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(db.getConnector(user.id,'gmail')){
               const {searchEmails}=await import('./src/gmail.js');
               const q=mc.title.split(/\s+/).slice(0,4).join(' ');
+              assertProactiveAction(user.id);
               const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:q,max:3});
               if(res.emails?.length)emailCtx=`Recent related emails:\n${res.emails.map((e)=>`- From ${e.from}: "${e.subject}" (${e.snippet.slice(0,100)})`).join('\n')}`;
             }
@@ -2160,16 +2278,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}${emoGuide}`;
         }
 
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
-        db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
-        if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
-        if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
-        if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
-        if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`,{date:today,token:slotToken,onRecorded:()=>{
+          db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
+          db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
+          if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
+          if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
+          if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
+          if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
+        }});
+        if(!outcome.recorded){db.releaseProactiveSlot(user.id,today,slotToken);continue;}
       }catch(error){
-        db.releaseProactiveSlot(user.id,today);
+        db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code==='PROACTIVE_DEFERRED')continue;
         // Silent skip on rate limits — the worker retries in 5 min; don't pollute the Reliability tab
         if(error.classification==='rate_limit')return;
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
@@ -2179,22 +2301,28 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runQuietNudges(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
       const lastOutreach=db.getLastOutreachAt(user.id);if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<24*3600_000)continue;
-      const today=todayInZone(preferences.time_zone,nowMs);if(!db.claimProactiveSlot(user.id,today))continue;
+      const today=todayInZone(preferences.time_zone,nowMs);const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
       const prompt=`Write a short, warm check-in (1-2 sentences, plain text) for someone you have not heard from in a couple of days. Sound like a friend popping by, not a notification. You may gently reference something from their memories if one fits naturally; otherwise keep it simple. Do not mention that this is automated.`;
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-        db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.');
-      }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.',{date:today,token:slotToken,onRecorded:()=>db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString())});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
+      }catch(error){db.releaseProactiveSlot(user.id,today,slotToken);if(error.code==='PROACTIVE_LEASE_LOST')throw error;if(error.code!=='PROACTIVE_DEFERRED')db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
     }
   }
-  let proactiveBusy=false;
+  let proactiveBusy=false,proactiveLeaseToken=null,proactiveLeaseAlive=false;
+  function assertProactiveWorkerLease(){
+    if(proactiveBusy&&(!proactiveLeaseAlive||!proactiveLeaseToken||!db.isWorkerLeaseCurrent('proactive',proactiveLeaseToken)))
+      throw Object.assign(new Error('Proactive worker lease was lost.'),{code:'PROACTIVE_LEASE_LOST'});
+  }
   async function runWeeklyReview(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -2209,14 +2337,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(lastActive&&nowMs-lastActive<4*3600_000)continue;
 
       const today=todayInZone(timeZone,nowMs);
-      if(!db.claimProactiveSlot(user.id,today))continue;
+      const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
 
       const sinceISO=new Date(nowMs-7*24*3600_000).toISOString();
       const tasks=db.listTasksCompletedSince(user.id,sinceISO);
       const checkins=db.listGoalCheckinsSince(user.id,sinceISO);
       const memories=db.listMemoriesSince(user.id,sinceISO).filter((m)=>m.source!=='registration'); // L3: the registration-seeded name memory is onboarding scaffolding, not week activity
       const userMessages=db.listMessages(user.id,200).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
-      if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today);continue;}
+      if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today,slotToken);continue;}
 
       try{
         const parts=[];
@@ -2225,12 +2353,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(memories.length)parts.push(`New memories: ${memories.slice(0,8).map((m)=>m.content.slice(0,120)).join('; ')}`);
         parts.push(`Messages sent this week: ${userMessages.length}`);
         const prompt=`Write a warm weekly review for ${user.display_name||'the user'} (4-6 sentences, plain text). Celebrate their wins, note goal progress, observe one interesting pattern if you see one, and offer one concrete suggestion for next week. Sound like a caring friend, not a status report. Do not mention that this is automated.\n\nThis week's activity:\n${parts.join('\n')}`;
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`weekly_review_last_${user.id}`,weekKey);
-        await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.');
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.',{date:today,token:slotToken,onRecorded:()=>db.setSetting(`weekly_review_last_${user.id}`,weekKey)});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
       }catch(error){
-        db.releaseProactiveSlot(user.id,today);
-        db.addEvent(user.id,'weekly_review_failed','Could not send the weekly review.',error.message);
+        db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code!=='PROACTIVE_DEFERRED')db.addEvent(user.id,'weekly_review_failed','Could not send the weekly review.',error.message);
       }
     }
   }
@@ -2239,6 +2368,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
     for(const user of db.listUsers()){
       if(user.disabled||user.role!=='owner')continue;
+      if(!proactiveActionAllowed(user.id))continue;
       let gmailRow=null;
       try{gmailRow=db.getConnector(user.id,'gmail');}catch(e){}
       if(!gmailRow)continue;
@@ -2253,9 +2383,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(lastUserMsg&&nowMs-new Date(lastUserMsg).valueOf()<60*60_000)continue;
 
       const today=todayInZone(timeZone,nowMs);
+      let slotToken=null;
       try{
+        assertProactiveAction(user.id);
         const {searchEmails}=await import('./src/gmail.js');
         const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:'is:unread newer_than:2h',max:10});
+        assertProactiveAction(user.id);
         const candidates=(res.emails||[]).filter((e)=>{
           const from=String(e.from||'');
           const subj=String(e.subject||'');
@@ -2267,17 +2400,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
         // Let the AI decide if any are truly urgent
         const decidePrompt=`You are triaging unread emails from the last 2 hours for ${user.display_name||'the user'}. Be very conservative — only flag something as urgent if it's a direct question needing a timely reply, time-sensitive (deadline today/tomorrow), or from a real person about something important. Newsletters, promos, receipts, and FYIs are NOT urgent.\n\nEmails:\n${candidates.map((e,i)=>`${i+1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet.slice(0,150)}`).join('\n')}\n\nRespond with ONLY the number of the single most urgent email (e.g. "2"), or "NONE" if nothing is urgent enough to interrupt them.`;
-        const {text:decision}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const {text:decision}=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const pick=parseInt(decision.trim(),10);
         if(!Number.isInteger(pick)||pick<1||pick>candidates.length)continue;
         const urgent=candidates[pick-1];
 
-        if(!db.claimProactiveSlot(user.id,today))continue;
+        slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
         const genPrompt=`Write a brief heads-up (2 sentences, plain text) about an urgent email for ${user.display_name||'the user'}. Summarize what it's about and suggest one concrete action (e.g. reply, check the attachment). Sound natural, not alarming. Do not mention that this is automated.\n\nFrom: ${urgent.from}\nSubject: ${urgent.subject}\nPreview: ${urgent.snippet.slice(0,200)}`;
-        const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
+        const {text}=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`,{date:today,token:slotToken,onRecorded:()=>db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString())});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
       }catch(error){
+        if(slotToken)db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code==='PROACTIVE_DEFERRED')continue;
         // Silent skip on rate limits — the worker retries in 5 min
         if(error.classification==='rate_limit')return;
         // Distinct event for Gmail auth failures so Edward gets an actionable message
@@ -2295,6 +2431,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(db.getUserById(userId)?.role!=='owner')return '';
       if(!db.getConnector(userId,'gmail'))return '';
       const {searchEmails}=await import('./src/gmail.js');
+      assertProactiveAction(userId);
       const res=await searchEmails(()=>connectors.getValidToken(userId,'gmail'),{query:'is:unread newer_than:24h',max:10});
       const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
       const items=(res.emails||[]).filter((e)=>!NEWSLETTER_RE.test(String(e.from||''))&&!/unsubscribe/i.test(String(e.subject||'')));
@@ -2304,9 +2441,25 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(e){return '';}
   }
   async function runProactiveChecks(nowMs=Date.now()){
-    if(proactiveBusy||paused())return;proactiveBusy=true;
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
-    finally{proactiveBusy=false;}
+    if(proactiveBusy||paused())return;
+    const token=randomUUID();
+    try{if(!db.claimWorkerLease('proactive',token))return;}
+    catch(error){console.error('Proactive worker lease unavailable:',error?.code||error?.name||'error');return;}
+    proactiveBusy=true;proactiveLeaseToken=token;proactiveLeaseAlive=true;
+    const heartbeat=setInterval(()=>{
+      try{if(!db.renewWorkerLease('proactive',token))proactiveLeaseAlive=false;}
+      catch{proactiveLeaseAlive=false;}
+    },env.NODE_ENV==='test'&&Number.isInteger(options.proactiveHeartbeatMs)?Math.max(1,options.proactiveHeartbeatMs):30_000);
+    heartbeat.unref();
+    try{
+      for(const stage of [runFollowUps,runRoutines,runQuietNudges,runSmartCheckins,runEmailTriage,runWeeklyReview,runLearningCycle,runProjectRadar,runStudyCoaching,runProactiveMemory,runMemoryConnections]){
+        assertProactiveWorkerLease();
+        if(paused())break;
+        await stage(nowMs);
+      }
+    }
+    catch(error){console.error('Proactive worker stopped after an account or database change:',error?.code||error?.name||'error');}
+    finally{clearInterval(heartbeat);try{db.releaseWorkerLease('proactive',token);}catch{}proactiveBusy=false;proactiveLeaseToken=null;proactiveLeaseAlive=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
   // Polls at most every 30 minutes (see src/radar.js); high-signal findings
@@ -2315,13 +2468,16 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   // the rest of the proactive loop.
   async function runProjectRadar(nowMs){
     try{
-      const poll=await runRadarPoll({db,env,nowMs});
+      const poll=await runRadarPoll({db,env,nowMs,assertActive:()=>{
+        assertProactiveWorkerLease();
+        if(paused())throw Object.assign(new Error('Proactive action deferred.'),{code:'PROACTIVE_DEFERRED'});
+      }});
       if(poll.surfaced.length){
         await deliverRadarFindings({
           db,surfaced:poll.surfaced,nowMs,
           isQuiet:(prefs)=>isQuietHours(prefs,nowMs),
-          deliver:async({user,finding,text})=>{
-            await deliverProactive(user,text,'radar_checkin_sent',`Project radar: ${finding.title}`);
+          deliver:async({user,finding,text,slotToken,localDate})=>{
+            return deliverProactive(user,text,'radar_checkin_sent',`Project radar: ${finding.title}`,{date:localDate,token:slotToken});
           },
         });
       }
@@ -2337,18 +2493,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled||isDemoUser(user))continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
         const today=todayInZone(timeZone,nowMs);
         if(db.getSetting(`proactive_memory_pushed_${user.id}`)===today)continue;
         try{
+          let slotToken=null;
           const sent=await runProactiveMemoryPush({
-            db,model,user,timeZone,nowMs,
+            db,model:{respond:(options)=>proactiveRespond(user,options)},user,timeZone,nowMs,
             buddyName:buddyNameFor(user.id),
-            claimSlot:()=>db.claimProactiveSlot(user.id,today),
-            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage),
+            claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
+            deliver:(text,eventMessage,onRecorded)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage,{date:today,token:slotToken,onRecorded}),
           });
           if(sent>0)db.setSetting(`proactive_memory_pushed_${user.id}`,today);
         }catch(error){console.error('proactive memory user failed',user.id,error&&error.message);}
@@ -2365,18 +2523,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled||isDemoUser(user))continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
         const today=todayInZone(timeZone,nowMs);
         if(db.getSetting(`memory_connections_pushed_${user.id}`)===today)continue;
         try{
+          let slotToken=null;
           const sent=await runMemoryConnectionPush({
-            db,model,user,timeZone,nowMs,
+            db,model:{respond:(options)=>proactiveRespond(user,options)},user,timeZone,nowMs,
             buddyName:buddyNameFor(user.id),
-            claimSlot:()=>db.claimProactiveSlot(user.id,today),
-            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage),
+            claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
+            deliver:(text,eventMessage,onRecorded)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage,{date:today,token:slotToken,onRecorded}),
           });
           if(sent>0)db.setSetting(`memory_connections_pushed_${user.id}`,today);
         }catch(error){console.error('memory connections user failed',user.id,error&&error.message);}
@@ -2401,6 +2561,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled)continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2414,27 +2575,36 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(error){console.error('study coaching failed',error&&error.message);}
   }
   async function runStudyCoachingForUser(user,timeZone,today,nowMs){
+    async function sendStudyNudge(text,eventMessage,mark){
+      if(!proactiveActionAllowed(user.id))return false;
+      const token=db.reserveProactiveSlot(user.id,today);if(!token)return false;
+      try{
+        const outcome=await deliverProactive(user,text,'study_nudge_sent',eventMessage,{date:today,token,onRecorded:mark});
+        if(!outcome.recorded){db.releaseProactiveSlot(user.id,today,token);return false;}
+        return true;
+      }catch(error){db.releaseProactiveSlot(user.id,today,token);if(error.code==='PROACTIVE_LEASE_LOST')throw error;return false;}
+    }
     // At most one study nudge per pass; pre-session nudges take priority.
     let events=[];
     let feeds=[];
     try{
-      const range=await getEventsForRange(db,user.id,nowMs-2*3600_000,nowMs+7*86400_000,timeZone);
+      const range=await getEventsForRange(db,user.id,nowMs-2*3600_000,nowMs+7*86400_000,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
       events=range.events||[];
       feeds=range.feeds||[];
     }catch{events=[];feeds=[];}
+    if(!proactiveActionAllowed(user.id))return;
     const studyEvents=findStudyEvents(events);
     // 1. Pre-session nudge: study session starting within 45 minutes.
     const upcoming=studyEvents.find((e)=>e.startMs>nowMs&&e.startMs-nowMs<=45*60_000);
     if(upcoming){
       const key=`study_pre_${user.id}_${upcoming.startMs}`;
       if(db.getSetting(key)!==today){
-        if(!db.claimProactiveSlot(user.id,today))return;
         const mins=Math.max(1,Math.round((upcoming.startMs-nowMs)/60000));
         const exam=normalizeStudyExam(upcoming.title);
         const quizBit=exam?` Want a warm-up quiz? Just say "quiz me on ${exam}".`:'';
-        await deliverProactive(user,`Heads up: "${upcoming.title}" starts in about ${mins} min.${quizBit}`,'study_nudge_sent',`Pre-session study nudge for "${upcoming.title}".`);
-        db.setSetting(key,today);
-        db.setSetting(`study_nudged_${user.id}`,today);
+        await sendStudyNudge(`Heads up: "${upcoming.title}" starts in about ${mins} min.${quizBit}`,`Pre-session study nudge for "${upcoming.title}".`,()=>{
+          db.setSetting(key,today);db.setSetting(`study_nudged_${user.id}`,today);
+        });
         return;
       }
     }
@@ -2443,12 +2613,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(recent){
       const key=`study_post_${user.id}_${recent.startMs}`;
       if(db.getSetting(key)!==today){
-        if(!db.claimProactiveSlot(user.id,today))return;
         const exam=normalizeStudyExam(recent.title);
         const quizBit=exam?` Say "quiz me on ${exam}" for a quick review quiz to lock it in.`:' Want a quick review quiz to lock it in? Just say the word.';
-        await deliverProactive(user,`How did "${recent.title}" go?${quizBit}`,'study_nudge_sent',`Post-session study nudge for "${recent.title}".`);
-        db.setSetting(key,today);
-        db.setSetting(`study_nudged_${user.id}`,today);
+        await sendStudyNudge(`How did "${recent.title}" go?${quizBit}`,`Post-session study nudge for "${recent.title}".`,()=>{
+          db.setSetting(key,today);db.setSetting(`study_nudged_${user.id}`,today);
+        });
         return;
       }
     }
@@ -2460,11 +2629,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const lastSuggest=db.getSetting(`study_suggest_${user.id}`)||'';
       if(lastSuggest<studyDateMinus(7,today)){
         const slots=findFreeStudySlots(events,timeZone,today,nowMs,{days:7,minMinutes:60,maxSlots:3});
-        if(slots.length>=2&&db.claimProactiveSlot(user.id,today)){
+        if(slots.length>=2){
           const lines=slots.map((s)=>`• ${s.label}`).join('\n');
-          await deliverProactive(user,`I don't see any study time on your calendar for the next week. How about one of these?\n${lines}\nReply with one that works (or a time that suits you better) and I'll add it — I won't schedule anything without your yes.`,'study_nudge_sent','Suggested study slots from calendar gaps.');
-          db.setSetting(`study_suggest_${user.id}`,today);
-          db.setSetting(`study_nudged_${user.id}`,today);
+          await sendStudyNudge(`I don't see any study time on your calendar for the next week. How about one of these?\n${lines}\nReply with one that works (or a time that suits you better) and I'll add it — I won't schedule anything without your yes.`,'Suggested study slots from calendar gaps.',()=>{
+            db.setSetting(`study_suggest_${user.id}`,today);db.setSetting(`study_nudged_${user.id}`,today);
+          });
           return;
         }
         if(slots.length<2)db.setSetting(`study_suggest_${user.id}`,today); // no usable gaps: don't retry for a week
@@ -2476,10 +2645,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     const lastActive=getLastStudyActivity(db,user.id);
     const lastIdle=db.getSetting(`study_idle_${user.id}`)||'';
     if(lastActive&&nowMs-new Date(lastActive).valueOf()>=3*86400_000&&lastIdle<studyDateMinus(3,today)){
-      if(!db.claimProactiveSlot(user.id,today))return;
-      await deliverProactive(user,`It's been a few days since your last quiz — no pressure, but a quick warm-up keeps things fresh. Say "quiz me" and pick an exam whenever you feel like it.`,'study_nudge_sent','Idle study re-engagement nudge.');
-      db.setSetting(`study_idle_${user.id}`,today);
-      db.setSetting(`study_nudged_${user.id}`,today);
+      await sendStudyNudge(`It's been a few days since your last quiz — no pressure, but a quick warm-up keeps things fresh. Say "quiz me" and pick an exam whenever you feel like it.`,'Idle study re-engagement nudge.',()=>{
+        db.setSetting(`study_idle_${user.id}`,today);db.setSetting(`study_nudged_${user.id}`,today);
+      });
     }
   }
 
@@ -2504,10 +2672,15 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     return{configured:true,state,lastSuccess,lastError:lastError||null,fileCount,expectedFiles};
   }
   async function runBackups(){
-    if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;
-    const today=new Date().toISOString().slice(0,10);
-    try{if(db.getSetting('last_automatic_backup')===today)return;}catch(e){console.error('Backup check failed:',e.message);}
+    if(backupBusy)return;
     backupBusy=true;
+    try{
+      const cleanup=await cleanupDeletedUserBackups({db,dataDir,backupDir});
+      if(cleanup.failed)console.error('Backup cleanup remains pending for deleted accounts.');
+    }catch(error){console.error('Backup cleanup check failed:',error.message);}
+    if(!env.BACKUP_ENCRYPTION_KEY){backupBusy=false;return;}
+    const today=new Date().toISOString().slice(0,10);
+    try{if(db.getSetting('last_automatic_backup')===today){backupBusy=false;return;}}catch(e){console.error('Backup check failed:',e.message);}
     try{
       for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,backupDir,passphrase:env.BACKUP_ENCRYPTION_KEY});
       try{db.setSetting('last_automatic_backup',today);db.setSetting('last_backup_error','');}catch(e){console.error('Backup status update failed:',e.message);}
@@ -2585,7 +2758,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured,appleSignInReady:appleAuthReady(env),appleSignupReady:appleAuthReady(env)&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
+        const hasSignupBindingKey=!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
+        const emailVerificationReady=transactionalEmailConfigured&&hasSignupBindingKey;
+        const appleSignupReady=appleAuthReady(env)&&hasSignupBindingKey;
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'&&(emailVerificationReady||appleSignupReady),emailVerificationReady,appleSignInReady:appleAuthReady(env),appleSignupReady,appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
@@ -2649,31 +2825,31 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(owner){await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});await apns.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});}
         return json(res,201,{ok:true});
       }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
-        requireOwner(req);
-        const rows=db.listWaitlist();
-        return json(res,200,{ok:true,waitlist:rows});
-      }
-      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
-        requireOwner(req);
-        const id=url.pathname.split('/').pop();
-        const body=await readJson(req);
-        const status=String(body.status||'').trim();
-        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
-        db.updateWaitlistStatus(id,status);
-        return json(res,200,{ok:true});
-      }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        const body=await readJson(req);
-        const n=parseInt(body.invitesPerWeek,10);
-        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
-        db.setSetting('waitlist_invites_per_week',String(n));
-        return json(res,200,{ok:true,invitesPerWeek:n});
+      if(url.pathname==='/api/admin/waitlist'||url.pathname.startsWith('/api/admin/waitlist/')){
+        const admin=authenticate(req);
+        if(!admin)return json(res,401,{error:'Sign in first.'});
+        requireOwner(admin);
+        if(req.method==='POST')requireCsrf(req,admin);
+        res.setHeader('Cache-Control','no-store');
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist')return json(res,200,{ok:true,waitlist:db.listWaitlist()});
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings')
+          return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+        if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+          const body=await readJson(req);
+          const n=Number(body.invitesPerWeek);
+          if(!Number.isInteger(n)||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1–1000.'),{status:400});
+          db.setSetting('waitlist_invites_per_week',String(n));
+          return json(res,200,{ok:true,invitesPerWeek:n});
+        }
+        const row=url.pathname.match(/^\/api\/admin\/waitlist\/(wl_[A-Za-z0-9_-]{1,100})$/);
+        if(req.method==='POST'&&row){
+          const body=await readJson(req);
+          const status=String(body.status||'').trim();
+          if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+          if(!db.updateWaitlistStatus(row[1],status))return json(res,404,{error:'Waitlist entry not found.'});
+          return json(res,200,{ok:true});
+        }
+        return json(res,404,{error:'Waitlist route not found.'});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
@@ -2744,38 +2920,46 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(!verifyTwilioSignature({authToken:env.TWILIO_AUTH_TOKEN,url:webhookUrl,params,signature:req.headers['x-twilio-signature']})){
           return json(res,403,{error:'Invalid signature.'});
         }
+        const inboundSid=String(params.MessageSid||'').trim();
+        if(inboundSid.length>128)return json(res,400,{error:'Invalid message SID.'});
         const from=normalizePhone(params.From);
         const body=String(params.Body||'').trim();
         const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
         // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
-        if(/^\d{6}$/.test(body)){
-          const record=db.getSetting(`whatsapp_link_code_${body}`);
-          if(record){
-            const sep=record.indexOf(':'); // userId is a UUID (no colons); the ISO timestamp after it has colons
-            const linkUserId=record.slice(0,sep);
-            const expiresAt=record.slice(sep+1);
-            db.setSetting(`whatsapp_link_code_${body}`,''); // single-use
-            const linkUser=linkUserId?db.getUserById(linkUserId):null; // WhatsApp is owner-only: code must belong to the owner
-            if(linkUserId&&linkUser&&linkUser.role==='owner'&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
-              try{
-                db.linkWhatsApp(linkUserId,from);
-                db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
-                try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
-              }catch(e){
-                try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
-              }
-              return json(res,200,{ok:true});
-            }
+        const existingPhoneLink=from?db.getUserByWhatsApp(from):null;
+        if(/^\d{6}$/.test(body)&&(!existingPhoneLink||db.getSetting(`whatsapp_link_code_${body}`))){
+          if(inboundSid&&db.getWhatsAppInboundState(inboundSid))return json(res,200,{ok:true,deduped:true});
+          if(!from)return json(res,200,{ok:true,ignored:true});
+          if(!db.allowWhatsAppLinkAttempt(from))return json(res,429,{ok:false,linkRateLimited:true});
+          let linkUserId=null;
+          try{
+            linkUserId=db.consumeAndLinkWhatsApp(body,from,inboundSid);
+          }catch(e){
+            const phoneConflict=(e.code==='23505'&&String(e.constraint||'').includes('phone_e164'))||
+              /UNIQUE constraint failed: whatsapp_links\.phone_e164|duplicate key value violates unique constraint "whatsapp_links_phone_e164_key"/.test(String(e.message||''));
+            if(!phoneConflict)throw e;
+            try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
+            return json(res,200,{ok:true});
           }
+          if(linkUserId){
+            try{db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');}catch(e){console.error('whatsapp link event failed',e.message);}
+            try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
+            return json(res,200,{ok:true});
+          }
+          if(inboundSid&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
           // Code didn't match: fall through to normal message handling below.
         }
         const link=from?db.getUserByWhatsApp(from):null;
         if(!link)return json(res,200,{ok:true,ignored:true}); // unknown sender (or status callback): ignore
+        if(!inboundSid&&(body||Number(params.NumMedia||0)>0||params.Latitude||params.Longitude))
+          return json(res,400,{error:'Message SID is required.'});
         const waUserId=link.user_id;
         const waUser=db.getUserById(waUserId);
         if(!waUser||waUser.disabled===1||waUser.moderation_blocked===1)return json(res,200,{ok:true,ignored:true});
-        if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
-        if(paused())return json(res,200,{ok:true,paused:true});
+        if(inboundSid&&['accepted','failed'].includes(db.getWhatsAppInboundState(inboundSid)))
+          return json(res,200,{ok:true,deduped:true});
+        if(paused())return json(res,503,{ok:false,paused:true});
+        if(userRateLimited(waUserId,'whatsapp'))return json(res,429,{ok:false,rateLimited:true});
         db.setWhatsAppLastInbound(waUserId);
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
@@ -2786,8 +2970,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(sharedLocation){
           const locationMessage=formatLocationMessage(sharedLocation,body);
           const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
-            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-          ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
+            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid});
+          if(!accepted)return json(res,200,{ok:true,deduped:true});
+          ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:locationMessage,images:[],createdAt:Date.now()});
           scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
         }
@@ -2797,24 +2982,39 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Voice notes (audio/ogg): download, transcribe with Whisper, feed the
           // transcript into the normal pipeline. Audio is never stored.
           if(isAudioContentType(mediaContentType)&&mediaUrl){
+            const mediaClaim=db.claimWhatsAppInboundMedia(inboundSid);
+            if(mediaClaim.state==='busy')return json(res,503,{ok:false,retry:true});
+            if(mediaClaim.state!=='claimed')return json(res,200,{ok:true,deduped:true});
             let transcript=null;
+            let releaseUpload=null;
             try{
-              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+              releaseUpload=acquireAttachmentUpload(waUserId);
+              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl,messageSid:inboundSid});
               transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
             }catch(e){
               console.error('whatsapp voice note failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE';
+              const permanent=tooLong||/Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
+              // HTTP error retries are opt-in at Twilio. Preserve the existing
+              // user-facing resend reply until that provider policy is verified.
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,
+                !permanent&&env.TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS==='1');
+              if(finished==='retryable')return json(res,503,{ok:false,retry:true});
+              if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,tooLong
-                ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
-                :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
+                ?'That voice note is a bit long for me — try keeping it under a few minutes and I’ll give it a listen.'
+                :'I couldn’t quite grab that voice note — mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
               return json(res,200,{ok:true,voiceNote:false});
-            }
+            }finally{releaseUpload?.();}
             if(!transcript){
-              try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
+              db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,false);
+              try{await twilioSend(from,'I listened but couldn’t quite make out what you said — mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
-            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+            const accepted=db.acceptReplyJob(waUserId,conversation.id,voiceMessage,
+              {channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid,inboundLeaseToken:mediaClaim.token});
+            if(!accepted)return json(res,503,{ok:false,retry:true});
             scheduleReplyPump();
             return json(res,200,{ok:true,voiceNote:true});
           }
@@ -2824,32 +3024,54 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Only the first image is handled (Twilio may send several); image
           // bytes stay in memory and are never stored or logged.
           if(isImageContentType(mediaContentType)&&mediaUrl){
-            let imageBlock=null;
+            const mediaClaim=db.claimWhatsAppInboundMedia(inboundSid);
+            if(mediaClaim.state==='busy')return json(res,503,{ok:false,retry:true});
+            if(mediaClaim.state!=='claimed')return json(res,200,{ok:true,deduped:true});
+            let imageBlock=null,releaseImage=null,releaseUpload=null;
             try{
-              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
-              imageBlock=processImageInput({bytes,mimeType:mediaContentType});
-            }catch(e){
-              console.error('whatsapp image failed',e.code||e.message);
-              const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
-              try{await twilioSend(from,tooLong
-                ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
-                :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
-              return json(res,200,{ok:true,image:false});
-            }
-            const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
-              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-            ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
-            scheduleReplyPump();
-            return json(res,200,{ok:true,image:true});
+              try{
+                releaseUpload=acquireAttachmentUpload(waUserId);
+                const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl,messageSid:inboundSid});
+                // Reserve the eventual data URL before making its base64 copy.
+                // Keep upload admission until a failure reply has settled.
+                releaseImage=reserveMediaBytes(Math.ceil(bytes.length/3)*4+64);
+                imageBlock=processImageInput({bytes,mimeType:mediaContentType});
+              }catch(e){
+                imageBlock=null;
+                releaseImage?.();releaseImage=null;
+                console.error('whatsapp image failed',e.code||e.message);
+                const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
+                const permanent=tooLong||[400,415].includes(e.status)||
+                  /Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
+                const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,
+                  !permanent&&env.TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS==='1');
+                if(finished==='retryable')return json(res,503,{ok:false,retry:true});
+                if(!finished)return json(res,503,{ok:false,retry:true});
+                try{await twilioSend(from,tooLong
+                  ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
+                  :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
+                return json(res,200,{ok:true,image:false});
+              }
+              const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
+              const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
+                {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid,inboundLeaseToken:mediaClaim.token});
+              if(!accepted)return json(res,503,{ok:false,retry:true});
+              ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:caption||'Look at this.',images:[imageBlock],releaseMedia:releaseImage,createdAt:Date.now()});
+              releaseImage=null;
+              scheduleReplyPump();
+              return json(res,200,{ok:true,image:true});
+            }finally{releaseImage?.();releaseUpload?.();}
           }
           // Other media types (video, documents) are not supported yet.
+          if(inboundSid&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
           try{await twilioSend(from,'I can read text, listen to voice notes, and look at photos — other file types aren’t supported yet.');}catch(e){console.error('whatsapp media reply failed',e.message);}
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
-        db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+        const accepted=db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),
+          {channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid});
+        if(!accepted)return json(res,200,{ok:true,deduped:true});
         scheduleReplyPump();
         return json(res,200,{ok:true});
       }
@@ -2868,11 +3090,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/apple/complete'){
         if(rateLimited(req,20,'apple-complete'))return json(res,429,{error:'Try again later.'});
-        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';let user=null,binding=purpose;
+        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';let user=null,binding=purpose,linkPasswordProof=null;
         if(purpose==='link'){
           user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;
           const account=db.getUserById(binding);
-          if(!await verifyPassword(body.password,account.password_hash,account.password_salt))return json(res,401,{error:'Current password is required to link Apple.'});
+          if(!account)return json(res,401,{error:'Sign in again to link Apple.'});
+          if(!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))return json(res,401,{error:'Current password is required to link Apple.'});
+          linkPasswordProof={hash:account.password_hash,salt:account.password_salt};
         }
         if(!db.consumeSignupChallenge(hashToken(String(body.nonce||'')),'apple-'+purpose,binding))return json(res,401,{error:'Start Apple sign-in again.'});
         const identity=await validateAppleAuthorization(body,env,options.appleVerification||{});
@@ -2880,7 +3104,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(purpose==='link'){
           if(!authenticate(req))return json(res,401,{error:'Sign in again to link Apple.'});
           if(linked&&linked.user_id!==binding)return json(res,409,{error:'This Apple identity is already linked.'});
-          if(!linked){try{db.linkAuthIdentity('apple',identity.subject,binding);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}}
+          if(!linked){let linkedNow=false;try{const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);linkedNow=db.linkAuthIdentityIfCurrent('apple',identity.subject,binding,hashToken(token),linkPasswordProof.hash,linkPasswordProof.salt);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}if(!linkedNow)return json(res,401,{error:'Sign in again to link Apple.'});}
           db.addEvent(binding,'apple_linked','Linked Sign in with Apple.');return json(res,200,{ok:true});
         }
         if(purpose==='signup'){
@@ -2897,7 +3121,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Never link by email, even if Apple says that email is verified.
         if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
         user=db.getUserById(linked.user_id);if(!user||user.disabled||user.moderation_blocked)return json(res,401,{error:'Sign-in was not accepted.'});
-        const {csrf,token:sessionToken}=createSession(user,req,res);
+        const appleSession=createSession(user,req,res,{identitySubject:identity.subject});if(!appleSession)return json(res,401,{error:'Sign-in was not accepted.'});
+        const {csrf,token:sessionToken}=appleSession;
         return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/attest/challenge'){
@@ -2954,7 +3179,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const verifiedEmail=Boolean(appleProof||(emailHash&&verificationTokenHash&&db.getSignupVerificationToken(verificationTokenHash,emailHash)));
         const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen(),verifiedEmail});
         if(admission.action==='deny')throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
-        if(admission.action==='verify'){
+        // A low risk score (or an open legacy door) is not proof that the
+        // applicant controls the mailbox they are claiming.
+        if(admission.action==='verify'||(count>0&&!verifiedEmail&&admission.action==='allow')){
           if(!transactionalEmailConfigured||!emailHash)throw Object.assign(new Error('Email verification is temporarily unavailable. Please try again later.'),{status:503});
           if(db.getPendingSignupVerificationForEmail(emailHash))throw Object.assign(new Error('Check your email to verify your address and finish creating your Orbit account.'),{status:403,verificationRequired:true,verificationSent:true});
           if(hourlyLimited(req,5,'signup-verify'))throw Object.assign(new Error('Too many verification emails. Please try again later.'),{status:429});
@@ -2971,10 +3198,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Password hashing yields: recheck pause and the registration door afterward.
         const currentCount=db.countUsers();
         if(currentCount>0&&signupPause())return json(res,503,{error:'New signups are temporarily paused.'});
-        if(currentCount>0&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow')return json(res,403,{error:'Registration is not currently available.'});
+        if(currentCount>0&&(!verifiedEmail||signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow'))return json(res,403,{error:'Registration is not currently available.'});
         let user;
         try{user=db.createSignupAccount({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,
-          verificationHash:admission.reason==='verified_email'&&!appleProof?verificationTokenHash:null,emailHash,appleProofHash,appleEmailHash:emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
+          verificationHash:verifiedEmail&&!appleProof?verificationTokenHash:null,emailHash,appleProofHash,appleEmailHash:emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
         catch{return json(res,409,{error:'Account creation could not complete. Sign in or request a fresh verification link.'});}
         if(user.role==='owner')db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
         // L3: simpler onboarding — seed the default conversation with a warm welcome
@@ -2987,8 +3214,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
         if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyPassword(body.password,user.password_hash,user.password_salt);
-        if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyAccountPassword(body.password,user.password_hash,user.password_salt);
+        if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const session=createSession(user,req,res,{passwordProof:true});if(!session)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=session;db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
         if(rateLimited(req,25,'recover'))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
@@ -3139,14 +3366,21 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const curKey=`${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}`;
           const monthLabel=(key)=>{const[y,m]=key.split('-').map(Number);return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'});};
           const out=[];
+          let modelNarratives=0;
           for(let i=0;i<months;i++){
             const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));
             const key=`${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
             const data=db.timelineMonthData(userId,key);
             const activity=data.memories.length+data.conversations.length+data.goalsCreated.length+data.goalsCompleted.length+data.checkins;
             if(!activity)continue;
-            let narrative=db.getTimelineNarrative(userId,key);
-            if(!narrative||key===curKey){
+            const cached=db.getTimelineNarrativeRecord(userId,key);
+            let narrative=cached?.narrative||null;
+            const freshCurrent=key===curKey&&narrative&&new Date(cached.generated_at).valueOf()>Date.now()-6*60*60_000;
+            const needsNarrative=!narrative||(key===curKey&&!freshCurrent);
+            const lease=needsNarrative&&!paused()&&!isDemoUser(user)&&modelNarratives<1
+              ?db.claimTimelineNarrative(userId,key,key===curKey?new Date(Date.now()-6*60*60_000).toISOString():null):null;
+            if(lease){
+              modelNarratives++;
               const facts=[];
               if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
               if(data.goalsCompleted.length)facts.push(`Completed ${data.goalsCompleted.length} goals: ${data.goalsCompleted.map((g)=>g.title).join(', ')}`);
@@ -3155,18 +3389,25 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
               try{
                 const prefs=db.getPreferences(userId);
-                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
-                narrative=text.trim().slice(0,1200)||null;
-                if(narrative)db.setTimelineNarrative(userId,key,narrative);
-              }catch(e){narrative=null;}
-              if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
+                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw Object.assign(new Error('Timeline generation is no longer authorized.'),{code:'REPLY_LEASE_LOST'});};
+                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
+                const generated=text.trim().slice(0,1200);
+                if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;
+              }catch(e){/* keep the last cached narrative when generation fails */}
+              finally{db.releaseTimelineNarrative(userId,lease);}
+            }else if(needsNarrative){
+              // Another replica may have populated the cache since this request read it.
+              narrative=db.getTimelineNarrativeRecord(userId,key)?.narrative||narrative;
             }
+            if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
             const highlights=[];
             for(const g of data.goalsCompleted.slice(0,3))highlights.push(`Completed "${g.title}"`);
             for(const g of data.goalsCreated.slice(0,2))highlights.push(`Started "${g.title}"`);
             if(data.memories.length)highlights.push(`${data.memories.length} memories saved`);
             out.push({key,label:monthLabel(key),narrative,highlights:highlights.slice(0,6),stats:{memories:data.memories.length,conversations:data.conversations.length,goalsCompleted:data.goalsCompleted.length}});
           }
+          const activeUser=db.getUserById(userId);
+          if(!activeUser||activeUser.disabled||activeUser.moderation_blocked)throw Object.assign(new Error('Account unavailable.'),{status:403});
           return json(res,200,{months:out});
         }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){
@@ -3243,16 +3484,22 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(userRateLimited(userId,'chat-attachments',20,60*60_000))throw Object.assign(new Error('Too many uploads. Try again shortly.'),{status:429});
           const uploadType=req.headers['content-type']||'';
           if(!uploadType.includes('multipart/form-data'))throw Object.assign(new Error('Send the image as multipart form data.'),{status:400});
-          const chunks=[];let size=0;
-          for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
-          const raw=Buffer.concat(chunks);
-          if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
-          const file=parseMultipartImage(raw,uploadType);
-          if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
-          if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
-          const attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType}); // validates size too
-          db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
-          return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          const releaseUpload=acquireAttachmentUpload(userId);
+          let attachmentId=null;
+          try{
+            if(Number(req.headers['content-length'])>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});
+            const chunks=[];let size=0;
+            for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
+            const raw=Buffer.concat(chunks);
+            if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
+            const file=parseMultipartImage(raw,uploadType);
+            if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
+            if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
+            attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType});
+            db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
+            return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          }catch(error){if(attachmentId)takeAttachment(userId,attachmentId);throw error;}
+          finally{releaseUpload();}
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
@@ -3266,28 +3513,35 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // along. Stored history keeps a text placeholder — bytes are never
           // persisted.
           const attachmentIds=Array.isArray(body.attachmentIds)?body.attachmentIds.map((id)=>String(id||'')).filter(Boolean).slice(0,3):[];
+          if(new Set(attachmentIds).size!==attachmentIds.length)throw Object.assign(new Error('Each attached image can be sent only once.'),{status:400});
           // Two-phase: verify every id resolves BEFORE consuming any, so one
           // stale id never silently drops the other attachments in the turn.
+          let projectedImageBytes=0;
           for(const attachmentId of attachmentIds){
-            if(!peekAttachment(userId,attachmentId))throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            const staged=peekAttachment(userId,attachmentId);
+            if(!staged)throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            projectedImageBytes+=Math.ceil(staged.bytes.length/3)*4+64;
           }
-          const imageBlocks=[];
-          for(const attachmentId of attachmentIds){
-            imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
-          }
-          const hasImages=imageBlocks.length>0;
-          const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
-          if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
-          // One atomic database operation both checks and consumes the free
-          // allowance, so simultaneous requests cannot send message 26.
-          const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
-            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
-          const userMsg=accepted.userMessage;
-          if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
-          scheduleReplyPump();
-          return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          let releaseMedia=projectedImageBytes?reserveMediaBytes(projectedImageBytes):null;
+          try{
+            const imageBlocks=[];
+            for(const attachmentId of attachmentIds){
+              imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
+            }
+            const hasImages=imageBlocks.length>0;
+            const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
+            if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
+            // One atomic database operation both checks and consumes the free
+            // allowance, so simultaneous requests cannot send message 26.
+            const quota=subscriptions.consumeQuota(userId,user);
+            if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
+            const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+              {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+            const userMsg=accepted.userMessage;
+            if(hasImages){ephemeralReplyPayloads.set(accepted.job.id,{userId,message:message||'Look at this.',images:imageBlocks,releaseMedia,createdAt:Date.now()});releaseMedia=null;}
+            scheduleReplyPump();
+            return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          }finally{releaseMedia?.();}
         }
         // W1: per-message actions.
         // Regenerate re-runs an assistant turn through the same pipeline as a
@@ -3319,7 +3573,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
-          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt);
+          const quotaPolicy=subscriptions.quotaPolicy(userId,user);
+          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt,quotaPolicy);
+          if(accepted?.quotaDenied)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota:accepted.quotaDenied});
           if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
           scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
@@ -3429,9 +3685,14 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
           if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
           requireOwner(user); // WhatsApp is owner-only
-          const code=String(randomInt(100000,1000000));
+          let code=null;
           const expiresAt=new Date(Date.now()+10*60_000).toISOString();
-          db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
+          for(let attempt=0;attempt<5;attempt++){
+            const candidate=String(randomInt(100000,1000000));
+            try{db.issueWhatsAppLinkCode(userId,candidate,expiresAt);code=candidate;break;}
+            catch(error){if(error.message!=='Link code collision')throw error;}
+          }
+          if(!code)throw Object.assign(new Error('Could not issue a link code. Try again.'),{status:503});
           db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
           return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER,deepLink:buildLinkDeepLink(env.TWILIO_WHATSAPP_NUMBER,code)});
         }
@@ -3442,7 +3703,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         }
         if(req.method==='DELETE'&&url.pathname==='/api/whatsapp/link'){
           requireOwner(user); // WhatsApp is owner-only
-          db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
+          db.unlinkWhatsAppAndRevoke(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
           return json(res,200,{ok:true});
         }
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
@@ -3461,10 +3722,19 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const format=String(url.searchParams.get('format')||'markdown').toLowerCase();
           if(format!=='markdown'&&format!=='pdf')throw Object.assign(new Error('format must be "markdown" or "pdf".'),{status:400});
           const prefs=db.getPreferences(userId);
-          const messages=db.listConversationMessages(userId,convoId,200);
-          const markdown=renderConversationMarkdown(conversation,messages,buddyNameFor(userId),prefs&&prefs.time_zone);
+          const messageCount=db.countConversationMessages(userId,convoId);
+          const buddyName=buddyNameFor(userId),timeZone=prefs&&prefs.time_zone;
           const base=(String(conversation.title||'conversation').replace(/[^\w\-. ]+/g,'').trim().slice(0,60))||'conversation';
           if(format==='pdf'){
+            let markdown=renderConversationMarkdown(conversation,[],buddyName,timeZone);
+            let after=null,remaining=messageCount;
+            while(remaining>0){
+              const page=await(db.async?db.async.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)):db.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)));
+              if(!page.length)throw Object.assign(new Error('Conversation changed during export. Please retry.'),{status:409});
+              markdown+='\n'+renderConversationMarkdown(conversation,page,buddyName,timeZone,false);
+              if(Buffer.byteLength(markdown)>2*1024*1024)throw Object.assign(new Error('This conversation is too large for PDF. Export it as Markdown instead.'),{status:413});
+              remaining-=page.length;after=page.at(-1);
+            }
             // Reuse the Canvas print-flow PDF pipeline (same markdownToPdfBuffer
             // as GET /api/canvas/render/:token?format=pdf) — no second pipeline.
             const pdf=await markdownToPdfBuffer(markdown);
@@ -3472,12 +3742,27 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             return res.end(pdf);
           }
           res.writeHead(200,{'Content-Type':'text/markdown; charset=utf-8','Content-Disposition':`attachment; filename="${base}.md"`.replace(/["\r\n]/g,''),'Cache-Control':'no-store'});
-          return res.end(markdown);
+          res.write(renderConversationMarkdown(conversation,[],buddyName,timeZone));
+          let after=null,remaining=messageCount;
+          try{
+            while(remaining>0&&!res.destroyed){
+              const page=await(db.async?db.async.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)):db.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)));
+              if(!page.length)throw new Error('Conversation changed during export.');
+              if(!res.write('\n'+renderConversationMarkdown(conversation,page,buddyName,timeZone,false)))await new Promise(resolve=>{
+                const done=()=>{res.off('drain',done);res.off('close',done);resolve();};
+                res.once('drain',done);res.once('close',done);
+              });
+              remaining-=page.length;after=page.at(-1);
+            }
+            return res.end();
+          }catch(error){res.destroy(error);return;}
         }
         if(req.method==='GET'&&url.pathname==='/api/import/status'){
           return json(res,200,{jobs:db.listImportJobs(userId)});
         }
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
+          if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
+          if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3499,6 +3784,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const extracted=extractMessages(parsed);
           if(!extracted||!extracted.messages.length)throw Object.assign(new Error('No conversation messages found. Upload a ChatGPT export (conversations.json) or a {messages:[...]} file.'),{status:422});
           const job=db.createImportJob(userId,filename);
+          if(!job)throw Object.assign(new Error('An import is already running or the daily import limit was reached. Try again later.'),{status:429});
           db.addEvent(userId,'import_started',`Started analyzing ${extracted.messages.length} imported messages.`);
           // Process in background — raw export lives in memory only, never persisted.
           setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));
@@ -3556,6 +3842,12 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           }
           if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
           if(approval.kind==='gmail_send'||approval.kind==='gmail_delete'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});}
+          if(['delete_goal','delete_task','delete_routine'].includes(approval.kind)){
+            const outcome=db.executeDeleteApprovalIfCurrent(userId,approval.id);
+            if(outcome.status!=='executed')throw Object.assign(new Error('This deletion request is stale or was already reviewed. Ask Orbit to stage it again.'),{status:409});
+            try{db.addEvent(userId,'approval_executed',`Deleted ${approval.payload.objectType} “${approval.payload.title}” after approval.`);}catch(error){console.error('Deletion completed; audit event write failed:',error);}
+            return json(res,200,{approval:outcome.approval});
+          }
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
             if(approval.kind==='calendar_event'){
@@ -3571,19 +3863,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
               return json(res,200,{approval:executed});
             }
-            if(approval.kind==='delete_goal'||approval.kind==='delete_task'||approval.kind==='delete_routine'){
-              const {id,title,objectType}=approval.payload||{};
-              const ok=approval.kind==='delete_goal'?db.deleteGoal(userId,id):approval.kind==='delete_task'?db.deleteTask(userId,id):db.deleteRoutine(userId,id);
-              if(!ok){
-                db.finishApproval(userId,approval.id,'failed',{error:'The item was already gone.'});
-                db.addEvent(userId,'approval_failed',`Could not delete “${title||'item'}” — it no longer exists.`);
-                return json(res,200,{approval:db.getApproval(userId,approval.id)});
-              }
-              const executed=db.finishApproval(userId,approval.id,'executed',{result:{deleted:approval.kind,id,title}});
-              db.addEvent(userId,'approval_executed',`Deleted ${objectType||'item'} “${title}” after approval.`);
-              return json(res,200,{approval:executed});
-            }
-            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
+            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id,expectedPreview:approval.payload.preview});
             const executed=db.finishApproval(userId,approval.id,'executed',{result});
             db.addEvent(userId,'approval_executed','Moved an approved Gmail message to trash.');
             return json(res,200,{approval:executed});
@@ -3599,9 +3879,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const artifactDelMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='DELETE'&&artifactDelMatch){const ok=db.deleteArtifact(userId,artifactDelMatch[1]);if(!ok)throw Object.assign(new Error('File not found.'),{status:404});return json(res,200,{deleted:true});}
         const artifactMatch=url.pathname.match(/^\/api\/artifacts\/([0-9a-f-]+)$/);if(req.method==='GET'&&artifactMatch){const artifact=db.getArtifact(userId,artifactMatch[1]);if(!artifact)throw Object.assign(new Error('Artifact not found.'),{status:404});if(artifact.mime_type==='text/markdown'&&url.searchParams.get('format')==='pdf'){const pdf=await markdownToPdfBuffer(artifact.content);res.writeHead(200,{'Content-Type':'application/pdf','Content-Disposition':`inline; filename="${artifact.name.replace(/\.md$/,'.pdf').replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(pdf);}if(artifact.mime_type==='text/markdown'){const autoPrint=url.searchParams.get('print')==='1';const printUrl=`${publicBase||''}/api/artifacts/${artifact.id}?print=1`;const html=markdownToHtml(artifact.content,autoPrint,printUrl);res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'});return res.end(html);}res.writeHead(200,{'Content-Type':artifact.mime_type,'Content-Disposition':`attachment; filename="${artifact.name.replace(/["\r\n]/g,'')}"`,'Cache-Control':'no-store'});return res.end(artifact.content);}
         if(req.method==='GET'&&url.pathname==='/api/push/public-key')return json(res,200,{configured:push.configured,publicKey:push.publicKey});
-        if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});db.savePush(userId,body);db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
+        if(req.method==='POST'&&url.pathname==='/api/push/subscribe'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(!push.configured)throw Object.assign(new Error('Push is not configured.'),{status:503});const body=await readJson(req);if(!body.endpoint||!body.keys?.p256dh||!body.keys?.auth)throw Object.assign(new Error('Push subscription is incomplete.'),{status:400});saveAuthenticatedPushRegistration(()=>db.savePush(userId,body,user.token_hash));db.addEvent(userId,'push_enabled','Enabled push notifications on a device.');return json(res,201,{ok:true});}
         if(req.method==='POST'&&url.pathname==='/api/push/unsubscribe'){const body=await readJson(req);db.deletePush(userId,String(body.endpoint||''));return json(res,200,{ok:true});}
-        if(req.method==='POST'&&url.pathname==='/api/push/token'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(userRateLimited(userId,'push-token',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const body=await readJson(req);const token=String(body.token||'').trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(token))throw Object.assign(new Error('Device token is invalid.'),{status:400});db.saveApnsToken(userId,token);db.addEvent(userId,'push_enabled','Enabled native push notifications on iPhone.');if(body.verifyDelivery===true){if(!apns.configured)throw Object.assign(new Error('iPhone notifications are not configured on the server.'),{status:503});const delivery=await apns.notify(userId,'Notifications are ready','Orbit can now reach this iPhone.',{view:'today'});if(delivery.sent<1)throw Object.assign(new Error(`Apple rejected the test notification${delivery.error?`: ${delivery.error}`:'.'}`),{status:502});return json(res,201,{ok:true,verified:true});}return json(res,201,{ok:true,verified:false,configured:apns.configured});}
+        if(req.method==='POST'&&url.pathname==='/api/push/token'){if(isDemoUser(user))throw Object.assign(new Error('Push is not available in demo mode.'),{status:403});if(userRateLimited(userId,'push-token',30))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const body=await readJson(req);const token=String(body.token||'').trim().toLowerCase();if(!/^[0-9a-f]{64}$/.test(token))throw Object.assign(new Error('Device token is invalid.'),{status:400});saveAuthenticatedPushRegistration(()=>db.saveApnsToken(userId,token,user.token_hash));db.addEvent(userId,'push_enabled','Enabled native push notifications on iPhone.');if(body.verifyDelivery===true){if(!apns.configured)throw Object.assign(new Error('iPhone notifications are not configured on the server.'),{status:503});const delivery=await apns.notify(userId,'Notifications are ready','Orbit can now reach this iPhone.',{view:'today'});if(delivery.sent<1)throw Object.assign(new Error(`Apple rejected the test notification${delivery.error?`: ${delivery.error}`:'.'}`),{status:502});return json(res,201,{ok:true,verified:true});}return json(res,201,{ok:true,verified:false,configured:apns.configured});}
 
         // Subscriptions (StoreKit 2). Quota is only enforced when the service
         // reports ready (enabled + Apple config complete); otherwise fail-open.
@@ -3625,13 +3905,16 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const body=await readJson(req);const signedTransaction=String(body.signedTransaction||'');const requestedToken=String(body.appAccountToken||'').trim();const requestedProduct=String(body.productId||'');
           if(!signedTransaction)throw Object.assign(new Error('Missing transaction.'),{status:400});
           if(requestedToken&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedToken))throw Object.assign(new Error('Invalid app account token.'),{status:400});
-          const current=db.getSubscription(userId);const intent=requestedToken?db.getPurchaseIntent(userId,requestedToken,requestedProduct):null;
+          const signedBinding=requestedToken?null:await subscriptions.signedTransactionBinding(signedTransaction);
+          const bindingToken=requestedToken||signedBinding.appAccountToken;
+          const current=db.getSubscription(userId);const intent=db.getPurchaseIntent(userId,bindingToken,requestedToken?requestedProduct:signedBinding.productId);
           if(requestedToken&&!intent)throw Object.assign(new Error('Purchase intent is missing or expired.'),{status:403});
-          const expectedToken=intent?.app_account_token||current?.app_account_token;
+          const expectedToken=intent?.app_account_token||(current?.app_account_token===bindingToken?current.app_account_token:null);
           if(!expectedToken)throw Object.assign(new Error('Purchase is not bound to this Orbit account.'),{status:403});
           const owner=db.findUserByAppAccountToken(expectedToken);if(owner&&owner!==userId)throw Object.assign(new Error('Purchase belongs to another Orbit account.'),{status:403});
           const result=await subscriptions.verifyTransaction(signedTransaction,{expectedAppAccountToken:expectedToken,expectedProductId:intent?.product_id});
-          db.saveSubscription(userId,{...result,lastEventSignedAt:result.signedAt});
+          if(!db.saveSubscriptionIfUnchanged(userId,current,{...result,lastEventSignedAt:result.signedAt}))
+            throw Object.assign(new Error('Subscription changed during verification. Please retry.'),{status:409});
           if(intent&&!db.completePurchaseIntent(intent.id,result.transactionId))throw Object.assign(new Error('Purchase intent was already consumed.'),{status:409});
           db.addEvent(userId,'subscription_verified','Subscription verified.');
           return json(res,200,{ok:true,transactionId:result.transactionId,product:result.productId,status:result.status,expiresAt:result.expiresAt});
@@ -3639,24 +3922,39 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/subscriptions/restore'){
           if(isDemoUser(user))throw Object.assign(new Error('Subscriptions are not available in demo mode.'),{status:403});
           if(userRateLimited(userId,'sub-restore',10))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
-          const entitlements=await subscriptions.fetchEntitlements(userId);
-          for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
+          const current=db.getSubscription(userId);
+          const entitlements=await subscriptions.fetchEntitlements(userId,current);
+          for(const entitlement of entitlements){
+            if(!db.saveSubscriptionIfUnchanged(userId,current,{...entitlement,lastEventSignedAt:entitlement.signedAt}))
+              throw Object.assign(new Error('Subscription changed during restore. Please retry.'),{status:409});
+          }
           return json(res,200,{ok:true,entitlements});
         }
         const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
-        if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
+        if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!account||!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);const codes=makeRecoveryCodes();if(!db.replaceRecoveryCodesIfCurrent(userId,hashToken(token),account.password_hash,account.password_salt,codes.map(hashToken)))throw Object.assign(new Error('Sign in again before rotating recovery codes.'),{status:401});db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='DELETE'&&url.pathname==='/api/account'){
           if(isDemoUser(user))throw Object.assign(new Error('Demo accounts expire automatically.'),{status:403});
           const body=await readJson(req);
           if(body.confirm!=='DELETE')throw Object.assign(new Error('Type DELETE to confirm permanent account deletion.'),{status:400});
           const account=db.getUserById(userId);
-          if(!account||!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});
-          const result=db.deleteUserAccount(userId);
+          if(!account||!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});
+          const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);
+          const result=db.deleteUserAccount(userId,{sessionHash:hashToken(token),expectedPasswordHash:account.password_hash,expectedPasswordSalt:account.password_salt});
+          if(result?.staleCredentials)throw Object.assign(new Error('Sign in again before deleting this account.'),{status:401});
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
+          clearAttachmentsForUser(userId);
+          clearWhatsAppMediaForUser(userId);
+          ephemeralReplyPayloads.clearUser(userId,activeReplyJobs);
+          let backupCleanupPending=true;
+          try{
+            const cleanup=await cleanupDeletedUserBackups({db,dataDir,backupDir,accountRef:userId});
+            backupCleanupPending=cleanup.failed>0;
+          }catch(error){console.error('Backup cleanup check failed:',error.message);}
+          if(backupCleanupPending)console.error('Backup cleanup remains pending for deleted accounts.');
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
-          return json(res,200,{deleted:true});
+          return json(res,200,{deleted:true,backupCleanupPending});
         }
         if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const bundle=await(db.async?db.async.exportUser(userId):db.exportUser(userId));const payload=await encryptPortable(bundle,body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
         if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,64*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);await(db.async?db.async.restoreUser(userId,bundle):db.restoreUser(userId,bundle));db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
@@ -3712,7 +4010,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const password=await hashPassword(randomToken(48));
             const currentOwner=authenticate(req);if(!currentOwner)return json(res,401,{error:'Sign in again to approve access.'});requireOwner(currentOwner);
             if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
-            try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
+            try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,ownerApproved:true,environmentPaused:signupsPaused(env)});}
             catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
           }else if(target.moderation_blocked)return json(res,409,{error:'This account is blocked. Restore it from Users before approving access.'});
           else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}
@@ -3737,8 +4035,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
-  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+  return {server,db,push,apns,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}try{db.pruneWhatsAppInbound();}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(()=>{runBackups();try{db.pruneWhatsAppInbound();}catch{}},60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
       if(workerTimer)clearInterval(workerTimer);
@@ -3755,7 +4053,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
-      db.close();
+      ephemeralReplyPayloads.clearAll();
+      await db.close();
     }
   };
 }

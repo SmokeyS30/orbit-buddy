@@ -7,6 +7,7 @@ import { createHmac } from 'node:crypto';
 import { openDatabase } from '../src/database.js';
 import { hashToken } from '../src/security.js';
 import { createOrbitServer } from '../server.js';
+import { MAX_EPHEMERAL_MEDIA_BYTES, mediaBytesReserved, reserveMediaBytes } from '../src/media-memory.js';
 import {
   verifyTwilioSignature,
   stripWhatsAppPrefix,
@@ -32,6 +33,11 @@ import {
 
 const TOKEN = 'test-auth-token-123';
 const WEBHOOK_URL = 'https://orbitbuddy.app/api/whatsapp/webhook';
+const MEDIA_ACCOUNT_SID = `AC${'a'.repeat(32)}`;
+const mediaMessageSid = (digit) => `SM${digit.repeat(32)}`;
+const mediaUrl = (messageSid, digit = 'f') =>
+  `https://api.twilio.com/2010-04-01/Accounts/${MEDIA_ACCOUNT_SID}/Messages/${messageSid}/Media/ME${digit.repeat(32)}`;
+const UNIT_MEDIA_URL = mediaUrl(mediaMessageSid('1'));
 
 function sign(url, params, token = TOKEN) {
   const data = Object.keys(params).sort().reduce((acc, k) => acc + k + params[k], String(url));
@@ -119,7 +125,7 @@ test('whatsapp link/unlink round-trips', () => {
 // --- Server: webhook + linking flow ---
 
 const TWILIO_ENV = {
-  TWILIO_ACCOUNT_SID: 'ACtest123',
+  TWILIO_ACCOUNT_SID: MEDIA_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN: 'test-auth-token-xyz',
   TWILIO_WHATSAPP_NUMBER: '+14155238886',
 };
@@ -264,6 +270,34 @@ test('linked user text gets a WhatsApp reply through the chat pipeline', async (
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test('paused WhatsApp webhook asks for redelivery without burning the SID', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app,base,'owner-pause@example.test');
+  const sent=[];const restore=stubTwilio(sent);t.after(restore);
+  const params={From:WA_FROM,Body:'hello after pause',MessageSid:'SMpause-synthetic'};
+  app.db.setSetting('system_paused','true');
+  const paused=await webhookPost(base,params);
+  assert.equal(paused.status,503);
+  assert.equal(app.db.getWhatsAppInboundState(params.MessageSid),null);
+  app.db.setSetting('system_paused','false');
+  const accepted=await webhookPost(base,params);
+  assert.equal(accepted.status,200);
+  assert.equal(app.db.getWhatsAppInboundState(params.MessageSid),'accepted');
+});
+
+test('a pending link code from an already-linked phone is consumed without model egress', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app,base,'owner-relink@example.test');
+  const sent=[];const restore=stubTwilio(sent);t.after(restore);
+  const code='443322';
+  app.db.issueWhatsAppLinkCode(userId,code,new Date(Date.now()+60_000).toISOString());
+  const before=userMessages(app,userId).length;
+  const result=await webhookPost(base,{From:WA_FROM,Body:code,MessageSid:'SMrelink'});
+  assert.equal(result.status,200);
+  assert.equal(app.db.getSetting(`whatsapp_link_code_${code}`),null);
+  assert.equal(userMessages(app,userId).length,before,'link secret never enters chat history');
 });
 
 test('deferred WhatsApp replies stay bound to the accepting link and enabled account', async (t) => {
@@ -422,18 +456,18 @@ test('downloadTwilioMedia sends Basic auth and returns bytes', async () => {
   const { bytes, contentType } = await withFetchStub(async (url, opts) => {
     calls.push({ url: String(url), auth: opts.headers.Authorization });
     return mediaResponse([1, 2, 3, 4]);
-  }, () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' }));
+  }, () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL }));
   assert.equal(bytes.length, 4);
   assert.equal(contentType, 'audio/ogg');
-  assert.equal(calls[0].url, 'https://api.twilio.com/x');
-  assert.equal(calls[0].auth, `Basic ${Buffer.from('ACx:tok', 'utf8').toString('base64')}`);
+  assert.equal(calls[0].url, UNIT_MEDIA_URL);
+  assert.equal(calls[0].auth, `Basic ${Buffer.from(`${MEDIA_ACCOUNT_SID}:tok`, 'utf8').toString('base64')}`);
 });
 
 test('downloadTwilioMedia rejects oversized media via Content-Length and streaming', async () => {
   // Declared size over the cap: rejected without reading the body
   await assert.rejects(
     withFetchStub(async () => mediaResponse([1], { contentLength: String(MAX_TWILIO_MEDIA_BYTES + 1) }),
-      () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+      () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL })),
     (e) => e.code === 'MEDIA_TOO_LARGE'
   );
   // No declared size but the stream exceeds the cap: rejected mid-read
@@ -441,14 +475,14 @@ test('downloadTwilioMedia rejects oversized media via Content-Length and streami
     withFetchStub(async () => ({
       ...mediaResponse([1], { contentLength: null }),
       body: (async function* () { yield Buffer.alloc(MAX_TWILIO_MEDIA_BYTES + 1); })(),
-    }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x', maxBytes: 100 })),
+    }), () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL, maxBytes: 100 })),
     (e) => e.code === 'MEDIA_TOO_LARGE'
   );
 });
 
 test('downloadTwilioMedia throws on HTTP errors and missing URL', async () => {
   await assert.rejects(
-    withFetchStub(async () => mediaResponse([], { status: 401 }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+    withFetchStub(async () => mediaResponse([], { status: 401 }), () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL })),
     /401/
   );
   await assert.rejects(downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: '' }), /No media URL/);
@@ -566,8 +600,8 @@ test('webhook: voice note is downloaded, transcribed, and fed to the pipeline', 
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'audio/ogg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv/Media/MEv',
-      Body: '', MessageSid: 'SMvoice',
+      MediaUrl0: mediaUrl(mediaMessageSid('2'),'a'),
+      Body: '', MessageSid: mediaMessageSid('2'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, voiceNote: true });
@@ -601,8 +635,8 @@ test('webhook: oversized voice note gets the "bit long" reply and is not transcr
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'audio/ogg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv2/Media/MEv2',
-      Body: '', MessageSid: 'SMvoice2',
+      MediaUrl0: mediaUrl(mediaMessageSid('3'),'b'),
+      Body: '', MessageSid: mediaMessageSid('3'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, voiceNote: false });
@@ -629,8 +663,8 @@ test('webhook: inbound image is downloaded and fed through the vision pipeline',
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'image/jpeg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi/Media/MEi',
-      Body: 'look at this', MessageSid: 'SMimg',
+      MediaUrl0: mediaUrl(mediaMessageSid('4'),'c'),
+      Body: 'look at this', MessageSid: mediaMessageSid('4'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, image: true });
@@ -646,31 +680,126 @@ test('webhook: inbound image is downloaded and fed through the vision pipeline',
   }
 });
 
-test('webhook: failed image download gets the retry reply and no pipeline run', async (t) => {
-  const { app, base } = await serverFixture(); t.after(() => app.close());
+test('webhook: transient image download failure permits a retry when provider HTTP retries are configured', async (t) => {
+  const { app, base } = await serverFixture({TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS:'1'}); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base, 'owner-img2@example.com');
   const sent = [];
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  let mediaCalls=0;
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
-    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return { ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' };
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) {
+      mediaCalls++;
+      return mediaCalls===1
+        ?{ ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' }
+        :mediaResponse(png,{contentType:'image/png'});
+    }
     if (u?.hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
     return origFetch(url, opts);
   };
   try {
-    const hook = await webhookPost(base, {
+    const params = {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'image/png',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi2/Media/MEi2',
-      Body: '', MessageSid: 'SMimg2',
-    });
-    assert.equal(hook.status, 200);
-    assert.deepEqual(await hook.json(), { ok: true, image: false });
-    assert.ok(sent.some((b) => decodeForm(b).includes('mind sending it again')), 'expected the polite retry reply');
+      MediaUrl0: mediaUrl(mediaMessageSid('5'),'d'),
+      Body: '', MessageSid: mediaMessageSid('5'),
+    };
+    const hook = await webhookPost(base, params);
+    assert.equal(hook.status, 503);
+    assert.deepEqual(await hook.json(), { ok: false, retry: true });
+    assert.equal(sent.length,0,'transient failure does not send duplicate failure replies');
     const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
     assert.ok(!msgs.some((m) => m.content === WHATSAPP_IMAGE_STORED_MESSAGE), 'no image message stored on download failure');
+    const retry=await webhookPost(base,params);
+    assert.equal(retry.status,200);
+    assert.deepEqual(await retry.json(),{ok:true,image:true});
+    const duplicate=await webhookPost(base,params);
+    assert.deepEqual(await duplicate.json(),{ok:true,deduped:true});
+    assert.equal(mediaCalls,2,'accepted image is not downloaded again');
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('default media failure gives a resend reply because Twilio HTTP retries are unverified', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app,base,'owner-media-default@example.com');
+  const sent=[];
+  const origFetch=globalThis.fetch;
+  globalThis.fetch=async (url,opts)=>{
+    const parsed=(()=>{try{return new URL(String(url));}catch{return null;}})();
+    if(parsed?.hostname==='api.twilio.com'&&parsed.pathname.includes('/Media/'))
+      return {ok:false,status:500,headers:{get:()=>null},text:async()=>''};
+    if(parsed?.hostname==='api.twilio.com'){
+      sent.push(String(opts?.body||''));
+      return {ok:true,status:201,json:async()=>({sid:'SMsynthetic'}),text:async()=>''};
+    }
+    return origFetch(url,opts);
+  };
+  try{
+    const sid=mediaMessageSid('7');
+    const params={From:WA_FROM,Body:'',NumMedia:'1',MediaContentType0:'image/png',
+      MediaUrl0:mediaUrl(sid,'7'),MessageSid:sid};
+    const response=await webhookPost(base,params);
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{ok:true,image:false});
+    assert.ok(sent.some(body=>decodeForm(body).includes('mind sending it again')));
+    assert.equal(app.db.getWhatsAppInboundState(sid),'failed');
+    const replay=await webhookPost(base,params);
+    assert.deepEqual(await replay.json(),{ok:true,deduped:true});
+  }finally{globalThis.fetch=origFetch;}
+});
+
+test('stalled image failure replies retain upload admission when media capacity is full',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  await linkOwnerDirectly(app,base,'owner-capacity@example.test');
+  const releaseBudget=reserveMediaBytes(MAX_EPHEMERAL_MEDIA_BYTES-mediaBytesReserved());
+  const originalFetch=globalThis.fetch;
+  let releaseReplies;
+  const replyGate=new Promise(resolve=>{releaseReplies=resolve;});
+  let downloads=0,replies=0;
+  globalThis.fetch=async(url,options)=>{
+    const parsed=new URL(String(url));
+    if(parsed.hostname==='api.twilio.com'&&parsed.pathname.includes('/Media/')){
+      downloads++;
+      return mediaResponse(Buffer.alloc(3*1024*1024),{contentType:'image/png'});
+    }
+    if(parsed.hostname==='api.twilio.com'){
+      replies++;if(replies<=2)await replyGate;
+      return{ok:true,status:201,json:async()=>({sid:'synthetic'}),text:async()=>''};
+    }
+    return originalFetch(url,options);
+  };
+  const post=(n)=>{
+    const sid=mediaMessageSid(String(n));
+    return webhookPost(base,{
+    From:WA_FROM,To:`whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+    NumMedia:'1',MediaContentType0:'image/png',
+    MediaUrl0:mediaUrl(sid,String(n)),
+    Body:'',MessageSid:sid
+    });
+  };
+  const waitForReplies=async count=>{
+    const deadline=Date.now()+5_000;
+    while(replies<count&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(replies,count);
+  };
+  try{
+    const pending=[post(1),post(2)];
+    await waitForReplies(2);
+    const rejected=await post(3);
+    assert.equal(rejected.status,200);
+    assert.deepEqual(await rejected.json(),{ok:true,image:false});
+    assert.equal(replies,3);
+    assert.equal(downloads,2,'the third same-account request cannot download while rejected handlers wait');
+    assert.equal(mediaBytesReserved(),MAX_EPHEMERAL_MEDIA_BYTES);
+    releaseReplies();
+    const responses=await Promise.all(pending);
+    for(const response of responses)assert.deepEqual(await response.json(),{ok:true,image:false});
+    assert.equal(mediaBytesReserved(),MAX_EPHEMERAL_MEDIA_BYTES);
+  }finally{
+    releaseReplies();releaseBudget();globalThis.fetch=originalFetch;
   }
 });
 
@@ -687,8 +816,8 @@ test('webhook: non-image media gets the unsupported-type reply', async (t) => {
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'video/mp4',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv3/Media/MEv3',
-      Body: '', MessageSid: 'SMvid',
+      MediaUrl0: mediaUrl(mediaMessageSid('6'),'e'),
+      Body: '', MessageSid: mediaMessageSid('6'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true });
@@ -762,6 +891,41 @@ test('deliverProactive: window closed skips WhatsApp, push still fires', async (
   } finally { restore(); }
 });
 
+test('deliverProactive: ambiguous WhatsApp outcome never starts a second channel',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const original=globalThis.fetch;
+  const pushes=[];stubPush(app,pushes);
+  globalThis.fetch=async url=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')throw new Error('synthetic response lost after send');
+    return original(url);
+  };
+  try{
+    const outcome=await app.deliverProactive(app.db.getUserById(userId),'Synthetic check-in','test','Synthetic test');
+    assert.equal(outcome.recorded,true);
+    assert.equal(pushes.length,0,'the provider might have accepted the WhatsApp message');
+    assert.ok(app.db.listEvents(userId).some(event=>event.type==='whatsapp_send_uncertain'));
+  }finally{globalThis.fetch=original;}
+});
+
+test('deliverProactive: explicit WhatsApp 4xx rejection permits push fallback',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const original=globalThis.fetch;
+  const pushes=[];stubPush(app,pushes);
+  globalThis.fetch=async url=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')return{ok:false,status:400};
+    return original(url);
+  };
+  try{
+    const outcome=await app.deliverProactive(app.db.getUserById(userId),'Synthetic check-in','test','Synthetic test');
+    assert.equal(outcome.recorded,true);
+    assert.equal(pushes.length,1);
+  }finally{globalThis.fetch=original;}
+});
+
 test('deliverProactive: no WhatsApp link and non-owner fall back to push', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base);
@@ -801,16 +965,53 @@ test('runDueTasks: whatsapp-channel task delivered via WhatsApp when window open
   assert.equal(task.delivery_channel, 'whatsapp');
   const sent = []; const restore = stubTwilio(sent);
   const pushes = []; stubPush(app, pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
   try {
     await app.runDueTasks();
     assert.ok(sent.some((s) => s.body.includes('whatsapp%3A%2B15085551234')), 'reminder went out via WhatsApp');
     assert.equal(pushes.length, 0, 'no duplicate push');
+    assert.equal(apnsCalls,0,'WhatsApp replaces APNs for this task too');
     assert.equal(app.db.getTask(userId, task.id).status, 'completed');
     const convo = app.db.ensureDefaultConversation(userId);
     const messages = app.db.listConversationMessages(userId, convo.id, 8);
     assert.ok(messages.some((m) => m.role === 'assistant' && app.db.getTask(userId, task.id).result && m.content.includes(app.db.getTask(userId, task.id).result.slice(0, 20))), 'result written to the conversation');
     assert.ok(app.db.listEvents(userId).some((e) => e.type === 'task_delivered_whatsapp'), 'delivery event recorded');
   } finally { restore(); }
+});
+
+test('runDueTasks: ambiguous WhatsApp outcome never triggers web push or APNs',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const task=dueTask(app,userId);
+  const original=globalThis.fetch;const pushes=[];stubPush(app,pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
+  globalThis.fetch=async(url,options)=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')throw new Error('synthetic response lost');
+    return original(url,options);
+  };
+  try{
+    await app.runDueTasks();
+    assert.equal(app.db.getTask(userId,task.id).status,'completed');
+    assert.equal(pushes.length,0);
+    assert.equal(apnsCalls,0);
+    assert.ok(app.db.listEvents(userId).some(event=>event.type==='whatsapp_send_uncertain'));
+  }finally{globalThis.fetch=original;}
+});
+
+test('runDueTasks: explicit WhatsApp rejection falls back to web push and APNs',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  dueTask(app,userId);
+  const original=globalThis.fetch;const pushes=[];stubPush(app,pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
+  globalThis.fetch=async(url,options)=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')return{ok:false,status:400};
+    return original(url,options);
+  };
+  try{await app.runDueTasks();assert.equal(pushes.length,1);assert.equal(apnsCalls,1);}
+  finally{globalThis.fetch=original;}
 });
 
 test('runDueTasks: whatsapp-channel task falls back to push when window closed', async (t) => {

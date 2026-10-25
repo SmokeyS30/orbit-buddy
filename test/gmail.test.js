@@ -22,7 +22,7 @@ function mockGmailApi(responses) {
 }
 
 test('gmail tools are registered in TOOL_DEFINITIONS', () => {
-  assert.equal(TOOL_DEFINITIONS.length, 48);
+  assert.equal(TOOL_DEFINITIONS.length, 47);
   const names = TOOL_DEFINITIONS.map((t) => t.name).sort();
   assert.ok(names.includes('gmail_send'));
   assert.ok(names.includes('gmail_search'));
@@ -76,7 +76,7 @@ test('toolGmailSearch throws when Gmail not connected', async () => {
   await assert.rejects(() => toolGmailSearch({ query: 'test' }, ctx), /not connected/);
 });
 
-test('gmail write tools create approvals without calling Gmail', async () => {
+test('gmail write tools gate execution and deletion stages verified Gmail metadata', async () => {
   const approvals = [];
   const db = { addApproval: (_userId, value) => { approvals.push(value); return { id: `a${approvals.length}`, status: 'pending', ...value }; } };
   const ctx = { db, userId: 'u1', messageId: 'm1', gmail: { getToken: mockGetToken } };
@@ -86,10 +86,18 @@ test('gmail write tools create approvals without calling Gmail', async () => {
   assert.equal(approvals[0].kind, 'gmail_send');
   assert.equal(approvals[0].payload.to, 'test@example.com');
 
-  const deleted = await toolGmailDelete({ id: 'msg456', subject: 'Old note', from: 'sender@example.com' }, ctx);
-  assert.equal(deleted.status, 'pending');
-  assert.equal(approvals[1].kind, 'gmail_delete');
-  assert.equal(approvals[1].payload.id, 'msg456');
+  const restore=mockGmailApi([
+    ['/profile',{emailAddress:'owner@example.test'}],
+    ['/messages/msg456?format=metadata',{id:'msg456',threadId:'thread-1',historyId:'123',labelIds:['INBOX'],snippet:'Verified preview',payload:{headers:[{name:'From',value:'Actual sender <sender@example.test>'},{name:'Subject',value:'Actual subject'},{name:'Date',value:'Sun, 25 Oct 2026 09:00:00 +0000'}]}}]
+  ]);
+  try{
+    const deleted = await toolGmailDelete({ id: 'msg456', subject: 'Old note', from: 'made-up@example.test' }, ctx);
+    assert.equal(deleted.status, 'pending');
+    assert.equal(approvals[1].kind, 'gmail_delete');
+    assert.equal(approvals[1].payload.id, 'msg456');
+    assert.equal(approvals[1].payload.preview.subject,'Actual subject');
+    assert.match(approvals[1].summary,/Actual sender/);
+  }finally{restore();}
 });
 
 test('executeTool routes Gmail writes to the approval gate', async () => {

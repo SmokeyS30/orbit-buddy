@@ -309,6 +309,17 @@ test('runRadarPoll skips without a token and within the poll interval', async ()
   assert.equal(tooSoon.surfaced.length, 0);
 });
 
+test('radar stops new GitHub requests and state writes after proactive pause',async()=>{
+  const {db}=fixture();
+  let active=true,calls=0;
+  const fetchImpl=async()=>{calls++;active=false;return{ok:true,status:200,json:async()=>({default_branch:'main'})};};
+  await assert.rejects(runRadarPoll({db,env:{GITHUB_RADAR_TOKEN:'synthetic',RADAR_REPOS:'Synthetic/repo'},nowMs:10_000,fetchImpl,
+    assertActive:()=>{if(!active)throw Object.assign(new Error('paused'),{code:'PROACTIVE_DEFERRED'});}}),
+  error=>error.code==='PROACTIVE_DEFERRED');
+  assert.equal(calls,1);
+  assert.equal(db.getSetting('radar_last_poll'),null);
+});
+
 test('runRadarPoll dedupes: a second poll surfaces nothing new', async () => {
   const { db } = fixture();
   const env = { GITHUB_RADAR_TOKEN: 't' };
