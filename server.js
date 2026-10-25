@@ -1006,7 +1006,7 @@ export function createOrbitServer(options={}) {
       const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,regenerated:replyJob?.kind==='regenerate',model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
         onTurn:onStreamTurn,onToken:onStreamToken,assertActive:assertReplyLease}));
       await assertReplyLease();
@@ -1751,21 +1751,27 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
     const row=db.getImportJob(userId,id);
     if(!row||row.status!=='processing')return;
     try{
+      if(!db.isImportJobActive(userId,id))throw new Error('Import stopped before starting.');
       const extracted=extractMessages(parsed);
       if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
       const chunks=chunkMessages(extracted.messages,20);
       if(!chunks.length)throw new Error('Nothing substantial to learn from in this export.');
-      // Cap chunks to bound cost on huge exports
-      const work=chunks.slice(0,60);
-      db.updateImportJob(userId,id,{total_chunks:work.length});
+      // Each user can start at most three imports a day; bound one import's
+      // model work too, even when the uploaded export is very large.
+      const work=chunks.slice(0,20);
+      if(!db.updateImportJobIfCurrent(userId,id,{total_chunks:work.length}))throw new Error('Import stopped before starting model work.');
       const prefs=db.getPreferences(userId);
       const timeZone=prefs.time_zone||'America/New_York';
       const user=db.getUserById(userId);
       let added=0;
       for(let i=0;i<work.length;i++){
+        const currentUser=db.getUserById(userId);
+        if(paused()||!currentUser||currentUser.disabled||isDemoUser(currentUser))throw new Error('Import stopped because AI work is paused or this account is unavailable.');
+        if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw Object.assign(new Error('Import job is no longer authorized.'),{code:'REPLY_LEASE_LOST'});},
             message:`Extract durable facts about this user from these past AI conversations.
 
 Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
@@ -1775,6 +1781,8 @@ ${convoText}
 
 Respond with a JSON array of insights, max 6: [{"content":"brief clear fact","kind":"fact"|"preference"|"goal"|"relationship"|"decision","confidence":0.0-1.0}]
 Only include what's clearly supported — skip one-off questions, transient topics, and anything uncertain. If nothing durable, respond with [].`});
+          const activeUser=db.getUserById(userId);
+          if(paused()||!activeUser||activeUser.disabled||isDemoUser(activeUser)||db.getImportJob(userId,id)?.status!=='processing')throw new Error('Import stopped before applying this model result.');
           const jm=text.match(/\[[\s\S]*\]/);
           if(jm){
             const insights=JSON.parse(jm[0]);
@@ -1787,19 +1795,23 @@ Only include what's clearly supported — skip one-off questions, transient topi
                 if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 const sug=db.listMemorySuggestions(userId);
                 if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
-                db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
+                if(!db.addImportSuggestionIfCurrent(userId,id,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))}))throw new Error('Import stopped before saving a suggestion.');
                 added++;
               }
             }
           }
-        }catch(e){/* one bad chunk shouldn't kill the job */}
-        db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
+        }catch(e){
+          const latestUser=db.getUserById(userId);
+          if(paused()||!latestUser||latestUser.disabled||isDemoUser(latestUser))throw e;
+          // One malformed or failed chunk should not discard the whole import.
+        }
+        if(!db.updateImportJobIfCurrent(userId,id,{done_chunks:i+1,suggestions_added:added}))throw new Error('Import stopped before recording progress.');
       }
-      db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
+      if(!db.updateImportJobIfCurrent(userId,id,{status:'done',suggestions_added:added}))throw new Error('Import stopped before completion.');
       db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
-      db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+      if(db.updateImportJobIfCurrent(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)},true)&&db.getUserById(userId))
+        db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
@@ -2649,31 +2661,31 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(owner){await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});await apns.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});}
         return json(res,201,{ok:true});
       }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
-        requireOwner(req);
-        const rows=db.listWaitlist();
-        return json(res,200,{ok:true,waitlist:rows});
-      }
-      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
-        requireOwner(req);
-        const id=url.pathname.split('/').pop();
-        const body=await readJson(req);
-        const status=String(body.status||'').trim();
-        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
-        db.updateWaitlistStatus(id,status);
-        return json(res,200,{ok:true});
-      }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        const body=await readJson(req);
-        const n=parseInt(body.invitesPerWeek,10);
-        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
-        db.setSetting('waitlist_invites_per_week',String(n));
-        return json(res,200,{ok:true,invitesPerWeek:n});
+      if(url.pathname==='/api/admin/waitlist'||url.pathname.startsWith('/api/admin/waitlist/')){
+        const admin=authenticate(req);
+        if(!admin)return json(res,401,{error:'Sign in first.'});
+        requireOwner(admin);
+        if(req.method==='POST')requireCsrf(req,admin);
+        res.setHeader('Cache-Control','no-store');
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist')return json(res,200,{ok:true,waitlist:db.listWaitlist()});
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings')
+          return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+        if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+          const body=await readJson(req);
+          const n=Number(body.invitesPerWeek);
+          if(!Number.isInteger(n)||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1–1000.'),{status:400});
+          db.setSetting('waitlist_invites_per_week',String(n));
+          return json(res,200,{ok:true,invitesPerWeek:n});
+        }
+        const row=url.pathname.match(/^\/api\/admin\/waitlist\/(wl_[A-Za-z0-9_-]{1,100})$/);
+        if(req.method==='POST'&&row){
+          const body=await readJson(req);
+          const status=String(body.status||'').trim();
+          if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+          if(!db.updateWaitlistStatus(row[1],status))return json(res,404,{error:'Waitlist entry not found.'});
+          return json(res,200,{ok:true});
+        }
+        return json(res,404,{error:'Waitlist route not found.'});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
@@ -3139,14 +3151,21 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const curKey=`${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}`;
           const monthLabel=(key)=>{const[y,m]=key.split('-').map(Number);return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'});};
           const out=[];
+          let modelNarratives=0;
           for(let i=0;i<months;i++){
             const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));
             const key=`${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
             const data=db.timelineMonthData(userId,key);
             const activity=data.memories.length+data.conversations.length+data.goalsCreated.length+data.goalsCompleted.length+data.checkins;
             if(!activity)continue;
-            let narrative=db.getTimelineNarrative(userId,key);
-            if(!narrative||key===curKey){
+            const cached=db.getTimelineNarrativeRecord(userId,key);
+            let narrative=cached?.narrative||null;
+            const freshCurrent=key===curKey&&narrative&&new Date(cached.generated_at).valueOf()>Date.now()-6*60*60_000;
+            const needsNarrative=!narrative||(key===curKey&&!freshCurrent);
+            const lease=needsNarrative&&!paused()&&!isDemoUser(user)&&modelNarratives<1
+              ?db.claimTimelineNarrative(userId,key,key===curKey?new Date(Date.now()-6*60*60_000).toISOString():null):null;
+            if(lease){
+              modelNarratives++;
               const facts=[];
               if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
               if(data.goalsCompleted.length)facts.push(`Completed ${data.goalsCompleted.length} goals: ${data.goalsCompleted.map((g)=>g.title).join(', ')}`);
@@ -3155,18 +3174,25 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
               try{
                 const prefs=db.getPreferences(userId);
-                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
-                narrative=text.trim().slice(0,1200)||null;
-                if(narrative)db.setTimelineNarrative(userId,key,narrative);
-              }catch(e){narrative=null;}
-              if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
+                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw Object.assign(new Error('Timeline generation is no longer authorized.'),{code:'REPLY_LEASE_LOST'});};
+                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
+                const generated=text.trim().slice(0,1200);
+                if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;
+              }catch(e){/* keep the last cached narrative when generation fails */}
+              finally{db.releaseTimelineNarrative(userId,lease);}
+            }else if(needsNarrative){
+              // Another replica may have populated the cache since this request read it.
+              narrative=db.getTimelineNarrativeRecord(userId,key)?.narrative||narrative;
             }
+            if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
             const highlights=[];
             for(const g of data.goalsCompleted.slice(0,3))highlights.push(`Completed "${g.title}"`);
             for(const g of data.goalsCreated.slice(0,2))highlights.push(`Started "${g.title}"`);
             if(data.memories.length)highlights.push(`${data.memories.length} memories saved`);
             out.push({key,label:monthLabel(key),narrative,highlights:highlights.slice(0,6),stats:{memories:data.memories.length,conversations:data.conversations.length,goalsCompleted:data.goalsCompleted.length}});
           }
+          const activeUser=db.getUserById(userId);
+          if(!activeUser||activeUser.disabled||activeUser.moderation_blocked)throw Object.assign(new Error('Account unavailable.'),{status:403});
           return json(res,200,{months:out});
         }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){
@@ -3319,7 +3345,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
-          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt);
+          const quotaPolicy=subscriptions.quotaPolicy(userId,user);
+          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt,quotaPolicy);
+          if(accepted?.quotaDenied)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota:accepted.quotaDenied});
           if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
           scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
@@ -3478,6 +3506,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{jobs:db.listImportJobs(userId)});
         }
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
+          if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
+          if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3499,6 +3529,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const extracted=extractMessages(parsed);
           if(!extracted||!extracted.messages.length)throw Object.assign(new Error('No conversation messages found. Upload a ChatGPT export (conversations.json) or a {messages:[...]} file.'),{status:422});
           const job=db.createImportJob(userId,filename);
+          if(!job)throw Object.assign(new Error('An import is already running or the daily import limit was reached. Try again later.'),{status:429});
           db.addEvent(userId,'import_started',`Started analyzing ${extracted.messages.length} imported messages.`);
           // Process in background — raw export lives in memory only, never persisted.
           setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));
@@ -3556,6 +3587,12 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           }
           if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
           if(approval.kind==='gmail_send'||approval.kind==='gmail_delete'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});}
+          if(['delete_goal','delete_task','delete_routine'].includes(approval.kind)){
+            const outcome=db.executeDeleteApprovalIfCurrent(userId,approval.id);
+            if(outcome.status!=='executed')throw Object.assign(new Error('This deletion request is stale or was already reviewed. Ask Orbit to stage it again.'),{status:409});
+            try{db.addEvent(userId,'approval_executed',`Deleted ${approval.payload.objectType} “${approval.payload.title}” after approval.`);}catch(error){console.error('Deletion completed; audit event write failed:',error);}
+            return json(res,200,{approval:outcome.approval});
+          }
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
             if(approval.kind==='calendar_event'){
@@ -3571,19 +3608,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
               return json(res,200,{approval:executed});
             }
-            if(approval.kind==='delete_goal'||approval.kind==='delete_task'||approval.kind==='delete_routine'){
-              const {id,title,objectType}=approval.payload||{};
-              const ok=approval.kind==='delete_goal'?db.deleteGoal(userId,id):approval.kind==='delete_task'?db.deleteTask(userId,id):db.deleteRoutine(userId,id);
-              if(!ok){
-                db.finishApproval(userId,approval.id,'failed',{error:'The item was already gone.'});
-                db.addEvent(userId,'approval_failed',`Could not delete “${title||'item'}” — it no longer exists.`);
-                return json(res,200,{approval:db.getApproval(userId,approval.id)});
-              }
-              const executed=db.finishApproval(userId,approval.id,'executed',{result:{deleted:approval.kind,id,title}});
-              db.addEvent(userId,'approval_executed',`Deleted ${objectType||'item'} “${title}” after approval.`);
-              return json(res,200,{approval:executed});
-            }
-            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
+            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id,expectedPreview:approval.payload.preview});
             const executed=db.finishApproval(userId,approval.id,'executed',{result});
             db.addEvent(userId,'approval_executed','Moved an approved Gmail message to trash.');
             return json(res,200,{approval:executed});
@@ -3755,7 +3780,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
-      db.close();
+      await db.close();
     }
   };
 }

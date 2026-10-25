@@ -8,6 +8,7 @@ import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalize
 import { assertMemorySafe } from './relational-intelligence.js';
 import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from './portable-recovery.js';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './reply-jobs.js';
+import { currentDeleteApproval, decodeApprovalRow } from './delete-approval.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -251,6 +252,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       narrative TEXT NOT NULL,
       generated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, month_key)
+    );
+    CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      month_key TEXT NOT NULL,
+      token TEXT NOT NULL,
+      expires_at TEXT NOT NULL
     );
     DROP TABLE IF EXISTS automation_tokens;
     CREATE TABLE IF NOT EXISTS conversations (
@@ -589,7 +596,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -615,6 +622,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
       (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listMessagesByInsertion: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY rowid DESC LIMIT ?'),
     getReportSubmission: db.prepare('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?'),
     countRecentReports: db.prepare('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?'),
     addReport: db.prepare(`INSERT INTO reports(id,reporter_user_id,submission_id,kind,reason,description,message_id,message_excerpt,status,created_at,updated_at,reviewed_at)
@@ -646,6 +654,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
     addImportJob: db.prepare('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'),
+    expireStaleImportJobs: db.prepare("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?"),
+    activeImportJob: db.prepare("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1"),
+    countRecentImportJobs: db.prepare('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?'),
     getImportJob: db.prepare('SELECT * FROM import_jobs WHERE id=? AND user_id=?'),
     listImportJobs: db.prepare('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5'),
     updateImportJob: db.prepare('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?'),
@@ -1120,11 +1131,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       s.touchConversation.run(timestamp(),conversationId,userId);
       return{userMessage,job};
     });},
-    acceptRegenerateReplyJob(userId,conversationId,userMessageId,targetMessageId,insertCreatedAt){return withImmediate(()=>{
+    acceptRegenerateReplyJob(userId,conversationId,userMessageId,targetMessageId,insertCreatedAt,quotaPolicy=null){return withImmediate(()=>{
       const userMessage=s.getMessage.get(userMessageId,userId);
       if(!userMessage||userMessage.conversation_id!==conversationId||userMessage.role!=='user')return null;
       const target=s.getMessage.get(targetMessageId,userId);
       if(!target||target.conversation_id!==conversationId||target.role!=='assistant')return null;
+      if(quotaPolicy?.enforced){
+        const prior=s.getDailyUsage.get(userId,quotaPolicy.day)?.count||0;
+        if(prior>=quotaPolicy.limit)return{quotaDenied:{...quotaPolicy,allowed:false,used:prior}};
+        s.incrementDailyUsage.run(userId,quotaPolicy.day,timestamp());
+      }
       s.deleteMessageRow.run(targetMessageId,userId);
       const job=insertReplyJob({userId,conversationId,userMessageId,kind:'regenerate',insertCreatedAt});
       s.touchConversation.run(timestamp(),conversationId,userId);
@@ -1367,10 +1383,39 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
       return saved;
     },
-    createImportJob(userId,filename){const now=timestamp();const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;},
+    createImportJob(userId,filename){return withImmediate(()=>{
+      const now=timestamp();
+      s.expireStaleImportJobs.run(now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(s.activeImportJob.get(userId)||s.countRecentImportJobs.get(userId,new Date(Date.now()-24*60*60_000).toISOString()).count>=3)return null;
+      const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};
+      s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;
+    });},
     getImportJob:(userId,id)=>s.getImportJob.get(id,userId)||null,
     listImportJobs:(userId)=>s.listImportJobs.all(userId),
     updateImportJob(userId,id,patch={}){const cur=s.getImportJob.get(id,userId);if(!cur)return null;const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);return {...cur,...next};},
+    isImportJobActive(userId,id){
+      const row=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      return !!(row?.status==='processing'&&user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true');
+    },
+    updateImportJobIfCurrent(userId,id,patch={},allowInactive=false){return withImmediate(()=>{
+      const cur=s.getImportJob.get(id,userId);
+      if(cur?.status!=='processing')return null;
+      const user=s.userById.get(userId);
+      if(!allowInactive&&(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'))return null;
+      const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,
+        done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,
+        error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};
+      s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);
+      return{...cur,...next};
+    });},
+    addImportSuggestionIfCurrent(userId,id,content,options={}){return withImmediate(()=>{
+      const job=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      if(job?.status!=='processing'||!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const now=timestamp(),row={id:randomUUID(),user_id:userId,content:assertMemorySafe(content),created_at:now,
+        kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};
+      s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);
+      return row;
+    });},
     addFollowUp(userId,{description,dueDate,priority=2,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:validDateString(dueDate)||dueDate,status:'scheduled',priority:normalizePriority(priority),source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.priority,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===row.due_date);},
     listFollowUps:(userId)=>s.listFollowUps.all(userId),
     dueFollowUps:(userId,today,at=timestamp())=>s.dueFollowUps.all(userId,today,at),
@@ -1459,6 +1504,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimApproval(userId,id){const at=timestamp();const staleBefore=new Date(Date.now()-10*60_000).toISOString();if(!s.claimApproval.run(at,at,id,userId,staleBefore).changes)return null;return this.getApproval(userId,id);},
     resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     finishApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','failed'].includes(status))return null;const at=timestamp();if(!s.finishApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
+    executeDeleteApprovalIfCurrent(userId,approvalId){return withImmediate(()=>{
+      const raw=s.getApproval.get(approvalId,userId);
+      if(!raw||raw.status!=='pending'||raw.execution_started_at)return{status:'already'};
+      const approval=decodeApprovalRow(raw),{id,objectType}=approval.payload||{};
+      const target=objectType==='goal'?s.getGoal.get(id,userId):objectType==='task'?s.getTask.get(id,userId):objectType==='routine'?s.getRoutine.get(id,userId):null;
+      const recent=s.listMessagesByInsertion.all(userId,200);
+      const selected=currentDeleteApproval(approval,recent,target);
+      const now=timestamp();
+      if(!selected){
+        db.prepare("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run('Deletion request or target changed.',now,now,approvalId,userId);
+        return{status:'stale',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId))};
+      }
+      const deleted=selected.objectType==='goal'?s.deleteGoal.run(id,userId).changes:selected.objectType==='task'?s.deleteTask.run(id,userId).changes:s.deleteRoutine.run(id,userId).changes;
+      if(!deleted)throw new Error('Deletion target changed during transaction.');
+      const result={deleted:approval.kind,id:selected.id,title:selected.title};
+      db.prepare("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run(JSON.stringify(result),now,now,approvalId,userId);
+      return{status:'executed',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId)),result};
+    });},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
@@ -1549,7 +1612,35 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
     getTimelineNarrative:(userId,monthKey)=>{const row=s.getTimelineNarrative.get(userId,monthKey);return row?row.narrative:null;},
+    getTimelineNarrativeRecord:(userId,monthKey)=>s.getTimelineNarrative.get(userId,monthKey)||null,
     setTimelineNarrative:(userId,monthKey,narrative)=>{s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());},
+    claimTimelineNarrative(userId,monthKey,freshAfter=null){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const cached=s.getTimelineNarrative.get(userId,monthKey);
+      if(cached&&(!freshAfter||cached.generated_at>freshAfter))return null;
+      const now=timestamp(),token=randomUUID();
+      const claimed=db.prepare(`INSERT INTO timeline_generation_leases(user_id,month_key,token,expires_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET month_key=excluded.month_key,token=excluded.token,expires_at=excluded.expires_at
+        WHERE timeline_generation_leases.expires_at<=?`).run(userId,monthKey,token,new Date(Date.now()+5*60_000).toISOString(),now);
+      return claimed.changes?token:null;
+    });},
+    isTimelineNarrativeLeaseActive(userId,monthKey,token){
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      return !!(user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true'
+        &&lease?.token===token&&lease.month_key===monthKey&&lease.expires_at>timestamp());
+    },
+    completeTimelineNarrative(userId,monthKey,token,narrative){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'
+        ||lease?.token!==token||lease.month_key!==monthKey||lease.expires_at<=timestamp())return false;
+      s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());
+      db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);
+      return true;
+    });},
+    releaseTimelineNarrative(userId,token){db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);},
     timelineMonthData(userId,monthKey){
       return {
         memories:s.timelineMemories.all(userId,monthKey),

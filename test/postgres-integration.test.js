@@ -7,9 +7,121 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
+import { Worker } from 'node:worker_threads';
+import { createSyncPgAdapter, waitForPgResponse } from '../src/db/sync-pg-wrapper.mjs';
+import { toolDeleteGoal,toolConfirmDeleteApproval } from '../src/tools.js';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
+
+test('PostgreSQL deletion tool remains unable to execute after a later yes',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const db=createSyncPgAdapter(DATABASE_URL);
+  let userId=null;
+  try{
+    const user=db.createUser({email:`delete-gate-${Date.now()}-${Math.random()}@example.com`,displayName:'Delete gate',passwordHash:'test',passwordSalt:'test',role:'member'});
+    userId=user.id;
+    const conversation=db.createConversation(userId,'Delete gate');
+    const goal=db.addGoal(userId,{title:'Private goal'});
+    const first=db.addMessage(userId,conversation.id,'user','Delete Private goal');
+    const context={db,userId,messageId:first.id};
+    const staged=toolDeleteGoal({title:'Private goal'},context);
+    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},context),/Chat cannot execute deletions/i);
+    db.addMessage(userId,conversation.id,'assistant',`Confirm deletion: ${staged.preview}`);
+    const next=db.addMessage(userId,conversation.id,'user','yes, delete it');
+    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...context,messageId:next.id}),/Chat cannot execute deletions/i);
+    assert.ok(db.getGoal(userId,goal.id));
+    assert.equal(db.getApproval(userId,staged.approvalId).status,'pending');
+    assert.equal(db.executeDeleteApprovalIfCurrent(userId,staged.approvalId).status,'stale');
+    assert.ok(db.getGoal(userId,goal.id));
+    const second=db.addMessage(userId,conversation.id,'user','Delete the exact goal now');
+    const refreshed=toolDeleteGoal({title:'Private goal'},{...context,messageId:second.id});
+    assert.equal(db.executeDeleteApprovalIfCurrent(userId,refreshed.approvalId).status,'executed');
+    assert.equal(db.getGoal(userId,goal.id),null);
+  }finally{
+    if(userId)db.deleteUserAccount(userId);
+    db.close();
+  }
+});
+
+test('a late successful-call notification cannot complete the next synchronous call',async()=>{
+  const resultBuffer=new SharedArrayBuffer(16),controlBuffer=new SharedArrayBuffer(4);
+  const result=new Int32Array(resultBuffer),control=new Int32Array(controlBuffer);
+  const worker=new Worker(`
+    const {workerData}=require('node:worker_threads');
+    const result=new Int32Array(workerData.result),control=new Int32Array(workerData.control);
+    Atomics.wait(control,0,0);
+    Atomics.wait(control,0,1,30); // second response follows the old notification
+    Atomics.store(result,1,42);
+    Atomics.store(result,0,1);
+    Atomics.notify(result,0,1);
+  `,{eval:true,workerData:{result:resultBuffer,control:controlBuffer}});
+  const originalWait=Atomics.wait;
+  let oldWake=false;
+  try{
+    Atomics.store(result,0,1); // prior call finished, before its notify
+    assert.equal(waitForPgResponse(result,100),true);
+    Atomics.store(result,0,0); // next call reuses the buffer
+    Atomics.wait=(array,index,expected,timeout)=>{
+      if(array===result&&!oldWake){
+        oldWake=true;
+        Atomics.notify(result,0,1); // delayed notification from prior call
+        Atomics.store(control,0,1);Atomics.notify(control,0,1);
+        return 'ok'; // the old notify wakes this call with FLAG still zero
+      }
+      return originalWait(array,index,expected,timeout);
+    };
+    assert.equal(waitForPgResponse(result,1000),true);
+    assert.equal(oldWake,true);
+    assert.equal(Atomics.load(result,1),42,'only the new response completes the call');
+  }finally{
+    Atomics.wait=originalWait;
+    await worker.terminate();
+  }
+});
+
+test('PostgreSQL sync calls never return a timed-out earlier call result',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {Pool}=await import('pg');
+  const pool=new Pool({connectionString:DATABASE_URL,ssl:DATABASE_URL.includes('sslmode=disable')?false:true});
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  const settingsFunction=`orbit_delay_settings_${suffix}`;
+  const usersFunction=`orbit_delay_users_${suffix}`;
+  const settingsTrigger=`orbit_settings_trigger_${suffix}`;
+  const usersTrigger=`orbit_users_trigger_${suffix}`;
+  const key=`sync-timeout-${suffix}`;
+  const email=`sync-timeout-${suffix}@example.test`;
+  let db;
+  try{
+    await pool.query(`CREATE FUNCTION ${settingsFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.key='${key}' THEN PERFORM pg_sleep(1.4); END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER ${settingsTrigger} BEFORE INSERT ON settings FOR EACH ROW EXECUTE FUNCTION ${settingsFunction}()`);
+    await pool.query(`CREATE FUNCTION ${usersFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.email='${email}' THEN PERFORM pg_sleep(4); END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER ${usersTrigger} BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION ${usersFunction}()`);
+    db=createSyncPgAdapter(DATABASE_URL,{queryTimeoutMs:1000});
+    assert.throws(()=>db.setSetting(key,'first'),/PG query timeout: setSetting/);
+    assert.throws(()=>db.createUser({email,displayName:'Synthetic',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'}),
+      /PG query timeout: createUser/,'a late setting result must never wake createUser');
+    let found=false;
+    for(let attempt=0;attempt<35;attempt++){
+      if((await pool.query('SELECT 1 FROM users WHERE email=$1',[email])).rowCount){found=true;break;}
+      await new Promise(resolve=>setTimeout(resolve,150));
+    }
+    assert.equal(found,true,'the delayed write can still complete after its wrapper timeout');
+    assert.equal(db.getUserByEmail(email)?.email,email,'later synchronous reads use a fresh response buffer');
+  }finally{
+    if(db)await db.close();
+    await pool.query(`DROP TRIGGER IF EXISTS ${settingsTrigger} ON settings`);
+    await pool.query(`DROP TRIGGER IF EXISTS ${usersTrigger} ON users`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${settingsFunction}()`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${usersFunction}()`);
+    await pool.query('DELETE FROM settings WHERE key=$1',[key]);
+    await pool.query('DELETE FROM users WHERE email=$1',[email]);
+    await pool.end();
+  }
+});
 
 // Apply schema idempotently before tests. Uses a direct pg Pool (not the
 // sync wrapper) so schema setup doesn't depend on the code under test.
