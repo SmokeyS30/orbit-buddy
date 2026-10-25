@@ -1751,6 +1751,7 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
     const row=db.getImportJob(userId,id);
     if(!row||row.status!=='processing')return;
     try{
+      if(!db.isImportJobActive(userId,id))throw new Error('Import stopped before starting.');
       const extracted=extractMessages(parsed);
       if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
       const chunks=chunkMessages(extracted.messages,20);
@@ -1758,7 +1759,7 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
       // Each user can start at most three imports a day; bound one import's
       // model work too, even when the uploaded export is very large.
       const work=chunks.slice(0,20);
-      db.updateImportJob(userId,id,{total_chunks:work.length});
+      if(!db.updateImportJobIfCurrent(userId,id,{total_chunks:work.length}))throw new Error('Import stopped before starting model work.');
       const prefs=db.getPreferences(userId);
       const timeZone=prefs.time_zone||'America/New_York';
       const user=db.getUserById(userId);
@@ -1766,10 +1767,11 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
       for(let i=0;i<work.length;i++){
         const currentUser=db.getUserById(userId);
         if(paused()||!currentUser||currentUser.disabled||isDemoUser(currentUser))throw new Error('Import stopped because AI work is paused or this account is unavailable.');
-        if(db.getImportJob(userId,id)?.status!=='processing')return;
+        if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');},
             message:`Extract durable facts about this user from these past AI conversations.
 
 Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
@@ -1793,7 +1795,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
                 if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 const sug=db.listMemorySuggestions(userId);
                 if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
-                db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
+                if(!db.addImportSuggestionIfCurrent(userId,id,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))}))throw new Error('Import stopped before saving a suggestion.');
                 added++;
               }
             }
@@ -1803,13 +1805,13 @@ Only include what's clearly supported — skip one-off questions, transient topi
           if(paused()||!latestUser||latestUser.disabled||isDemoUser(latestUser))throw e;
           // One malformed or failed chunk should not discard the whole import.
         }
-        db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
+        if(!db.updateImportJobIfCurrent(userId,id,{done_chunks:i+1,suggestions_added:added}))throw new Error('Import stopped before recording progress.');
       }
-      db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
+      if(!db.updateImportJobIfCurrent(userId,id,{status:'done',suggestions_added:added}))throw new Error('Import stopped before completion.');
       db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
-      db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+      if(db.updateImportJobIfCurrent(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)},true)&&db.getUserById(userId))
+        db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
@@ -3159,7 +3161,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const cached=db.getTimelineNarrativeRecord(userId,key);
             let narrative=cached?.narrative||null;
             const freshCurrent=key===curKey&&narrative&&new Date(cached.generated_at).valueOf()>Date.now()-6*60*60_000;
-            if((!narrative||(key===curKey&&!freshCurrent))&&!paused()&&!isDemoUser(user)&&modelNarratives<1){
+            const needsNarrative=!narrative||(key===curKey&&!freshCurrent);
+            const lease=needsNarrative&&!paused()&&!isDemoUser(user)&&modelNarratives<1
+              ?db.claimTimelineNarrative(userId,key,key===curKey?new Date(Date.now()-6*60*60_000).toISOString():null):null;
+            if(lease){
               modelNarratives++;
               const facts=[];
               if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
@@ -3169,10 +3174,15 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
               try{
                 const prefs=db.getPreferences(userId);
-                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
+                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw new Error('Timeline generation is no longer authorized.');};
+                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
                 const generated=text.trim().slice(0,1200);
-                if(generated){narrative=generated;db.setTimelineNarrative(userId,key,narrative);}
+                if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;
               }catch(e){/* keep the last cached narrative when generation fails */}
+              finally{db.releaseTimelineNarrative(userId,lease);}
+            }else if(needsNarrative){
+              // Another replica may have populated the cache since this request read it.
+              narrative=db.getTimelineNarrativeRecord(userId,key)?.narrative||narrative;
             }
             if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
             const highlights=[];
@@ -3181,6 +3191,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             if(data.memories.length)highlights.push(`${data.memories.length} memories saved`);
             out.push({key,label:monthLabel(key),narrative,highlights:highlights.slice(0,6),stats:{memories:data.memories.length,conversations:data.conversations.length,goalsCompleted:data.goalsCompleted.length}});
           }
+          const activeUser=db.getUserById(userId);
+          if(!activeUser||activeUser.disabled||activeUser.moderation_blocked)throw Object.assign(new Error('Account unavailable.'),{status:403});
           return json(res,200,{months:out});
         }
         if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){
@@ -3333,9 +3345,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
-          const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt);
+          const quotaPolicy=subscriptions.quotaPolicy(userId,user);
+          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt,quotaPolicy);
+          if(accepted?.quotaDenied)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota:accepted.quotaDenied});
           if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
           scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
