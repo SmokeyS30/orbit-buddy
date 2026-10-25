@@ -1,4 +1,4 @@
-import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
+import { assertPublicUrl, fetchPublicBytes, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
@@ -120,20 +120,12 @@ async function duckDuckGoSearch(query) {
 }
 
 export async function toolFetchUrl(args = {}) {
-  const url = await assertPublicUrl(args.url);
   const headers = { 'User-Agent': 'orbit-buddy/1.0 (read-only page reader)' };
-  let response;
-  try {
-    response = await fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-  } catch (error) {
-    throw new Error(`Could not fetch that page: ${error.message}`);
-  }
-  // Re-check after redirects: a public URL must not bounce into the private network.
-  const finalUrl = await assertPublicUrl(response.url);
-  const contentType = response.headers.get('content-type') || '';
-  if (!/text|json|xml|html/i.test(contentType)) throw new Error('That URL did not return readable text.');
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_PAGE_BYTES) throw new Error('That page is too large to read.');
+  const response=await fetchPublicBytes(args.url,{headers,maxBytes:MAX_PAGE_BYTES,
+    sizeError:'That page is too large to read.',contentTypePattern:/text|json|xml|html/i,
+    networkErrorPrefix:'Could not fetch that page'});
+  if(!response.ok)throw new Error(`That page returned HTTP ${response.status}.`);
+  const {buffer}=response;
   const text = buffer.toString('utf8')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -141,7 +133,7 @@ export async function toolFetchUrl(args = {}) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!text) throw new Error('No readable text found on that page.');
-  return { url: finalUrl, text: text.slice(0, 6000) };
+  return { url: response.url, text: text.slice(0, 6000) };
 }
 
 const geoCache = new Map();
