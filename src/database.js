@@ -822,7 +822,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     failClaimedTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
     releaseClaimedTask: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
-      AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
+      AND (schedule_at IS NULL OR schedule_at<=?)
+      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)
+      ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
     listEvents: db.prepare('SELECT * FROM events WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     countToolUseSince: db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='tool_use' AND message LIKE ? AND created_at>=?"),
