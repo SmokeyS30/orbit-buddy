@@ -200,7 +200,11 @@ test('PostgreSQL portable recovery restores a full synthetic bundle into an isol
     if(source&&sourceUser)await source.deleteUserAccount(sourceUser.id);
     if(source)await source.close();
     if(target)await target.close();
-    if(created)await admin.query(`DROP DATABASE ${name}`);
+    if(created){
+      const active=await admin.query('SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname=$1',[name]);
+      assert.equal(active.rows[0].count,0,'all application and test connections must close before dropping the temporary backup database');
+      await admin.query(`DROP DATABASE ${name}`);
+    }
     await admin.end();
     fs.rmSync(backupDir,{recursive:true,force:true});
   }
@@ -271,7 +275,11 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     if(adapter)await adapter.close();
     if(app)await app.close();
     if(sql)await sql.end();
-    if(created)await admin.query(`DROP DATABASE ${name}`);
+    if(created){
+      const active=await admin.query('SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname=$1',[name]);
+      assert.equal(active.rows[0].count,0,'all application and test connections must close before dropping the temporary backup database');
+      await admin.query(`DROP DATABASE ${name}`);
+    }
     await admin.end();
     fs.rmSync(directory,{recursive:true,force:true});
   }
