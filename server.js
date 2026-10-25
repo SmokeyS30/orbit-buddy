@@ -2649,31 +2649,31 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(owner){await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});await apns.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});}
         return json(res,201,{ok:true});
       }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
-        requireOwner(req);
-        const rows=db.listWaitlist();
-        return json(res,200,{ok:true,waitlist:rows});
-      }
-      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
-        requireOwner(req);
-        const id=url.pathname.split('/').pop();
-        const body=await readJson(req);
-        const status=String(body.status||'').trim();
-        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
-        db.updateWaitlistStatus(id,status);
-        return json(res,200,{ok:true});
-      }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        const body=await readJson(req);
-        const n=parseInt(body.invitesPerWeek,10);
-        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
-        db.setSetting('waitlist_invites_per_week',String(n));
-        return json(res,200,{ok:true,invitesPerWeek:n});
+      if(url.pathname==='/api/admin/waitlist'||url.pathname.startsWith('/api/admin/waitlist/')){
+        const admin=authenticate(req);
+        if(!admin)return json(res,401,{error:'Sign in first.'});
+        requireOwner(admin);
+        if(req.method==='POST')requireCsrf(req,admin);
+        res.setHeader('Cache-Control','no-store');
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist')return json(res,200,{ok:true,waitlist:db.listWaitlist()});
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings')
+          return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+        if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+          const body=await readJson(req);
+          const n=Number(body.invitesPerWeek);
+          if(!Number.isInteger(n)||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1–1000.'),{status:400});
+          db.setSetting('waitlist_invites_per_week',String(n));
+          return json(res,200,{ok:true,invitesPerWeek:n});
+        }
+        const row=url.pathname.match(/^\/api\/admin\/waitlist\/(wl_[A-Za-z0-9_-]{1,100})$/);
+        if(req.method==='POST'&&row){
+          const body=await readJson(req);
+          const status=String(body.status||'').trim();
+          if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+          if(!db.updateWaitlistStatus(row[1],status))return json(res,404,{error:'Waitlist entry not found.'});
+          return json(res,200,{ok:true});
+        }
+        return json(res,404,{error:'Waitlist route not found.'});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
