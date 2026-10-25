@@ -3755,7 +3755,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
-      db.close();
+      await db.close();
     }
   };
 }

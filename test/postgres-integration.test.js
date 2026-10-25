@@ -11,6 +11,49 @@ import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 
+test('PostgreSQL sync calls never return a timed-out earlier call result',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {Pool}=await import('pg');
+  const pool=new Pool({connectionString:DATABASE_URL,ssl:DATABASE_URL.includes('sslmode=disable')?false:true});
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  const settingsFunction=`orbit_delay_settings_${suffix}`;
+  const usersFunction=`orbit_delay_users_${suffix}`;
+  const settingsTrigger=`orbit_settings_trigger_${suffix}`;
+  const usersTrigger=`orbit_users_trigger_${suffix}`;
+  const key=`sync-timeout-${suffix}`;
+  const email=`sync-timeout-${suffix}@example.test`;
+  let db;
+  try{
+    await pool.query(`CREATE FUNCTION ${settingsFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.key='${key}' THEN PERFORM pg_sleep(1.4); END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER ${settingsTrigger} BEFORE INSERT ON settings FOR EACH ROW EXECUTE FUNCTION ${settingsFunction}()`);
+    await pool.query(`CREATE FUNCTION ${usersFunction}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.email='${email}' THEN PERFORM pg_sleep(4); END IF; RETURN NEW; END $$`);
+    await pool.query(`CREATE TRIGGER ${usersTrigger} BEFORE INSERT ON users FOR EACH ROW EXECUTE FUNCTION ${usersFunction}()`);
+    db=createSyncPgAdapter(DATABASE_URL,{queryTimeoutMs:1000});
+    assert.throws(()=>db.setSetting(key,'first'),/PG query timeout: setSetting/);
+    assert.throws(()=>db.createUser({email,displayName:'Synthetic',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'}),
+      /PG query timeout: createUser/,'a late setting result must never wake createUser');
+    let found=false;
+    for(let attempt=0;attempt<35;attempt++){
+      if((await pool.query('SELECT 1 FROM users WHERE email=$1',[email])).rowCount){found=true;break;}
+      await new Promise(resolve=>setTimeout(resolve,150));
+    }
+    assert.equal(found,true,'the delayed write can still complete after its wrapper timeout');
+    assert.equal(db.getUserByEmail(email)?.email,email,'later synchronous reads use a fresh response buffer');
+  }finally{
+    if(db)await db.close();
+    await pool.query(`DROP TRIGGER IF EXISTS ${settingsTrigger} ON settings`);
+    await pool.query(`DROP TRIGGER IF EXISTS ${usersTrigger} ON users`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${settingsFunction}()`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${usersFunction}()`);
+    await pool.query('DELETE FROM settings WHERE key=$1',[key]);
+    await pool.query('DELETE FROM users WHERE email=$1',[email]);
+    await pool.end();
+  }
+});
+
 // Apply schema idempotently before tests. Uses a direct pg Pool (not the
 // sync wrapper) so schema setup doesn't depend on the code under test.
 async function ensureSchema() {

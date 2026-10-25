@@ -258,7 +258,7 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     assert.ok(Date.now()-began>=150,'restore waits for its SQL transaction result');
     assert.equal((await sql.query('SELECT content FROM messages WHERE id=$1',[restoredId])).rows[0].content,
       'Delayed synthetic restore');
-    adapter.close();adapter=null;
+    await adapter.close();adapter=null;
     await sql.query('DROP TRIGGER orbit_slow_restore_trigger ON messages');
     await sql.query('DROP FUNCTION orbit_slow_restore()');
 
@@ -268,10 +268,10 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     assert.equal(repeat.status,200);
     assert.equal((await repeat.json()).paused,true);
   }finally{
-    adapter?.close();
+    if(adapter)await adapter.close();
     if(app)await app.close();
     if(sql)await sql.end();
-    if(created)await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
+    if(created)await admin.query(`DROP DATABASE ${name}`);
     await admin.end();
     fs.rmSync(directory,{recursive:true,force:true});
   }
