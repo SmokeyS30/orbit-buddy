@@ -206,9 +206,8 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     return { appAccountToken: payload.appAccountToken, productId: payload.productId };
   }
 
-  async function fetchEntitlements(userId) {
+  async function fetchEntitlements(userId, current = db.getSubscription(userId)) {
     if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
-    const current = db.getSubscription(userId);
     if (!current?.original_transaction_id || !current?.app_account_token) return [];
     const preferred = current.environment === 'sandbox' ? runtime.sandbox : runtime.production;
     const entitlement = await resolveEntitlement(current.original_transaction_id, preferred);

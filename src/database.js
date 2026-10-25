@@ -918,6 +918,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       original_transaction_id=excluded.original_transaction_id,last_event_signed_at=excluded.last_event_signed_at,updated_at=excluded.updated_at
       WHERE (subscriptions.app_account_token IS NULL OR subscriptions.app_account_token=excluded.app_account_token)
         AND (subscriptions.last_event_signed_at IS NULL OR subscriptions.last_event_signed_at<excluded.last_event_signed_at)`),
+    insertSubscriptionIfAbsent: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING`),
+    updateSubscriptionIfUnchanged: db.prepare(`UPDATE subscriptions SET product_id=?,status=?,expires_at=?,app_account_token=?,environment=?,
+      original_transaction_id=?,last_event_signed_at=CASE WHEN ? IS NOT NULL AND (last_event_signed_at IS NULL OR last_event_signed_at<?)
+        THEN ? ELSE last_event_signed_at END,updated_at=?
+      WHERE user_id=? AND id=? AND product_id=? AND status=? AND expires_at IS ? AND app_account_token IS ?
+        AND environment=? AND original_transaction_id IS ? AND last_event_signed_at IS ?`),
     getSubscription: db.prepare('SELECT * FROM subscriptions WHERE user_id=?'),
     getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
     incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
@@ -1876,6 +1883,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       if(!appAccountToken||!lastEventSignedAt)throw new Error('Signed notification binding and date are required.');
       const now=timestamp();
       return s.upsertSubscriptionNotification.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now).changes>0;
+    },
+    saveSubscriptionIfUnchanged(userId,expected,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
+      const now=timestamp(),expiry=expiresAt||null,token=appAccountToken||null,origin=originalTransactionId||null,appEnvironment=environment||'production';
+      if(!expected)return s.insertSubscriptionIfAbsent.run(randomUUID(),userId,productId,status,expiry,token,appEnvironment,origin,lastEventSignedAt,now,now).changes>0;
+      if(expected.user_id!==userId)throw new Error('Subscription snapshot belongs to another account.');
+      return s.updateSubscriptionIfUnchanged.run(productId,status,expiry,token,appEnvironment,origin,
+        lastEventSignedAt,lastEventSignedAt,lastEventSignedAt,now,userId,expected.id,expected.product_id,
+        expected.status,expected.expires_at,expected.app_account_token,expected.environment,
+        expected.original_transaction_id,expected.last_event_signed_at).changes>0;
     },
     getSubscription: (userId) => s.getSubscription.get(userId)||null,
     getDailyUsageCount(userId,dayNy) { const row=s.getDailyUsage.get(userId,dayNy); return row?row.count:0; },
