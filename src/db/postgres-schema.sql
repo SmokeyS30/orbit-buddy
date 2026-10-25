@@ -279,7 +279,8 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   endpoint TEXT NOT NULL UNIQUE,
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  session_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS apns_device_tokens (
@@ -290,6 +291,7 @@ CREATE TABLE IF NOT EXISTS apns_device_tokens (
   apns_environment TEXT NOT NULL DEFAULT 'production',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  session_hash TEXT,
   UNIQUE(user_id, device_token)
 );
 

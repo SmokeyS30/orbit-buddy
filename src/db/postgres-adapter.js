@@ -307,6 +307,8 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         updated_at TEXT NOT NULL,
         UNIQUE(user_id, device_token)
       )`,
+      'ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS session_hash TEXT',
+      'ALTER TABLE apns_device_tokens ADD COLUMN IF NOT EXISTS session_hash TEXT',
       `CREATE TABLE IF NOT EXISTS subscriptions (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -410,6 +412,8 @@ const indexMigrations = [
     await client.query('SELECT 1 FROM reports LIMIT 0');
     await client.query('SELECT 1 FROM reply_jobs LIMIT 0');
     await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
+    await client.query('SELECT session_hash FROM push_subscriptions LIMIT 0');
+    await client.query('SELECT session_hash FROM apns_device_tokens LIMIT 0');
     const ordering=await client.query(`SELECT column_default FROM information_schema.columns
       WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
     if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
@@ -1672,22 +1676,31 @@ const indexMigrations = [
     deleteArtifact: async (userId, id) => { const r = await run('DELETE FROM artifacts WHERE id=? AND user_id=?', id, userId); return (r.rowCount||r.changes||0)>0; },
 
     // --- Push subscriptions ---
-    savePush: async (userId, { endpoint, keys }) => {
-      await run(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
-        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`, randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp());
+    savePush: async (userId, { endpoint, keys }, sessionHash) => {
+      if(!sessionHash||!(await get('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp())))
+        throw new Error('Push registration requires an active session.');
+      await run(`INSERT INTO push_subscriptions(id,user_id,endpoint,p256dh,auth,created_at,session_hash) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,session_hash=excluded.session_hash,created_at=excluded.created_at`,
+        randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp(),sessionHash);
     },
-    listPush: async (userId) => all('SELECT * FROM push_subscriptions WHERE user_id=?', userId),
+    listPush: async (userId) => all(`SELECT p.* FROM push_subscriptions p JOIN sessions s ON s.token_hash=p.session_hash
+      AND s.user_id=p.user_id AND s.expires_at>? WHERE p.user_id=?`,timestamp(),userId),
     deletePush: async (userId, endpoint) => { await run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, userId); },
     deletePushById: async (id) => { await run('DELETE FROM push_subscriptions WHERE id=?', id); },
 
     // --- APNs device tokens (native iOS push) ---
-    saveApnsToken: async (userId, token) => {
+    saveApnsToken: async (userId, token, sessionHash) => withTransaction(async ({query:tQuery,get:tGet,run:tRun}) => {
+      await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[token]);
+      if(!sessionHash||!(await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp())))
+        throw new Error('Push registration requires an active session.');
       const now = timestamp();
-      await run(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,
-        randomUUID(), userId, token, 'ios', 'production', now, now);
-    },
-    listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
+      await tRun('UPDATE apns_device_tokens SET session_hash=NULL WHERE device_token=?',token);
+      await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at,session_hash)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at,session_hash=excluded.session_hash`,
+        randomUUID(), userId, token, 'ios', 'production', now, now,sessionHash);
+    }),
+    listApnsTokens: async (userId) => all(`SELECT a.* FROM apns_device_tokens a JOIN sessions s ON s.token_hash=a.session_hash
+      AND s.user_id=a.user_id AND s.expires_at>? WHERE a.user_id=?`,timestamp(),userId),
     deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
 
     // --- Subscriptions (StoreKit 2) ---
