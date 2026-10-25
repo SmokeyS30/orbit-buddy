@@ -80,6 +80,7 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
   const response = await fetch(endpoint, {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: {
       Authorization: `Basic ${credentials}`,
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -87,8 +88,7 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
     body: form.toString(),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio send failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Twilio send failed (${response.status})`);
   }
   const data = await response.json().catch(() => ({}));
   return data.sid || null;
@@ -116,6 +116,7 @@ export async function sendWhatsAppMedia({ accountSid, authToken, fromNumber, toP
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
   const response = await fetch(endpoint, {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: {
       Authorization: `Basic ${credentials}`,
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -123,8 +124,7 @@ export async function sendWhatsAppMedia({ accountSid, authToken, fromNumber, toP
     body: form.toString(),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio media send failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Twilio media send failed (${response.status})`);
   }
   const data = await response.json().catch(() => ({}));
   return data.sid || null;
@@ -206,11 +206,11 @@ export async function downloadTwilioMedia({ accountSid, authToken, url, maxBytes
   if (!url) throw new Error('No media URL provided.');
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
   const response = await fetch(String(url), {
+    signal: AbortSignal.timeout(20_000),
     headers: { Authorization: `Basic ${credentials}` },
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio media download failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Twilio media download failed (${response.status})`);
   }
   const declared = Number(response.headers?.get?.('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -244,12 +244,12 @@ export async function transcribeVoiceNote({ apiKey, audioBytes, filename = 'voic
   form.append('file', new Blob([bytes], { type: mimeType }), filename);
   const response = await fetch(WHISPER_ENDPOINT, {
     method: 'POST',
+    signal: AbortSignal.timeout(30_000),
     headers: { Authorization: `Bearer ${apiKey.trim()}` },
     body: form,
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Transcription failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Transcription failed (${response.status})`);
   }
   const data = await response.json().catch(() => ({}));
   return String(data.text || '').trim();

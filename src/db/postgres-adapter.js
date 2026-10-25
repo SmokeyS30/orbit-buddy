@@ -201,6 +201,8 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         last_inbound_at TEXT,
         created_at TEXT NOT NULL
       )`,
+      'CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (sid TEXT PRIMARY KEY, created_at TEXT NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL)',
       `CREATE TABLE IF NOT EXISTS radar_findings (
         finding_key TEXT PRIMARY KEY,
         repo TEXT NOT NULL,
@@ -1715,6 +1717,40 @@ const indexMigrations = [
         userId, phoneE164, now, now, now);
       return get('SELECT * FROM whatsapp_links WHERE user_id=?', userId);
     },
+    issueWhatsAppLinkCode: async (userId,code,expiresAt) => withTransaction(async ({get:tGet,run:tRun}) => {
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))throw new Error('Account not found');
+      const key=`whatsapp_link_code_${code}`;
+      const prior=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
+      if(prior&&new Date(prior.slice(prior.indexOf(':')+1)).valueOf()>Date.now())throw new Error('Link code collision');
+      await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
+      await tRun(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,key,`${userId}:${expiresAt}`,timestamp());
+      return true;
+    }),
+    consumeWhatsAppLinkCode: async (code) => withTransaction(async ({get:tGet}) => {
+      const key=`whatsapp_link_code_${code}`;
+      const record=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(userId)await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId);
+      const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
+      return taken&&sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
+    }),
+    revokeWhatsAppLinkCodes: async (userId) => (await run("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`)).changes,
+    allowWhatsAppLinkAttempt: async (phone) => withTransaction(async ({get:tGet}) => {
+      const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
+      for(const [subject,limit] of [[phone,5],['*',30]]){
+        const row=await tGet(`INSERT INTO whatsapp_link_attempts(subject,window_start,attempts) VALUES(?,?,1)
+          ON CONFLICT(subject) DO UPDATE SET
+          attempts=CASE WHEN whatsapp_link_attempts.window_start<? THEN 1 ELSE whatsapp_link_attempts.attempts+1 END,
+          window_start=CASE WHEN whatsapp_link_attempts.window_start<? THEN excluded.window_start ELSE whatsapp_link_attempts.window_start END
+          RETURNING attempts`,subject,now,cutoff,cutoff);
+        if(Number(row.attempts)>limit)return false;
+      }
+      return true;
+    }),
+    claimWhatsAppInboundSid: async (sid) => (await run('INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?) ON CONFLICT(sid) DO NOTHING',sid,timestamp())).changes>0,
+    pruneWhatsAppInbound: async () => {await run('DELETE FROM whatsapp_inbound_messages WHERE created_at<?',new Date(Date.now()-30*86400_000).toISOString());await run('DELETE FROM whatsapp_link_attempts WHERE window_start<?',new Date(Date.now()-86400_000).toISOString());},
     getWhatsAppLink: async (userId) => (await get('SELECT * FROM whatsapp_links WHERE user_id=?', userId)) || null,
     getUserByWhatsApp: async (phoneE164) => (await get('SELECT * FROM whatsapp_links WHERE phone_e164=?', phoneE164)) || null,
     setWhatsAppLastInbound: async (userId, at = timestamp()) => (await run('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?', at, userId)).changes > 0,

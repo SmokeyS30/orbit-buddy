@@ -361,6 +361,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       last_inbound_at TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+      sid TEXT PRIMARY KEY, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
+      subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS radar_findings (
       finding_key TEXT PRIMARY KEY,
       repo TEXT NOT NULL,
@@ -1632,6 +1638,39 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
+    issueWhatsAppLinkCode(userId,code,expiresAt) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const prior=s.setting.get(key)?.value;
+      if(prior&&new Date(prior.slice(prior.indexOf(':')+1)).valueOf()>Date.now())throw new Error('Link code collision');
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      s.setSetting.run(key,`${userId}:${expiresAt}`,timestamp());
+      return true;
+    });},
+    consumeWhatsAppLinkCode(code) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const record=s.setting.get(key)?.value;
+      if(!record)return null;
+      db.prepare('DELETE FROM settings WHERE key=?').run(key);
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      return sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
+    });},
+    revokeWhatsAppLinkCodes(userId) { return db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`).changes; },
+    allowWhatsAppLinkAttempt(phone) { return withImmediate(()=>{
+      const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
+      const get=db.prepare('SELECT window_start,attempts FROM whatsapp_link_attempts WHERE subject=?');
+      const put=db.prepare(`INSERT INTO whatsapp_link_attempts(subject,window_start,attempts) VALUES(?,?,?)
+        ON CONFLICT(subject) DO UPDATE SET window_start=excluded.window_start,attempts=excluded.attempts`);
+      for(const [subject,limit] of [[phone,5],['*',30]]){
+        const previous=get.get(subject);
+        const sameWindow=previous&&previous.window_start>=cutoff;
+        const attempts=sameWindow?previous.attempts+1:1;
+        if(attempts>limit)return false;
+        put.run(subject,sameWindow?previous.window_start:now,attempts);
+      }
+      return true;
+    });},
+    claimWhatsAppInboundSid(sid) { return db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)').run(sid,timestamp()).changes>0; },
+    pruneWhatsAppInbound() { const cutoff=new Date(Date.now()-30*86400_000).toISOString();db.prepare('DELETE FROM whatsapp_inbound_messages WHERE created_at<?').run(cutoff);db.prepare('DELETE FROM whatsapp_link_attempts WHERE window_start<?').run(new Date(Date.now()-86400_000).toISOString()); },
     getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
     setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,
