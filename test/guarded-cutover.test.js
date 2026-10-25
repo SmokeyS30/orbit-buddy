@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { deployHeld, openHeld, retired } from '../scripts/guarded-cutover.mjs';
-import { azureArgs, normalizeRevision } from '../scripts/guarded-containerapp.mjs';
+import { azureArgs, normalizeRevision, assertExpectedOpenTarget } from '../scripts/guarded-containerapp.mjs';
 
 const oldSha = '1'.repeat(40);
 const newSha = '2'.repeat(40);
@@ -25,7 +25,7 @@ function fixture({ oldHold = false } = {}) {
       const next = `r${++state.counter}`;
       previous.active = false;
       previous.replicas = [];
-      state.revisions[next] = { name: next, image: operation === 'updateHeld' ? value : previous.image,
+      state.revisions[next] = { name: next, image: operation === 'updateHeld' ? value : value.image,
         hold: operation === 'updateHeld', active: true, health: 'Healthy', replicas: [next + '-1'] };
       state.current = next;
       return null;
@@ -121,7 +121,7 @@ test('opening exact held image succeeds only after all predecessors retire', asy
   const result = await openHeld({ ...options, sha: newSha, bootstrapSha: oldSha });
   assert.equal(result.cutoverHold, false);
   assert.equal(state.revisions[result.revision].image, image(newSha));
-  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'stale').length, 2);
+  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'stale').length, 4);
   assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'old').length, 2);
 });
 
@@ -183,6 +183,145 @@ test('open command committed then errored, so observed open state is restored to
   assert.equal(state.calls.filter(([op]) => op === 'updateOpen').length, 1);
 });
 
+test('applied-then-errored open cannot claim held rollback while old OPEN replica remains', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  let openName;
+  const az = async (op, value) => {
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') {
+      openName = state.current;
+      throw new Error('synthetic timeout after commit');
+    }
+    if (op === 'updateHeld' && openName)
+      state.revisions[openName].replicas = ['old-open-still-running'];
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, sha: newSha, bootstrapSha: oldSha }),
+    /held rollback verification FAILED: A predecessor revision remains active or has replicas/);
+  assert.equal(state.revisions[state.current].hold, true);
+  assert.deepEqual(state.revisions[openName].replicas, ['old-open-still-running']);
+});
+
+test('applied-then-errored open verifies rollback only after explicit OPEN replica drain', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  let openName;
+  const az = async (op, value) => {
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') {
+      openName = state.current;
+      throw new Error('synthetic timeout after commit');
+    }
+    if (op === 'updateHeld' && openName)
+      state.revisions[openName].replicas = ['old-open-still-running'];
+    return result;
+  };
+  const sleep = async () => {
+    if (openName && state.revisions[openName].replicas.length)
+      state.revisions[openName].replicas = [];
+  };
+  await assert.rejects(openHeld({ ...options, az, sleep, drainAttempts: 3,
+    sha: newSha, bootstrapSha: oldSha }), /held rollback verified/);
+  assert.equal(state.revisions[openName].replicas.length, 0);
+  assert.ok(state.calls.filter(([op, value]) => op === 'replicas' && value === openName).length >= 3);
+});
+
+test('cancelled open cannot claim rollback with old OPEN replicas or failed replica query', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  const abort = new AbortController();
+  let openName;
+  const az = async (op, value) => {
+    if (op === 'replicas' && value === openName) throw new Error('synthetic replica query failure');
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') { openName = state.current; abort.abort(); }
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, signal: abort.signal,
+    sha: newSha, bootstrapSha: oldSha }),
+  /held rollback verification FAILED: synthetic replica query failure/);
+  assert.equal(state.revisions[state.current].hold, true);
+});
+
+test('cancelled open with retained OPEN replica never reports verified rollback', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  const abort = new AbortController();
+  let openName;
+  const az = async (op, value) => {
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') { openName = state.current; abort.abort(); }
+    if (op === 'updateHeld' && openName)
+      state.revisions[openName].replicas = ['cancelled-open-still-running'];
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, signal: abort.signal,
+    sha: newSha, bootstrapSha: oldSha }),
+  /held rollback verification FAILED: A predecessor revision remains active or has replicas/);
+  assert.deepEqual(state.revisions[openName].replicas, ['cancelled-open-still-running']);
+});
+
+test('uncertain Azure ready state after open mutation does not trigger blind rollback', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  let updateAttempted = false;
+  const az = async (op, value) => {
+    if (op === 'show' && updateAttempted)
+      return { mode: 'Single', latest: state.current, ready: 'old' };
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') { updateAttempted = true; throw new Error('synthetic uncertain timeout'); }
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, sha: newSha, bootstrapSha: oldSha }),
+    /Azure ready state is unknown or unexpected. No blind update was attempted/);
+  assert.equal(state.calls.filter(([op]) => op === 'updateHeld').length, 0);
+});
+
+test('unexpected revision mode during verification cannot be called a safe opening', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  let opening = false;
+  const az = async (op, value) => {
+    if (op === 'show' && opening)
+      return { mode: 'Multiple', latest: state.current, ready: state.current };
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') opening = true;
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, sha: newSha, bootstrapSha: oldSha }),
+    /held rollback verification FAILED|Azure ready state is unknown or unexpected/);
+});
+
+test('missing observed OPEN revision from inventory prevents rollback success', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  let openName;
+  const az = async (op, value) => {
+    if (op === 'revisions' && openName && state.current !== openName)
+      return Object.keys(state.revisions).filter(name => name !== openName).map(name => ({ name }));
+    const result = await options.az(op, value);
+    if (op === 'updateOpen') { openName = state.current; throw new Error('synthetic timeout'); }
+    return result;
+  };
+  await assert.rejects(openHeld({ ...options, az, sha: newSha, bootstrapSha: oldSha }),
+    /held rollback verification FAILED: Revision inventory is missing, incomplete, or malformed/);
+});
+
 test('operator cancellation after open mutation restores held state', async () => {
   const { state, options } = fixture({ oldHold: true });
   state.revisions.old.image = image(newSha);
@@ -209,8 +348,26 @@ test('first guard image cannot be opened and unrelated stale revisions do not au
 test('Azure command builder preserves other env vars and excludes secret-bearing output', () => {
   assert.deepEqual(azureArgs('updateHeld', image(newSha)).slice(-4),
     ['--set-env-vars', 'ORBIT_CUTOVER_HOLD=true', '--output', 'none']);
-  assert.equal(azureArgs('updateOpen').includes('--set-env-vars'), true);
+  const openArgs=azureArgs('updateOpen',{image:image(newSha),expectedRevision:'old'});
+  assert.equal(openArgs.includes('--set-env-vars'), true);
+  assert.equal(openArgs.includes(image(newSha)), true);
   assert.equal(azureArgs('replicas', 'old').includes('--revision'), true);
+  assert.equal(azureArgs('revisions').includes('--all'), true);
   assert.equal(normalizeRevision({ name: 'old', env: [{ name: 'SECRET', value: 'unlogged' }] }).hold, null);
   assert.equal(normalizeRevision({ name: 'new', env: [{ name: 'ORBIT_CUTOVER_HOLD', value: 'true' }] }).hold, true);
+});
+
+test('opening command rejects an out-of-band revision or image before mutation', () => {
+  const expected={image:image(newSha),expectedRevision:'held'};
+  const app={mode:'Single',latest:'held',ready:'held'};
+  const revision={name:'held',active:true,health:'Healthy',image:image(newSha),hold:true};
+  assert.doesNotThrow(()=>assertExpectedOpenTarget(app,revision,expected));
+  assert.throws(()=>assertExpectedOpenTarget({...app,latest:'intruder'},revision,expected),/changed before opening/);
+  assert.throws(()=>assertExpectedOpenTarget(app,{...revision,image:image(oldSha)},expected),/changed before opening/);
+  assert.throws(()=>assertExpectedOpenTarget({...app,mode:'Multiple'},revision,expected),/changed before opening/);
+});
+
+test('a mismatched revision name is not accepted as a drained predecessor', async () => {
+  const az=async(op)=>op==='revision'?{name:'different',active:false}:[];
+  await assert.rejects(retired({az,name:'expected',attempts:1,sleep:async()=>{}}),/unknown/);
 });

@@ -13,6 +13,7 @@ begin, disconnect, callback, or token refresh work automatically.
    `ORBIT_CUTOVER_HOLD=true` value. Verify exact image/SHA, `cutoverHold:true`
    on `/readyz` and `/healthz`, ordinary HTTP availability, and that every
    predecessor revision is inactive with **zero replicas in two observations**.
+   Revision inventory explicitly includes inactive revisions (`--all`).
    Record this guard bootstrap SHA and revision. Only now is the narrow pause
    established. Chat and unrelated HTTP routes remain available.
 2. Rebase and review the corrected task/media/OAuth release on that exact main.
@@ -28,6 +29,16 @@ begin, disconnect, callback, or token refresh work automatically.
    `ORBIT_CUTOVER_HOLD=false`. It verifies public SHA and open flag and waits
    until the held predecessor has no replicas. Report the completed revision
    and time when tasks/connectors are available again.
+
+The two workflows share the production concurrency group. Immediately before
+the opening update, the CLI rechecks Single mode, the exact held revision, and
+the exact reviewed image, and pins that image in the update. The supported
+`az containerapp update` command has no documented conditional revision/ETag
+argument. It cannot atomically exclude a direct out-of-band Azure mutation in
+the gap between that final read and the update. Operators must avoid direct
+Azure writes during this cutover. If another deployment is observed, stop and
+reconcile it; do not claim that workflow concurrency protects Azure changes
+made outside these workflows.
 
 If the initial guard image never becomes healthy, the prior unguarded app may
 remain active. The script **does not** call that a safe pause and does not

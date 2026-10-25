@@ -14,14 +14,14 @@ export function azureArgs(operation, value) {
     '--query', '{mode:properties.configuration.activeRevisionsMode,latest:properties.latestRevisionName,ready:properties.latestReadyRevisionName}', '-o', 'json'];
   if (operation === 'revision') return ['containerapp', 'revision', 'show', ...resource, '--revision', value,
     '--query', '{name:name,active:properties.active,health:properties.healthState,image:properties.template.containers[0].image,env:properties.template.containers[0].env}', '-o', 'json'];
-  if (operation === 'revisions') return ['containerapp', 'revision', 'list', ...resource,
+  if (operation === 'revisions') return ['containerapp', 'revision', 'list', ...resource, '--all',
     '--query', '[].{name:name}', '-o', 'json'];
   if (operation === 'replicas') return ['containerapp', 'replica', 'list', ...resource, '--revision', value,
     '--query', '[].name', '-o', 'json'];
   if (operation === 'updateHeld') return ['containerapp', 'update', ...resource,
     '--image', value, '--set-env-vars', 'ORBIT_CUTOVER_HOLD=true', '--output', 'none'];
   if (operation === 'updateOpen') return ['containerapp', 'update', ...resource,
-    '--set-env-vars', 'ORBIT_CUTOVER_HOLD=false', '--output', 'none'];
+    '--image', value.image, '--set-env-vars', 'ORBIT_CUTOVER_HOLD=false', '--output', 'none'];
   throw new Error('Unknown Azure operation.');
 }
 
@@ -36,7 +36,21 @@ export function normalizeRevision(raw) {
   return { ...revision, hold };
 }
 
+export function assertExpectedOpenTarget(app, revision, expected) {
+  if (!expected || !/^ghcr\.io\/smokeys30\/orbit-buddy:[0-9a-f]{40}$/.test(expected.image || '') ||
+      !expected.expectedRevision || String(app?.mode).toLowerCase() !== 'single' ||
+      app.latest !== expected.expectedRevision || app.ready !== expected.expectedRevision ||
+      revision?.name !== expected.expectedRevision || revision.active !== true ||
+      revision.health !== 'Healthy' || revision.image !== expected.image || revision.hold !== true)
+    throw new Error('The exact held Azure revision changed before opening.');
+}
+
 export async function cliAz(operation, value) {
+  if (operation === 'updateOpen') {
+    const app = await cliAz('show');
+    const revision = await cliAz('revision', value?.expectedRevision);
+    assertExpectedOpenTarget(app, revision, value);
+  }
   const args = azureArgs(operation, value);
   let stdout;
   try {
