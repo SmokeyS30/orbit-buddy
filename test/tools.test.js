@@ -140,6 +140,65 @@ test('tool loop calls functions and returns the final answer', async (t) => {
   assert.equal(requests, 2);
 });
 
+test('lost reply ownership after a model response starts no tool or model follow-up', async (t) => {
+  let release, requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  let requests = 0, writes = 0, active = true;
+  const stub = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', async () => {
+      requests++; requestStarted();
+      await new Promise((resolve) => { release = resolve; });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [
+        { type: 'function_call', call_id: 'one', name: 'create_task', arguments: '{"title":"first","prompt":"first"}' },
+        { type: 'function_call', call_id: 'two', name: 'create_task', arguments: '{"title":"second","prompt":"second"}' }
+      ] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => { release?.(); stub.close(); });
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'test-model',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const assertActive = () => { if (!active) throw Object.assign(new Error('Lease lost'), { code: 'REPLY_LEASE_LOST' }); };
+  const toolContext = { userId: 'user', db: { addTask: () => { writes++; return { id: 'task', title: 'first', status: 'active', risk: 'internal', delivery_channel: 'push' }; } } };
+  const pending = model.respond({ buddyName: 'Orbit', message: 'Create two tasks', tools: true, toolContext, assertActive });
+  await started;
+  active = false;
+  release();
+  await assert.rejects(pending, { code: 'REPLY_LEASE_LOST' });
+  assert.equal(writes, 0);
+  assert.equal(requests, 1);
+});
+
+test('lost ownership after a mutating tool prevents the next tool and model iteration', async (t) => {
+  let requests = 0, writes = 0, active = true;
+  const stub = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      requests++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ output: [
+        { type: 'function_call', call_id: 'one', name: 'create_task', arguments: '{"title":"first","prompt":"first"}' },
+        { type: 'function_call', call_id: 'two', name: 'create_task', arguments: '{"title":"second","prompt":"second"}' }
+      ] }));
+    });
+  });
+  await new Promise((resolve) => stub.listen(0, '127.0.0.1', resolve));
+  t.after(() => stub.close());
+  const model = createModelClient({ OPENAI_API_KEY: 'test-key', OPENAI_MODEL: 'test-model',
+    OPENAI_BASE_URL: `http://127.0.0.1:${stub.address().port}`, ALLOW_INSECURE_MODEL_URL: 'true' });
+  const assertActive = () => { if (!active) throw Object.assign(new Error('Lease lost'), { code: 'REPLY_LEASE_LOST' }); };
+  const toolContext = { userId: 'user', db: { addTask: () => {
+    writes++; active = false;
+    return { id: 'task', title: 'first', status: 'active', risk: 'internal', delivery_channel: 'push' };
+  } } };
+  await assert.rejects(model.respond({ buddyName: 'Orbit', message: 'Create two tasks', tools: true, toolContext, assertActive }),
+    { code: 'REPLY_LEASE_LOST' });
+  assert.equal(writes, 1);
+  assert.equal(requests, 1);
+});
+
 test('respond without tools keeps the single-request behavior', async (t) => {
   let requests = 0;
   const stub = http.createServer((req, res) => {
