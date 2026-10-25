@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { createOrbitServer } from '../server.js';
 import { hashToken, verifyPassword } from '../src/security.js';
@@ -133,15 +134,55 @@ test('PostgreSQL credential-bound mutations reject stale proofs after reset',asy
     assert.equal(await db.replaceRecoveryCodesIfCurrent(user.id,'old-session-'+user.id,'old-hash','old-salt',['old-code']),false);
     assert.equal(await db.createAppleSessionIfCurrent({tokenHash:'bad-apple-'+user.id,userId:user.id,csrfToken:'bad',expiresAt:expiry,identitySubject:'old-apple-'+user.id}),false);
     assert.equal(await db.linkAuthIdentityIfCurrent('apple','old-apple-'+user.id,user.id,'old-session-'+user.id,'old-hash','old-salt'),false);
-    assert.equal(await db.savePush(user.id,{endpoint:'https://push.example.test/stale',keys:{p256dh:'synthetic',auth:'synthetic'}},'old-session-'+user.id),false);
-    assert.equal(await db.saveApnsToken(user.id,'a'.repeat(64),'old-session-'+user.id),false);
+    await assert.rejects(db.savePush(user.id,{endpoint:'https://push.example.test/stale',keys:{p256dh:'synthetic',auth:'synthetic'}},'old-session-'+user.id),/active session/);
+    await assert.rejects(db.saveApnsToken(user.id,'a'.repeat(64),'old-session-'+user.id),/active session/);
     assert.equal((await db.listPush(user.id)).length,0);
     assert.equal((await db.listApnsTokens(user.id)).length,0);
     assert.equal(await db.getAuthIdentity('apple','old-apple-'+user.id),null);
     assert.equal((await db.deleteUserAccount(user.id,{sessionHash:'old-session-'+user.id,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'})).staleCredentials,true);
     assert.ok(await db.getUserById(user.id));
     assert.equal(await db.createPasswordSessionIfCurrent({tokenHash:'new-session-'+user.id,userId:user.id,csrfToken:'new',expiresAt:expiry,expectedPasswordHash:'new-hash',expectedPasswordSalt:'new-salt'}),true);
-    assert.equal(await db.savePush(user.id,{endpoint:'https://push.example.test/current',keys:{p256dh:'synthetic',auth:'synthetic'}},'new-session-'+user.id),true);
-    assert.equal(await db.saveApnsToken(user.id,'b'.repeat(64),'new-session-'+user.id),true);
+    await db.savePush(user.id,{endpoint:'https://push.example.test/current',keys:{p256dh:'synthetic',auth:'synthetic'}},'new-session-'+user.id);
+    await db.saveApnsToken(user.id,'b'.repeat(64),'new-session-'+user.id);
   }finally{if(user)await db.run('DELETE FROM users WHERE id=?',user.id);await db.close();}
+});
+
+test('PostgreSQL push writers wait behind reset revocation before accepting an old session',{timeout:15_000},async()=>{
+  assert.ok(process.env.TEST_DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const appName=`push_reset_${randomUUID().replaceAll('-','')}`;
+  const adapterUrl=new URL(process.env.TEST_DATABASE_URL);
+  adapterUrl.searchParams.set('application_name',appName);
+  const db=await openPostgres(adapterUrl.toString());
+  const pool=new pg.Pool({connectionString:process.env.TEST_DATABASE_URL,
+    ssl:process.env.TEST_DATABASE_URL.includes('sslmode=disable')?false:true});
+  const blocker=await pool.connect();
+  let user=null,transaction=false;
+  try{
+    user=await db.createUser({email:`${appName}@example.test`,displayName:'Synthetic',passwordHash:'hash',passwordSalt:'salt',role:'member'});
+    const sessionHash=`old-${user.id}`;
+    await db.createSession({tokenHash:sessionHash,userId:user.id,csrfToken:'synthetic',expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic'});
+    await blocker.query('BEGIN');transaction=true;
+    await blocker.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[user.id]);
+    await blocker.query('DELETE FROM sessions WHERE user_id=$1',[user.id]);
+    const web=db.savePush(user.id,{endpoint:`https://push.example.test/${user.id}`,keys:{p256dh:'synthetic',auth:'synthetic'}},sessionHash);
+    const native=db.saveApnsToken(user.id,'c'.repeat(64),sessionHash);
+    const deadline=Date.now()+5_000;
+    let blocked=0;
+    while(Date.now()<deadline){
+      blocked=Number((await pool.query("SELECT COUNT(*) AS n FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock' AND query LIKE 'SELECT id FROM users%'",[appName])).rows[0].n);
+      if(blocked>=2)break;
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    assert.equal(blocked,2,'both registration writers wait for the reset account lock');
+    await blocker.query('COMMIT');transaction=false;
+    await assert.rejects(web,/active session/);
+    await assert.rejects(native,/active session/);
+    assert.equal((await db.listPush(user.id)).length,0);
+    assert.equal((await db.listApnsTokens(user.id)).length,0);
+  }finally{
+    if(transaction)await blocker.query('ROLLBACK');
+    blocker.release();
+    if(user)await db.deleteUserAccount(user.id);
+    await db.close();await pool.end();
+  }
 });

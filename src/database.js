@@ -1884,22 +1884,20 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
     deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
     savePush(userId,{endpoint,keys},sessionHash) { return withImmediate(()=>{
-      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))return false;
+      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
       s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp());
       s.bindPush.run(endpoint,userId,sessionHash);
-      return true;
     }); },
     listPush: (userId) => s.listPush.all(timestamp(),userId),
     isPushRegistrationCurrent: (userId,endpoint,sessionHash) => Boolean(sessionHash&&s.currentPush.get(timestamp(),userId,endpoint,sessionHash)),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
     deletePushById: (id,sessionHash) => s.deletePushById.run(id,sessionHash).changes>0,
     saveApnsToken(userId,token,sessionHash) { return withImmediate(()=>{
-      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))return false;
+      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
       const now=timestamp();
       s.clearOtherApnsOwners.run(token,userId);
       s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now);
       s.bindApnsToken.run(token,userId,sessionHash);
-      return true;
     }); },
     listApnsTokens: (userId) => s.listApnsTokens.all(timestamp(),userId),
     isApnsRegistrationCurrent: (userId,token,sessionHash) => Boolean(sessionHash&&s.currentApns.get(timestamp(),userId,token,sessionHash)),
