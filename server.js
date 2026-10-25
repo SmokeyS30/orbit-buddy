@@ -442,11 +442,11 @@ function sanitizeAssistantMessages(messages){return messages.map((message)=>mess
 // W3: conversation share/export — clean markdown for a whole thread:
 // title, roles with timestamps, code blocks preserved, no internal
 // metadata (model markers stripped, ids/sessions omitted).
-function renderConversationMarkdown(conversation,messages,buddyName,timeZone){
+function renderConversationMarkdown(conversation,messages,buddyName,timeZone,includeHeader=true){
   const title=String(conversation.title||'Conversation').trim()||'Conversation';
   const tz=timeZone||'America/New_York';
   const stamp=(iso)=>{try{return new Intl.DateTimeFormat('en-US',{dateStyle:'medium',timeStyle:'short',timeZone:tz}).format(new Date(iso));}catch(_){return String(iso||'');}};
-  const lines=[`# ${title}`,'',`Exported from Orbit on ${stamp(new Date().toISOString())}`,''];
+  const lines=includeHeader?[`# ${title}`,'',`Exported from Orbit on ${stamp(new Date().toISOString())}`,'']:[];
   for(const m of messages||[]){
     const role=m.role==='assistant'?(buddyName||'Orbit'):'You';
     const body=m.role==='assistant'?stripModelMarkers(m.content):String(m.content||'');
@@ -3502,10 +3502,19 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const format=String(url.searchParams.get('format')||'markdown').toLowerCase();
           if(format!=='markdown'&&format!=='pdf')throw Object.assign(new Error('format must be "markdown" or "pdf".'),{status:400});
           const prefs=db.getPreferences(userId);
-          const messages=db.listConversationMessages(userId,convoId,200);
-          const markdown=renderConversationMarkdown(conversation,messages,buddyNameFor(userId),prefs&&prefs.time_zone);
+          const messageCount=db.countConversationMessages(userId,convoId);
+          const buddyName=buddyNameFor(userId),timeZone=prefs&&prefs.time_zone;
           const base=(String(conversation.title||'conversation').replace(/[^\w\-. ]+/g,'').trim().slice(0,60))||'conversation';
           if(format==='pdf'){
+            let markdown=renderConversationMarkdown(conversation,[],buddyName,timeZone);
+            let after=null,remaining=messageCount;
+            while(remaining>0){
+              const page=await(db.async?db.async.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)):db.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)));
+              if(!page.length)throw Object.assign(new Error('Conversation changed during export. Please retry.'),{status:409});
+              markdown+='\n'+renderConversationMarkdown(conversation,page,buddyName,timeZone,false);
+              if(Buffer.byteLength(markdown)>2*1024*1024)throw Object.assign(new Error('This conversation is too large for PDF. Export it as Markdown instead.'),{status:413});
+              remaining-=page.length;after=page.at(-1);
+            }
             // Reuse the Canvas print-flow PDF pipeline (same markdownToPdfBuffer
             // as GET /api/canvas/render/:token?format=pdf) — no second pipeline.
             const pdf=await markdownToPdfBuffer(markdown);
@@ -3513,7 +3522,20 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             return res.end(pdf);
           }
           res.writeHead(200,{'Content-Type':'text/markdown; charset=utf-8','Content-Disposition':`attachment; filename="${base}.md"`.replace(/["\r\n]/g,''),'Cache-Control':'no-store'});
-          return res.end(markdown);
+          res.write(renderConversationMarkdown(conversation,[],buddyName,timeZone));
+          let after=null,remaining=messageCount;
+          try{
+            while(remaining>0&&!res.destroyed){
+              const page=await(db.async?db.async.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)):db.listConversationExportPage(userId,convoId,after,Math.min(200,remaining)));
+              if(!page.length)throw new Error('Conversation changed during export.');
+              if(!res.write('\n'+renderConversationMarkdown(conversation,page,buddyName,timeZone,false)))await new Promise(resolve=>{
+                const done=()=>{res.off('drain',done);res.off('close',done);resolve();};
+                res.once('drain',done);res.once('close',done);
+              });
+              remaining-=page.length;after=page.at(-1);
+            }
+            return res.end();
+          }catch(error){res.destroy(error);return;}
         }
         if(req.method==='GET'&&url.pathname==='/api/import/status'){
           return json(res,200,{jobs:db.listImportJobs(userId)});

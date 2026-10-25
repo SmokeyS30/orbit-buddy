@@ -839,6 +839,10 @@ const indexMigrations = [
     async listConversationMessages(userId, conversationId, limit=60) {
       return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
+    listConversationExportPage: async (userId,conversationId,after=null,limit=200)=>all(`SELECT *,COALESCE(insert_order,0) AS export_order FROM messages
+      WHERE user_id=? AND conversation_id=? AND (created_at,COALESCE(insert_order,0),id)>(?,?,?)
+      ORDER BY created_at ASC,COALESCE(insert_order,0) ASC,id ASC LIMIT ?`,
+      userId,conversationId,after?.created_at||'',after?.export_order||0,after?.id||'',Math.min(Math.max(limit,1),200)),
     async listConversationMessagesThrough(userId, conversationId, messageId, limit=60) {
       return (await all(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND (created_at,COALESCE(insert_order,0),id)<=
         (SELECT created_at,COALESCE(insert_order,0),id FROM messages WHERE id=? AND user_id=? AND conversation_id=?)

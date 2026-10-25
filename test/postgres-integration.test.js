@@ -79,6 +79,28 @@ test('PostgreSQL deletion tool requires a later explicit user turn and visible p
   }
 });
 
+test('PostgreSQL conversation export pages retain all messages in order',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await db.createUser({email:`export-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const conversation=await db.createConversation(user.id,'Long synthetic conversation');
+    for(let i=0;i<235;i++)await db.addMessage(user.id,conversation.id,i%2?'assistant':'user',`EXPORT-PG-${String(i).padStart(3,'0')}`);
+    const read=[];let after=null;
+    while(true){
+      const page=await db.listConversationExportPage(user.id,conversation.id,after,80);
+      if(!page.length)break;
+      read.push(...page);after=page.at(-1);
+    }
+    assert.equal(read.length,235);
+    assert.equal(read[0].content,'EXPORT-PG-000');
+    assert.equal(read.at(-1).content,'EXPORT-PG-234');
+  }finally{if(user)await db.deleteUserAccount(user.id);await db.close();}
+});
+
 // Apply schema idempotently before tests. Uses a direct pg Pool (not the
 // sync wrapper) so schema setup doesn't depend on the code under test.
 async function ensureSchema() {

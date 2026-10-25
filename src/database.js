@@ -624,6 +624,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listConversationExportPage: db.prepare(`SELECT *,rowid AS export_order FROM messages
+      WHERE user_id=? AND conversation_id=? AND (created_at,rowid)>(?,?)
+      ORDER BY created_at ASC,rowid ASC LIMIT ?`),
     listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
       (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
@@ -1265,6 +1268,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listPendingReplyDeliveries(limit=10){return db.prepare(`SELECT * FROM reply_jobs WHERE channel='whatsapp' AND status IN ('completed','interrupted')
       AND delivery_attempted_at IS NULL AND reply_message_id IS NOT NULL ORDER BY seq LIMIT ?`).all(Math.min(Math.max(limit,1),50));},
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
+    listConversationExportPage(userId,conversationId,after=null,limit=200){return s.listConversationExportPage.all(userId,conversationId,after?.created_at||'',after?.export_order||0,Math.min(Math.max(limit,1),200));},
     listConversationMessagesThrough(userId,conversationId,messageId,limit=60){return s.listConversationMessagesThrough.all(userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200)).reverse();},
     // Chat hot path: keep the SQLite and PostgreSQL adapters on one contract.
     // PostgreSQL resolves these independent reads concurrently inside its
