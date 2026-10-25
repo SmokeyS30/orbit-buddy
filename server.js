@@ -2856,7 +2856,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // transcript into the normal pipeline. Audio is never stored.
           if(isAudioContentType(mediaContentType)&&mediaUrl){
             let transcript=null;
+            let releaseUpload=null;
             try{
+              releaseUpload=acquireAttachmentUpload(waUserId);
               const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
               transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
             }catch(e){
@@ -2866,7 +2868,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
                 ?'That voice note is a bit long for me — try keeping it under a few minutes and I’ll give it a listen.'
                 :'I couldn’t quite grab that voice note — mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
               return json(res,200,{ok:true,voiceNote:false});
-            }
+            }finally{releaseUpload?.();}
             if(!transcript){
               try{await twilioSend(from,'I listened but couldn’t quite make out what you said — mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
