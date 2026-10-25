@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { stageWhatsAppMedia, peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
