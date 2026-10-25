@@ -286,6 +286,19 @@ test('paused WhatsApp webhook asks for redelivery without burning the SID', asyn
   assert.equal(app.db.getWhatsAppInboundState(params.MessageSid),'accepted');
 });
 
+test('a pending link code from an already-linked phone is consumed without model egress', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  const { userId } = await linkOwnerDirectly(app,base,'owner-relink@example.test');
+  const sent=[];const restore=stubTwilio(sent);t.after(restore);
+  const code='443322';
+  app.db.issueWhatsAppLinkCode(userId,code,new Date(Date.now()+60_000).toISOString());
+  const before=userMessages(app,userId).length;
+  const result=await webhookPost(base,{From:WA_FROM,Body:code,MessageSid:'SMrelink'});
+  assert.equal(result.status,200);
+  assert.equal(app.db.getSetting(`whatsapp_link_code_${code}`),null);
+  assert.equal(userMessages(app,userId).length,before,'link secret never enters chat history');
+});
+
 test('deferred WhatsApp replies stay bound to the accepting link and enabled account', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base);
