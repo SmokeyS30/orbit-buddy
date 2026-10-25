@@ -327,6 +327,17 @@ test('a newer cancellation invalidates the server-owned deletion card',async t=>
   assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
 });
 
+test('any newer chat turn invalidates a staged deletion card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  const source=app.db.getMessage(userId,app.db.getApproval(userId,staged.approvalId).source_message_id);
+  app.db.addMessage(userId,source.conversation_id,'user','Thanks, and what is next?');
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
 test('a renamed target cannot be deleted through its old approval card',async t=>{
   const {app,account,approve,stage}=await approvalApiFixture(t);
   const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});

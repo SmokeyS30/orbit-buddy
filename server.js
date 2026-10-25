@@ -631,7 +631,9 @@ export function createOrbitServer(options={}) {
     const recent=db.listConversationMessages(userId,source.conversation_id,200);
     const sourceIndex=recent.findIndex(row=>row.id===source.id);
     if(sourceIndex<0)return null;
-    if(recent.slice(sourceIndex+1).some(row=>row.role==='user'&&/^(?:no\b|cancel\b|never\s?mind\b|stop\b)|\b(?:do not|don't)\s+(?:delete|remove)\b/i.test(String(row.content||'').trim())))return null;
+    // A later chat turn changes the context of this request. Require a new
+    // card instead of guessing whether a reply confirms or cancels deletion.
+    if(recent.slice(sourceIndex+1).some(row=>row.role==='user'))return null;
     const target=objectType==='goal'?db.getGoal(userId,id):objectType==='task'?db.getTask(userId,id):objectType==='routine'?db.getRoutine(userId,id):null;
     return target?.title===title?target:null;
   }
