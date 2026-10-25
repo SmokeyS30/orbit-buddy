@@ -109,7 +109,7 @@ Run on the branch (base: main @ 2bb642a), 2026-10-25:
   tests, unmodified).
 - Full suite: `npm test` with a disposable local PostgreSQL 16
   (`TEST_DATABASE_URL` pointing at a throwaway `orbit_test` database, as
-  `scripts/prepare-test-postgres.mjs` requires) — **1,039 tests, 1,039
+  `scripts/prepare-test-postgres.mjs` requires) — **1,054 tests, 1,054
   pass, 0 fail**, exit code 0. Wall-clock was ~22 minutes on the shared
   build VM (many test files run serially with real timers); no test was
   skipped. With zero failures there was nothing to baseline against clean
