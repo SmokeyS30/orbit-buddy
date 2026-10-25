@@ -251,6 +251,15 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     return activeProduct(userId, user)?.plan || 'included';
   }
 
+  function quotaPolicy(userId,user,now=new Date()){
+    if(isComped(userId,user))return{enforced:false,unlimited:true,comped:true};
+    if(!enforcementReady)return{enforced:false};
+    const product=activeProduct(userId,user);
+    if(product&&product.dailyLimit==null)return{enforced:false,unlimited:true,plan:product.plan};
+    return{enforced:true,limit:product?.dailyLimit||FREE_DAILY_LIMIT,day:nyDayKey(now),
+      plan:product?.plan||'included',resetAt:nextResetUtc(now).toISOString()};
+  }
+
   function consumeQuota(userId, user, now = new Date()) {
     if (isComped(userId, user)) return { allowed: true, unlimited: true, comped: true };
     if (!enforcementReady) return { allowed: true, enforced: false };
@@ -286,6 +295,6 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   return {
     enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT, BASIC_DAILY_LIMIT,
     status, verifyTransaction, fetchEntitlements, handleNotification,
-    isPaid, isComped, tier, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
+    isPaid, isComped, tier, consumeQuota, quotaPolicy, runDailyReset, nyDayKey, nextResetUtc,
   };
 }
