@@ -1127,9 +1127,18 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     try{
       db.recoverStaleTasks();
       for(const task of db.dueTasks()){
+        if(paused())break;
         if(!db.startTask(task.user_id,task.id))continue;
-        db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
+        const attempt=db.getTask(task.user_id,task.id)?.attempt_count;
+        if(!Number.isInteger(attempt))continue;
+        let leaseAlive=true;
+        const heartbeat=setInterval(()=>{
+          try{if(!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
+          catch{leaseAlive=false;}
+        },30_000);
+        heartbeat.unref();
         try{
+          db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
           // Strip stale "check the calendar first / suppress if absent" clauses from old reminder prompts.
@@ -1139,8 +1148,12 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
             try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
           const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+          if(paused()){
+            db.releaseClaimedTask(task.user_id,task.id,attempt);
+            continue;
+          }
           const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);
-          db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
+          if(!leaseAlive||!db.completeClaimedTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
           // Delivery channel: WhatsApp replaces push when the 24h window is open;
@@ -1149,7 +1162,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
           await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}
   }

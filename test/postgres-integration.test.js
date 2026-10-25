@@ -348,6 +348,33 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
   }
 });
 
+test('PostgreSQL task attempts fence stale and cancelled worker completions',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  let user;
+  try{
+    user=await db.createUser({email:`task-fence-${suffix}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+    assert.equal(await db.startTask(user.id,task.id,-1000),true);
+    const stale=(await db.getTask(user.id,task.id)).attempt_count;
+    assert.equal(await db.recoverStaleTasks(),1);
+    assert.equal(await db.startTask(user.id,task.id),true);
+    const current=(await db.getTask(user.id,task.id)).attempt_count;
+    assert.ok(current>stale);
+    assert.equal(await db.renewTaskLease(user.id,task.id,stale),false);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,stale,'stale'),false);
+    assert.equal(await db.setTaskStatus(user.id,task.id,'cancelled'),true);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,current,'cancelled result'),false);
+    assert.equal((await db.getTask(user.id,task.id)).status,'cancelled');
+  }finally{
+    if(user)await db.deleteUserAccount(user.id);
+    await db.close();
+  }
+});
+
 test('PostgreSQL sync wrapper: fails fast with bad connection string', async () => {
   // Must throw promptly, not hang for 30s. readyTimeoutMs=3000 in the
   // connection string makes the wrapper fail fast.
