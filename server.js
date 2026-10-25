@@ -523,6 +523,7 @@ export function createOrbitServer(options={}) {
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=options.modelClient||createModelClient(env);
+  const verifyAccountPassword=options.passwordVerifier||verifyPassword;
   const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
@@ -623,7 +624,7 @@ export function createOrbitServer(options={}) {
   function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled&&!session.moderation_blocked)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
-  function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
+  function createSession(user,req,res,{passwordProof=false,identitySubject=null}={}){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();const record={tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)};const created=passwordProof?db.createPasswordSessionIfCurrent({...record,expectedPasswordHash:user.password_hash,expectedPasswordSalt:user.password_salt}):identitySubject?db.createAppleSessionIfCurrent({...record,identitySubject}):db.createSession(record);if(created===false)return null;res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
@@ -2868,11 +2869,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/apple/complete'){
         if(rateLimited(req,20,'apple-complete'))return json(res,429,{error:'Try again later.'});
-        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';let user=null,binding=purpose;
+        const body=await readJson(req);const purpose=['link','signup'].includes(body.purpose)?body.purpose:'login';let user=null,binding=purpose,linkPasswordProof=null;
         if(purpose==='link'){
           user=authenticate(req);if(!user)return json(res,401,{error:'Sign in first.'});requireCsrf(req,user);binding=user.user_id||user.id;
           const account=db.getUserById(binding);
-          if(!await verifyPassword(body.password,account.password_hash,account.password_salt))return json(res,401,{error:'Current password is required to link Apple.'});
+          if(!account)return json(res,401,{error:'Sign in again to link Apple.'});
+          if(!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))return json(res,401,{error:'Current password is required to link Apple.'});
+          linkPasswordProof={hash:account.password_hash,salt:account.password_salt};
         }
         if(!db.consumeSignupChallenge(hashToken(String(body.nonce||'')),'apple-'+purpose,binding))return json(res,401,{error:'Start Apple sign-in again.'});
         const identity=await validateAppleAuthorization(body,env,options.appleVerification||{});
@@ -2880,7 +2883,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(purpose==='link'){
           if(!authenticate(req))return json(res,401,{error:'Sign in again to link Apple.'});
           if(linked&&linked.user_id!==binding)return json(res,409,{error:'This Apple identity is already linked.'});
-          if(!linked){try{db.linkAuthIdentity('apple',identity.subject,binding);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}}
+          if(!linked){let linkedNow=false;try{const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);linkedNow=db.linkAuthIdentityIfCurrent('apple',identity.subject,binding,hashToken(token),linkPasswordProof.hash,linkPasswordProof.salt);}catch{return json(res,409,{error:'An Apple identity is already linked. Contact support to recover access.'});}if(!linkedNow)return json(res,401,{error:'Sign in again to link Apple.'});}
           db.addEvent(binding,'apple_linked','Linked Sign in with Apple.');return json(res,200,{ok:true});
         }
         if(purpose==='signup'){
@@ -2897,7 +2900,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Never link by email, even if Apple says that email is verified.
         if(!linked)return json(res,409,{error:'Create an account or sign in with your password, then link Apple in Safety.'});
         user=db.getUserById(linked.user_id);if(!user||user.disabled||user.moderation_blocked)return json(res,401,{error:'Sign-in was not accepted.'});
-        const {csrf,token:sessionToken}=createSession(user,req,res);
+        const appleSession=createSession(user,req,res,{identitySubject:identity.subject});if(!appleSession)return json(res,401,{error:'Sign-in was not accepted.'});
+        const {csrf,token:sessionToken}=appleSession;
         return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/attest/challenge'){
@@ -2987,8 +2991,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
         if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyPassword(body.password,user.password_hash,user.password_salt);
-        if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyAccountPassword(body.password,user.password_hash,user.password_salt);
+        if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const session=createSession(user,req,res,{passwordProof:true});if(!session)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=session;db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
         if(rateLimited(req,25,'recover'))throw Object.assign(new Error('Too many recovery attempts.'),{status:429});
@@ -3646,14 +3650,16 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
-        if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
+        if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!account||!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);const codes=makeRecoveryCodes();if(!db.replaceRecoveryCodesIfCurrent(userId,hashToken(token),account.password_hash,account.password_salt,codes.map(hashToken)))throw Object.assign(new Error('Sign in again before rotating recovery codes.'),{status:401});db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='DELETE'&&url.pathname==='/api/account'){
           if(isDemoUser(user))throw Object.assign(new Error('Demo accounts expire automatically.'),{status:403});
           const body=await readJson(req);
           if(body.confirm!=='DELETE')throw Object.assign(new Error('Type DELETE to confirm permanent account deletion.'),{status:400});
           const account=db.getUserById(userId);
-          if(!account||!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});
-          const result=db.deleteUserAccount(userId);
+          if(!account||!await verifyAccountPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});
+          const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);
+          const result=db.deleteUserAccount(userId,{sessionHash:hashToken(token),expectedPasswordHash:account.password_hash,expectedPasswordSalt:account.password_salt});
+          if(result?.staleCredentials)throw Object.assign(new Error('Sign in again before deleting this account.'),{status:401});
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
           return json(res,200,{deleted:true});
