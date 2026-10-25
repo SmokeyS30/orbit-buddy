@@ -338,6 +338,17 @@ test('any newer chat turn invalidates a staged deletion card',async t=>{
   assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
 });
 
+test('a cancellation in another conversation invalidates the deletion card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  const other=app.db.createConversation(userId,'Different thread');
+  app.db.addMessage(userId,other.id,'user','Cancel the Gym deletion');
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
 test('a renamed target cannot be deleted through its old approval card',async t=>{
   const {app,account,approve,stage}=await approvalApiFixture(t);
   const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
