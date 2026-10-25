@@ -584,6 +584,14 @@ CREATE TABLE IF NOT EXISTS whatsapp_links (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+  sid TEXT PRIMARY KEY, created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
+  subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS radar_findings (
   finding_key TEXT PRIMARY KEY,
   repo TEXT NOT NULL,

@@ -2756,19 +2756,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(!verifyTwilioSignature({authToken:env.TWILIO_AUTH_TOKEN,url:webhookUrl,params,signature:req.headers['x-twilio-signature']})){
           return json(res,403,{error:'Invalid signature.'});
         }
+        const inboundSid=String(params.MessageSid||'').trim();
+        if(inboundSid&&inboundSid.length<=128&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
         const from=normalizePhone(params.From);
         const body=String(params.Body||'').trim();
         const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
         // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
         if(/^\d{6}$/.test(body)){
-          const record=db.getSetting(`whatsapp_link_code_${body}`);
-          if(record){
-            const sep=record.indexOf(':'); // userId is a UUID (no colons); the ISO timestamp after it has colons
-            const linkUserId=record.slice(0,sep);
-            const expiresAt=record.slice(sep+1);
-            db.setSetting(`whatsapp_link_code_${body}`,''); // single-use
+          if(!from||!db.allowWhatsAppLinkAttempt(from))return json(res,200,{ok:true,linkRateLimited:true});
+          const linkUserId=db.consumeWhatsAppLinkCode(body);
+          if(linkUserId){
             const linkUser=linkUserId?db.getUserById(linkUserId):null; // WhatsApp is owner-only: code must belong to the owner
-            if(linkUserId&&linkUser&&linkUser.role==='owner'&&expiresAt&&Date.now()<new Date(expiresAt).valueOf()&&from){
+            if(linkUser&&linkUser.role==='owner'){
               try{
                 db.linkWhatsApp(linkUserId,from);
                 db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
@@ -2817,12 +2816,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               console.error('whatsapp voice note failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE';
               try{await twilioSend(from,tooLong
-                ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
-                :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
+                ?'That voice note is a bit long for me — try keeping it under a few minutes and I’ll give it a listen.'
+                :'I couldn’t quite grab that voice note — mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }
             if(!transcript){
-              try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
+              try{await twilioSend(from,'I listened but couldn’t quite make out what you said — mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
@@ -3452,9 +3451,14 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/whatsapp/link/start'){
           if(!whatsappConfigured(env))throw Object.assign(new Error('WhatsApp is not configured on this server yet.'),{status:503});
           requireOwner(user); // WhatsApp is owner-only
-          const code=String(randomInt(100000,1000000));
+          let code=null;
           const expiresAt=new Date(Date.now()+10*60_000).toISOString();
-          db.setSetting(`whatsapp_link_code_${code}`,`${userId}:${expiresAt}`);
+          for(let attempt=0;attempt<5;attempt++){
+            const candidate=String(randomInt(100000,1000000));
+            try{db.issueWhatsAppLinkCode(userId,candidate,expiresAt);code=candidate;break;}
+            catch(error){if(error.message!=='Link code collision')throw error;}
+          }
+          if(!code)throw Object.assign(new Error('Could not issue a link code. Try again.'),{status:503});
           db.addEvent(userId,'whatsapp_link_started','Started WhatsApp linking (code issued).');
           return json(res,200,{code,expiresAt,whatsappNumber:env.TWILIO_WHATSAPP_NUMBER,deepLink:buildLinkDeepLink(env.TWILIO_WHATSAPP_NUMBER,code)});
         }
@@ -3465,7 +3469,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         }
         if(req.method==='DELETE'&&url.pathname==='/api/whatsapp/link'){
           requireOwner(user); // WhatsApp is owner-only
-          db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
+          db.revokeWhatsAppLinkCodes(userId);db.unlinkWhatsApp(userId);db.addEvent(userId,'whatsapp_unlinked','Disconnected WhatsApp from Orbit.');
           return json(res,200,{ok:true});
         }
         if(req.method==='GET'&&url.pathname==='/api/conversations')return json(res,200,{conversations:db.listConversations(userId)});
@@ -3768,7 +3772,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
   return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}try{db.pruneWhatsAppInbound();}catch{}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(()=>{runBackups();try{db.pruneWhatsAppInbound();}catch{}},60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
       if(workerTimer)clearInterval(workerTimer);
