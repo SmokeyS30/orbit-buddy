@@ -1295,7 +1295,7 @@ const indexMigrations = [
         // writes until this short transaction commits, including newer chat
         // turns on separate application replicas.
         await tQuery('LOCK TABLE messages IN SHARE MODE');
-        const recent = await tAll('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC, insert_order DESC NULLS LAST, id DESC LIMIT 200', userId);
+        const recent = await tAll('SELECT * FROM messages WHERE user_id=? ORDER BY insert_order DESC NULLS LAST, created_at DESC, id DESC LIMIT 200', userId);
         const selected = currentDeleteApproval(approval, recent, target);
         const now = timestamp();
         if (!selected) {

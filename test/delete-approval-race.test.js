@@ -68,7 +68,7 @@ test('PostgreSQL deletion approval is atomic with target edits and newer chat tu
     const cancelled=await stage();
     await blocker.query('BEGIN');inBlockerTransaction=true;
     await blocker.query('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES($1,$2,$3,$4,$5,$6)',
-      [randomUUID(),userId,cancelled.conversation.id,'user','Cancel the deletion',new Date().toISOString()]);
+      [randomUUID(),userId,cancelled.conversation.id,'user','Cancel the deletion',new Date(Date.parse(cancelled.goal.created_at)-60_000).toISOString()]);
     const cancelAttempt=db.executeDeleteApprovalIfCurrent(userId,cancelled.approval.id);
     try{await waitForBlockedQuery(pool,appName,/LOCK TABLE messages IN SHARE MODE/is);}finally{await blocker.query('COMMIT');inBlockerTransaction=false;}
     assert.equal((await cancelAttempt).status,'stale','the committed cancellation must be visible after the table lock clears');
