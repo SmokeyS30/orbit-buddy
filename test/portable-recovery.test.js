@@ -122,12 +122,29 @@ test('automated backup selects the nonblocking PostgreSQL export path',async()=>
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-async-backup-'));
   try{
     const db={
-      async:{exportUser:async()=>({version:6,messages:[{content:'synthetic'}]})},
+      async:{exportUser:async()=>({version:6,messages:[{content:'synthetic'}]}),getUserById:async()=>({id:'synthetic'})},
       exportUser:()=>{throw new Error('blocking export must not run');}
     };
     const file=await writeAutomatedBackup({db,userId:'synthetic',backupDir:directory,passphrase:'synthetic portable passphrase'});
     const bundle=await decryptPortable(fs.readFileSync(file,'utf8'),'synthetic portable passphrase');
     assert.equal(bundle.messages[0].content,'synthetic');
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
+});
+
+test('a late backup writer removes its archive after the account was deleted during export',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-late-backup-'));
+  let release,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const db={async:{
+    exportUser:async()=>{started();await new Promise(resolve=>{release=resolve;});return{version:6,messages:[{content:'synthetic private data'}]};},
+    getUserById:async()=>null,
+  }};
+  try{
+    const writing=writeAutomatedBackup({db,userId:'synthetic-deleted',backupDir:directory,passphrase:'synthetic portable passphrase'});
+    await entered;
+    release();
+    assert.equal(await writing,null);
+    assert.deepEqual(fs.readdirSync(directory),[]);
   }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 

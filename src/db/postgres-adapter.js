@@ -108,6 +108,9 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
       ...signupSecuritySchema,
+      `CREATE TABLE IF NOT EXISTS backup_deletion_queue (
+        account_ref TEXT PRIMARY KEY, requested_at TEXT NOT NULL
+      )`,
       `CREATE TABLE IF NOT EXISTS waitlist (
         id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
         status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
@@ -649,10 +652,13 @@ const indexMigrations = [
         await tRun('DELETE FROM settings WHERE POSITION(? IN key)>0', userId);
         await tRun('DELETE FROM access_requests WHERE LOWER(email)=LOWER(?)', account.email);
         await tRun('DELETE FROM waitlist WHERE LOWER(email)=LOWER(?)', account.email);
+        await tRun('INSERT INTO backup_deletion_queue(account_ref,requested_at) VALUES(?,?) ON CONFLICT DO NOTHING',userId,timestamp());
         const deleted = await tRun('DELETE FROM users WHERE id=?', userId);
         return { deleted: deleted.changes > 0, successorId };
       });
     },
+    listPendingBackupDeletions: async()=>all('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
+    clearPendingBackupDeletion: async(accountRef)=>(await run('DELETE FROM backup_deletion_queue WHERE account_ref=?',accountRef)).changes>0,
     async claimOrphans(userId) {
       await run('UPDATE messages SET user_id=? WHERE user_id IS NULL', userId);
       await run('UPDATE memories SET user_id=? WHERE user_id IS NULL', userId);

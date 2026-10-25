@@ -585,3 +585,23 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     await db.deleteUserAccount(user.id);await db.deleteUserAccount(other.id);
   } finally { await db.close(); }
 });
+
+test('PostgreSQL account deletion commits backup cleanup intent atomically',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await db.createUser({email:`backup-delete-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    assert.equal((await db.deleteUserAccount(user.id)).deleted,true);
+    assert.equal(await db.getUserById(user.id),null);
+    assert.ok((await db.listPendingBackupDeletions()).some(row=>row.account_ref===user.id));
+    assert.equal(await db.clearPendingBackupDeletion(user.id),true);
+    assert.equal((await db.listPendingBackupDeletions()).some(row=>row.account_ref===user.id),false);
+  }finally{
+    if(user&&await db.getUserById(user.id))await db.deleteUserAccount(user.id);
+    if(user)await db.clearPendingBackupDeletion(user.id);
+    await db.close();
+  }
+});

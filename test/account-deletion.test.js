@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
 import { signupInbox } from './helpers/signup-inbox.js';
+import { writeAutomatedBackup,cleanupDeletedUserBackups } from '../src/backups.js';
 
 const PASSWORD='correct horse battery staple';
 
@@ -18,7 +19,8 @@ async function fixture(){
 }
 
 async function register(base,email,displayName,inbox){
-  const response=await inbox.register(base,{email,displayName,password:PASSWORD});
+  const response=inbox?await inbox.register(base,{email,displayName,password:PASSWORD})
+    :await fetch(`${base}/api/auth/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,displayName:displayName||'Reviewer',password:PASSWORD})});
   assert.equal(response.status,201);
   const body=await response.json();
   return{cookie:response.headers.get('set-cookie').split(';')[0],csrf:body.csrf,user:body.user};
@@ -48,6 +50,46 @@ test('account deletion removes the account, sessions, and associated data',async
   assert.equal(app.db.getUserById(auth.user.id),undefined);
   assert.equal(app.db.getSetting(`private_${auth.user.id}`),null);
   assert.equal((await fetch(`${base}/api/auth/me`,{headers:{Cookie:auth.cookie}})).status,401);
+});
+
+test('account deletion removes its encrypted server archives and retains unrelated archives',async t=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-delete-archive-'));
+  const backupDir=path.join(directory,'backups');
+  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test',BACKUP_DIR:backupDir}});
+  await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await app.close();fs.rmSync(directory,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  const auth=await register(base,'archive-delete@example.test');
+  const ownArchive=await writeAutomatedBackup({db:app.db,userId:auth.user.id,dataDir:directory,backupDir,passphrase:'synthetic backup passphrase'});
+  assert.ok(fs.existsSync(ownArchive));
+  const unrelated=path.join(backupDir,'orbit-unrelated-2026-10-25.orbitbackup');
+  fs.writeFileSync(unrelated,'synthetic unrelated archive');
+  const response=await fetch(`${base}/api/account`,{method:'DELETE',headers:headers(auth),body:JSON.stringify({password:PASSWORD,confirm:'DELETE'})});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).backupCleanupPending,false);
+  assert.equal(fs.existsSync(ownArchive),false);
+  assert.equal(fs.existsSync(unrelated),true);
+  assert.deepEqual(app.db.listPendingBackupDeletions(),[]);
+});
+
+test('unavailable backup mount leaves a durable deletion retry instead of reporting cleanup complete',async t=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-delete-retry-'));
+  const backupDir=path.join(directory,'unavailable-backups');
+  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test',BACKUP_DIR:backupDir}});
+  await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await app.close();fs.rmSync(directory,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  const auth=await register(base,'retry-delete@example.test');
+  const response=await fetch(`${base}/api/account`,{method:'DELETE',headers:headers(auth),body:JSON.stringify({password:PASSWORD,confirm:'DELETE'})});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).backupCleanupPending,true);
+  assert.equal(app.db.listPendingBackupDeletions().length,1);
+  fs.mkdirSync(backupDir);
+  const archive=path.join(backupDir,`orbit-${auth.user.id}-synthetic.orbitbackup`);
+  fs.writeFileSync(archive,'synthetic encrypted archive');
+  assert.deepEqual(await cleanupDeletedUserBackups({db:app.db,dataDir:directory,backupDir}),{cleaned:1,failed:0});
+  assert.equal(fs.existsSync(archive),false);
+  assert.deepEqual(app.db.listPendingBackupDeletions(),[]);
 });
 
 test('deleting the owner transfers ownership to the oldest active member',async(t)=>{

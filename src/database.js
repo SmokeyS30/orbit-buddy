@@ -87,6 +87,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','member')),
       disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS backup_deletion_queue (
+      account_ref TEXT PRIMARY KEY, requested_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, user_agent TEXT
@@ -587,6 +590,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     createDemoUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,is_demo,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)'),
     listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<=?"),
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
+    queueBackupDeletion: db.prepare('INSERT OR IGNORE INTO backup_deletion_queue(account_ref,requested_at) VALUES(?,?)'),
+    listBackupDeletions: db.prepare('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
+    clearBackupDeletion: db.prepare('DELETE FROM backup_deletion_queue WHERE account_ref=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
     authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
@@ -1131,6 +1137,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         db.prepare('DELETE FROM settings WHERE instr(key, ?) > 0').run(userId);
         db.prepare('DELETE FROM access_requests WHERE lower(email)=lower(?)').run(account.email);
         db.prepare('DELETE FROM waitlist WHERE lower(email)=lower(?)').run(account.email);
+        s.queueBackupDeletion.run(userId,timestamp());
         s.deleteUser.run(userId);
         db.exec('COMMIT');
         return { deleted: true, successorId };
@@ -1140,6 +1147,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
     },
     claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
+    listPendingBackupDeletions:()=>s.listBackupDeletions.all(),
+    clearPendingBackupDeletion:(accountRef)=>s.clearBackupDeletion.run(accountRef).changes>0,
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
     createPasswordSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,expectedPasswordHash,expectedPasswordSalt}) { return withImmediate(()=>{
       const user=s.userById.get(userId);

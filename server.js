@@ -19,7 +19,7 @@ import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
-import { writeAutomatedBackup } from './src/backups.js';
+import { writeAutomatedBackup, cleanupDeletedUserBackups } from './src/backups.js';
 import { clientIpForRateLimit } from './src/client-ip.js';
 import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
@@ -2517,10 +2517,15 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     return{configured:true,state,lastSuccess,lastError:lastError||null,fileCount,expectedFiles};
   }
   async function runBackups(){
-    if(backupBusy||!env.BACKUP_ENCRYPTION_KEY)return;
-    const today=new Date().toISOString().slice(0,10);
-    try{if(db.getSetting('last_automatic_backup')===today)return;}catch(e){console.error('Backup check failed:',e.message);}
+    if(backupBusy)return;
     backupBusy=true;
+    try{
+      const cleanup=await cleanupDeletedUserBackups({db,dataDir,backupDir});
+      if(cleanup.failed)console.error('Backup cleanup remains pending for deleted accounts.');
+    }catch(error){console.error('Backup cleanup check failed:',error.message);}
+    if(!env.BACKUP_ENCRYPTION_KEY){backupBusy=false;return;}
+    const today=new Date().toISOString().slice(0,10);
+    try{if(db.getSetting('last_automatic_backup')===today){backupBusy=false;return;}}catch(e){console.error('Backup check failed:',e.message);}
     try{
       for(const user of db.listUsers())await writeAutomatedBackup({db,userId:user.id,dataDir,backupDir,passphrase:env.BACKUP_ENCRYPTION_KEY});
       try{db.setSetting('last_automatic_backup',today);db.setSetting('last_backup_error','');}catch(e){console.error('Backup status update failed:',e.message);}
@@ -3713,8 +3718,14 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const result=db.deleteUserAccount(userId,{sessionHash:hashToken(token),expectedPasswordHash:account.password_hash,expectedPasswordSalt:account.password_salt});
           if(result?.staleCredentials)throw Object.assign(new Error('Sign in again before deleting this account.'),{status:401});
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
+          let backupCleanupPending=true;
+          try{
+            const cleanup=await cleanupDeletedUserBackups({db,dataDir,backupDir,accountRef:userId});
+            backupCleanupPending=cleanup.failed>0;
+          }catch(error){console.error('Backup cleanup check failed:',error.message);}
+          if(backupCleanupPending)console.error('Backup cleanup remains pending for deleted accounts.');
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
-          return json(res,200,{deleted:true});
+          return json(res,200,{deleted:true,backupCleanupPending});
         }
         if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const bundle=await(db.async?db.async.exportUser(userId):db.exportUser(userId));const payload=await encryptPortable(bundle,body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
         if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,64*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);await(db.async?db.async.restoreUser(userId,bundle):db.restoreUser(userId,bundle));db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
