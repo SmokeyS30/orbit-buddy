@@ -20,6 +20,7 @@ import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
+import { clientIpForRateLimit } from './src/client-ip.js';
 import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
@@ -576,20 +577,7 @@ export function createOrbitServer(options={}) {
 
   const requestLog=new Map();
   function getClientIp(req){
-    // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
-    // Take the leftmost (original client) IP, validate format to prevent header injection.
-    const cfIp=req.headers['cf-connecting-ip'];
-    if(cfIp){
-      const ip=String(cfIp).trim();
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
-    }
-    const fwd=req.headers['x-forwarded-for'];
-    if(fwd){
-      const ip=String(fwd).split(',')[0].trim();
-      // Basic IPv4/IPv6 validation
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
-    }
-    return req.socket.remoteAddress||'unknown';
+    return clientIpForRateLimit(req,{trustIngress:production});
   }
   function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
   const hourLog=new Map();
