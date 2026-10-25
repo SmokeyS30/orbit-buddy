@@ -679,8 +679,8 @@ test('webhook: inbound image is downloaded and fed through the vision pipeline',
   }
 });
 
-test('webhook: transient image download failure permits the same signed SID to retry once', async (t) => {
-  const { app, base } = await serverFixture(); t.after(() => app.close());
+test('webhook: transient image download failure permits a retry when provider HTTP retries are configured', async (t) => {
+  const { app, base } = await serverFixture({TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS:'1'}); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base, 'owner-img2@example.com');
   const sent = [];
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
@@ -719,6 +719,35 @@ test('webhook: transient image download failure permits the same signed SID to r
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test('default media failure gives a resend reply because Twilio HTTP retries are unverified', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app,base,'owner-media-default@example.com');
+  const sent=[];
+  const origFetch=globalThis.fetch;
+  globalThis.fetch=async (url,opts)=>{
+    const parsed=(()=>{try{return new URL(String(url));}catch{return null;}})();
+    if(parsed?.hostname==='api.twilio.com'&&parsed.pathname.includes('/Media/'))
+      return {ok:false,status:500,headers:{get:()=>null},text:async()=>''};
+    if(parsed?.hostname==='api.twilio.com'){
+      sent.push(String(opts?.body||''));
+      return {ok:true,status:201,json:async()=>({sid:'SMsynthetic'}),text:async()=>''};
+    }
+    return origFetch(url,opts);
+  };
+  try{
+    const sid=mediaMessageSid('7');
+    const params={From:WA_FROM,Body:'',NumMedia:'1',MediaContentType0:'image/png',
+      MediaUrl0:mediaUrl(sid,'7'),MessageSid:sid};
+    const response=await webhookPost(base,params);
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{ok:true,image:false});
+    assert.ok(sent.some(body=>decodeForm(body).includes('mind sending it again')));
+    assert.equal(app.db.getWhatsAppInboundState(sid),'failed');
+    const replay=await webhookPost(base,params);
+    assert.deepEqual(await replay.json(),{ok:true,deduped:true});
+  }finally{globalThis.fetch=origFetch;}
 });
 
 test('webhook: non-image media gets the unsupported-type reply', async (t) => {

@@ -2817,7 +2817,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               console.error('whatsapp voice note failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE';
               const permanent=tooLong||/Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
-              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,!permanent);
+              // HTTP error retries are opt-in at Twilio. Preserve the existing
+              // user-facing resend reply until that provider policy is verified.
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,
+                !permanent&&env.TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS==='1');
               if(finished==='retryable')return json(res,503,{ok:false,retry:true});
               if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,tooLong
@@ -2855,7 +2858,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
               const permanent=tooLong||[400,415].includes(e.status)||
                 /Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
-              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,!permanent);
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,
+                !permanent&&env.TWILIO_WEBHOOK_RETRIES_HTTP_ERRORS==='1');
               if(finished==='retryable')return json(res,503,{ok:false,retry:true});
               if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,tooLong
