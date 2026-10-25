@@ -7,13 +7,14 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
-import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { stageAttachment, takeAttachment, peekAttachment, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { reserveMediaBytes } from './src/media-memory.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
@@ -632,6 +633,21 @@ export function createOrbitServer(options={}) {
   let workerBusy=false;
   const activeReplyJobs=new Map();
   const ephemeralReplyPayloads=new Map();
+  const EPHEMERAL_REPLY_TTL_MS=30*60_000;
+  function dropEphemeralReplyPayload(jobId){
+    const payload=ephemeralReplyPayloads.get(jobId);
+    if(!payload)return;
+    ephemeralReplyPayloads.delete(jobId);
+    payload.releaseMedia?.();
+  }
+  function pruneEphemeralReplyPayloads(nowMs=Date.now()){
+    for(const [jobId,payload] of ephemeralReplyPayloads){
+      if(!activeReplyJobs.has(jobId)&&nowMs-(payload.createdAt||nowMs)>EPHEMERAL_REPLY_TTL_MS)dropEphemeralReplyPayload(jobId);
+    }
+  }
+  function reserveImagePayload(images){
+    return reserveMediaBytes(images.reduce((sum,image)=>sum+Buffer.byteLength(String(image.image_url||'')),0));
+  }
   let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
   const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
@@ -642,6 +658,7 @@ export function createOrbitServer(options={}) {
     setImmediate(()=>{replyPumpScheduled=false;pumpReplyJobs();});
   }
   function pumpReplyJobs(){
+    pruneEphemeralReplyPayloads();
     if(closing)return Promise.resolve();
     if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
     replyPumpRunning=true;
@@ -666,7 +683,7 @@ export function createOrbitServer(options={}) {
             console.error('chat job failed',job.id,error&&error.message);
           }).finally(()=>{
             activeReplyJobs.delete(job.id);
-            ephemeralReplyPayloads.delete(job.id);
+            dropEphemeralReplyPayload(job.id);
             scheduleReplyPump();
           });
           activeReplyJobs.set(job.id,task);
@@ -2879,10 +2896,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Only the first image is handled (Twilio may send several); image
           // bytes stay in memory and are never stored or logged.
           if(isImageContentType(mediaContentType)&&mediaUrl){
-            let imageBlock=null;
+            let imageBlock=null,releaseImage=null;
             try{
-              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
-              imageBlock=processImageInput({bytes,mimeType:mediaContentType});
+              const releaseUpload=acquireAttachmentUpload(waUserId);
+              try{
+                const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+                imageBlock=processImageInput({bytes,mimeType:mediaContentType});
+                releaseImage=reserveImagePayload([imageBlock]);
+              }finally{releaseUpload();}
             }catch(e){
               console.error('whatsapp image failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
@@ -2892,11 +2913,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,image:false});
             }
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
-              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-            ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
-            scheduleReplyPump();
-            return json(res,200,{ok:true,image:true});
+            try{
+              const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
+                {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+              ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:caption||'Look at this.',images:[imageBlock],releaseMedia:releaseImage,createdAt:Date.now()});
+              releaseImage=null;
+              scheduleReplyPump();
+              return json(res,200,{ok:true,image:true});
+            }finally{releaseImage?.();}
           }
           // Other media types (video, documents) are not supported yet.
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
@@ -3307,16 +3331,22 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(userRateLimited(userId,'chat-attachments',20,60*60_000))throw Object.assign(new Error('Too many uploads. Try again shortly.'),{status:429});
           const uploadType=req.headers['content-type']||'';
           if(!uploadType.includes('multipart/form-data'))throw Object.assign(new Error('Send the image as multipart form data.'),{status:400});
-          const chunks=[];let size=0;
-          for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
-          const raw=Buffer.concat(chunks);
-          if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
-          const file=parseMultipartImage(raw,uploadType);
-          if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
-          if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
-          const attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType}); // validates size too
-          db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
-          return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          const releaseUpload=acquireAttachmentUpload(userId);
+          let attachmentId=null;
+          try{
+            if(Number(req.headers['content-length'])>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});
+            const chunks=[];let size=0;
+            for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
+            const raw=Buffer.concat(chunks);
+            if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
+            const file=parseMultipartImage(raw,uploadType);
+            if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
+            if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
+            attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType});
+            db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
+            return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          }catch(error){if(attachmentId)takeAttachment(userId,attachmentId);throw error;}
+          finally{releaseUpload();}
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
@@ -3330,28 +3360,35 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // along. Stored history keeps a text placeholder — bytes are never
           // persisted.
           const attachmentIds=Array.isArray(body.attachmentIds)?body.attachmentIds.map((id)=>String(id||'')).filter(Boolean).slice(0,3):[];
+          if(new Set(attachmentIds).size!==attachmentIds.length)throw Object.assign(new Error('Each attached image can be sent only once.'),{status:400});
           // Two-phase: verify every id resolves BEFORE consuming any, so one
           // stale id never silently drops the other attachments in the turn.
+          let projectedImageBytes=0;
           for(const attachmentId of attachmentIds){
-            if(!peekAttachment(userId,attachmentId))throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            const staged=peekAttachment(userId,attachmentId);
+            if(!staged)throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            projectedImageBytes+=Math.ceil(staged.bytes.length/3)*4+64;
           }
-          const imageBlocks=[];
-          for(const attachmentId of attachmentIds){
-            imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
-          }
-          const hasImages=imageBlocks.length>0;
-          const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
-          if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
-          // One atomic database operation both checks and consumes the free
-          // allowance, so simultaneous requests cannot send message 26.
-          const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
-            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
-          const userMsg=accepted.userMessage;
-          if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
-          scheduleReplyPump();
-          return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          let releaseMedia=projectedImageBytes?reserveMediaBytes(projectedImageBytes):null;
+          try{
+            const imageBlocks=[];
+            for(const attachmentId of attachmentIds){
+              imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
+            }
+            const hasImages=imageBlocks.length>0;
+            const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
+            if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
+            // One atomic database operation both checks and consumes the free
+            // allowance, so simultaneous requests cannot send message 26.
+            const quota=subscriptions.consumeQuota(userId,user);
+            if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
+            const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+              {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+            const userMsg=accepted.userMessage;
+            if(hasImages){ephemeralReplyPayloads.set(accepted.job.id,{userId,message:message||'Look at this.',images:imageBlocks,releaseMedia,createdAt:Date.now()});releaseMedia=null;}
+            scheduleReplyPump();
+            return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          }finally{releaseMedia?.();}
         }
         // W1: per-message actions.
         // Regenerate re-runs an assistant turn through the same pipeline as a
@@ -3760,6 +3797,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const result=db.deleteUserAccount(userId,{sessionHash:hashToken(token),expectedPasswordHash:account.password_hash,expectedPasswordSalt:account.password_salt});
           if(result?.staleCredentials)throw Object.assign(new Error('Sign in again before deleting this account.'),{status:401});
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
+          clearAttachmentsForUser(userId);
+          clearWhatsAppMediaForUser(userId);
+          for(const [jobId,payload] of ephemeralReplyPayloads){
+            if(payload.userId===userId&&!activeReplyJobs.has(jobId))dropEphemeralReplyPayload(jobId);
+          }
           let backupCleanupPending=true;
           try{
             const cleanup=await cleanupDeletedUserBackups({db,dataDir,backupDir,accountRef:userId});
@@ -3866,6 +3908,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
+      for(const jobId of ephemeralReplyPayloads.keys())dropEphemeralReplyPayload(jobId);
       await db.close();
     }
   };
