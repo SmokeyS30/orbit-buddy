@@ -605,3 +605,17 @@ test('PostgreSQL account deletion commits backup cleanup intent atomically',asyn
     await db.close();
   }
 });
+
+test('PostgreSQL concurrent proactive claims respect the shared daily cap',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await db.createUser({email:`proactive-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const claimed=await Promise.all(Array.from({length:16},()=>db.claimProactiveSlot(user.id,'2026-10-25',3)));
+    assert.equal(claimed.filter(Boolean).length,3);
+    assert.equal(Number((await db.get('SELECT outreach_count FROM proactive_state WHERE user_id=?',user.id)).outreach_count),3);
+  }finally{if(user)await db.deleteUserAccount(user.id);await db.close();}
+});

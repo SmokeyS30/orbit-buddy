@@ -1357,12 +1357,11 @@ const indexMigrations = [
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`, userId, iso); },
     getLastOutreachAt: async (userId) => (await get('SELECT * FROM proactive_state WHERE user_id=?', userId))?.last_outreach_at || null,
     async claimProactiveSlot(userId, localDate, limit=3) {
-      const current = await get('SELECT * FROM proactive_state WHERE user_id=?', userId);
-      if (current?.outreach_date === localDate && current.outreach_count >= limit) return false;
-      await run(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
+      const claimed=await run(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
         ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
-        outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END`, userId, localDate);
-      return true;
+        outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
+        WHERE proactive_state.outreach_date IS DISTINCT FROM excluded.outreach_date OR proactive_state.outreach_count<?`,userId,localDate,limit);
+      return claimed.changes>0;
     },
     markOutreach: async (userId) => (await run('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?', timestamp(), userId)).changes > 0,
     releaseProactiveSlot: async (userId, localDate) => (await run(`UPDATE proactive_state SET outreach_count=GREATEST(0,outreach_count-1)

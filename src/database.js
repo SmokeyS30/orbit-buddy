@@ -732,7 +732,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getProactiveState: db.prepare('SELECT * FROM proactive_state WHERE user_id=?'),
     upsertProactiveSlot: db.prepare(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
       ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
-      outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END`),
+      outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
+      WHERE proactive_state.outreach_date IS DISTINCT FROM excluded.outreach_date OR proactive_state.outreach_count<?`),
     markOutreach: db.prepare('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?'),
     releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
       WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
@@ -1554,7 +1555,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
     getLastOutreachAt: (userId) => s.getProactiveState.get(userId)?.last_outreach_at || null,
-    claimProactiveSlot(userId,localDate,limit=3){const current=s.getProactiveState.get(userId);if(current?.outreach_date===localDate&&current.outreach_count>=limit)return false;s.upsertProactiveSlot.run(userId,localDate);return true;},
+    claimProactiveSlot(userId,localDate,limit=3){return s.upsertProactiveSlot.run(userId,localDate,limit).changes>0;},
     markOutreach:(userId)=>s.markOutreach.run(timestamp(),userId).changes>0,
     releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},

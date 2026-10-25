@@ -206,6 +206,17 @@ test('recovers a task whose worker lease expired', () => {
   db.close();
 });
 
+test('proactive outreach claims stop at the daily cap and reset on a new local date',()=>{
+  const {db,user}=fixture();
+  for(let i=0;i<3;i++)assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),true);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),false);
+  assert.equal(db.releaseProactiveSlot(user.id,'2026-10-25'),true);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),true);
+  for(let i=0;i<3;i++)assert.equal(db.claimProactiveSlot(user.id,'2026-10-26',3),true);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-26',3),false);
+  db.close();
+});
+
 test('tracks goal progress and recurring routine leases', () => {
   const { db, user } = fixture();
   const goal = db.addGoal(user.id, { title: 'Certification', priority: 3, targetDate: '2026-12-01', nextStep: 'Finish module two' });
