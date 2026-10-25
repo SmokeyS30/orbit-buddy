@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { validateImageInput, MAX_IMAGE_BYTES } from './model.js';
-import { reserveMediaBytes } from './media-memory.js';
+import { reserveRetainedMediaBuffer } from './media-memory.js';
 
 /** Staged attachments expire this long after upload. */
 export const ATTACHMENT_TTL_MS = 10 * 60_000;
@@ -106,16 +106,18 @@ export function stageAttachment(userId, { bytes, mimeType }) {
     throw Object.assign(new Error('Too many pending attachments. Send or remove one first.'), { status: 429 });
   }
   const {buffer,mime}=validateImageInput({bytes,mimeType}); // no throwaway base64 copy
-  const releaseBudget=reserveMediaBytes(buffer.length);
-  const id = randomUUID();
-  staged.set(id, {
-    userId,
-    bytes:buffer,
-    mimeType:mime,
-    createdAt: Date.now(),
-    releaseBudget,
-  });
-  return id;
+  const {bytes:retained,releaseBudget}=reserveRetainedMediaBuffer(buffer);
+  try{
+    const id = randomUUID();
+    staged.set(id, {
+      userId,
+      bytes:retained,
+      mimeType:mime,
+      createdAt: Date.now(),
+      releaseBudget,
+    });
+    return id;
+  }catch(error){releaseBudget();throw error;}
 }
 
 /**
