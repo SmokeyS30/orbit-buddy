@@ -832,9 +832,8 @@ export function toolUpdateRoutine(args = {}, ctx = null) {
   };
 }
 
-// Deletion is always a two-step, confirm-in-chat flow: the delete_* tools only
-// STAGE a request as a pending approval (nothing is removed), and
-// confirm_delete_approval executes it after the user's explicit yes in chat.
+// Chat may only stage a deletion. The shipped Approvals screen shows the
+// server-owned target and requires a separate authenticated button press.
 const DELETE_APPROVAL_KINDS = ['delete_goal', 'delete_task', 'delete_routine'];
 
 function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
@@ -849,7 +848,7 @@ function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
   db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for in-chat confirmation.`);
   return {
     approvalId: approval.id, objectType, id, title, preview,
-    note: 'NOT deleted — this only staged a delete request. Present the preview in your visible reply (exactly what will be deleted), then wait for the user’s explicit yes. Only after they confirm, call confirm_delete_approval with this approvalId. Never call confirm_delete_approval without that explicit yes, and never stage or confirm a deletion from an ambiguous single message.'
+    note: 'NOT deleted — this staged a request in Approvals. Show the exact target and consequences. Ask the user to open Approvals and press Approve & delete on that specific card, or Reject. A chat reply such as yes cannot delete anything.'
   };
 }
 
@@ -887,53 +886,13 @@ export function toolDeleteRoutine(args = {}, ctx = null) {
   return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine.id, routine.title, preview);
 }
 
-function hasFreshDeleteConfirmation(ctx, approval, userId) {
-  if(ctx?.regenerated)return false;
-  const sourceId=approval.source_message_id;
-  const currentId=ctx?.messageId;
-  if(!sourceId||!currentId||sourceId===currentId)return false;
-  const source=ctx.db.getMessage(userId,sourceId);
-  const current=ctx.db.getMessage(userId,currentId);
-  if(!source||!current||source.role!=='user'||current.role!=='user'||source.conversation_id!==current.conversation_id)return false;
-  const text=String(current.content||'').trim().replace(/[.!]+$/,'').trim().toLocaleLowerCase();
-  const title=String(approval.payload?.title||'').trim().toLocaleLowerCase();
-  const explicit=/^(?:yes|yes please|yes,? delete it|confirm(?: the)? deletion|delete it)$/.test(text)
-    ||(title&&[`yes, delete ${title}`,`delete ${title}`,`confirm delete ${title}`].includes(text));
-  if(!explicit)return false;
-  const recent=ctx.db.listConversationMessagesThrough(userId,current.conversation_id,currentId,200);
-  if(recent.at(-1)?.id!==currentId)return false;
-  const earlierUsers=recent.filter(row=>row.role==='user');
-  if(earlierUsers.at(-2)?.id!==sourceId)return false;
-  const sourceIndex=recent.findIndex(row=>row.id===sourceId);
-  if(sourceIndex<0)return false;
-  return recent.slice(sourceIndex+1,-1).some(row=>{
-    if(row.role!=='assistant')return false;
-    const preview=String(row.content||'').toLocaleLowerCase();
-    return preview.includes(title)&&/delet|remov/.test(preview);
-  });
-}
-
 export function toolConfirmDeleteApproval(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'confirm_delete_approval');
   const approvalId = cleanArg(args.approvalId, 80, 'approvalId');
   const approval = db.getApproval(userId, approvalId);
   if (!approval || !DELETE_APPROVAL_KINDS.includes(approval.kind)) throw new Error('No pending deletion found for that approval.');
   if (approval.status !== 'pending') throw new Error('That deletion request was already reviewed — nothing to confirm.');
-  if (!hasFreshDeleteConfirmation(ctx,approval,userId)) throw new Error('Deletion requires a fresh explicit confirmation after the preview in this conversation. Nothing was deleted.');
-  const claimed = db.claimApproval(userId, approval.id);
-  if (!claimed) throw new Error('That deletion request is already being handled.');
-  const { id, title, objectType } = claimed.payload || {};
-  let ok = false;
-  if (claimed.kind === 'delete_goal') ok = db.deleteGoal(userId, id);
-  else if (claimed.kind === 'delete_task') ok = db.deleteTask(userId, id);
-  else if (claimed.kind === 'delete_routine') ok = db.deleteRoutine(userId, id);
-  if (!ok) {
-    db.finishApproval(userId, approval.id, 'failed', { error: 'The item was already gone.' });
-    throw new Error(`That ${objectType || 'item'} no longer exists — nothing was deleted.`);
-  }
-  db.finishApproval(userId, approval.id, 'executed', { result: { deleted: claimed.kind, id, title } });
-  db.addEvent(userId, `${objectType}_deleted`, `Deleted ${objectType} “${title}” via chat after explicit confirmation.`);
-  return { deleted: true, objectType, id, title, note: `Deleted the ${objectType} “${title}”. Say so plainly in your visible reply.` };
+  throw new Error('Chat cannot execute deletions. Ask the user to open Approvals and press Approve & delete on the matching card. Nothing was deleted.');
 }
 
 export function toolProposeCalendarEvent(args = {}, ctx = null) {
@@ -1540,7 +1499,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_goal',
-    description: 'STAGE a goal deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_goal speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which goal in chat and wait.',
+    description: 'STAGE a goal deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which goal and wait.',
     parameters: {
       type: 'object',
       properties: {
@@ -1553,7 +1512,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_task',
-    description: 'STAGE a task deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_task speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which task in chat and wait.',
+    description: 'STAGE a task deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which task and wait.',
     parameters: {
       type: 'object',
       properties: {
@@ -1565,25 +1524,13 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_routine',
-    description: 'STAGE a routine deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_routine speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which routine in chat and wait.',
+    description: 'STAGE a routine deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which routine and wait.',
     parameters: {
       type: 'object',
       properties: {
         routine: { type: 'string', description: 'Routine title to find (fuzzy).' }
       },
       required: ['routine'], additionalProperties: false
-    }
-  },
-  {
-    type: 'function',
-    name: 'confirm_delete_approval',
-    description: 'Execute a staged deletion AFTER the user explicitly confirmed it in chat (said yes to the exact preview shown). Takes the approvalId returned by delete_goal, delete_task, or delete_routine. Call this only after that explicit in-chat yes — never on the same turn as the delete_* call, never speculatively.',
-    parameters: {
-      type: 'object',
-      properties: {
-        approvalId: { type: 'string', description: 'The approvalId returned by delete_goal/delete_task/delete_routine.' }
-      },
-      required: ['approvalId'], additionalProperties: false
     }
   },
   {
