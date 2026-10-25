@@ -1884,13 +1884,17 @@ const indexMigrations = [
 
     // --- Push subscriptions ---
     savePush: async (userId, { endpoint, keys }, sessionHash) => withTransaction(async ({get:tGet,run:tRun}) => {
+      // Password reset serializes on this user row before revoking sessions.
+      // Take the same lock before checking the old request's session.
+      if(!(await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId)))return false;
       if(!sessionHash||!(await tGet(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE
         s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`,sessionHash,userId,timestamp())))
-        throw new Error('Push registration requires an active session.');
+        return false;
       await tRun(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
         ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`, randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp());
       await tRun(`INSERT INTO push_session_bindings(endpoint,user_id,session_hash) VALUES(?,?,?)
         ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`,endpoint,userId,sessionHash);
+      return true;
     }),
     listPush: async (userId) => all(`SELECT p.*,b.session_hash AS bound_session_hash FROM push_subscriptions p JOIN push_session_bindings b
       ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
@@ -1908,9 +1912,10 @@ const indexMigrations = [
     // --- APNs device tokens (native iOS push) ---
     saveApnsToken: async (userId, token, sessionHash) => withTransaction(async ({query:tQuery,get:tGet,run:tRun}) => {
       await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[token]);
+      if(!(await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId)))return false;
       if(!sessionHash||!(await tGet(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE
         s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`,sessionHash,userId,timestamp())))
-        throw new Error('Push registration requires an active session.');
+        return false;
       const now = timestamp();
       await tRun('DELETE FROM apns_device_tokens WHERE device_token=? AND user_id<>?',token,userId);
       await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
@@ -1918,6 +1923,7 @@ const indexMigrations = [
         randomUUID(), userId, token, 'ios', 'production', now, now);
       await tRun(`INSERT INTO apns_session_bindings(device_token,user_id,session_hash) VALUES(?,?,?)
         ON CONFLICT(device_token) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`,token,userId,sessionHash);
+      return true;
     }),
     listApnsTokens: async (userId) => all(`SELECT a.*,b.session_hash AS bound_session_hash FROM apns_device_tokens a JOIN apns_session_bindings b
       ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
