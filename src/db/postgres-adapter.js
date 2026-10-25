@@ -201,6 +201,12 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         last_inbound_at TEXT,
         created_at TEXT NOT NULL
       )`,
+      'CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (sid TEXT PRIMARY KEY, created_at TEXT NOT NULL)',
+      "ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'accepted'",
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS lease_token TEXT',
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS lease_expires_at TEXT',
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
+      'CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL)',
       `CREATE TABLE IF NOT EXISTS radar_findings (
         finding_key TEXT PRIMARY KEY,
         repo TEXT NOT NULL,
@@ -410,6 +416,7 @@ const indexMigrations = [
     await client.query('SELECT 1 FROM reports LIMIT 0');
     await client.query('SELECT 1 FROM reply_jobs LIMIT 0');
     await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
+    await client.query('SELECT state,lease_token,lease_expires_at,attempts FROM whatsapp_inbound_messages LIMIT 0');
     const ordering=await client.query(`SELECT column_default FROM information_schema.columns
       WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
     if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
@@ -691,6 +698,19 @@ const indexMigrations = [
     acceptReplyJob: async (userId,conversationId,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
       const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
       if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
+      if(options.inboundSid){
+        const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+        const link=await tGet('SELECT phone_e164,verified_at FROM whatsapp_links WHERE user_id=? FOR UPDATE',userId);
+        if(!user||user.disabled===1||user.moderation_blocked===1||!link||
+          link.phone_e164!==deliveryToPhone||link.verified_at!==deliveryLinkVerifiedAt)return null;
+        const claimed=options.inboundLeaseToken
+          ?await tGet(`UPDATE whatsapp_inbound_messages SET state='accepted',lease_token=NULL,lease_expires_at=NULL
+            WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING sid`,
+            options.inboundSid,options.inboundLeaseToken,timestamp())
+          :await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
+            ON CONFLICT(sid) DO NOTHING RETURNING sid`,options.inboundSid,timestamp());
+        if(!claimed)return null;
+      }
       // Serialize accepts for one conversation before allocating the global
       // sequence. Otherwise a later seq can commit and run before an earlier
       // uncommitted job becomes visible to claimers.
@@ -1715,6 +1735,83 @@ const indexMigrations = [
         userId, phoneE164, now, now, now);
       return get('SELECT * FROM whatsapp_links WHERE user_id=?', userId);
     },
+    issueWhatsAppLinkCode: async (userId,code,expiresAt) => withTransaction(async ({get:tGet,run:tRun}) => {
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))throw new Error('Account not found');
+      const key=`whatsapp_link_code_${code}`;
+      await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
+      const issued=await tGet(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+        WHERE right(settings.value,24)<?
+        RETURNING value`,key,`${userId}:${expiresAt}`,timestamp(),timestamp());
+      if(!issued)throw new Error('Link code collision');
+      return true;
+    }),
+    consumeWhatsAppLinkCode: async (code) => withTransaction(async ({get:tGet}) => {
+      const key=`whatsapp_link_code_${code}`;
+      const record=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(userId)await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId);
+      const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
+      return taken&&sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
+    }),
+    consumeAndLinkWhatsApp: async (code,phoneE164,inboundSid=null) => withTransaction(async ({get:tGet}) => {
+      const key=`whatsapp_link_code_${code}`;
+      const record=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
+      const owner=await tGet("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0 FOR UPDATE",userId);
+      if(!owner||Date.now()>=new Date(expiresAt).valueOf())return null;
+      if(inboundSid&&!await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
+        ON CONFLICT(sid) DO NOTHING RETURNING sid`,inboundSid,timestamp()))return null;
+      const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
+      if(!taken)return null;
+      const now=timestamp();
+      await tGet(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+        VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,
+        verified_at=excluded.verified_at,created_at=excluded.created_at RETURNING user_id`,userId,phoneE164,now,now,now);
+      return userId;
+    }),
+    revokeWhatsAppLinkCodes: async (userId) => (await run("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`)).changes,
+    unlinkWhatsAppAndRevoke: async (userId) => withTransaction(async ({get:tGet,run:tRun}) => {
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
+      await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
+      return (await tRun('DELETE FROM whatsapp_links WHERE user_id=?',userId)).changes>0;
+    }),
+    allowWhatsAppLinkAttempt: async (phone) => withTransaction(async ({get:tGet}) => {
+      const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
+      for(const [subject,limit] of [[phone,5],['*',30]]){
+        const row=await tGet(`INSERT INTO whatsapp_link_attempts(subject,window_start,attempts) VALUES(?,?,1)
+          ON CONFLICT(subject) DO UPDATE SET
+          attempts=CASE WHEN whatsapp_link_attempts.window_start<? THEN 1 ELSE whatsapp_link_attempts.attempts+1 END,
+          window_start=CASE WHEN whatsapp_link_attempts.window_start<? THEN excluded.window_start ELSE whatsapp_link_attempts.window_start END
+          RETURNING attempts`,subject,now,cutoff,cutoff);
+        if(Number(row.attempts)>limit)return false;
+      }
+      return true;
+    }),
+    claimWhatsAppInboundSid: async (sid) => (await run('INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?) ON CONFLICT(sid) DO NOTHING',sid,timestamp())).changes>0,
+    getWhatsAppInboundState: async (sid) => (await get('SELECT state FROM whatsapp_inbound_messages WHERE sid=?',sid))?.state||null,
+    claimWhatsAppInboundMedia: async (sid,leaseMs=90_000) => withTransaction(async ({get:tGet,run:tRun}) => {
+      const now=timestamp(),token=randomUUID(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      const inserted=await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at,state,lease_token,lease_expires_at,attempts)
+        VALUES(?,?,'processing',?,?,1) ON CONFLICT(sid) DO NOTHING RETURNING sid`,sid,now,token,expiresAt);
+      if(inserted)return{state:'claimed',token};
+      const row=await tGet('SELECT state,lease_expires_at,attempts FROM whatsapp_inbound_messages WHERE sid=? FOR UPDATE',sid);
+      if(row?.state==='accepted'||row?.state==='failed')return{state:row.state};
+      if(row?.state==='processing'&&row.lease_expires_at>now)return{state:'busy'};
+      if(row?.attempts>=5){
+        await tRun("UPDATE whatsapp_inbound_messages SET state='failed',lease_token=NULL,lease_expires_at=NULL WHERE sid=?",sid);
+        return{state:'failed'};
+      }
+      await tRun(`UPDATE whatsapp_inbound_messages SET state='processing',lease_token=?,lease_expires_at=?,attempts=attempts+1 WHERE sid=?`,token,expiresAt,sid);
+      return{state:'claimed',token};
+    }),
+    finishWhatsAppInboundMedia: async (sid,token,retryable=false) => (await get(`UPDATE whatsapp_inbound_messages
+      SET state=CASE WHEN ?=1 AND attempts<5 THEN 'retryable' ELSE 'failed' END,lease_token=NULL,lease_expires_at=NULL
+      WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING state`,retryable?1:0,sid,token,timestamp()))?.state||null,
+    pruneWhatsAppInbound: async () => {await run('DELETE FROM whatsapp_inbound_messages WHERE created_at<?',new Date(Date.now()-30*86400_000).toISOString());await run('DELETE FROM whatsapp_link_attempts WHERE window_start<?',new Date(Date.now()-86400_000).toISOString());},
     getWhatsAppLink: async (userId) => (await get('SELECT * FROM whatsapp_links WHERE user_id=?', userId)) || null,
     getUserByWhatsApp: async (phoneE164) => (await get('SELECT * FROM whatsapp_links WHERE phone_e164=?', phoneE164)) || null,
     setWhatsAppLastInbound: async (userId, at = timestamp()) => (await run('UPDATE whatsapp_links SET last_inbound_at=? WHERE user_id=?', at, userId)).changes > 0,

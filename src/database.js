@@ -361,6 +361,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       last_inbound_at TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+      sid TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'accepted', lease_token TEXT, lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
+      subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS radar_findings (
       finding_key TEXT PRIMARY KEY,
       repo TEXT NOT NULL,
@@ -533,6 +541,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'writing_voice_updated_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'writing_voice_offered', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'state', "TEXT NOT NULL DEFAULT 'accepted'");
+  ensureColumn(db, 'whatsapp_inbound_messages', 'lease_token', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'lease_expires_at', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
   ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
   ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
@@ -1114,6 +1126,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     acceptReplyJob(userId,conversationId,content,options={}){return withImmediate(()=>{
+      if(options.inboundSid){
+        const link=s.getWhatsAppLink.get(userId);
+        const user=db.prepare('SELECT disabled,moderation_blocked FROM users WHERE id=?').get(userId);
+        if(!link||link.phone_e164!==options.deliveryToPhone||link.verified_at!==options.deliveryLinkVerifiedAt||
+            !user||user.disabled===1||user.moderation_blocked===1)return null;
+        if(options.inboundLeaseToken){
+          if(!db.prepare(`UPDATE whatsapp_inbound_messages SET state='accepted',lease_token=NULL,lease_expires_at=NULL
+            WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>?`)
+            .run(options.inboundSid,options.inboundLeaseToken,timestamp()).changes)return null;
+        }else if(!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+          .run(options.inboundSid,timestamp()).changes)return null;
+      }
       const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
       s.addMessage.run(userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
       const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...options});
@@ -1632,6 +1656,77 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
+    issueWhatsAppLinkCode(userId,code,expiresAt) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const prior=s.setting.get(key)?.value;
+      if(prior&&new Date(prior.slice(prior.indexOf(':')+1)).valueOf()>Date.now())throw new Error('Link code collision');
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      s.setSetting.run(key,`${userId}:${expiresAt}`,timestamp());
+      return true;
+    });},
+    consumeWhatsAppLinkCode(code) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const record=s.setting.get(key)?.value;
+      if(!record)return null;
+      db.prepare('DELETE FROM settings WHERE key=?').run(key);
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      return sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
+    });},
+    consumeAndLinkWhatsApp(code,phoneE164,inboundSid=null) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`,record=s.setting.get(key)?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
+      const owner=db.prepare("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0").get(userId);
+      if(!owner)return null;
+      if(inboundSid&&!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+        .run(inboundSid,timestamp()).changes)return null;
+      db.prepare('DELETE FROM settings WHERE key=? AND value=?').run(key,record);
+      const now=timestamp();
+      s.linkWhatsApp.run(userId,phoneE164,now,now,now);
+      return userId;
+    });},
+    revokeWhatsAppLinkCodes(userId) { return db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`).changes; },
+    unlinkWhatsAppAndRevoke(userId) { return withImmediate(()=>{
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      return s.unlinkWhatsApp.run(userId).changes>0;
+    });},
+    allowWhatsAppLinkAttempt(phone) { return withImmediate(()=>{
+      const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
+      const get=db.prepare('SELECT window_start,attempts FROM whatsapp_link_attempts WHERE subject=?');
+      const put=db.prepare(`INSERT INTO whatsapp_link_attempts(subject,window_start,attempts) VALUES(?,?,?)
+        ON CONFLICT(subject) DO UPDATE SET window_start=excluded.window_start,attempts=excluded.attempts`);
+      for(const [subject,limit] of [[phone,5],['*',30]]){
+        const previous=get.get(subject);
+        const sameWindow=previous&&previous.window_start>=cutoff;
+        const attempts=sameWindow?previous.attempts+1:1;
+        if(attempts>limit)return false;
+        put.run(subject,sameWindow?previous.window_start:now,attempts);
+      }
+      return true;
+    });},
+    claimWhatsAppInboundSid(sid) { return db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)').run(sid,timestamp()).changes>0; },
+    getWhatsAppInboundState(sid) { return db.prepare('SELECT state FROM whatsapp_inbound_messages WHERE sid=?').get(sid)?.state||null; },
+    claimWhatsAppInboundMedia(sid,leaseMs=90_000) { return withImmediate(()=>{
+      const now=timestamp(),row=db.prepare('SELECT state,lease_expires_at,attempts FROM whatsapp_inbound_messages WHERE sid=?').get(sid);
+      if(row?.state==='accepted'||row?.state==='failed')return{state:row.state};
+      if(row?.state==='processing'&&row.lease_expires_at>now)return{state:'busy'};
+      if(row&&row.attempts>=5){
+        db.prepare("UPDATE whatsapp_inbound_messages SET state='failed',lease_token=NULL,lease_expires_at=NULL WHERE sid=?").run(sid);
+        return{state:'failed'};
+      }
+      const token=randomUUID(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      if(row)db.prepare(`UPDATE whatsapp_inbound_messages SET state='processing',lease_token=?,lease_expires_at=?,attempts=attempts+1 WHERE sid=?`)
+        .run(token,expiresAt,sid);
+      else db.prepare(`INSERT INTO whatsapp_inbound_messages(sid,created_at,state,lease_token,lease_expires_at,attempts)
+        VALUES(?,?,'processing',?,?,1)`).run(sid,now,token,expiresAt);
+      return{state:'claimed',token};
+    });},
+    finishWhatsAppInboundMedia(sid,token,retryable=false) { return db.prepare(`UPDATE whatsapp_inbound_messages
+      SET state=CASE WHEN ?=1 AND attempts<5 THEN 'retryable' ELSE 'failed' END,lease_token=NULL,lease_expires_at=NULL
+      WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING state`)
+      .get(retryable?1:0,sid,token,timestamp())?.state||null; },
+    pruneWhatsAppInbound() { const cutoff=new Date(Date.now()-30*86400_000).toISOString();db.prepare('DELETE FROM whatsapp_inbound_messages WHERE created_at<?').run(cutoff);db.prepare('DELETE FROM whatsapp_link_attempts WHERE window_start<?').run(new Date(Date.now()-86400_000).toISOString()); },
     getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
     setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,
