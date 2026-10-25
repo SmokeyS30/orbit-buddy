@@ -7,13 +7,13 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { stageWhatsAppMedia, peekWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
-import { stageAttachment, takeAttachment, peekAttachment, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { stageAttachment, takeAttachment, peekAttachment, pruneAttachments, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { reserveMediaBytes } from './src/media-memory.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
@@ -645,6 +645,8 @@ export function createOrbitServer(options={}) {
   }
   function pumpReplyJobs(){
     pruneEphemeralReplyPayloads();
+    pruneAttachments();
+    pruneWhatsAppMedia();
     if(closing)return Promise.resolve();
     if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
     replyPumpRunning=true;
