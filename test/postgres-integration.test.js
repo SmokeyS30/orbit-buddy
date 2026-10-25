@@ -55,7 +55,7 @@ test('PostgreSQL sync calls never return a timed-out earlier call result',async(
   }
 });
 
-test('PostgreSQL deletion tool requires a later explicit user turn and visible preview',async()=>{
+test('PostgreSQL deletion tool remains unable to execute after a later yes',async()=>{
   assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
   await ensureSchema();
   const db=createSyncPgAdapter(DATABASE_URL);
@@ -68,11 +68,12 @@ test('PostgreSQL deletion tool requires a later explicit user turn and visible p
     const first=db.addMessage(userId,conversation.id,'user','Delete Private goal');
     const context={db,userId,messageId:first.id};
     const staged=toolDeleteGoal({title:'Private goal'},context);
-    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},context),/fresh explicit confirmation/i);
+    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},context),/Chat cannot execute deletions/i);
     db.addMessage(userId,conversation.id,'assistant',`Confirm deletion: ${staged.preview}`);
     const next=db.addMessage(userId,conversation.id,'user','yes, delete it');
-    assert.equal(toolConfirmDeleteApproval({approvalId:staged.approvalId},{...context,messageId:next.id}).deleted,true);
-    assert.equal(db.getGoal(userId,goal.id),null);
+    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...context,messageId:next.id}),/Chat cannot execute deletions/i);
+    assert.ok(db.getGoal(userId,goal.id));
+    assert.equal(db.getApproval(userId,staged.approvalId).status,'pending');
   }finally{
     if(userId)db.deleteUserAccount(userId);
     db.close();
