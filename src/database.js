@@ -90,6 +90,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS backup_deletion_queue (
       account_ref TEXT PRIMARY KEY, requested_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS worker_leases (
+      name TEXT PRIMARY KEY, owner_token TEXT NOT NULL, expires_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       csrf_token TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, user_agent TEXT
@@ -593,6 +596,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     queueBackupDeletion: db.prepare('INSERT OR IGNORE INTO backup_deletion_queue(account_ref,requested_at) VALUES(?,?)'),
     listBackupDeletions: db.prepare('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
     clearBackupDeletion: db.prepare('DELETE FROM backup_deletion_queue WHERE account_ref=?'),
+    claimWorkerLease: db.prepare(`INSERT INTO worker_leases(name,owner_token,expires_at) VALUES(?,?,?)
+      ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,expires_at=excluded.expires_at
+      WHERE worker_leases.expires_at<=?`),
+    renewWorkerLease: db.prepare('UPDATE worker_leases SET expires_at=? WHERE name=? AND owner_token=? AND expires_at>?'),
+    currentWorkerLease: db.prepare('SELECT 1 FROM worker_leases WHERE name=? AND owner_token=? AND expires_at>?'),
+    releaseWorkerLease: db.prepare('DELETE FROM worker_leases WHERE name=? AND owner_token=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
     authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
@@ -1003,6 +1012,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    claimWorkerLease:(name,token,leaseMs=2*60_000)=>{const now=timestamp();return s.claimWorkerLease.run(name,token,new Date(Date.now()+leaseMs).toISOString(),now).changes>0;},
+    renewWorkerLease:(name,token,leaseMs=2*60_000)=>s.renewWorkerLease.run(new Date(Date.now()+leaseMs).toISOString(),name,token,timestamp()).changes>0,
+    isWorkerLeaseCurrent:(name,token)=>!!s.currentWorkerLease.get(name,token,timestamp()),
+    releaseWorkerLease:(name,token)=>s.releaseWorkerLease.run(name,token).changes>0,
     setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
     createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,ownerApproved=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');

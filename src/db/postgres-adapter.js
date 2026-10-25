@@ -111,6 +111,9 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       `CREATE TABLE IF NOT EXISTS backup_deletion_queue (
         account_ref TEXT PRIMARY KEY, requested_at TEXT NOT NULL
       )`,
+      `CREATE TABLE IF NOT EXISTS worker_leases (
+        name TEXT PRIMARY KEY, owner_token TEXT NOT NULL, expires_at TEXT NOT NULL
+      )`,
       `CREATE TABLE IF NOT EXISTS waitlist (
         id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT,
         status TEXT NOT NULL DEFAULT 'pending', notes TEXT,
@@ -502,6 +505,14 @@ const indexMigrations = [
     query, get, all, run,
 
     // --- Users ---
+    claimWorkerLease: async(name,token,leaseMs=2*60_000)=>{
+      const now=timestamp();return (await run(`INSERT INTO worker_leases(name,owner_token,expires_at) VALUES(?,?,?)
+        ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,expires_at=excluded.expires_at
+        WHERE worker_leases.expires_at<=?`,name,token,new Date(Date.now()+leaseMs).toISOString(),now)).changes>0;
+    },
+    renewWorkerLease: async(name,token,leaseMs=2*60_000)=>(await run('UPDATE worker_leases SET expires_at=? WHERE name=? AND owner_token=? AND expires_at>?',new Date(Date.now()+leaseMs).toISOString(),name,token,timestamp())).changes>0,
+    isWorkerLeaseCurrent: async(name,token)=>!!(await get('SELECT 1 FROM worker_leases WHERE name=? AND owner_token=? AND expires_at>?',name,token,timestamp())),
+    releaseWorkerLease: async(name,token)=>(await run('DELETE FROM worker_leases WHERE name=? AND owner_token=?',name,token)).changes>0,
     countUsers: async () => Number((await get('SELECT COUNT(*) AS count FROM users')).count),
     listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
     async createUser({ email, displayName, passwordHash, passwordSalt, role }) {

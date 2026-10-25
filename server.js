@@ -1167,6 +1167,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     }
   }
   async function deliverProactive(user,text,eventType,eventMessage){
+    assertProactiveWorkerLease();
     if(paused())return false;
     const current=db.getUserById(user.id);
     if(!current||current.disabled)return false;
@@ -1175,6 +1176,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
+    assertProactiveWorkerLease();
     if(paused()||!db.getUserById(user.id))return false;
     if(await tryWhatsAppProactive(user.id,text))return;
     if(paused()||!db.getUserById(user.id))return false;
@@ -2209,7 +2211,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
     }
   }
-  let proactiveBusy=false;
+  let proactiveBusy=false,proactiveLeaseToken=null,proactiveLeaseAlive=false;
+  function assertProactiveWorkerLease(){
+    if(proactiveBusy&&(!proactiveLeaseAlive||!proactiveLeaseToken||!db.isWorkerLeaseCurrent('proactive',proactiveLeaseToken)))
+      throw Object.assign(new Error('Proactive worker lease was lost.'),{code:'PROACTIVE_LEASE_LOST'});
+  }
   async function runWeeklyReview(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
@@ -2322,10 +2328,19 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(e){return '';}
   }
   async function runProactiveChecks(nowMs=Date.now()){
-    if(proactiveBusy||paused())return;proactiveBusy=true;
+    if(proactiveBusy||paused())return;
+    const token=randomUUID();
+    try{if(!db.claimWorkerLease('proactive',token))return;}
+    catch(error){console.error('Proactive worker lease unavailable:',error?.code||error?.name||'error');return;}
+    proactiveBusy=true;proactiveLeaseToken=token;proactiveLeaseAlive=true;
+    const heartbeat=setInterval(()=>{
+      try{if(!db.renewWorkerLease('proactive',token))proactiveLeaseAlive=false;}
+      catch{proactiveLeaseAlive=false;}
+    },30_000);
+    heartbeat.unref();
     try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
     catch(error){console.error('Proactive worker stopped after an account or database change:',error?.code||error?.name||'error');}
-    finally{proactiveBusy=false;}
+    finally{clearInterval(heartbeat);try{db.releaseWorkerLease('proactive',token);}catch{}proactiveBusy=false;proactiveLeaseToken=null;proactiveLeaseAlive=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
   // Polls at most every 30 minutes (see src/radar.js); high-signal findings

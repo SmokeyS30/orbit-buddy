@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS backup_deletion_queue (
   requested_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS worker_leases (
+  name TEXT PRIMARY KEY,
+  owner_token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,

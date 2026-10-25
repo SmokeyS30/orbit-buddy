@@ -101,6 +101,26 @@ test('PostgreSQL conversation export pages retain all messages in order',async()
   }finally{if(user)await db.deleteUserAccount(user.id);await db.close();}
 });
 
+test('PostgreSQL proactive worker lease admits only one replica at a time',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const one=await openPostgres(DATABASE_URL),two=await openPostgres(DATABASE_URL);
+  const name=`proactive-test-${Date.now()}-${Math.random()}`;
+  try{
+    const claims=await Promise.all([one.claimWorkerLease(name,'replica-a'),two.claimWorkerLease(name,'replica-b')]);
+    assert.equal(claims.filter(Boolean).length,1);
+    const winner=claims[0]?one:two,loser=claims[0]?two:one;
+    const winningToken=claims[0]?'replica-a':'replica-b',losingToken=claims[0]?'replica-b':'replica-a';
+    assert.equal(await loser.renewWorkerLease(name,losingToken),false);
+    assert.equal(await loser.releaseWorkerLease(name,losingToken),false);
+    assert.equal(await winner.isWorkerLeaseCurrent(name,winningToken),true);
+    assert.equal(await winner.releaseWorkerLease(name,winningToken),true);
+    assert.equal(await loser.claimWorkerLease(name,losingToken),true);
+    assert.equal(await winner.renewWorkerLease(name,winningToken),false);
+  }finally{await one.releaseWorkerLease(name,'replica-a');await two.releaseWorkerLease(name,'replica-b');await one.close();await two.close();}
+});
+
 // Apply schema idempotently before tests. Uses a direct pg Pool (not the
 // sync wrapper) so schema setup doesn't depend on the code under test.
 async function ensureSchema() {
