@@ -213,27 +213,27 @@ function markdownToPdfBuffer(md){
   }
   if(cur.length)pages.push(cur);
   if(!pages.length)pages.push([]);
+  // Reserve catalog, page tree, and font IDs before allocating page pairs.
   const objs=[];
-  const contentRefs=pages.map((_,i)=>`${6+i*2} 0 R`).join(' ');
   objs[1]='<< /Type /Catalog /Pages 2 0 R >>';
-  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${3+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
+  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${5+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
   pages.forEach((pg,i)=>{
-    const p=3+i*2,c=6+i*2;
-    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents ${c} 0 R >>`;
+    const p=5+i*2,c=6+i*2;
+    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${c} 0 R >>`;
     let stream='';
     for(const t of pg){stream+=`BT /${t.font} ${t.size} Tf ${t.x.toFixed(1)} ${t.y.toFixed(1)} Td (${pdfEscape(t.text)}) Tj ET\n`;}
-    objs[c]=`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
+    objs[c]=`<< /Length ${Buffer.byteLength(stream,'latin1')} >>\nstream\n${stream}\nendstream`;
   });
-  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
-  objs[5]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+  objs[3]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
   let pdf='%PDF-1.4\n';const offsets=[];
   const maxObj=Math.max(...Object.keys(objs).map(Number));
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
-    offsets[i]=Buffer.byteLength(pdf);
+    offsets[i]=Buffer.byteLength(pdf,'latin1');
     pdf+=`${i} 0 obj\n${objs[i]}\nendobj\n`;
   }
-  const xrefPos=Buffer.byteLength(pdf);
+  const xrefPos=Buffer.byteLength(pdf,'latin1');
   pdf+=`xref\n0 ${maxObj+1}\n0000000000 65535 f \n`;
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
@@ -2577,7 +2577,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
-    const url=new URL(req.url,'http://localhost');
+    let url;
+    try{url=new URL(req.url,'http://localhost');}
+    catch{return json(res,400,{error:'Invalid request URL.'});}
     // ===== CORS FOR THE NATIVE APP (capacitor://localhost) =====
     // Answered before the maintenance block so preflights always get a clean
     // answer. Web requests (no matching Origin) are completely unaffected.
@@ -3733,7 +3735,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
           return json(res,200,{ok:true,entitlements});
         }
-        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req),user.token_hash)});}
         const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}

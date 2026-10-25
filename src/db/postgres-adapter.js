@@ -379,6 +379,9 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       )`,
       'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_to_phone TEXT',
       'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_link_verified_at TEXT',
+      `CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+        state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL, claimed_at TEXT)`,
     ];
 const indexMigrations = [
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id)',
@@ -386,6 +389,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_oauth_states_user_provider ON oauth_states(user_id,provider)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
@@ -1838,8 +1842,14 @@ const indexMigrations = [
         data.id || randomUUID(), userId, provider, data.accessEncrypted, data.refreshEncrypted || null, data.scopes || '', data.expiresAt || null, JSON.stringify(data.profile || {}), now, now);
     },
     listConnectors: async (userId) => all('SELECT id,provider,scopes,expires_at,profile_json,created_at,updated_at FROM connectors WHERE user_id=?', userId),
+    refreshConnector: async (userId,provider,previous,data) => (await run('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted)).changes>0,
+    deleteConnectorIfCurrent: async (userId,provider,previous) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',userId,provider,previous.id,previous.access_encrypted)).changes>0,
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
-    deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
+    deleteConnector: async (userId,provider) => withTransaction(async ({get:tGet,run:tRun})=>{
+      await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId);
+      await tRun('DELETE FROM oauth_states WHERE user_id=? AND provider=?',userId,provider);
+      return (await tRun('DELETE FROM connectors WHERE user_id=? AND provider=?',userId,provider)).changes>0;
+    }),
 
     // --- WhatsApp linking ---
     async linkWhatsApp(userId, phoneE164) {
@@ -1939,12 +1949,41 @@ const indexMigrations = [
       ORDER BY schedule_at ASC LIMIT ?`, userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
 
     // --- OAuth states ---
-    addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },
-    async consumeOauthState(hash) {
-      const row = await get('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?', hash, timestamp());
-      if (row) await run('DELETE FROM oauth_states WHERE state_hash=?', hash);
-      return row;
-    },
+    addOauthState: async row=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',row.userId);
+      const session=row.sessionHash?await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',row.sessionHash,row.userId,timestamp()):null;
+      if(!user||user.disabled||user.moderation_blocked||(row.provider==='gmail'&&user.role!=='owner')||!session)
+        throw new Error('OAuth link requires an active owner session.');
+      await tRun('DELETE FROM oauth_states WHERE expires_at<=?',timestamp());
+      await tRun('DELETE FROM oauth_states WHERE user_id=? AND provider=?',row.userId,row.provider);
+      await tRun('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)',
+        row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt);
+      await tRun('INSERT INTO oauth_state_bindings(state_hash,session_hash,claimed_at) VALUES(?,?,NULL)',row.stateHash,row.sessionHash);
+    }),
+    consumeOauthState: async hash=>withTransaction(async ({get:tGet})=>{
+      const claim=await tGet(`UPDATE oauth_state_bindings SET claimed_at=? WHERE state_hash=? AND claimed_at IS NULL
+        AND EXISTS (SELECT 1 FROM oauth_states WHERE oauth_states.state_hash=oauth_state_bindings.state_hash AND expires_at>?) RETURNING state_hash`,timestamp(),hash,timestamp());
+      if(!claim)return null;
+      return await tGet('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?',hash);
+    }),
+    finishOauthConnection: async(stateHash,userId,provider,data)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const now=timestamp();
+      const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||(provider==='gmail'&&user.role!=='owner'))return false;
+      const state=await tGet(`SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,now);
+      if(!state?.session_hash)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,now);
+      if(!session)return false;
+      await tRun('DELETE FROM oauth_states WHERE state_hash=?',stateHash);
+      await tRun(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
+        refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
+        profile_json=excluded.profile_json,updated_at=excluded.updated_at`,
+        randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
+      return true;
+    }),
+    discardOauthState: async hash=>(await run('DELETE FROM oauth_states WHERE state_hash=?',hash)).changes>0,
 
     // --- Access requests ---
     async addAccessRequest({ name, email, note }) {

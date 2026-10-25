@@ -242,6 +242,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, code_verifier TEXT, redirect_uri TEXT NOT NULL, expires_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+      state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL, claimed_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS calendar_feeds (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       label TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -543,6 +547,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
   ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
   ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
+  db.exec(`CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+    state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+    session_hash TEXT NOT NULL, claimed_at TEXT)`);
   db.exec("UPDATE processed_notifications SET state='processed',completed_at=COALESCE(completed_at,received_at) WHERE state IS NULL OR state!='processing'");
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL');
@@ -551,6 +558,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_oauth_states_user_provider ON oauth_states(user_id,provider)');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -870,7 +878,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     connector: db.prepare('SELECT * FROM connectors WHERE user_id=? AND provider=?'),
     deleteConnector: db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=?'),
     addOauthState: db.prepare('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)'),
-    consumeOauthState: db.prepare('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?'),
+    addOauthBinding: db.prepare('INSERT INTO oauth_state_bindings(state_hash,session_hash,claimed_at) VALUES(?,?,NULL)'),
+    claimOauthState: db.prepare('UPDATE oauth_state_bindings SET claimed_at=? WHERE state_hash=? AND claimed_at IS NULL AND EXISTS (SELECT 1 FROM oauth_states WHERE oauth_states.state_hash=oauth_state_bindings.state_hash AND expires_at>?) RETURNING state_hash'),
+    oauthState: db.prepare('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?'),
+    revokeOauthStates: db.prepare('DELETE FROM oauth_states WHERE user_id=? AND provider=?'),
+    pruneOauthStates: db.prepare('DELETE FROM oauth_states WHERE expires_at<=?'),
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     addWaitlistEntry: db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)'),
@@ -1740,8 +1752,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     prunePurchaseIntents() { s.prunePurchaseIntents.run(timestamp()); },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
+    // The randomized encrypted access token is the credential revision.
+    // A stale refresh may neither upsert nor remove a replacement connection.
+    refreshConnector:(userId,provider,previous,data)=>db.prepare('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted).changes>0,
+    deleteConnectorIfCurrent:(userId,provider,previous)=>db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(userId,provider,previous.id,previous.access_encrypted).changes>0,
     getConnector: (userId,provider) => s.connector.get(userId,provider),
-    deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
+    deleteConnector: (userId,provider) => withImmediate(()=>{
+      s.revokeOauthStates.run(userId,provider);
+      return s.deleteConnector.run(userId,provider).changes>0;
+    }),
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
     getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
@@ -1792,8 +1811,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listUndeliveredRadarFindingsSince: (userId, sinceIso, limit = 15) => s.listUndeliveredRadarFindingsSince.all(userId, sinceIso, Math.max(1, Math.min(50, Number(limit) || 15))),
     listUnrecoveredFailureDetails: (limit = 10) => s.listUnrecoveredFailureDetails.all(Math.max(1, Math.min(25, Number(limit) || 10))),
     listTasksDueBefore: (userId, cutoffIso, limit = 10) => s.listTasksDueBefore.all(userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
-    addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
-    consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
+    addOauthState(row) { return withImmediate(()=>{
+      const session=row.sessionHash?s.session.get(row.sessionHash,timestamp()):null;
+      if(session?.user_id!==row.userId||session.disabled||session.moderation_blocked||(row.provider==='gmail'&&session.role!=='owner'))
+        throw new Error('OAuth link requires an active owner session.');
+      s.pruneOauthStates.run(timestamp());
+      s.revokeOauthStates.run(row.userId,row.provider);
+      s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt);
+      s.addOauthBinding.run(row.stateHash,row.sessionHash);
+    }); },
+    consumeOauthState: hash => withImmediate(()=>s.claimOauthState.get(timestamp(),hash,timestamp())?s.oauthState.get(hash):null),
+    finishOauthConnection(stateHash,userId,provider,data) { return withImmediate(()=>{
+      const now=timestamp(),state=s.oauthState.get(stateHash);
+      const session=state?.session_hash?s.session.get(state.session_hash,now):null;
+      if(!state||state.user_id!==userId||state.provider!==provider||!state.claimed_at||state.expires_at<=now
+        ||session?.user_id!==userId||session.disabled||session.moderation_blocked||(provider==='gmail'&&session.role!=='owner'))return false;
+      s.deleteOauthState.run(stateHash);
+      s.upsertConnector.run(randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
+      return true;
+    }); },
+    discardOauthState: hash => s.deleteOauthState.run(hash).changes>0,
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     getAccessRequest: (id) => s.getAccessRequest.get(id),
     listAccessRequests: () => s.listAccessRequests.all(),
