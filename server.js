@@ -2596,7 +2596,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce',emailVerificationReady:transactionalEmailConfigured,appleSignInReady:appleAuthReady(env),appleSignupReady:appleAuthReady(env)&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
+        const emailVerificationReady=transactionalEmailConfigured&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'&&emailVerificationReady,emailVerificationReady,appleSignInReady:appleAuthReady(env),appleSignupReady:appleAuthReady(env)&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
@@ -2968,7 +2969,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const verifiedEmail=Boolean(appleProof||(emailHash&&verificationTokenHash&&db.getSignupVerificationToken(verificationTokenHash,emailHash)));
         const admission=signupAdmission({mode:riskMode,result:risk,hasOwner:count>0,registrationOpen:registrationOpen(),verifiedEmail});
         if(admission.action==='deny')throw Object.assign(new Error('We could not verify this signup. Please try again from the Orbit app.'),{status:403});
-        if(admission.action==='verify'){
+        // A low risk score (or an open legacy door) is not proof that the
+        // applicant controls the mailbox they are claiming.
+        if(admission.action==='verify'||(count>0&&!verifiedEmail&&admission.action==='allow')){
           if(!transactionalEmailConfigured||!emailHash)throw Object.assign(new Error('Email verification is temporarily unavailable. Please try again later.'),{status:503});
           if(db.getPendingSignupVerificationForEmail(emailHash))throw Object.assign(new Error('Check your email to verify your address and finish creating your Orbit account.'),{status:403,verificationRequired:true,verificationSent:true});
           if(hourlyLimited(req,5,'signup-verify'))throw Object.assign(new Error('Too many verification emails. Please try again later.'),{status:429});
@@ -2985,10 +2988,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         // Password hashing yields: recheck pause and the registration door afterward.
         const currentCount=db.countUsers();
         if(currentCount>0&&signupPause())return json(res,503,{error:'New signups are temporarily paused.'});
-        if(currentCount>0&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow')return json(res,403,{error:'Registration is not currently available.'});
+        if(currentCount>0&&(!verifiedEmail||signupAdmission({mode:riskMode,result:risk,hasOwner:true,registrationOpen:registrationOpen(),verifiedEmail}).action!=='allow'))return json(res,403,{error:'Registration is not currently available.'});
         let user;
         try{user=db.createSignupAccount({email,displayName,passwordHash:password.hash,passwordSalt:password.salt,
-          verificationHash:admission.reason==='verified_email'&&!appleProof?verificationTokenHash:null,emailHash,appleProofHash,appleEmailHash:emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
+          verificationHash:verifiedEmail&&!appleProof?verificationTokenHash:null,emailHash,appleProofHash,appleEmailHash:emailHash,environmentPaused:signupsPaused(env),automatic:riskMode==='enforce'&&signupAdmission({mode:riskMode,result:risk,hasOwner:true,verifiedEmail}).action==='allow'});}
         catch{return json(res,409,{error:'Account creation could not complete. Sign in or request a fresh verification link.'});}
         if(user.role==='owner')db.claimOrphans(user.id);const codes=makeRecoveryCodes();db.replaceRecoveryCodes(user.id,codes.map(hashToken));const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'account_created','Created an Orbit account.');
         // L3: simpler onboarding — seed the default conversation with a warm welcome
@@ -3737,7 +3740,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const password=await hashPassword(randomToken(48));
             const currentOwner=authenticate(req);if(!currentOwner)return json(res,401,{error:'Sign in again to approve access.'});requireOwner(currentOwner);
             if(signupPause())return json(res,503,{error:'New signups are paused. Request remains pending.'});
-            try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,environmentPaused:signupsPaused(env)});}
+            try{db.createSignupAccount({email:request.email,displayName:request.name,passwordHash:password.hash,passwordSalt:password.salt,automatic:true,ownerApproved:true,environmentPaused:signupsPaused(env)});}
             catch{return json(res,409,{error:'Approval could not complete. The request remains pending; refresh and retry.'});}
           }else if(target.moderation_blocked)return json(res,409,{error:'This account is blocked. Restore it from Users before approving access.'});
           else if(target.disabled){db.setUserDisabled(target.id,false);db.deleteUserSessions(target.id);}

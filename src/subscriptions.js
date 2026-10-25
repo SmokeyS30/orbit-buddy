@@ -234,7 +234,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
 
   const isComped = (userId, user) => {
     const email = String(user?.email || user?.user_email || '').trim().toLowerCase();
-    return compedUserIds.has(String(userId)) || (email && compedUserEmails.has(email)) || user?.role === 'owner' || user?.user_role === 'owner';
+    return compedUserIds.has(String(userId)) || (email && Boolean(user?.email_verified_at) && compedUserEmails.has(email)) || user?.role === 'owner' || user?.user_role === 'owner';
   };
   function activeProduct(userId, user) {
     if (isComped(userId, user)) return { plan: 'unlimited', dailyLimit: null, comped: true };

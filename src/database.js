@@ -595,7 +595,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
+    session: db.prepare(`SELECT sessions.*, users.email, users.email_verified_at, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -983,13 +983,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
     setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
-    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
+    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,ownerApproved=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const apple=appleProofHash?db.prepare('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject').get(appleProofHash,appleEmailHash,timestamp()):null;
         if(appleProofHash&&!apple)throw new Error('Apple proof expired');
         if(verificationHash && !s.useSignupVerificationToken.run(timestamp(),verificationHash,emailHash,timestamp()).changes) throw new Error('Verification expired');
         const count=s.countUsers.get().count;
+        if(count>0&&!verificationHash&&!apple&&!ownerApproved)throw new Error('Email proof required');
         if(count>0&&(environmentPaused||s.setting.get('signups_paused')?.value==='true'||(!automatic&&s.setting.get('registration_open')?.value!=='true')))throw new Error('Registration unavailable');
         const role=count===0?'owner':'member';
         const id=randomUUID(),now=timestamp();s.createUser.run(id,email,displayName,passwordHash,passwordSalt,role,now,now);

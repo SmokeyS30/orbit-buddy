@@ -230,7 +230,7 @@ test('owner and configured comped users remain unlimited', () => {
     COMPED_USER_IDS: 'dad,friend',
     COMPED_USER_EMAILS: ' MOM@EXAMPLE.COM ',
   }, db, { appleRuntime: apple.runtime });
-  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', { email: 'mom@example.com' }], ['dad', null], ['friend', null]]) {
+  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', { email: 'mom@example.com', email_verified_at: '2026-10-25T00:00:00.000Z' }], ['dad', null], ['friend', null]]) {
     for (let i = 0; i < 30; i++) assert.equal(service.consumeQuota(id, user).allowed, true);
   }
 });

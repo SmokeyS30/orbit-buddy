@@ -526,13 +526,14 @@ const indexMigrations = [
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
     }),
-    createSignupAccount: async ({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) => withTransaction(async ({get:tGet,run:tRun,query:tQuery}) => {
+    createSignupAccount: async ({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,ownerApproved=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) => withTransaction(async ({get:tGet,run:tRun,query:tQuery}) => {
       // Serialize bootstrap across server processes without modifying existing accounts.
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       const count=Number((await tGet('SELECT COUNT(*) AS count FROM users')).count);
       if(count>0&&(environmentPaused||(await tGet("SELECT value FROM settings WHERE key='signups_paused'"))?.value==='true'||(!automatic&&(await tGet("SELECT value FROM settings WHERE key='registration_open'"))?.value!=='true')))throw new Error('Registration unavailable');
       const apple=appleProofHash?await tGet('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject',appleProofHash,appleEmailHash,timestamp()):null;
       if(appleProofHash&&!apple)throw new Error('Apple proof expired');
+      if(count>0&&!verificationHash&&!apple&&!ownerApproved)throw new Error('Email proof required');
       if(verificationHash && !(await tRun('UPDATE signup_verification_tokens SET used_at=? WHERE token_hash=? AND email_hash=? AND used_at IS NULL AND expires_at>?',timestamp(),verificationHash,emailHash,timestamp())).changes)throw new Error('Verification expired');
       const id=randomUUID(),now=timestamp();
       await tRun('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,created_at,updated_at,email_verified_at) VALUES(?,?,?,?,?,?,?,?,?)',id,email,displayName,passwordHash,passwordSalt,count===0?'owner':'member',now,now,(verificationHash||apple)?now:null);
@@ -674,7 +675,7 @@ const indexMigrations = [
       await tRun('INSERT INTO sessions VALUES(?,?,?,?,?,?)',tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
       return true;
     }),
-    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
+    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.email_verified_at, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`, tokenHash, timestamp()),
     deleteSession: async (tokenHash) => { await run('DELETE FROM sessions WHERE token_hash=?', tokenHash); },
     deleteUserSessions: async (userId) => { await run('DELETE FROM sessions WHERE user_id=?', userId); },

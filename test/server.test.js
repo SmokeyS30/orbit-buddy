@@ -5,16 +5,22 @@ import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
 import { encryptSecret, readEncryptionKey } from '../src/security.js';
+import { signupInbox } from './helpers/signup-inbox.js';
+
+const inboxes=new Map();
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-server-'));
-  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', ...extraEnv } });
+  const inbox=signupInbox();
+  const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', SIGNUP_AUDIT_KEY:'synthetic-server-key', ...extraEnv },sendEmail:inbox.sendEmail });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
-  return { app, base: `http://127.0.0.1:${app.server.address().port}` };
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  inboxes.set(base,inbox);
+  return { app, base };
 }
 
 async function register(base, { email = 'owner@example.com', displayName = 'Owner' } = {}) {
-  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName, password: 'correct horse battery staple' }) });
+  const response = await inboxes.get(base).register(base,{ email, displayName, password: 'correct horse battery staple' });
   assert.equal(response.status, 201);
   const body = await response.json();
   return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, body };

@@ -471,6 +471,15 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     const user=await db.createUser({email:`security-${suffix}@example.com`,displayName:'Existing',passwordHash:'old',passwordSalt:'salt',role:'member'});
     const other=await db.createUser({email:`other-${suffix}@example.com`,displayName:'Other',passwordHash:'old',passwordSalt:'salt',role:'member'});
     const expiry=new Date(Date.now()+60_000).toISOString();
+    await assert.rejects(db.createSignupAccount({email:`unverified-${suffix}@example.com`,displayName:'Unverified',passwordHash:'hash',passwordSalt:'salt',automatic:true}),/Email proof required/);
+    assert.equal(await db.getUserByEmail(`unverified-${suffix}@example.com`),null);
+    const proofHash=`verified-proof-${suffix}`,emailHash=`verified-email-${suffix}`;
+    await db.addSignupVerificationToken(proofHash,emailHash,expiry);
+    const verifiedUser=await db.createSignupAccount({email:`verified-${suffix}@example.com`,displayName:'Verified',passwordHash:'hash',passwordSalt:'salt',verificationHash:proofHash,emailHash,automatic:true});
+    assert.ok(verifiedUser.email_verified_at);
+    assert.equal(await db.getSignupVerificationToken(proofHash,emailHash),null);
+    await db.createSession({tokenHash:`verified-session-${suffix}`,userId:verifiedUser.id,csrfToken:'csrf',expiresAt:expiry,userAgent:'synthetic-test'});
+    assert.ok((await db.getSession(`verified-session-${suffix}`)).email_verified_at,'session carries mailbox proof to entitlement checks');
     await db.addSignupChallenge(suffix,'link',user.id,expiry);
     assert.equal(await db.consumeSignupChallenge(suffix,'link',other.id),false);
     assert.deepEqual((await Promise.all([db.consumeSignupChallenge(suffix,'link',user.id),db.consumeSignupChallenge(suffix,'link',user.id)])).sort(),[false,true]);
@@ -521,6 +530,7 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     await db.setSignupPause(false);
     await db.deleteUserAccount(appleUser.id);
     await db.deleteUserAccount(reclaim.id);
+    await db.deleteUserAccount(verifiedUser.id);
     await db.deleteUserAccount(user.id);await db.deleteUserAccount(other.id);
   } finally { await db.close(); }
 });
