@@ -1750,7 +1750,9 @@ const indexMigrations = [
     releaseNotification: async (notificationId) => (await run("DELETE FROM processed_notifications WHERE notification_id=? AND state='processing'", notificationId)).changes > 0,
     pruneNotifications: async () => { await run("DELETE FROM processed_notifications WHERE state='processed' AND received_at::timestamptz < NOW() - INTERVAL '30 days'"); },
     findUserByAppAccountToken: async (appAccountToken) => {
-      const row = await get('SELECT user_id FROM subscriptions WHERE app_account_token=?', appAccountToken);
+      const row = await get(`SELECT user_id FROM subscriptions WHERE app_account_token=?
+        UNION ALL SELECT user_id FROM subscription_purchase_intents WHERE app_account_token=? AND status='pending' AND expires_at>?
+        LIMIT 1`, appAccountToken, appAccountToken, timestamp());
       return row ? row.user_id : null;
     },
     createPurchaseIntent: async (userId, productId, appAccountToken, expiresAt) => {
