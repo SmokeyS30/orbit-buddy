@@ -1120,6 +1120,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     acceptReplyJob(userId,conversationId,content,options={}){return withImmediate(()=>{
+      if(options.inboundSid){
+        const link=s.getWhatsAppLink.get(userId);
+        const user=db.prepare('SELECT disabled,moderation_blocked FROM users WHERE id=?').get(userId);
+        if(!link||link.phone_e164!==options.deliveryToPhone||link.verified_at!==options.deliveryLinkVerifiedAt||
+            !user||user.disabled===1||user.moderation_blocked===1)return null;
+        if(!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+          .run(options.inboundSid,timestamp()).changes)return null;
+      }
       const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
       s.addMessage.run(userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
       const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...options});
@@ -1654,7 +1662,23 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
       return sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
     });},
+    consumeAndLinkWhatsApp(code,phoneE164) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`,record=s.setting.get(key)?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
+      const owner=db.prepare("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0").get(userId);
+      if(!owner)return null;
+      db.prepare('DELETE FROM settings WHERE key=? AND value=?').run(key,record);
+      const now=timestamp();
+      s.linkWhatsApp.run(userId,phoneE164,now,now,now);
+      return userId;
+    });},
     revokeWhatsAppLinkCodes(userId) { return db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`).changes; },
+    unlinkWhatsAppAndRevoke(userId) { return withImmediate(()=>{
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      return s.unlinkWhatsApp.run(userId).changes>0;
+    });},
     allowWhatsAppLinkAttempt(phone) { return withImmediate(()=>{
       const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
       const get=db.prepare('SELECT window_start,attempts FROM whatsapp_link_attempts WHERE subject=?');

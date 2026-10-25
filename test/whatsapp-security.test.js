@@ -4,12 +4,48 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHmac,randomUUID } from 'node:crypto';
+import pg from 'pg';
 import { createOrbitServer } from '../server.js';
 import { openDatabase } from '../src/database.js';
 import { openPostgres } from '../src/db/postgres-adapter.js';
+import { downloadTwilioMedia, validateTwilioMediaUrl } from '../src/whatsapp.js';
 
 const env={NODE_ENV:'test',TWILIO_ACCOUNT_SID:'ACsynthetic',TWILIO_AUTH_TOKEN:'synthetic-secret',TWILIO_WHATSAPP_NUMBER:'+14155238886'};
 const phone='whatsapp:+15551234567';
+const accountSid=`AC${'a'.repeat(32)}`;
+const messageSid=`SM${'b'.repeat(32)}`;
+const mediaSid=`ME${'c'.repeat(32)}`;
+const validMediaUrl=`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages/${messageSid}/Media/${mediaSid}`;
+
+test('media Basic credentials are scoped to the exact Twilio account and message resource',async()=>{
+  const rejected=[
+    `https://example.test/2010-04-01/Accounts/${accountSid}/Messages/${messageSid}/Media/${mediaSid}`,
+    validMediaUrl.replace('https:','http:'),
+    validMediaUrl.replace('api.twilio.com','api.twilio.com.evil.test'),
+    validMediaUrl.replace(accountSid,`AC${'d'.repeat(32)}`),
+    validMediaUrl.replace(messageSid,`SM${'d'.repeat(32)}`),
+    `${validMediaUrl}?url=https://example.test`,
+    validMediaUrl.replace('/Media/','/%4dedia/'),
+  ];
+  const previousFetch=globalThis.fetch;
+  const requests=[];
+  globalThis.fetch=async (url,options)=>{
+    requests.push({url,options});
+    return new Response('redirect',{status:302,headers:{Location:'https://example.test/steal'}});
+  };
+  try{
+    for(const url of rejected){
+      assert.throws(()=>validateTwilioMediaUrl(url,accountSid,messageSid),/Invalid Twilio media URL/);
+      await assert.rejects(downloadTwilioMedia({accountSid,authToken:'synthetic',url,messageSid}),/Invalid Twilio media URL/);
+    }
+    assert.equal(requests.length,0,'untrusted URLs never receive credentials');
+    await assert.rejects(downloadTwilioMedia({accountSid,authToken:'synthetic',url:validMediaUrl,messageSid}),/redirected/);
+    assert.equal(requests.length,1,'redirect is never followed');
+    assert.equal(requests[0].url,validMediaUrl);
+    assert.equal(requests[0].options.redirect,'manual');
+    assert.match(requests[0].options.headers.Authorization,/^Basic /);
+  }finally{globalThis.fetch=previousFetch;}
+});
 
 async function serverFixture(t){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-security-'));
@@ -70,6 +106,48 @@ test('SQLite link codes consume once and inbound message SIDs deduplicate',()=>{
   }finally{db.close();fs.rmSync(dir,{recursive:true,force:true});}
 });
 
+test('SQLite link consumption and phone binding roll back together on phone conflict',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-link-'));
+  const db=openDatabase(path.join(dir,'test.sqlite'));
+  try{
+    const a=db.createUser({email:'owner-a@example.test',displayName:'A',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const b=db.createUser({email:'owner-b@example.test',displayName:'B',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const expiry=new Date(Date.now()+60_000).toISOString();
+    db.issueWhatsAppLinkCode(a.id,'111111',expiry);
+    assert.equal(db.consumeAndLinkWhatsApp('111111','+15551234567'),a.id);
+    db.issueWhatsAppLinkCode(b.id,'222222',expiry);
+    assert.throws(()=>db.consumeAndLinkWhatsApp('222222','+15551234567'),/UNIQUE/);
+    assert.ok(db.getSetting('whatsapp_link_code_222222'),'failed bind preserves code');
+    assert.equal(db.consumeAndLinkWhatsApp('222222','+15551234568'),b.id);
+    db.issueWhatsAppLinkCode(b.id,'333333',expiry);
+    assert.equal(db.unlinkWhatsAppAndRevoke(b.id),true);
+    assert.equal(db.getWhatsAppLink(b.id),null);
+    assert.equal(db.consumeAndLinkWhatsApp('333333','+15551234568'),null);
+  }finally{db.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('SQLite inbound SID is committed only with its accepted reply job',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-inbound-'));
+  const db=openDatabase(path.join(dir,'test.sqlite'));
+  try{
+    const user=db.createUser({email:'inbound@example.test',displayName:'Owner',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const conversation=db.ensureDefaultConversation(user.id);
+    db.linkWhatsApp(user.id,'+15551234567');
+    const link=db.getWhatsAppLink(user.id);
+    const options={channel:'whatsapp',deliveryToPhone:link.phone_e164,deliveryLinkVerifiedAt:link.verified_at,inboundSid:'SMaccepted'};
+    assert.throws(()=>db.acceptReplyJob(user.id,conversation.id,'hello',
+      {...options,inboundSid:'SMrollback',requiresEphemeral:true}),/Ephemeral/);
+    assert.equal(db.claimWhatsAppInboundSid('SMrollback'),true,'failure rolled back SID claim');
+    const accepted=db.acceptReplyJob(user.id,conversation.id,'hello',options);
+    assert.ok(accepted.job.id);
+    assert.equal(db.acceptReplyJob(user.id,conversation.id,'hello again',options),null);
+    assert.equal(db.listMessages(user.id,100).filter(row=>row.content==='hello').length,1);
+    db.unlinkWhatsAppAndRevoke(user.id);
+    assert.equal(db.acceptReplyJob(user.id,conversation.id,'stale',
+      {...options,inboundSid:'SMstale'}),null,'unlink invalidates a stale callback snapshot');
+  }finally{db.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
 test('PostgreSQL link consume and inbound SID claim are atomic across connections',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
@@ -87,4 +165,92 @@ test('PostgreSQL link consume and inbound SID claim are atomic across connection
     assert.equal(await b.revokeWhatsAppLinkCodes(user.id),1);
     assert.equal(await a.consumeWhatsAppLinkCode(code),null);
   }finally{await a.deleteUserAccount(user.id);await a.close();await b.close();}
+});
+
+test('PostgreSQL inbound SID and reply job commit together across connections',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const a=await openPostgres(url),b=await openPostgres(url);
+  const suffix=randomUUID(),sid=`SM${suffix.replaceAll('-','')}`;
+  const user=await a.createUser({email:`wa-inbound-${suffix}@example.test`,displayName:'Owner',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+  try{
+    const conversation=await a.ensureDefaultConversation(user.id);
+    const link=await a.linkWhatsApp(user.id,'+1555'+suffix.replaceAll('-','').slice(0,8));
+    const options={channel:'whatsapp',deliveryToPhone:link.phone_e164,deliveryLinkVerifiedAt:link.verified_at,inboundSid:sid};
+    await assert.rejects(a.acceptReplyJob(user.id,conversation.id,'failure',
+      {...options,inboundSid:`${sid}-rollback`,requiresEphemeral:true}),/Ephemeral/);
+    assert.equal(await b.claimWhatsAppInboundSid(`${sid}-rollback`),true);
+    const accepted=await Promise.all([
+      a.acceptReplyJob(user.id,conversation.id,'one',options),
+      b.acceptReplyJob(user.id,conversation.id,'one',options),
+    ]);
+    assert.equal(accepted.filter(Boolean).length,1,'only one durable reply job accepted');
+    await b.unlinkWhatsAppAndRevoke(user.id);
+    assert.equal(await a.acceptReplyJob(user.id,conversation.id,'stale',
+      {...options,inboundSid:`${sid}-stale`}),null);
+  }finally{await a.deleteUserAccount(user.id);await a.close();await b.close();}
+});
+
+test('PostgreSQL concurrent code collision cannot overwrite another owner, and revoked code cannot bind late',async()=>{
+  const testUrl=process.env.TEST_DATABASE_URL;
+  assert.ok(testUrl,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const database=`wa_security_${randomUUID().replaceAll('-','')}`;
+  const adminUrl=new URL(testUrl);adminUrl.pathname='/postgres';
+  const isolatedUrl=new URL(testUrl);isolatedUrl.pathname=`/${database}`;
+  const admin=new pg.Client({connectionString:adminUrl.href,ssl:false});
+  let a,b,blocker;
+  await admin.connect();
+  try{
+    await admin.query(`CREATE DATABASE ${database}`);
+    blocker=new pg.Client({connectionString:isolatedUrl.href,ssl:false});
+    await blocker.connect();
+    await blocker.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));
+    a=await openPostgres(isolatedUrl.href);b=await openPostgres(isolatedUrl.href);
+    const first=await a.createUser({email:'first@example.test',displayName:'First',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const second=await b.createUser({email:'second@example.test',displayName:'Second',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const expiry=new Date(Date.now()+60_000).toISOString();
+    await a.issueWhatsAppLinkCode(first.id,'111111',expiry);
+    await b.issueWhatsAppLinkCode(second.id,'222222',expiry);
+    await blocker.query('BEGIN');
+    await blocker.query('LOCK TABLE settings IN SHARE MODE');
+    const results=Promise.allSettled([
+      a.issueWhatsAppLinkCode(first.id,'333333',expiry),
+      b.issueWhatsAppLinkCode(second.id,'333333',expiry),
+    ]);
+    const waitFor=async (sql,count)=>{
+      const deadline=Date.now()+5000;
+      while(Date.now()<deadline){
+        const row=(await blocker.query(sql)).rows[0];
+        if(Number(row.n)>=count)return;
+        await new Promise(resolve=>setTimeout(resolve,20));
+      }
+      throw new Error(`Timed out waiting for ${count} PostgreSQL lock waiters.`);
+    };
+    try{
+      await waitFor("SELECT count(*) AS n FROM pg_locks WHERE relation='settings'::regclass AND NOT granted",2);
+    }finally{await blocker.query('COMMIT');}
+    const outcome=await results;
+    assert.equal(outcome.filter(row=>row.status==='fulfilled').length,1);
+    assert.equal(outcome.filter(row=>row.status==='rejected'&&row.reason.message==='Link code collision').length,1);
+    const winner=String((await blocker.query("SELECT value FROM settings WHERE key='whatsapp_link_code_333333'")).rows[0].value).split(':')[0];
+    const loser=winner===first.id?second.id:first.id;
+    const loserOld=loser===first.id?'111111':'222222';
+    assert.equal((await blocker.query('SELECT value FROM settings WHERE key=$1',[`whatsapp_link_code_${loserOld}`])).rows[0].value.split(':')[0],loser);
+
+    await a.issueWhatsAppLinkCode(first.id,'444444',expiry);
+    await blocker.query('BEGIN');
+    await blocker.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[first.id]);
+    const lateBind=b.consumeAndLinkWhatsApp('444444','+15551234567');
+    try{
+      await waitFor("SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM users WHERE id=%'",1);
+      await blocker.query("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE $1",[`${first.id}:%`]);
+      await blocker.query('DELETE FROM whatsapp_links WHERE user_id=$1',[first.id]);
+    }finally{await blocker.query('COMMIT');}
+    assert.equal(await lateBind,null);
+    assert.equal(await a.getWhatsAppLink(first.id),null);
+  }finally{
+    await a?.close();await b?.close();await blocker?.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    await admin.end();
+  }
 });
