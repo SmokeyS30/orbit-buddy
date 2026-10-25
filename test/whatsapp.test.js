@@ -7,6 +7,7 @@ import { createHmac } from 'node:crypto';
 import { openDatabase } from '../src/database.js';
 import { hashToken } from '../src/security.js';
 import { createOrbitServer } from '../server.js';
+import { MAX_EPHEMERAL_MEDIA_BYTES, mediaBytesReserved, reserveMediaBytes } from '../src/media-memory.js';
 import {
   verifyTwilioSignature,
   stripWhatsAppPrefix,
@@ -671,6 +672,53 @@ test('webhook: failed image download gets the retry reply and no pipeline run', 
     assert.ok(!msgs.some((m) => m.content === WHATSAPP_IMAGE_STORED_MESSAGE), 'no image message stored on download failure');
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('stalled image failure replies retain upload admission when media capacity is full',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  await linkOwnerDirectly(app,base,'owner-capacity@example.test');
+  const releaseBudget=reserveMediaBytes(MAX_EPHEMERAL_MEDIA_BYTES-mediaBytesReserved());
+  const originalFetch=globalThis.fetch;
+  let releaseReplies;
+  const replyGate=new Promise(resolve=>{releaseReplies=resolve;});
+  let downloads=0,replies=0;
+  globalThis.fetch=async(url,options)=>{
+    const parsed=new URL(String(url));
+    if(parsed.hostname==='api.twilio.com'&&parsed.pathname.includes('/Media/')){
+      downloads++;
+      return mediaResponse(Buffer.alloc(3*1024*1024),{contentType:'image/png'});
+    }
+    if(parsed.hostname==='api.twilio.com'){
+      replies++;await replyGate;
+      return{ok:true,status:201,json:async()=>({sid:'synthetic'}),text:async()=>''};
+    }
+    return originalFetch(url,options);
+  };
+  const post=(n)=>webhookPost(base,{
+    From:WA_FROM,To:`whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+    NumMedia:'1',MediaContentType0:'image/png',
+    MediaUrl0:`https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMcap${n}/Media/MEcap${n}`,
+    Body:'',MessageSid:`SMcap${n}`
+  });
+  const waitForReplies=async count=>{
+    const deadline=Date.now()+5_000;
+    while(replies<count&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(replies,count);
+  };
+  try{
+    const pending=[post(1),post(2)];
+    await waitForReplies(2);
+    const rejected=await post(3);
+    assert.equal(rejected.status,429);
+    assert.equal(downloads,2,'the third same-account request cannot download while rejected handlers wait');
+    assert.equal(mediaBytesReserved(),MAX_EPHEMERAL_MEDIA_BYTES);
+    releaseReplies();
+    const responses=await Promise.all(pending);
+    for(const response of responses)assert.deepEqual(await response.json(),{ok:true,image:false});
+    assert.equal(mediaBytesReserved(),MAX_EPHEMERAL_MEDIA_BYTES);
+  }finally{
+    releaseReplies();releaseBudget();globalThis.fetch=originalFetch;
   }
 });
 

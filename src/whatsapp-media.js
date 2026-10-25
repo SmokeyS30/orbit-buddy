@@ -11,6 +11,7 @@
 // fetch inside the window) and expiry is never extended on fetch.
 
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
+import { reserveRetainedMediaBuffer } from './media-memory.js';
 
 /** Signed media URLs live this long (Twilio may retry inside the window). */
 export const WHATSAPP_MEDIA_TTL_MS = 15 * 60_000;
@@ -25,8 +26,12 @@ const staged = new Map(); // mediaId -> { userId, bytes, mimeType, createdAt }
 
 export function pruneWhatsAppMedia(nowMs = Date.now()) {
   for (const [id, entry] of staged) {
-    if (nowMs - entry.createdAt > WHATSAPP_MEDIA_TTL_MS) staged.delete(id);
+    if (nowMs - entry.createdAt > WHATSAPP_MEDIA_TTL_MS){staged.delete(id);entry.releaseBudget();}
   }
+}
+
+export function clearWhatsAppMediaForUser(userId){
+  for(const [id,entry] of staged)if(entry.userId===userId){staged.delete(id);entry.releaseBudget();}
 }
 
 function normalizeContentType(mimeType) {
@@ -66,9 +71,12 @@ export function stageWhatsAppMedia(userId, { bytes, mimeType }, nowMs = Date.now
   if (owned >= MAX_STAGED_WHATSAPP_MEDIA) {
     throw Object.assign(new Error('Too many staged media files. Wait for the current send to finish.'), { status: 429 });
   }
-  const mediaId = randomUUID();
-  staged.set(mediaId, { userId, bytes: buf, mimeType: type, createdAt: nowMs });
-  return mediaId;
+  const {bytes:retained,releaseBudget}=reserveRetainedMediaBuffer(buf);
+  try{
+    const mediaId = randomUUID();
+    staged.set(mediaId, { userId, bytes: retained, mimeType: type, createdAt: nowMs, releaseBudget });
+    return mediaId;
+  }catch(error){releaseBudget();throw error;}
 }
 
 /**

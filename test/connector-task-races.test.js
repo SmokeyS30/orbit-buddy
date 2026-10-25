@@ -23,57 +23,57 @@ for (const driver of ['SQLite', 'PostgreSQL']) {
   test(`${driver}: task generations fence expired, cancelled, and completed workers`, (t) => {
     const { db, user } = fixture(t, driver);
     const task = db.addTask(user.id, { title: 'Race', prompt: 'Compute a result' });
-    const first = db.startTask(user.id, task.id, -1000);
+    const first = db.claimDueTask(user.id, task.id, -1000)?.attempt_count;
     assert.equal(first, 1);
-    assert.equal(db.startTask(user.id, task.id), null);
+    assert.equal(db.claimDueTask(user.id, task.id), null);
     assert.equal(db.renewTaskLease(user.id, task.id, first), false);
-    assert.equal(db.completeTask(user.id, task.id, first, 'expired'), false);
-    assert.equal(db.failTask(user.id, task.id, first, 'expired failure', 'error'), false);
+    assert.equal(db.completeClaimedTask(user.id, task.id, first, 'expired'), false);
+    assert.equal(db.failClaimedTask(user.id, task.id, first, 'expired failure', 'error'), false);
     db.recoverStaleTasks();
-    const second = db.startTask(user.id, task.id);
+    const second = db.claimDueTask(user.id, task.id)?.attempt_count;
     assert.equal(second, 2);
     assert.equal(db.renewTaskLease(user.id, task.id, first), false);
-    assert.equal(db.completeTask(user.id, task.id, first, 'stale'), false);
-    assert.equal(db.failTask(user.id, task.id, first, 'stale failure', 'error'), false);
+    assert.equal(db.completeClaimedTask(user.id, task.id, first, 'stale'), false);
+    assert.equal(db.failClaimedTask(user.id, task.id, first, 'stale failure', 'error'), false);
     const oldLease = db.getTask(user.id, task.id).lease_expires_at;
     assert.equal(db.renewTaskLease(user.id, task.id, second, 300_000), true);
     assert.ok(db.getTask(user.id, task.id).lease_expires_at > oldLease);
-    assert.equal(db.completeTask(user.id, task.id, second, 'fresh'), true);
-    assert.equal(db.failTask(user.id, task.id, first, 'stale failure', 'error'), false);
-    assert.equal(db.failTask(user.id, task.id, second, 'delivery failure', 'error'), false);
-    assert.equal(db.completeTask(user.id, task.id, second, 'duplicate'), false);
+    assert.equal(db.completeClaimedTask(user.id, task.id, second, 'fresh'), true);
+    assert.equal(db.failClaimedTask(user.id, task.id, first, 'stale failure', 'error'), false);
+    assert.equal(db.failClaimedTask(user.id, task.id, second, 'delivery failure', 'error'), false);
+    assert.equal(db.completeClaimedTask(user.id, task.id, second, 'duplicate'), false);
     assert.equal(db.getTask(user.id, task.id).result, 'fresh');
     db.setTaskStatus(user.id, task.id, 'queued');
-    const third = db.startTask(user.id, task.id);
+    const third = db.claimDueTask(user.id, task.id)?.attempt_count;
     db.setTaskStatus(user.id, task.id, 'cancelled');
     assert.equal(db.renewTaskLease(user.id, task.id, third), false);
-    assert.equal(db.completeTask(user.id, task.id, third, 'cancelled'), false);
-    assert.equal(db.failTask(user.id, task.id, third, 'cancelled failure', 'error'), false);
+    assert.equal(db.completeClaimedTask(user.id, task.id, third, 'cancelled'), false);
+    assert.equal(db.failClaimedTask(user.id, task.id, third, 'cancelled failure', 'error'), false);
     db.setTaskStatus(user.id, task.id, 'queued');
-    const fourth = db.startTask(user.id, task.id);
-    assert.equal(db.failTask(user.id, task.id, fourth, 'real failure', 'error'), true);
+    const fourth = db.claimDueTask(user.id, task.id)?.attempt_count;
+    assert.equal(db.failClaimedTask(user.id, task.id, fourth, 'real failure', 'error'), true);
     assert.equal(db.getTask(user.id, task.id).status, 'failed');
     db.setTaskStatus(user.id, task.id, 'queued');
-    const fifth = db.startTask(user.id, task.id);
+    const fifth = db.claimDueTask(user.id, task.id)?.attempt_count;
     const next = new Date(Date.now() + 86_400_000).toISOString();
-    assert.equal(db.completeTask(user.id, task.id, fifth, 'recurring result', 'scheduled', next), true);
+    assert.equal(db.completeClaimedTask(user.id, task.id, fifth, 'recurring result', 'scheduled', next), true);
     assert.equal(db.getTask(user.id, task.id).schedule_at, next);
-    assert.equal(db.startTask(user.id, task.id), null, 'a stale due-task snapshot cannot claim the next future occurrence');
+    assert.equal(db.claimDueTask(user.id, task.id), null, 'a stale due-task snapshot cannot claim the next future occurrence');
   });
 
   test(`${driver}: user completion stops future reminders and fences an active worker`, (t) => {
     const { db, user } = fixture(t, driver);
     for (const running of [false, true]) {
       const task = db.addTask(user.id, { title: running ? 'Running task' : 'Future task', prompt: 'Compute', scheduleAt: running ? null : new Date(Date.now() + 86_400_000).toISOString() });
-      const attempt = running ? db.startTask(user.id, task.id) : null;
+      const attempt = running ? db.claimDueTask(user.id, task.id)?.attempt_count : null;
       toolCompleteTask({ title: task.title }, { db, userId: user.id });
       const completed = db.getTask(user.id, task.id);
       assert.equal(completed.status, 'completed');
       assert.equal(completed.schedule_at, null);
       assert.equal(completed.lease_expires_at, null);
       if (running) {
-        assert.equal(db.completeTask(user.id, task.id, attempt, 'old result'), false);
-        assert.equal(db.failTask(user.id, task.id, attempt, 'old failure', 'error'), false);
+        assert.equal(db.completeClaimedTask(user.id, task.id, attempt, 'old result'), false);
+        assert.equal(db.failClaimedTask(user.id, task.id, attempt, 'old failure', 'error'), false);
       }
       assert.equal(db.getTask(user.id, task.id).result, 'Completed via chat.');
     }
@@ -118,6 +118,6 @@ test('PostgreSQL: only one replica can claim a task', async (t) => {
   const other = createSyncPgAdapter(process.env.TEST_DATABASE_URL);
   t.after(() => other.close());
   const task = db.addTask(user.id, { title: 'Claim race', prompt: 'Compute' });
-  const claims = await Promise.all([db.async.startTask(user.id, task.id), other.async.startTask(user.id, task.id)]);
-  assert.deepEqual(claims.sort(), [1, null]);
+  const claims = await Promise.all([db.async.claimDueTask(user.id, task.id), other.async.claimDueTask(user.id, task.id)]);
+  assert.deepEqual(claims.map(row=>row?.attempt_count??null).sort(), [1, null]);
 });

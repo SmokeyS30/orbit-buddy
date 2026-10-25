@@ -198,7 +198,7 @@ test('encrypts calendar feed URLs at rest and decrypts them through the database
 test('recovers a task whose worker lease expired', () => {
   const { db, user } = fixture();
   const task = db.addTask(user.id, { title: 'Recover me', prompt: 'Continue safely' });
-  assert.equal(db.startTask(user.id, task.id, -1000), 1);
+  assert.equal(db.startTask(user.id, task.id, -1000), true);
   assert.equal(db.getTask(user.id, task.id).status, 'running');
   assert.equal(db.recoverStaleTasks(), 1);
   assert.equal(db.getTask(user.id, task.id).status, 'queued');
@@ -341,7 +341,9 @@ test('finds memories from the same date in prior years', () => {
 test('lists recent completions for the weekly review', () => {
   const { db, user } = fixture();
   const task = db.addTask(user.id, { title: 'Finish report', prompt: 'Write it' });
-  db.completeTask(user.id, task.id, db.startTask(user.id, task.id), 'done');
+  const attempt=db.claimDueTask(user.id,task.id)?.attempt_count;
+  assert.ok(attempt);
+  assert.equal(db.completeClaimedTask(user.id,task.id,attempt,'done'),true);
   const pending = db.addTask(user.id, { title: 'Later thing', prompt: 'Later' });
   const weekAgo = new Date(Date.now() - 8 * 86400_000).toISOString();
   const done = db.listTasksCompletedSince(user.id, weekAgo);
