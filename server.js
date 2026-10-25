@@ -15,6 +15,7 @@ import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, pruneAttachments, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
 import { reserveMediaBytes } from './src/media-memory.js';
+import { EphemeralReplyPayloads } from './src/ephemeral-reply-payloads.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
@@ -629,21 +630,13 @@ export function createOrbitServer(options={}) {
 
   let workerBusy=false;
   const activeReplyJobs=new Map();
-  const ephemeralReplyPayloads=new Map();
+  const ephemeralReplyPayloads=new EphemeralReplyPayloads();
   const EPHEMERAL_REPLY_TTL_MS=30*60_000;
   function dropEphemeralReplyPayload(jobId){
-    const payload=ephemeralReplyPayloads.get(jobId);
-    if(!payload)return;
-    ephemeralReplyPayloads.delete(jobId);
-    payload.releaseMedia?.();
+    ephemeralReplyPayloads.drop(jobId);
   }
   function pruneEphemeralReplyPayloads(nowMs=Date.now()){
-    for(const [jobId,payload] of ephemeralReplyPayloads){
-      if(!activeReplyJobs.has(jobId)&&nowMs-(payload.createdAt||nowMs)>EPHEMERAL_REPLY_TTL_MS)dropEphemeralReplyPayload(jobId);
-    }
-  }
-  function reserveImagePayload(images){
-    return reserveMediaBytes(images.reduce((sum,image)=>sum+Buffer.byteLength(String(image.image_url||'')),0));
+    ephemeralReplyPayloads.prune(activeReplyJobs,nowMs,EPHEMERAL_REPLY_TTL_MS);
   }
   let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
   const summaryJobs=new Map();
@@ -2806,7 +2799,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const locationMessage=formatLocationMessage(sharedLocation,body);
           const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
             {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-          ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
+          ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:locationMessage,images:[],createdAt:Date.now()});
           scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
         }
@@ -2845,31 +2838,34 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Only the first image is handled (Twilio may send several); image
           // bytes stay in memory and are never stored or logged.
           if(isImageContentType(mediaContentType)&&mediaUrl){
-            let imageBlock=null,releaseImage=null;
+            let imageBlock=null,releaseImage=null,releaseUpload=null;
             try{
-              const releaseUpload=acquireAttachmentUpload(waUserId);
+              releaseUpload=acquireAttachmentUpload(waUserId);
               try{
                 const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+                // Reserve the eventual data URL before making its base64 copy.
+                // Keep upload admission until even a failed-send reply settles,
+                // so rejected raw downloads cannot accumulate in suspended handlers.
+                releaseImage=reserveMediaBytes(Math.ceil(bytes.length/3)*4+64);
                 imageBlock=processImageInput({bytes,mimeType:mediaContentType});
-                releaseImage=reserveImagePayload([imageBlock]);
-              }finally{releaseUpload();}
-            }catch(e){
-              console.error('whatsapp image failed',e.code||e.message);
-              const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
-              try{await twilioSend(from,tooLong
-                ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
-                :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
-              return json(res,200,{ok:true,image:false});
-            }
-            const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            try{
+              }catch(e){
+                imageBlock=null;
+                releaseImage?.();releaseImage=null;
+                console.error('whatsapp image failed',e.code||e.message);
+                const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
+                try{await twilioSend(from,tooLong
+                  ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
+                  :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
+                return json(res,200,{ok:true,image:false});
+              }
+              const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
               const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
                 {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
               ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:caption||'Look at this.',images:[imageBlock],releaseMedia:releaseImage,createdAt:Date.now()});
               releaseImage=null;
               scheduleReplyPump();
               return json(res,200,{ok:true,image:true});
-            }finally{releaseImage?.();}
+            }finally{releaseImage?.();releaseUpload?.();}
           }
           // Other media types (video, documents) are not supported yet.
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
@@ -3698,9 +3694,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
           clearAttachmentsForUser(userId);
           clearWhatsAppMediaForUser(userId);
-          for(const [jobId,payload] of ephemeralReplyPayloads){
-            if(payload.userId===userId&&!activeReplyJobs.has(jobId))dropEphemeralReplyPayload(jobId);
-          }
+          ephemeralReplyPayloads.clearUser(userId,activeReplyJobs);
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
           return json(res,200,{deleted:true});
         }
@@ -3801,7 +3795,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
-      for(const jobId of ephemeralReplyPayloads.keys())dropEphemeralReplyPayload(jobId);
+      ephemeralReplyPayloads.clearAll();
       db.close();
     }
   };
