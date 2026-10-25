@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { createOrbitServer } from '../server.js';
 import { hashToken, verifyPassword } from '../src/security.js';
@@ -34,6 +35,26 @@ async function fixture(t){
   };
 }
 const headers=(auth)=>({Cookie:auth.cookie,'X-Orbit-CSRF':auth.csrf,'Content-Type':'application/json'});
+
+async function pauseJsonPost(fx,pathname,payload){
+  const body=JSON.stringify(payload);
+  let seen;const arrived=new Promise(resolve=>{seen=resolve;});
+  const onRequest=req=>{if(req.url===pathname){fx.app.server.off('request',onRequest);seen();}};
+  fx.app.server.on('request',onRequest);
+  let finish;
+  const response=new Promise((resolve,reject)=>{
+    const request=http.request(`${fx.base}${pathname}`,{method:'POST',headers:{...headers(fx.auth),'Content-Length':Buffer.byteLength(body)}},res=>{
+      res.resume();res.on('end',()=>resolve(res.statusCode));
+    });
+    request.on('error',reject);
+    request.write(body.slice(0,10));
+    finish=()=>request.end(body.slice(10));
+  });
+  await arrived;
+  // The route authenticates synchronously, then waits for the rest of JSON.
+  await new Promise(resolve=>setImmediate(resolve));
+  return{finish,response};
+}
 
 test('email reset fences an in-flight recovery-code rotation',{timeout:10_000},async t=>{
   const fx=await fixture(t);const gate=fx.gateNextVerification();
@@ -79,6 +100,25 @@ test('current credentials still rotate recovery codes and delete an account',asy
   assert.equal(fx.app.db.getUserById(fx.auth.user.id),undefined);
 });
 
+test('email reset prevents an already-authenticated partial push request from re-registering',{timeout:10_000},async t=>{
+  const apns=await fixture(t);
+  const nativeToken='a'.repeat(64);
+  const pendingNative=await pauseJsonPost(apns,'/api/push/token',{token:nativeToken});
+  assert.equal((await apns.reset()).status,200);
+  pendingNative.finish();
+  assert.equal(await pendingNative.response,401);
+  assert.equal(apns.app.db.listApnsTokens(apns.auth.user.id).length,0);
+
+  const web=await fixture(t);
+  const pendingWeb=await pauseJsonPost(web,'/api/push/subscribe',{
+    endpoint:'https://push.example.test/synthetic',keys:{p256dh:'synthetic',auth:'synthetic'}
+  });
+  assert.equal((await web.reset()).status,200);
+  pendingWeb.finish();
+  assert.equal(await pendingWeb.response,401);
+  assert.equal(web.app.db.listPush(web.auth.user.id).length,0);
+});
+
 test('PostgreSQL credential-bound mutations reject stale proofs after reset',async()=>{
   assert.ok(process.env.TEST_DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
   const db=await openPostgres(process.env.TEST_DATABASE_URL);let user=null;
@@ -93,9 +133,15 @@ test('PostgreSQL credential-bound mutations reject stale proofs after reset',asy
     assert.equal(await db.replaceRecoveryCodesIfCurrent(user.id,'old-session-'+user.id,'old-hash','old-salt',['old-code']),false);
     assert.equal(await db.createAppleSessionIfCurrent({tokenHash:'bad-apple-'+user.id,userId:user.id,csrfToken:'bad',expiresAt:expiry,identitySubject:'old-apple-'+user.id}),false);
     assert.equal(await db.linkAuthIdentityIfCurrent('apple','old-apple-'+user.id,user.id,'old-session-'+user.id,'old-hash','old-salt'),false);
+    assert.equal(await db.savePushIfCurrent(user.id,{endpoint:'https://push.example.test/stale',keys:{p256dh:'synthetic',auth:'synthetic'}},'old-session-'+user.id),false);
+    assert.equal(await db.saveApnsTokenIfCurrent(user.id,'a'.repeat(64),'old-session-'+user.id),false);
+    assert.equal((await db.listPush(user.id)).length,0);
+    assert.equal((await db.listApnsTokens(user.id)).length,0);
     assert.equal(await db.getAuthIdentity('apple','old-apple-'+user.id),null);
     assert.equal((await db.deleteUserAccount(user.id,{sessionHash:'old-session-'+user.id,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'})).staleCredentials,true);
     assert.ok(await db.getUserById(user.id));
     assert.equal(await db.createPasswordSessionIfCurrent({tokenHash:'new-session-'+user.id,userId:user.id,csrfToken:'new',expiresAt:expiry,expectedPasswordHash:'new-hash',expectedPasswordSalt:'new-salt'}),true);
+    assert.equal(await db.savePushIfCurrent(user.id,{endpoint:'https://push.example.test/current',keys:{p256dh:'synthetic',auth:'synthetic'}},'new-session-'+user.id),true);
+    assert.equal(await db.saveApnsTokenIfCurrent(user.id,'b'.repeat(64),'new-session-'+user.id),true);
   }finally{if(user)await db.run('DELETE FROM users WHERE id=?',user.id);await db.close();}
 });

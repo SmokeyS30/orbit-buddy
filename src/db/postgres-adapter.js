@@ -1676,6 +1676,15 @@ const indexMigrations = [
       await run(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
         ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`, randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp());
     },
+    savePushIfCurrent: async (userId,{endpoint,keys},sessionHash)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||!sessionHash)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      await tRun(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`,randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp());
+      return true;
+    }),
     listPush: async (userId) => all('SELECT * FROM push_subscriptions WHERE user_id=?', userId),
     deletePush: async (userId, endpoint) => { await run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, userId); },
     deletePushById: async (id) => { await run('DELETE FROM push_subscriptions WHERE id=?', id); },
@@ -1687,6 +1696,16 @@ const indexMigrations = [
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,
         randomUUID(), userId, token, 'ios', 'production', now, now);
     },
+    saveApnsTokenIfCurrent: async (userId,token,sessionHash)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||!sessionHash)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      const now=timestamp();
+      await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,randomUUID(),userId,token,'ios','production',now,now);
+      return true;
+    }),
     listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
     deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
 

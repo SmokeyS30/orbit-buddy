@@ -1641,10 +1641,22 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
     deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
     savePush(userId,{endpoint,keys}) { s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp()); },
+    savePushIfCurrent(userId,subscription,sessionHash) { return withImmediate(()=>{
+      const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+      if(session?.user_id!==userId||session.disabled||session.moderation_blocked)return false;
+      s.addPush.run(randomUUID(),userId,subscription.endpoint,subscription.keys.p256dh,subscription.keys.auth,timestamp());
+      return true;
+    }); },
     listPush: (userId) => s.listPush.all(userId),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
     deletePushById: (id) => s.deletePushById.run(id),
     saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
+    saveApnsTokenIfCurrent(userId,token,sessionHash) { return withImmediate(()=>{
+      const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+      if(session?.user_id!==userId||session.disabled||session.moderation_blocked)return false;
+      const now=timestamp();s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now);
+      return true;
+    }); },
     listApnsTokens: (userId) => s.listApnsTokens.all(userId),
     deleteApnsToken: (token) => s.deleteApnsToken.run(token),
     saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
