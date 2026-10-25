@@ -2836,7 +2836,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             linkUserId=db.consumeAndLinkWhatsApp(body,from,inboundSid);
           }catch(e){
             const phoneConflict=(e.code==='23505'&&String(e.constraint||'').includes('phone_e164'))||
-              /UNIQUE constraint failed: whatsapp_links\.phone_e164/.test(String(e.message||''));
+              /UNIQUE constraint failed: whatsapp_links\.phone_e164|duplicate key value violates unique constraint "whatsapp_links_phone_e164_key"/.test(String(e.message||''));
             if(!phoneConflict)throw e;
             try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
             return json(res,200,{ok:true});
