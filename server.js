@@ -2750,7 +2750,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const body=String(params.Body||'').trim();
         const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
         // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
-        if(/^\d{6}$/.test(body)&&!(from&&db.getUserByWhatsApp(from))){
+        const existingPhoneLink=from?db.getUserByWhatsApp(from):null;
+        if(/^\d{6}$/.test(body)&&(!existingPhoneLink||db.getSetting(`whatsapp_link_code_${body}`))){
           if(inboundSid&&db.getWhatsAppInboundState(inboundSid))return json(res,200,{ok:true,deduped:true});
           if(!from)return json(res,200,{ok:true,ignored:true});
           if(!db.allowWhatsAppLinkAttempt(from))return json(res,429,{ok:false,linkRateLimited:true});
