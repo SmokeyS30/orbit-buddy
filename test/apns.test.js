@@ -45,11 +45,12 @@ function fakeHttp2({ status = 200, body = '' } = {}) {
 
 const TOKEN64 = 'a'.repeat(64);
 
-function mockDb(rows = [{ device_token: TOKEN64 }]) {
+function mockDb(rows = [{ device_token: TOKEN64, bound_session_hash:'synthetic-session' }]) {
   const deleted = [];
   return {
     db: {
       listApnsTokens: () => rows,
+      isApnsRegistrationCurrent: () => true,
       deleteApnsToken: (token) => { deleted.push(token); },
     },
     deleted,
@@ -92,7 +93,7 @@ test('push targets the APNs production endpoint with provider auth', async () =>
     { connect }
   );
   assert.equal(apns.configured, true);
-  const result = await apns.notify('user-1', 'Hello', 'World', { view: 'safety' });
+  const result = await apns.notify('user-1', 'Private task', 'Private result', { view: 'safety',taskId:'task-123',doorToken:'secret-token' });
   assert.deepEqual(result, { sent: 1, failed: 0 });
   assert.equal(captured.url, `https://${APNS_PRODUCTION_HOST}:${APNS_PRODUCTION_PORT}`);
   assert.equal(APNS_PRODUCTION_HOST, 'api.push.apple.com');
@@ -103,9 +104,11 @@ test('push targets the APNs production endpoint with provider auth', async () =>
   assert.equal(headers['apns-push-type'], 'alert');
   assert.match(headers['authorization'], /^bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
   const payload = JSON.parse(captured.payload);
-  assert.equal(payload.aps.alert.title, 'Hello');
-  assert.equal(payload.aps.alert.body, 'World');
+  assert.equal(payload.aps.alert.title, 'Orbit');
+  assert.equal(payload.aps.alert.body, 'Open Orbit to see your update.');
   assert.equal(payload.view, 'safety');
+  assert.ok(!JSON.stringify(payload).includes('Private'));
+  assert.ok(!JSON.stringify(payload).includes('secret-token'));
 });
 
 test('provider token is cached across sends (not re-signed every push)', async () => {
@@ -130,6 +133,27 @@ test('410 Unregistered deletes the dead token', async () => {
   const result = await apns.notify('user-1', 'A', 'B');
   assert.deepEqual(result, { sent: 0, failed: 1, error: 'Unregistered' });
   assert.deepEqual(deleted, [TOKEN64]);
+});
+
+test('logout or account switch after listing skips APNs provider send', async () => {
+  const { p8 } = ecKeyPair();
+  const { connect, captured } = fakeHttp2();
+  let current = true;
+  const db = {
+    listApnsTokens: () => {
+      // A logout or another account's registration lands between the
+      // delivery snapshot and its final ownership check.
+      current = false;
+      return [{ device_token: TOKEN64, bound_session_hash: 'old-session' }];
+    },
+    isApnsRegistrationCurrent: (userId, token, sessionHash) => {
+      assert.deepEqual([userId, token, sessionHash], ['user-1', TOKEN64, 'old-session']);
+      return current;
+    },
+  };
+  const apns = createApnsService({ APNS_KEY_P8: p8, APNS_KEY_ID: 'K', APNS_TEAM_ID: 'T' }, db, { connect });
+  assert.deepEqual(await apns.notify('user-1', 'Private', 'Private'), { sent: 0, failed: 0 });
+  assert.equal(captured.url, undefined, 'no APNs connection is opened after ownership changes');
 });
 
 test('unconfigured service degrades gracefully (no env vars, no crash)', async () => {
@@ -168,7 +192,9 @@ test('every table the Postgres adapter queries exists in postgres-schema.sql', (
     ...[...schema.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
     ...[...pg.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
   ]);
-  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'information_schema', 'text', 'context', 'today', 'existing', 'values']);
+  // EXCLUDED is PostgreSQL's proposed-row pseudo table in an UPSERT, not a
+  // persisted table that belongs in the fresh database schema.
+  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'information_schema', 'text', 'context', 'today', 'existing', 'values', 'excluded']);
   const missing = [...referenced].filter((t) => !defined.has(t) && !keywords.has(t));
   assert.deepEqual(missing, [], `adapter tables missing from postgres-schema.sql: ${missing.join(', ')}`);
 });

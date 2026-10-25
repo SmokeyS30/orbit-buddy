@@ -22,6 +22,17 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backup_deletion_queue (
+  account_ref TEXT PRIMARY KEY,
+  requested_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS worker_leases (
+  name TEXT PRIMARY KEY,
+  owner_token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -293,6 +304,18 @@ CREATE TABLE IF NOT EXISTS apns_device_tokens (
   UNIQUE(user_id, device_token)
 );
 
+CREATE TABLE IF NOT EXISTS push_session_bindings (
+  endpoint TEXT PRIMARY KEY REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS apns_session_bindings (
+  device_token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS subscriptions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -380,6 +403,13 @@ CREATE TABLE IF NOT EXISTS timeline_cache (
   PRIMARY KEY (user_id, month_key)
 );
 
+CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  month_key TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 DROP TABLE IF EXISTS automation_tokens;
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -424,6 +454,17 @@ CREATE TABLE IF NOT EXISTS proactive_state (
   last_outreach_at TEXT,
   outreach_date TEXT,
   outreach_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS proactive_slot_days (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  local_date TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(user_id,local_date)
+);
+CREATE TABLE IF NOT EXISTS proactive_slot_reservations (
+  token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  local_date TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','committed','released')),
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS user_preferences (
@@ -580,6 +621,16 @@ CREATE TABLE IF NOT EXISTS whatsapp_links (
   verified_at TEXT NOT NULL,
   last_inbound_at TEXT,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+  sid TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'accepted', lease_token TEXT, lease_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
+  subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS radar_findings (

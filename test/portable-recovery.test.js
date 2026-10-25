@@ -15,6 +15,20 @@ import { createOrbitServer } from '../server.js';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 
 const now='2026-10-24T12:00:00.000Z';
+async function assertPgSessionsClosed(admin,name){
+  // pool.end() closes client sockets, but the server may need a short moment
+  // to remove their backends from pg_stat_activity under concurrent CI load.
+  // Keep the plain DROP DATABASE gate: a persistent connection still fails.
+  const deadline=Date.now()+2000;
+  let active;
+  do{
+    active=await admin.query('SELECT pid,state,backend_type FROM pg_stat_activity WHERE datname=$1',[name]);
+    if(active.rowCount===0)return;
+    if(Date.now()>=deadline)break;
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }while(true);
+  assert.equal(active.rowCount,0,`all application and test connections must close before dropping the temporary backup database: ${JSON.stringify(active.rows)}`);
+}
 function sampleRow(entry,userId,prefix){
   const values={id:`${prefix}-${entry.table}`,user_id:userId,label:'Birthday',month:10,day:24,year:2026,type:'birthday',
     notes:'Call Alex',gift_nag:1,gift_done:0,item_type:'goal',item_id:'goal-1',date:'2026-10-24',record_json:'{}',version:1,
@@ -122,12 +136,29 @@ test('automated backup selects the nonblocking PostgreSQL export path',async()=>
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-async-backup-'));
   try{
     const db={
-      async:{exportUser:async()=>({version:6,messages:[{content:'synthetic'}]})},
+      async:{exportUser:async()=>({version:6,messages:[{content:'synthetic'}]}),getUserById:async()=>({id:'synthetic'})},
       exportUser:()=>{throw new Error('blocking export must not run');}
     };
     const file=await writeAutomatedBackup({db,userId:'synthetic',backupDir:directory,passphrase:'synthetic portable passphrase'});
     const bundle=await decryptPortable(fs.readFileSync(file,'utf8'),'synthetic portable passphrase');
     assert.equal(bundle.messages[0].content,'synthetic');
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
+});
+
+test('a late backup writer removes its archive after the account was deleted during export',async()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-late-backup-'));
+  let release,started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const db={async:{
+    exportUser:async()=>{started();await new Promise(resolve=>{release=resolve;});return{version:6,messages:[{content:'synthetic private data'}]};},
+    getUserById:async()=>null,
+  }};
+  try{
+    const writing=writeAutomatedBackup({db,userId:'synthetic-deleted',backupDir:directory,passphrase:'synthetic portable passphrase'});
+    await entered;
+    release();
+    assert.equal(await writing,null);
+    assert.deepEqual(fs.readdirSync(directory),[]);
   }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 
@@ -200,7 +231,10 @@ test('PostgreSQL portable recovery restores a full synthetic bundle into an isol
     if(source&&sourceUser)await source.deleteUserAccount(sourceUser.id);
     if(source)await source.close();
     if(target)await target.close();
-    if(created)await admin.query(`DROP DATABASE ${name}`);
+    if(created){
+      await assertPgSessionsClosed(admin,name);
+      await admin.query(`DROP DATABASE ${name}`);
+    }
     await admin.end();
     fs.rmSync(backupDir,{recursive:true,force:true});
   }
@@ -258,7 +292,7 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     assert.ok(Date.now()-began>=150,'restore waits for its SQL transaction result');
     assert.equal((await sql.query('SELECT content FROM messages WHERE id=$1',[restoredId])).rows[0].content,
       'Delayed synthetic restore');
-    adapter.close();adapter=null;
+    await adapter.close();adapter=null;
     await sql.query('DROP TRIGGER orbit_slow_restore_trigger ON messages');
     await sql.query('DROP FUNCTION orbit_slow_restore()');
 
@@ -268,10 +302,13 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     assert.equal(repeat.status,200);
     assert.equal((await repeat.json()).paused,true);
   }finally{
-    adapter?.close();
+    if(adapter)await adapter.close();
     if(app)await app.close();
     if(sql)await sql.end();
-    if(created)await admin.query(`DROP DATABASE ${name} WITH (FORCE)`);
+    if(created){
+      await assertPgSessionsClosed(admin,name);
+      await admin.query(`DROP DATABASE ${name}`);
+    }
     await admin.end();
     fs.rmSync(directory,{recursive:true,force:true});
   }

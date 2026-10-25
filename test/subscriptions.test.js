@@ -34,6 +34,13 @@ function mockDb() {
         last_event_signed_at: value.lastEventSignedAt || old?.last_event_signed_at || null,
       });
     },
+    applySubscriptionNotification(userId, value) {
+      const current=subs.get(userId);
+      if(current?.app_account_token && current.app_account_token!==value.appAccountToken)return false;
+      if(current?.last_event_signed_at && current.last_event_signed_at>=value.lastEventSignedAt)return false;
+      this.saveSubscription(userId,value);
+      return true;
+    },
     getDailyUsageCount: (userId, day) => usage.get(`${userId}:${day}`) || 0,
     incrementDailyUsage(userId, day) { usage.set(`${userId}:${day}`, (usage.get(`${userId}:${day}`) || 0) + 1); },
     consumeDailyUsage(userId, day, limit) {
@@ -230,7 +237,7 @@ test('owner and configured comped users remain unlimited', () => {
     COMPED_USER_IDS: 'dad,friend',
     COMPED_USER_EMAILS: ' MOM@EXAMPLE.COM ',
   }, db, { appleRuntime: apple.runtime });
-  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', { email: 'mom@example.com' }], ['dad', null], ['friend', null]]) {
+  for (const [id, user] of [['owner', { role: 'owner' }], ['mom', { email: 'mom@example.com', email_verified_at: '2026-10-25T00:00:00.000Z' }], ['dad', null], ['friend', null]]) {
     for (let i = 0; i < 30; i++) assert.equal(service.consumeQuota(id, user).allowed, true);
   }
 });

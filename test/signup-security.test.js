@@ -9,27 +9,36 @@ import {generateKeyPair,exportJWK,exportPKCS8,createLocalJWKSet,SignJWT} from 'j
 import { createOrbitServer } from '../server.js';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/database.js';
-import { hashToken } from '../src/security.js';
+import { hashToken, makeRecoveryCodes } from '../src/security.js';
 import { verifyAppAssertion,verifyAppAttestation } from '../src/app-attest.js';
 
 const password='correct horse battery staple';
 async function fixture(t,env={},options={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-signup-security-'));
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',SIGNUP_RISK_MODE:'observe',...env},...options});
+  const sent=[];
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',SIGNUP_RISK_MODE:'observe',SIGNUP_AUDIT_KEY:'synthetic-signup-security-key',...env},...options,
+    sendEmail:async(...args)=>{sent.push(args[1]);return options.sendEmail?options.sendEmail(...args):true;}});
   await new Promise(r=>app.server.listen(0,'127.0.0.1',r));
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
   const request=async(route,body,session)=>{
     const response=await fetch(`http://127.0.0.1:${app.server.address().port}${route}`,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json','User-Agent':'OrbitBuddy/1.1',...(session?{Cookie:session.cookie,'X-Orbit-CSRF':session.csrf}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
     return {status:response.status,body:await response.json(),cookie:response.headers.get('set-cookie')?.split(';')[0]};
   };
+  const registerVerified=async(body)=>{
+    const first=await request('/api/auth/register',body);
+    if(!first.body.verificationRequired)return first;
+    const link=sent.at(-1).text.match(/https?:\/\/\S+/)?.[0];assert.ok(link);
+    const token=new URL(link).hash.replace('#signup-verify=','');
+    return request('/api/auth/register',{...body,verificationToken:token});
+  };
   const owner=await request('/api/auth/register',{email:'owner@example.com',displayName:'Owner',password});owner.csrf=owner.body.csrf;
-  return {app,request,owner};
+  return {app,request,registerVerified,owner};
 }
 
 test('owner pause, appeals and recovery respect account boundaries',async t=>{
-  const {app,request,owner}=await fixture(t);
+  const {app,request,registerVerified,owner}=await fixture(t);
   await request('/api/admin/registration',{open:true},owner);
-  const member=await request('/api/auth/register',{email:'member@example.com',displayName:'Member',password});member.csrf=member.body.csrf;
+  const member=await registerVerified({email:'member@example.com',displayName:'Member',password});member.csrf=member.body.csrf;
   assert.equal((await request('/api/admin/signup-pause',{paused:true})).status,401);
   assert.equal((await request('/api/admin/signup-pause',{paused:true},member)).status,403);
   assert.equal((await request('/api/admin/signup-pause',{paused:true},{...owner,csrf:'wrong'})).status,403);
@@ -106,7 +115,7 @@ test('Apple HTTP flow requires authenticated explicit linking and cannot replay 
   const keys=createLocalJWKSet({keys:[{...await exportJWK(rsa.publicKey),kid:'test'}]});
   const env={APPLE_CLIENT_ID:'com.test',APPLE_TEAM_ID:'TEAM',APPLE_KEY_ID:'test',APPLE_PRIVATE_KEY:await exportPKCS8(ec.privateKey),SIGNUP_AUDIT_KEY:'test-only-binding-key'};
   let exchangedToken;
-  const {app,request,owner}=await fixture(t,env,{appleVerification:{keys,fetchImpl:async()=>Response.json({id_token:exchangedToken})}});
+  const {app,request,registerVerified,owner}=await fixture(t,env,{appleVerification:{keys,fetchImpl:async()=>Response.json({id_token:exchangedToken})}});
   assert.equal((await request('/api/status')).status,401);
   assert.equal((await request('/api/status',undefined,owner)).body.appleLinked,false);
   const credentials=async(nonce,sub='shared-subject',email='owner@example.com')=>{
@@ -123,7 +132,7 @@ test('Apple HTTP flow requires authenticated explicit linking and cannot replay 
   assert.equal((await request('/api/status',undefined,owner)).body.appleLinked,true);
   assert.equal((await request('/api/auth/apple/complete',input,owner)).status,401,'consumed nonce cannot replay');
   await request('/api/admin/registration',{open:true},owner);
-  const member=await request('/api/auth/register',{email:'member@example.com',displayName:'Member',password});member.csrf=member.body.csrf;
+  const member=await registerVerified({email:'member@example.com',displayName:'Member',password});member.csrf=member.body.csrf;
   assert.equal((await request('/api/status',undefined,member)).body.appleLinked,false,'link status belongs only to the signed-in account');
   const collision=(await request('/api/auth/apple/challenge',{purpose:'link'},member)).body;
   assert.equal((await request('/api/auth/apple/complete',{purpose:'link',password,...await credentials(collision.nonce)},member)).status,409);
@@ -169,7 +178,7 @@ test('pinned Apple attestation fixture verifies at its historical certificate da
 
 test('attestation API binds assertion to signup email, rejects replay, and ignores client attested flags',async t=>{
   const env={APPLE_TEAM_ID:'TEAM',APPLE_APP_BUNDLE_ID:'com.test'};
-  const {app,request,owner}=await fixture(t,env);
+  const {app,request,registerVerified,owner}=await fixture(t,env);
   await request('/api/admin/registration',{open:true},owner);
   const keyId=Buffer.alloc(32,7).toString('base64'),pair=generateKeyPairSync('ec',{namedCurve:'prime256v1'});
   app.db.addAppAttestKey(keyId,pair.publicKey.export({type:'spki',format:'pem'}),'production');
@@ -182,9 +191,9 @@ test('attestation API binds assertion to signup email, rejects replay, and ignor
   assert.equal((await request('/api/auth/attest/complete',{...input,email:'wrong@example.com'})).status,401);
   const complete=await request('/api/auth/attest/complete',input);assert.equal(complete.status,200);
   assert.equal((await request('/api/auth/attest/complete',input)).status,401);
-  const signup=await request('/api/auth/register',{email,displayName:'Proof',password,attestationProof:complete.body.proof});assert.equal(signup.status,201);
+  const signup=await registerVerified({email,displayName:'Proof',password,attestationProof:complete.body.proof});assert.equal(signup.status,201);
   assert.equal(app.db.consumeSignupChallenge(hashToken(complete.body.proof),'signup-attested',hashToken(email)),false);
-  assert.equal((await request('/api/auth/register',{email:'fallback@example.com',displayName:'Fallback',password,attested:true,attestationProof:'fake'})).status,201,'observe mode preserves fallback');
+  assert.equal((await registerVerified({email:'fallback@example.com',displayName:'Fallback',password,attested:true,attestationProof:'fake'})).status,201,'observe mode preserves fallback after mailbox proof');
 });
 
 test('paused access request resumes through owner approval and secure email claim without reserving an account',async t=>{
@@ -212,6 +221,57 @@ test('failed owner reset delivery invalidates its token and uses configured orig
   const response=await request('/api/admin/reset-password',{email:'owner@example.com'},owner);assert.equal(response.body.emailed,false);
   const url=new URL(sent[0].text.match(/https?:\/\/\S+/)[0]);assert.equal(url.origin,'https://test.orbit.example');
   assert.equal(app.db.getPasswordResetToken(hashToken(url.searchParams.get('token'))),undefined);
+});
+
+test('email reset reclaims an unverified pre-registered account and revokes its alternate sign-in proofs',async t=>{
+  const sent=[];
+  const {app,request}=await fixture(t,{SIGNUP_RISK_MODE:'enforce',PUBLIC_BASE_URL:'https://test.orbit.example'},
+    {sendEmail:async(_env,message)=>{sent.push(message);return true;}});
+  const email='claimed@example.com';
+  // Simulate a legacy unverified account: new member signup now requires
+  // mailbox proof, but existing accounts still need safe email reclamation.
+  const legacy=app.db.createUser({email,displayName:'Pre-registered',passwordHash:'legacy-hash',passwordSalt:'legacy-salt',role:'member'});
+  assert.equal(app.db.getUserByEmail(email).email_verified_at,null);
+  const userId=legacy.id;
+  const oldCode=makeRecoveryCodes(1)[0];
+  app.db.replaceRecoveryCodes(userId,[hashToken(oldCode)]);
+  const legacySession=hashToken('synthetic-legacy-session');
+  app.db.createSession({tokenHash:legacySession,userId,csrfToken:'synthetic',expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic-test'});
+  app.db.linkAuthIdentity('apple','pre-registration-subject',userId);
+  app.db.linkWhatsApp(userId,'+15555550001');
+  app.db.setSetting('whatsapp_link_code_123456',`${userId}:${new Date(Date.now()+60_000).toISOString()}`);
+  app.db.savePush(userId,{endpoint:'https://push.example.test/pre-registered',keys:{p256dh:'key',auth:'auth'}},legacySession);
+  app.db.saveApnsToken(userId,'synthetic-pre-registration-token',legacySession);
+  assert.equal((await request('/api/auth/forgot-password',{email})).status,200);
+  const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
+  assert.equal((await request('/api/auth/reset-password',{
+    token:resetUrl.searchParams.get('token'),newPassword:'new owner password 123',
+  })).status,200);
+  assert.equal((await request('/api/auth/recover',{
+    email,recoveryCode:oldCode,newPassword:'attacker replacement 123',
+  })).status,401);
+  assert.ok(app.db.getUserById(userId).email_verified_at,'mailbox owner has proved email ownership');
+  assert.equal(app.db.getAuthIdentity('apple','pre-registration-subject'),undefined);
+  assert.equal(app.db.getWhatsAppLink(userId),null);
+  assert.equal(app.db.getSetting('whatsapp_link_code_123456'),null);
+  assert.equal(app.db.listPush(userId).length,0);
+  assert.equal(app.db.listApnsTokens(userId).length,0);
+  assert.equal((await request('/api/auth/login',{email,password:'new owner password 123'})).status,200);
+});
+
+test('email reclaim of an unverified owner invalidates pending door actions',async t=>{
+  const sent=[];
+  const {app,request,owner}=await fixture(t,{PUBLIC_BASE_URL:'https://test.orbit.example'},
+    {sendEmail:async(_env,message)=>{sent.push(message);return true;}});
+  const expiry=new Date(Date.now()+60_000).toISOString();
+  app.db.addDoorToken('synthetic-door-token',expiry);
+  await request('/api/auth/forgot-password',{email:'owner@example.com'});
+  const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
+  assert.equal((await request('/api/auth/reset-password',{
+    token:resetUrl.searchParams.get('token'),newPassword:'new owner password 123',
+  })).status,200);
+  assert.equal(app.db.consumeDoorToken('synthetic-door-token'),undefined);
+  assert.ok(app.db.getUserById(owner.body.user.id).email_verified_at);
 });
 
 test('pause activated after approval password hashing still prevents account creation and keeps request pending',async t=>{

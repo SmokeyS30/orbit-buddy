@@ -14,6 +14,7 @@
  */
 import http2 from 'node:http2';
 import crypto from 'node:crypto';
+import { genericPushPayload } from './push-payload.js';
 
 export const APNS_PRODUCTION_HOST = 'api.push.apple.com';
 export const APNS_PRODUCTION_PORT = 443;
@@ -107,20 +108,23 @@ export function createApnsService(env, db, { connect = http2.connect } = {}) {
      * Send a push to every registered iOS device for the user.
      * A 410 (or Unregistered reason) means the token is dead — drop it.
      */
-    async notify(userId, title, body, data = {}) {
+    async notify(userId, title, body, data = {}, canDeliver = () => true) {
       if (!configured) return { sent: 0, failed: 0, skipped: true };
+      const publicPayload=genericPushPayload(data);
       let sent = 0;
       let failed = 0;
       let firstError = null;
       for (const row of db.listApnsTokens(userId)) {
+        if(!canDeliver())break;
+        if(!db.isApnsRegistrationCurrent(userId,row.device_token,row.bound_session_hash))continue;
         try {
-          await sendToToken(row.device_token, { title, body, data });
+          await sendToToken(row.device_token, publicPayload);
           sent += 1;
         } catch (error) {
           failed += 1;
           if (!firstError) firstError = error?.apnsReason || error?.message || 'APNs delivery failed';
           if (error && (error.apnsStatus === 410 || error.apnsReason === 'Unregistered')) {
-            try { db.deleteApnsToken(row.device_token); } catch (_) {}
+            try { db.deleteApnsToken(row.device_token,row.bound_session_hash); } catch (_) {}
           }
         }
       }

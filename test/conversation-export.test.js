@@ -129,3 +129,34 @@ test('export: format defaults to markdown', async (t) => {
   assert.equal(response.status, 200);
   assert.match(response.headers.get('content-type') || '', /text\/markdown/);
 });
+
+test('exports every message beyond the ordinary 200-message chat history window',async t=>{
+  const {app,base}=await fixture();t.after(()=>app.close());
+  const auth=await register(base);
+  const convo=app.db.createConversation(auth.userId,'Long synthetic conversation');
+  for(let i=0;i<235;i++)app.db.addMessage(auth.userId,convo.id,i%2?'assistant':'user',`EXPORT-SEQUENCE-${String(i).padStart(3,'0')}`);
+  const response=await fetch(exportUrl(base,convo.id,'markdown'),{headers:authHeaders(auth)});
+  assert.equal(response.status,200);
+  const markdown=await response.text();
+  assert.equal((markdown.match(/EXPORT-SEQUENCE-/g)||[]).length,235);
+  assert.ok(markdown.indexOf('EXPORT-SEQUENCE-000')<markdown.indexOf('EXPORT-SEQUENCE-234'));
+  const pdf=await fetch(exportUrl(base,convo.id,'pdf'),{headers:authHeaders(auth)});
+  assert.equal(pdf.status,200);
+  const bytes=Buffer.from(await pdf.arrayBuffer());
+  assert.ok(bytes.includes('EXPORT-SEQUENCE-000'));
+  assert.ok(bytes.includes('EXPORT-SEQUENCE-234'));
+});
+
+test('oversized PDF export fails explicitly while Markdown still streams the full thread',async t=>{
+  const {app,base}=await fixture();t.after(()=>app.close());
+  const auth=await register(base);
+  const convo=app.db.createConversation(auth.userId,'Large synthetic conversation');
+  app.db.addMessage(auth.userId,convo.id,'user','LARGE-EXPORT-BEGIN '+('x'.repeat(2*1024*1024))+' LARGE-EXPORT-END');
+  const pdf=await fetch(exportUrl(base,convo.id,'pdf'),{headers:authHeaders(auth)});
+  assert.equal(pdf.status,413);
+  const markdown=await fetch(exportUrl(base,convo.id,'markdown'),{headers:authHeaders(auth)});
+  assert.equal(markdown.status,200);
+  const text=await markdown.text();
+  assert.ok(text.includes('LARGE-EXPORT-BEGIN'));
+  assert.ok(text.includes('LARGE-EXPORT-END'));
+});

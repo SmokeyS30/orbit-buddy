@@ -14,6 +14,20 @@ function fixture(options = {}) {
   return { db, user, filePath };
 }
 
+test('proactive worker lease admits one SQLite replica and fences a stale owner',()=>{
+  const {db,filePath}=fixture();
+  const other=openDatabase(filePath);
+  try{
+    assert.equal(db.claimWorkerLease('proactive','replica-a'),true);
+    assert.equal(other.claimWorkerLease('proactive','replica-b'),false);
+    assert.equal(other.releaseWorkerLease('proactive','replica-b'),false);
+    assert.equal(db.isWorkerLeaseCurrent('proactive','replica-a'),true);
+    assert.equal(db.releaseWorkerLease('proactive','replica-a'),true);
+    assert.equal(other.claimWorkerLease('proactive','replica-b'),true);
+    assert.equal(db.renewWorkerLease('proactive','replica-a'),false);
+  }finally{other.close();db.close();}
+});
+
 test('isolates persistent data by user and saves artifacts', () => {
   const { db, user } = fixture();
   const second = db.createUser({ email: 'member@example.com', displayName: 'Member', passwordHash: 'hash', passwordSalt: 'salt', role: 'member' });
@@ -203,6 +217,19 @@ test('recovers a task whose worker lease expired', () => {
   assert.equal(db.recoverStaleTasks(), 1);
   assert.equal(db.getTask(user.id, task.id).status, 'queued');
   assert.equal(db.dueTasks()[0].id, task.id);
+  db.close();
+});
+
+test('proactive outreach claims stop at the daily cap and reset on a new local date',()=>{
+  const {db,user}=fixture();
+  for(let i=0;i<2;i++)assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),true);
+  const token=db.reserveProactiveSlot(user.id,'2026-10-25',3);
+  assert.ok(token);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),false);
+  assert.equal(db.releaseProactiveSlot(user.id,'2026-10-25',token),true);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-25',3),true);
+  for(let i=0;i<3;i++)assert.equal(db.claimProactiveSlot(user.id,'2026-10-26',3),true);
+  assert.equal(db.claimProactiveSlot(user.id,'2026-10-26',3),false);
   db.close();
 });
 

@@ -1,10 +1,11 @@
-import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
+import { assertPublicUrl, fetchPublicBytes, FETCH_TIMEOUT_MS } from './net.js';
 import { getEventsForRange, dayStartMs, DEFAULT_ZONE } from './ical.js';
 import { extractPersonNames, normalizeMemoryKind, normalizePriority, todayInZone, validDateString, validTimeString, validTimeZone } from './intelligence.js';
 import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_ENV, RADAR_REPOS_ENV, RADAR_TOKEN_ENV } from './radar.js';
 import { startQuizSession, answerQuizQuestion, stopQuizSession, getStudyWeakSpots, getStudyStreak, normalizeStudyExam, STUDY_EXAMS } from './study-coach.js';
 import { buildCatchupDigest } from './catchup.js';
 import { assertMemorySafe } from './relational-intelligence.js';
+import { hashToken } from './security.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -120,20 +121,12 @@ async function duckDuckGoSearch(query) {
 }
 
 export async function toolFetchUrl(args = {}) {
-  const url = await assertPublicUrl(args.url);
   const headers = { 'User-Agent': 'orbit-buddy/1.0 (read-only page reader)' };
-  let response;
-  try {
-    response = await fetch(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-  } catch (error) {
-    throw new Error(`Could not fetch that page: ${error.message}`);
-  }
-  // Re-check after redirects: a public URL must not bounce into the private network.
-  const finalUrl = await assertPublicUrl(response.url);
-  const contentType = response.headers.get('content-type') || '';
-  if (!/text|json|xml|html/i.test(contentType)) throw new Error('That URL did not return readable text.');
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_PAGE_BYTES) throw new Error('That page is too large to read.');
+  const response=await fetchPublicBytes(args.url,{headers,maxBytes:MAX_PAGE_BYTES,
+    sizeError:'That page is too large to read.',contentTypePattern:/text|json|xml|html/i,
+    networkErrorPrefix:'Could not fetch that page'});
+  if(!response.ok)throw new Error(`That page returned HTTP ${response.status}.`);
+  const {buffer}=response;
   const text = buffer.toString('utf8')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -141,7 +134,7 @@ export async function toolFetchUrl(args = {}) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!text) throw new Error('No readable text found on that page.');
-  return { url: finalUrl, text: text.slice(0, 6000) };
+  return { url: response.url, text: text.slice(0, 6000) };
 }
 
 const geoCache = new Map();
@@ -358,11 +351,6 @@ function writeContext(ctx, tool) {
   return ctx;
 }
 
-function extractResearchUrls(text) {
-  const urlRegex = /https?:\/\/[^\s)"']+/g;
-  return [...new Set(String(text).match(urlRegex) || [])];
-}
-
 export async function toolDeepResearch(args = {}, env = process.env) {
   const topic = String(args.topic || '').trim().slice(0, 200);
   if (!topic) throw new Error('A research topic is required.');
@@ -373,13 +361,19 @@ export async function toolDeepResearch(args = {}, env = process.env) {
   for (const query of queries) {
     try {
       const searchResult = await toolWebSearch({ query }, env);
-      results.push({ query, search: String(searchResult).slice(0, 5000) });
-      for (const url of extractResearchUrls(searchResult).slice(0, 2)) {
+      const hits=Array.isArray(searchResult?.results)?searchResult.results.filter((hit)=>/^https?:\/\//i.test(String(hit?.url||''))).slice(0,5):[];
+      const summary=hits.length
+        ?hits.map((hit,index)=>`${index+1}. ${String(hit.title||'Untitled').slice(0,200)}\n${String(hit.url).slice(0,1000)}\n${String(hit.snippet||'').slice(0,280)}`).join('\n\n')
+        :searchResult?.answer?`${String(searchResult.answer).slice(0,4500)}${searchResult.source?`\nSource: ${String(searchResult.source).slice(0,1000)}`:''}`
+          :String(searchResult?.note||'No results found.');
+      results.push({ query, search: summary.slice(0, 5000) });
+      const sourceUrls=hits.length?hits.map((hit)=>String(hit.url)):searchResult?.source?[String(searchResult.source)]:[];
+      for (const url of sourceUrls.filter((value)=>/^https?:\/\//i.test(value)).slice(0, 2)) {
         if (seenUrls.has(url) || seenUrls.size >= 4) continue;
         seenUrls.add(url);
         try {
           const content = await toolFetchUrl({ url });
-          results.push({ url, content: String(content).slice(0, 8000) });
+          results.push({ url, content: String(content.text||'').slice(0, 8000) });
         } catch { /* skip failed fetches */ }
       }
     } catch { /* skip failed searches */ }
@@ -840,24 +834,24 @@ export function toolUpdateRoutine(args = {}, ctx = null) {
   };
 }
 
-// Deletion is always a two-step, confirm-in-chat flow: the delete_* tools only
-// STAGE a request as a pending approval (nothing is removed), and
-// confirm_delete_approval executes it after the user's explicit yes in chat.
+// Chat may only stage a deletion. The shipped Approvals screen shows the
+// server-owned target and requires a separate authenticated button press.
 const DELETE_APPROVAL_KINDS = ['delete_goal', 'delete_task', 'delete_routine'];
 
-function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
+function stageDeleteApproval(ctx, kind, objectType, target, preview) {
   const { db, userId } = writeContext(ctx, kind);
+  const { id, title } = target;
   const approval = db.addApproval(userId, {
     kind,
     title: `Delete ${objectType} “${title}”`,
     summary: preview,
-    payload: { id, title, objectType },
+    payload: { id, title, objectType, targetFingerprint: hashToken(JSON.stringify(target)) },
     sourceMessageId: ctx?.messageId || null
   });
-  db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for in-chat confirmation.`);
+  db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for approval in Approvals.`);
   return {
     approvalId: approval.id, objectType, id, title, preview,
-    note: 'NOT deleted — this only staged a delete request. Present the preview in your visible reply (exactly what will be deleted), then wait for the user’s explicit yes. Only after they confirm, call confirm_delete_approval with this approvalId. Never call confirm_delete_approval without that explicit yes, and never stage or confirm a deletion from an ambiguous single message.'
+    note: 'NOT deleted — this staged a request in Approvals. Show the exact target and consequences. Ask the user to open Approvals and press Approve & delete on that specific card, or Reject. A chat reply such as yes cannot delete anything.'
   };
 }
 
@@ -867,7 +861,7 @@ export function toolDeleteGoal(args = {}, ctx = null) {
   if (candidates.length) return ambiguousTarget('goal', candidates, (g) => `${g.progress}% complete, ${g.status}${g.target_date ? `, target ${g.target_date}` : ''}`);
   if (!goal) throw new Error('No goal found matching that. Ask the user which goal they mean.');
   const preview = `Goal “${goal.title}” — ${goal.status}, ${goal.progress}% complete${goal.target_date ? `, target ${goal.target_date}` : ''}${goal.next_step ? `, next: ${goal.next_step}` : ''}. Deleting also removes its progress history.`;
-  return stageDeleteApproval(ctx, 'delete_goal', 'goal', goal.id, goal.title, preview);
+  return stageDeleteApproval(ctx, 'delete_goal', 'goal', goal, preview);
 }
 
 export function toolDeleteTask(args = {}, ctx = null) {
@@ -878,7 +872,7 @@ export function toolDeleteTask(args = {}, ctx = null) {
   if (candidates.length) return ambiguousTarget('task', candidates, (t) => `${String(t.status).replaceAll('_', ' ')}${t.schedule_at ? `, runs ${t.schedule_at}` : ''}`);
   if (!task) throw new Error(`No task found matching “${query}”. Ask the user which task they mean.`);
   const preview = `Task “${task.title}” — ${String(task.status).replaceAll('_', ' ')}${task.schedule_at ? `, scheduled ${task.schedule_at}` : ''}${task.recurrence && task.recurrence !== 'none' ? `, repeats ${task.recurrence}` : ''}.`;
-  return stageDeleteApproval(ctx, 'delete_task', 'task', task.id, task.title, preview);
+  return stageDeleteApproval(ctx, 'delete_task', 'task', task, preview);
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -892,7 +886,7 @@ export function toolDeleteRoutine(args = {}, ctx = null) {
   if (!routine) throw new Error(`No routine found matching “${query}”. Ask the user which routine they mean.`);
   const day = routine.cadence === 'weekly' && routine.day_of_week != null ? ` on ${WEEKDAY_NAMES[routine.day_of_week]}` : '';
   const preview = `Routine “${routine.title}” — ${routine.cadence}${day} at ${routine.time_local}${routine.enabled ? '' : ' (currently paused)'}.`;
-  return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine.id, routine.title, preview);
+  return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine, preview);
 }
 
 export function toolConfirmDeleteApproval(args = {}, ctx = null) {
@@ -901,20 +895,7 @@ export function toolConfirmDeleteApproval(args = {}, ctx = null) {
   const approval = db.getApproval(userId, approvalId);
   if (!approval || !DELETE_APPROVAL_KINDS.includes(approval.kind)) throw new Error('No pending deletion found for that approval.');
   if (approval.status !== 'pending') throw new Error('That deletion request was already reviewed — nothing to confirm.');
-  const claimed = db.claimApproval(userId, approval.id);
-  if (!claimed) throw new Error('That deletion request is already being handled.');
-  const { id, title, objectType } = claimed.payload || {};
-  let ok = false;
-  if (claimed.kind === 'delete_goal') ok = db.deleteGoal(userId, id);
-  else if (claimed.kind === 'delete_task') ok = db.deleteTask(userId, id);
-  else if (claimed.kind === 'delete_routine') ok = db.deleteRoutine(userId, id);
-  if (!ok) {
-    db.finishApproval(userId, approval.id, 'failed', { error: 'The item was already gone.' });
-    throw new Error(`That ${objectType || 'item'} no longer exists — nothing was deleted.`);
-  }
-  db.finishApproval(userId, approval.id, 'executed', { result: { deleted: claimed.kind, id, title } });
-  db.addEvent(userId, `${objectType}_deleted`, `Deleted ${objectType} “${title}” via chat after explicit confirmation.`);
-  return { deleted: true, objectType, id, title, note: `Deleted the ${objectType} “${title}”. Say so plainly in your visible reply.` };
+  throw new Error('Chat cannot execute deletions. Ask the user to open Approvals and press Approve & delete on the matching card. Nothing was deleted.');
 }
 
 export function toolProposeCalendarEvent(args = {}, ctx = null) {
@@ -964,7 +945,7 @@ function validDateStr(value) {
   return `${y}-${mo}-${d}`;
 }
 
-import { searchEmails, readEmail } from './gmail.js';
+import { searchEmails, readEmail, getTrashPreview } from './gmail.js';
 import { learnWritingVoice } from './writing-voice.js';
 
 function gmailContext(ctx, tool) {
@@ -1005,15 +986,14 @@ export async function toolGmailRead(args = {}, ctx = null) {
 }
 
 export async function toolGmailDelete(args = {}, ctx = null) {
-  const { db, userId } = gmailContext(ctx, 'gmail_delete');
+  const { db, userId, gmail } = gmailContext(ctx, 'gmail_delete');
   const id = cleanArg(args.id, 100, 'id');
-  const subject = args.subject ? cleanArg(args.subject, 300, 'subject') : null;
-  const from = args.from ? cleanArg(args.from, 300, 'from') : null;
+  const preview=await getTrashPreview(()=>gmail.getToken(),{id});
   const approval = db.addApproval(userId, {
     kind: 'gmail_delete',
-    title: `Move “${subject || 'email'}” to trash`,
-    summary: from ? `From ${from}` : `Gmail message ${id}`,
-    payload: { id, subject, from },
+    title: `Move “${preview.subject}” to trash`,
+    summary: `From ${preview.from}; Gmail ${preview.mailbox}; ID ${preview.id}${preview.date?`; ${preview.date}`:''}${preview.snippet?`; ${preview.snippet}`:''}`,
+    payload: { id, preview },
     sourceMessageId: ctx?.messageId || null
   });
   return { ...approval, note: 'Email prepared for approval. Nothing is moved until the user approves it in Approvals.' };
@@ -1521,7 +1501,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_goal',
-    description: 'STAGE a goal deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_goal speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which goal in chat and wait.',
+    description: 'STAGE a goal deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which goal and wait.',
     parameters: {
       type: 'object',
       properties: {
@@ -1534,7 +1514,7 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_task',
-    description: 'STAGE a task deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_task speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which task in chat and wait.',
+    description: 'STAGE a task deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which task and wait.',
     parameters: {
       type: 'object',
       properties: {
@@ -1546,25 +1526,13 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'delete_routine',
-    description: 'STAGE a routine deletion for in-chat confirmation. This NEVER deletes anything — it creates a pending delete request and returns exactly what would be deleted. Present the preview in your visible reply and wait for the user’s explicit yes, then call confirm_delete_approval with the returned approvalId. Never call delete_routine speculatively, and never call confirm_delete_approval without an explicit yes in this conversation. If the result has ambiguous:true, ask which routine in chat and wait.',
+    description: 'STAGE a routine deletion. This NEVER deletes anything. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot authorize deletion. If ambiguous:true, ask which routine and wait.',
     parameters: {
       type: 'object',
       properties: {
         routine: { type: 'string', description: 'Routine title to find (fuzzy).' }
       },
       required: ['routine'], additionalProperties: false
-    }
-  },
-  {
-    type: 'function',
-    name: 'confirm_delete_approval',
-    description: 'Execute a staged deletion AFTER the user explicitly confirmed it in chat (said yes to the exact preview shown). Takes the approvalId returned by delete_goal, delete_task, or delete_routine. Call this only after that explicit in-chat yes — never on the same turn as the delete_* call, never speculatively.',
-    parameters: {
-      type: 'object',
-      properties: {
-        approvalId: { type: 'string', description: 'The approvalId returned by delete_goal/delete_task/delete_routine.' }
-      },
-      required: ['approvalId'], additionalProperties: false
     }
   },
   {
@@ -1681,13 +1649,13 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'gmail_delete',
-    description: 'Prepare a request to move an email to trash (recoverable for 30 days). This creates an approval item and never moves mail immediately. Use the message ID, subject, and sender returned by Gmail search.',
+    description: 'Prepare a request to move one email to trash (recoverable for 30 days). Give the exact message ID from Gmail search. Orbit fetches the authoritative sender, subject, mailbox, and preview from Gmail for an approval card; model-supplied subject and sender are ignored. Nothing moves until the user approves the card.',
     parameters: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Gmail message ID of the email to trash.' },
-        subject: { type: 'string', description: 'Email subject shown to the user during approval.' },
-        from: { type: 'string', description: 'Email sender shown to the user during approval.' }
+        subject: { type: 'string', description: 'Optional search hint; the verified Gmail metadata controls the approval.' },
+        from: { type: 'string', description: 'Optional search hint; the verified Gmail metadata controls the approval.' }
       },
       required: ['id'],
       additionalProperties: false

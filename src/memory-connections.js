@@ -570,9 +570,15 @@ export async function runMemoryConnectionPush({ db, model, user, timeZone, nowMs
     return 0;
   }
   try {
-    await deliver(text, `Shared a memory-connection insight proactively (${candidate.reason}).`);
-    recordConnectionSurfacing(db, user.id, candidate);
-    db.addEvent(user.id, 'memory_connection_proactive', `Shared a pattern insight proactively (${candidate.reason}).`);
+    let surfaced=false;
+    const record=()=>{
+      recordConnectionSurfacing(db, user.id, candidate);
+      db.addEvent(user.id, 'memory_connection_proactive', `Shared a pattern insight proactively (${candidate.reason}).`);
+      surfaced=true;
+    };
+    const outcome=await deliver(text, `Shared a memory-connection insight proactively (${candidate.reason}).`,record);
+    if(outcome===false||outcome?.recorded===false){try{releaseSlot();}catch{}return 0;}
+    if(!surfaced)record(); // compatible with injected legacy delivery callbacks
     return 1;
   } catch (error) {
     console.error('memory connection deliver failed', error && error.message);

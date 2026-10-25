@@ -5,15 +5,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createOrbitServer } from '../server.js';
+import { signupInbox } from './helpers/signup-inbox.js';
 
 async function fixture(){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reporting-'));
-  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test',SIGNUP_RISK_MODE:'off'}});
+  const inbox=signupInbox();
+  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test',SIGNUP_RISK_MODE:'off',SIGNUP_AUDIT_KEY:'synthetic-reporting-key'},sendEmail:inbox.sendEmail});
   await new Promise((resolve)=>app.server.listen(0,'127.0.0.1',resolve));
-  return{app,base:`http://127.0.0.1:${app.server.address().port}`};
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  return{app,base,register:(email)=>register(base,email,inbox)};
 }
-async function register(base,email){
-  const response=await fetch(`${base}/api/auth/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,displayName:email.split('@')[0],password:'correct horse battery staple'})});
+async function register(base,email,inbox){
+  const response=await inbox.register(base,{email,displayName:email.split('@')[0],password:'correct horse battery staple'});
   assert.equal(response.status,201);
   const body=await response.json();
   return{cookie:response.headers.get('set-cookie').split(';')[0],csrf:body.csrf,userId:body.user.id};
@@ -23,10 +26,10 @@ const submit=(base,account,body)=>fetch(`${base}/api/reports`,{method:'POST',hea
 const responseBody=(messageId,extra={})=>({submissionId:randomUUID(),kind:'response',reason:'incorrect',description:'This answer was wrong.',messageId,includeMessage:false,consent:true,...extra});
 
 test('reports require consent, protect ownership and CSRF, and retain only chosen content',async(t)=>{
-  const{app,base}=await fixture();t.after(()=>app.close());
-  const owner=await register(base,'owner@example.com');
+  const{app,base,register}=await fixture();t.after(()=>app.close());
+  const owner=await register('owner@example.com');
   assert.equal((await fetch(`${base}/api/admin/registration`,{method:'POST',headers:headers(owner),body:JSON.stringify({open:true})})).status,200);
-  const member=await register(base,'member@example.com');
+  const member=await register('member@example.com');
   const convo=app.db.ensureDefaultConversation(member.userId);
   const userMessage=app.db.addMessage(member.userId,convo.id,'user','Private history and secret token: abc123');
   const reply=app.db.addMessage(member.userId,convo.id,'assistant','An answer with private data: secret-456');
@@ -63,10 +66,10 @@ test('reports require consent, protect ownership and CSRF, and retain only chose
 });
 
 test('submission IDs make repeated clicks and lost-response retries idempotent; owner alone tracks status',async(t)=>{
-  const{app,base}=await fixture();t.after(()=>app.close());
-  const owner=await register(base,'owner@example.com');
+  const{app,base,register}=await fixture();t.after(()=>app.close());
+  const owner=await register('owner@example.com');
   assert.equal((await fetch(`${base}/api/admin/registration`,{method:'POST',headers:headers(owner),body:JSON.stringify({open:true})})).status,200);
-  const member=await register(base,'member@example.com');
+  const member=await register('member@example.com');
   const convo=app.db.ensureDefaultConversation(member.userId);
   const reply=app.db.addMessage(member.userId,convo.id,'assistant','Report me');
   const body=responseBody(reply.id);
@@ -107,8 +110,8 @@ test('submission IDs make repeated clicks and lost-response retries idempotent; 
 });
 
 test('report input limits and rate limits reject excess without persisting payloads',async(t)=>{
-  const{app,base}=await fixture();t.after(()=>app.close());
-  const owner=await register(base,'owner@example.com');
+  const{app,base,register}=await fixture();t.after(()=>app.close());
+  const owner=await register('owner@example.com');
   const convo=app.db.ensureDefaultConversation(owner.userId);
   const reply=app.db.addMessage(owner.userId,convo.id,'assistant','Safe text');
   assert.equal((await submit(base,owner,responseBody(reply.id,{description:'x'.repeat(1001)}))).status,400);

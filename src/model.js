@@ -30,7 +30,7 @@ export function isImageContentType(mimeType) {
  * HTTP-style `status` (415/413/400) on unsupported type, oversize, or empty
  * payload. Image bytes are never logged.
  */
-export function processImageInput({ bytes, mimeType }) {
+export function validateImageInput({ bytes, mimeType }) {
   const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
   if (!IMAGE_MIME_TYPES.has(mime)) {
     throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'), { status: 415, code: 'UNSUPPORTED_IMAGE_TYPE' });
@@ -42,6 +42,11 @@ export function processImageInput({ bytes, mimeType }) {
   if (buffer.length > MAX_IMAGE_BYTES) {
     throw Object.assign(new Error('The image is too large (10MB max).'), { status: 413, code: 'IMAGE_TOO_LARGE' });
   }
+  return{buffer,mime};
+}
+
+export function processImageInput(input) {
+  const {buffer,mime}=validateImageInput(input);
   return { type: 'input_image', image_url: `data:${mime};base64,${buffer.toString('base64')}` };
 }
 
@@ -188,7 +193,7 @@ export function buildStableDeveloperPrompt() {
     `- Chat is the universal creator: when the user asks in plain language to track a goal, set a reminder, start a routine, save a memory, or schedule a follow-up ("track a goal to…", "remind me to…", "remember that…"), call the matching tool right away — no forms, no extra steps.`,
     `- Confirm in chat, never guess: if a creation request is missing a key detail or is ambiguous, ask ONE short clarifying question in chat and wait for the answer before calling the tool. That confirm-in-chat step replaces guessing. When the details are complete, create immediately, then say exactly what was created and where to manage it (the matching tab).`,
     `- Chat is the universal manager: updates happen in chat — when the user asks to move a deadline, rename, reprioritize, reschedule, or pause/resume a goal, task, or routine ("move that deadline to Friday", "rename the gym goal to…", "prioritize X", "pause my morning briefing"), call the matching update tool right away. Resolve relative dates ("Friday", "tomorrow") against today in their timezone. If the target is ambiguous, ask ONE short clarifying question and wait — never pick for them.`,
-    `- Deletion always confirms in chat first: when the user asks to delete or drop a goal, task, or routine, call delete_goal/delete_task/delete_routine to stage it — staging never deletes anything. Present exactly what will be deleted in your visible reply and wait for an explicit yes. Only then call confirm_delete_approval with the returned approvalId. Never delete on a single ambiguous message, and never call confirm_delete_approval without that explicit yes. For memories and follow-ups, deletion still lives in the Memory tab.`,
+    `- To delete a goal, task, or routine, call delete_goal/delete_task/delete_routine only when the target is clear. This stages a server-owned approval card; it never deletes. Show the exact target and consequences, then ask the user to open Approvals and press Approve & delete on that card, or Reject. A chat yes cannot execute deletion. For memories and follow-ups, deletion lives in the Memory tab.`,
     `- Private by design: their stuff stays theirs. Memories are theirs to view, correct, make manual-only, export, or delete — reference them naturally, never recite them.`
   ].join('\n');
 }

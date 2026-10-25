@@ -73,7 +73,7 @@ test('observation mode records risk but does not block registration', async (t) 
   assert.equal(response.status, 201);
 });
 
-test('enforcement automatically admits low-risk members without opening the legacy door', async (t) => {
+test('enforcement requires mailbox proof for low-risk members without opening the legacy door', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-signup-enforce-'));
   const sentEmails = [];
   const app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna', SIGNUP_RISK_MODE: 'enforce', SIGNUP_AUDIT_KEY: 'test-secret' }, sendEmail: async (_env, message) => { sentEmails.push(message);return true; } });
@@ -89,32 +89,37 @@ test('enforcement automatically admits low-risk members without opening the lega
   assert.equal(setup.automaticSignup, true);
   assert.equal(setup.emailVerificationReady, true);
   const memberResponse = await register('member@example.com', 'OrbitBuddy/1.1');
-  assert.equal(memberResponse.status, 201);
-  assert.equal(app.db.getUserByEmail('member@example.com').email_verified_at, null);
-  const memberCookie = memberResponse.headers.get('set-cookie').split(';')[0];
+  assert.equal(memberResponse.status, 403);
+  assert.equal((await memberResponse.json()).verificationRequired, true);
+  assert.equal(app.db.getUserByEmail('member@example.com'), undefined);
+  const memberToken = new URL(sentEmails[0].text.match(/https?:\/\/\S+/)[0]).hash.replace('#signup-verify=', '');
+  const verifiedMemberResponse = await register('member@example.com', 'OrbitBuddy/1.1', memberToken);
+  assert.equal(verifiedMemberResponse.status, 201);
+  assert.ok(app.db.getUserByEmail('member@example.com').email_verified_at);
+  const memberCookie = verifiedMemberResponse.headers.get('set-cookie').split(';')[0];
   assert.equal((await register('bot@example.com', 'HeadlessBot/1.0')).status, 403);
   const verifyResponse = await register('verify@example.com', 'curl/8.7.1');
   assert.equal(verifyResponse.status, 403);
   assert.deepEqual(await verifyResponse.json(), { error: 'Check your email to verify your address and finish creating your Orbit account.', verificationRequired: true, verificationSent: true });
-  assert.equal(sentEmails.length, 1);
-  const verificationUrl = sentEmails[0].text.match(/https?:\/\/\S+/)[0];
+  assert.equal(sentEmails.length, 2);
+  const verificationUrl = sentEmails[1].text.match(/https?:\/\/\S+/)[0];
   const verificationToken = new URL(verificationUrl).hash.replace('#signup-verify=', '');
   assert.ok(verificationToken);
   const repeatedResponse = await register('verify@example.com', 'curl/8.7.1');
   assert.equal(repeatedResponse.status, 403);
-  assert.equal(sentEmails.length, 1, 'pending email verification must suppress duplicate sends');
+  assert.equal(sentEmails.length, 2, 'pending email verification must suppress duplicate sends');
   assert.equal((await register('verify@example.com', 'curl/8.7.1', verificationToken)).status, 201);
   assert.ok(app.db.getUserByEmail('verify@example.com').email_verified_at, 'step-up verification must persist on the account');
   const wrongEmailResponse = await register('other@example.com', 'curl/8.7.1', verificationToken);
   assert.equal(wrongEmailResponse.status, 403, 'verification token must stay bound to its email');
-  assert.equal(sentEmails.length, 2, 'wrong-email token gets a fresh verification, not access');
+  assert.equal(sentEmails.length, 3, 'wrong-email token gets a fresh verification, not access');
   assert.equal((await fetch(`${base}/api/admin/signup-risk`)).status, 401);
   assert.equal((await fetch(`${base}/api/admin/signup-risk`, { headers: { Cookie: memberCookie } })).status, 403);
   const auditResponse = await fetch(`${base}/api/admin/signup-risk`, { headers: { Cookie: ownerCookie } });
   assert.equal(auditResponse.status, 200);
   const audit = await auditResponse.json();
-  assert.equal(audit.total, 7);
-  assert.deepEqual(audit.decisions, { allow: 1, verify: 4, deny: 2 });
+  assert.equal(audit.total, 8);
+  assert.deepEqual(audit.decisions, { allow: 2, verify: 4, deny: 2 });
   assert.doesNotMatch(JSON.stringify(audit), /subject|owner@example|member@example|bot@example/);
   const oneTimeEmailHash = signupAuditSubject('one-time@example.com', 'test-secret');
   const oneTimeTokenHash = hashToken('one-time-token');
@@ -137,6 +142,26 @@ test('ambiguous enforcement fails safely when transactional email is unavailable
   const response = await register('ambiguous@example.com', 'curl/8.7.1');
   assert.equal(response.status, 503);
   assert.equal(app.db.countUsers(), 1, 'unverified applicant must not be created');
+});
+
+test('Apple-only verified signup stays discoverable when email delivery is unavailable', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-apple-only-signup-'));
+  const app = createOrbitServer({ dataDir: directory, env: {
+    NODE_ENV: 'test', SIGNUP_RISK_MODE: 'enforce', SIGNUP_AUDIT_KEY: 'synthetic-signup-key',
+    APPLE_CLIENT_ID: 'com.test.orbit', APPLE_TEAM_ID: 'TEAM', APPLE_KEY_ID: 'KEY', APPLE_PRIVATE_KEY: 'synthetic-key'
+  }});
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await app.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  const owner = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'OrbitBuddy/1.1' }, body: JSON.stringify({ email: 'owner@example.test', displayName: 'Owner', password: 'correct horse battery staple' }) });
+  assert.equal(owner.status, 201);
+  const setup = await (await fetch(`${base}/api/auth/setup-status`)).json();
+  assert.equal(setup.emailVerificationReady, false);
+  assert.equal(setup.appleSignupReady, true);
+  assert.equal(setup.automaticSignup, true, 'the shipped client uses this flag to show Apple signup');
+  const unproved = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'OrbitBuddy/1.1' }, body: JSON.stringify({ email: 'unproved@example.test', displayName: 'Unproved', password: 'correct horse battery staple' }) });
+  assert.equal(unproved.status, 503, 'ordinary unverified signup must remain closed without email delivery');
+  assert.equal(app.db.countUsers(), 1);
 });
 
 test('failed email delivery releases the pending slot for a safe retry', async (t) => {

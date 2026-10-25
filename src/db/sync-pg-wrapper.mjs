@@ -30,6 +30,12 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
   if (timeoutMatch) readyTimeout = parseInt(timeoutMatch[1], 10);
   const sharedBuffer = new SharedArrayBuffer(BUFFER_SIZE);
   const sharedArray = new Int32Array(sharedBuffer);
+  let responseBuffer=sharedBuffer;
+  let responseArray=sharedArray;
+  const rotateResponseBuffer=()=>{
+    responseBuffer=new SharedArrayBuffer(BUFFER_SIZE);
+    responseArray=new Int32Array(responseBuffer);
+  };
 
   const worker = new Worker(path.join(__dirname, 'pg-worker.mjs'), {
     workerData: { connectionString, encryptionKey, sharedBuffer }
@@ -37,6 +43,7 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
 
   let workerExitCode = null;
   let closed = false;
+  let closePromise = null;
   const pendingAsync = new Map();
   function rejectPending(error) {
     for (const pending of pendingAsync.values()) {
@@ -119,7 +126,13 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
   return new Proxy({ driver: 'postgres', async: asyncMethods }, {
     get(target, method) {
       if (method === 'close') {
-        return () => { closed = true; rejectPending(new Error('PG worker closed.')); worker.terminate(); };
+        return () => {
+          if(closePromise)return closePromise;
+          closed = true;
+          rejectPending(new Error('PG worker closed.'));
+          closePromise=worker.terminate();
+          return closePromise;
+        };
       }
       // Expose the driver identifier as a plain property, not a DB method.
       if (method === 'driver') return target.driver;
@@ -129,15 +142,24 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
       return (...args) => {
         if (closed || workerExitCode !== null) throw new Error('PG worker is closed.');
         const id = nextId++;
-        Atomics.store(sharedArray, FLAG_OFFSET / 4, 0);
-        worker.postMessage({ id, method, args });
-        const result = Atomics.wait(sharedArray, FLAG_OFFSET / 4, 0, queryTimeoutMs);
+        const callBuffer=responseBuffer;
+        const callArray=responseArray;
+        Atomics.store(callArray, FLAG_OFFSET / 4, 0);
+        worker.postMessage({ id, method, args, sharedBuffer:callBuffer });
+        const result = Atomics.wait(callArray, FLAG_OFFSET / 4, 0, queryTimeoutMs);
         if (result === 'timed-out') {
+          // The worker may still finish this query. Never let its late result
+          // wake or overwrite a later synchronous call's response buffer.
+          rotateResponseBuffer();
           throw new Error(`PG query timeout: ${method}`);
         }
-        const len = sharedArray[LEN_OFFSET / 4];
-        const bytes = Buffer.from(sharedBuffer, DATA_OFFSET, len);
-        const msg = JSON.parse(bytes.toString('utf8'));
+        const len = Atomics.load(callArray,LEN_OFFSET / 4);
+        if(len<1||len>BUFFER_SIZE-DATA_OFFSET){rotateResponseBuffer();throw new Error(`Invalid PG worker response length: ${method}`);}
+        const bytes = Buffer.from(callBuffer, DATA_OFFSET, len);
+        let msg;
+        try{msg=JSON.parse(bytes.toString('utf8'));}
+        catch{rotateResponseBuffer();throw new Error(`Invalid PG worker response: ${method}`);}
+        if(msg.id!==id){rotateResponseBuffer();throw new Error(`Mismatched PG worker response: ${method}`);}
 
         if (!msg.ok) {
           const err = new Error(msg.error.message);

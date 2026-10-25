@@ -80,6 +80,7 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
   const response = await fetch(endpoint, {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: {
       Authorization: `Basic ${credentials}`,
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -87,8 +88,7 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
     body: form.toString(),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio send failed (${response.status}): ${text.slice(0, 200)}`);
+    throw Object.assign(new Error(`Twilio send failed (${response.status})`),{status:response.status});
   }
   const data = await response.json().catch(() => ({}));
   return data.sid || null;
@@ -116,6 +116,7 @@ export async function sendWhatsAppMedia({ accountSid, authToken, fromNumber, toP
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
   const response = await fetch(endpoint, {
     method: 'POST',
+    signal: AbortSignal.timeout(10_000),
     headers: {
       Authorization: `Basic ${credentials}`,
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -123,8 +124,7 @@ export async function sendWhatsAppMedia({ accountSid, authToken, fromNumber, toP
     body: form.toString(),
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio media send failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Twilio media send failed (${response.status})`);
   }
   const data = await response.json().catch(() => ({}));
   return data.sid || null;
@@ -196,21 +196,39 @@ export function isWindowOpen(lastInboundAt, nowMs = Date.now()) {
 /** Max bytes downloaded from a Twilio media URL (~10 MB; WhatsApp voice notes are far smaller). */
 export const MAX_TWILIO_MEDIA_BYTES = 10 * 1024 * 1024;
 
+/** Accept only this account's media resource, before adding Basic credentials. */
+export function validateTwilioMediaUrl(value, accountSid, messageSid = null) {
+  let parsed;
+  try { parsed = new URL(String(value)); } catch { throw new Error('Invalid Twilio media URL.'); }
+  const match = parsed.pathname.match(/^\/2010-04-01\/Accounts\/(AC[0-9a-f]{32})\/(?:Messages|Message)\/((?:SM|MM)[0-9a-f]{32})\/Media\/(ME[0-9a-f]{32})$/i);
+  if (parsed.protocol !== 'https:' || parsed.hostname !== 'api.twilio.com' || parsed.port || parsed.username || parsed.password ||
+      parsed.search || parsed.hash || !match || match[1] !== accountSid || (messageSid && match[2] !== messageSid)) {
+    throw new Error('Invalid Twilio media URL.');
+  }
+  return parsed.href;
+}
+
 /**
  * Download a Twilio-hosted media file (media URLs 401 without auth).
  * GET with Basic auth (AccountSid:AuthToken), with a size cap enforced via
  * Content-Length when present and a streaming cap as a backstop.
  * Returns { bytes: Buffer, contentType }. Throws on HTTP errors or oversize.
  */
-export async function downloadTwilioMedia({ accountSid, authToken, url, maxBytes = MAX_TWILIO_MEDIA_BYTES }) {
+export async function downloadTwilioMedia({ accountSid, authToken, url, messageSid = null, maxBytes = MAX_TWILIO_MEDIA_BYTES }) {
   if (!url) throw new Error('No media URL provided.');
+  const mediaUrl = validateTwilioMediaUrl(url, accountSid, messageSid);
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_TWILIO_MEDIA_BYTES) throw new Error('Invalid Twilio media size limit.');
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
-  const response = await fetch(String(url), {
+  const response = await fetch(mediaUrl, {
+    signal: AbortSignal.timeout(20_000),
+    redirect: 'manual',
     headers: { Authorization: `Basic ${credentials}` },
   });
+  // An automatic redirect can send credentials to a host chosen by an attacker
+  // or by a compromised upstream. Do not follow it, even if the initial URL was valid.
+  if (response.status >= 300 && response.status < 400) throw new Error('Twilio media redirected.');
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Twilio media download failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Twilio media download failed (${response.status})`);
   }
   const declared = Number(response.headers?.get?.('content-length'));
   if (Number.isFinite(declared) && declared > maxBytes) {
@@ -244,12 +262,12 @@ export async function transcribeVoiceNote({ apiKey, audioBytes, filename = 'voic
   form.append('file', new Blob([bytes], { type: mimeType }), filename);
   const response = await fetch(WHISPER_ENDPOINT, {
     method: 'POST',
+    signal: AbortSignal.timeout(30_000),
     headers: { Authorization: `Bearer ${apiKey.trim()}` },
     body: form,
   });
   if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    throw new Error(`Transcription failed (${response.status}): ${text.slice(0, 200)}`);
+    throw new Error(`Transcription failed (${response.status})`);
   }
   const data = await response.json().catch(() => ({}));
   return String(data.text || '').trim();

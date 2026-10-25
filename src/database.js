@@ -8,6 +8,7 @@ import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalize
 import { assertMemorySafe } from './relational-intelligence.js';
 import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from './portable-recovery.js';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './reply-jobs.js';
+import { currentDeleteApproval, decodeApprovalRow } from './delete-approval.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -86,6 +87,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
       password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','member')),
       disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS backup_deletion_queue (
+      account_ref TEXT PRIMARY KEY, requested_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS worker_leases (
+      name TEXT PRIMARY KEY, owner_token TEXT NOT NULL, expires_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -207,6 +214,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
       UNIQUE(user_id, device_token)
     );
+    CREATE TABLE IF NOT EXISTS push_session_bindings (
+      endpoint TEXT PRIMARY KEY REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS apns_session_bindings (
+      device_token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
       product_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
@@ -252,6 +269,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       generated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, month_key)
     );
+    CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      month_key TEXT NOT NULL,
+      token TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
     DROP TABLE IF EXISTS automation_tokens;
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -286,6 +309,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral);
     CREATE TABLE IF NOT EXISTS proactive_state (
       user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS proactive_slot_days (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      local_date TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(user_id,local_date)
+    );
+    CREATE TABLE IF NOT EXISTS proactive_slot_reservations (
+      token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      local_date TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','committed','released')),
+      created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS user_preferences (
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -360,6 +393,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       verified_at TEXT NOT NULL,
       last_inbound_at TEXT,
       created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
+      sid TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'accepted', lease_token TEXT, lease_expires_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
+      subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS radar_findings (
       finding_key TEXT PRIMARY KEY,
@@ -521,6 +562,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'people_mentions', 'sentiment', 'TEXT');
   ensureColumn(db, 'people_mentions', 'last_context_update', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
+  // Copy the old cap once. Reopening the database must never reset a new day's count.
+  db.exec(`INSERT OR IGNORE INTO proactive_slot_days(user_id,local_date,used_count)
+    SELECT p.user_id,p.outreach_date,p.outreach_count FROM proactive_state p
+    JOIN users u ON u.id=p.user_id WHERE p.outreach_date IS NOT NULL`);
   ensureColumn(db, 'proactive_state', 'last_app_open_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
@@ -533,7 +578,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'writing_voice_updated_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'writing_voice_offered', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'state', "TEXT NOT NULL DEFAULT 'accepted'");
+  ensureColumn(db, 'whatsapp_inbound_messages', 'lease_token', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'lease_expires_at', 'TEXT');
+  ensureColumn(db, 'whatsapp_inbound_messages', 'attempts', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_push_bindings_user ON push_session_bindings(user_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_apns_bindings_user ON apns_session_bindings(user_id)');
   ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
   ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
   db.exec("UPDATE processed_notifications SET state='processed',completed_at=COALESCE(completed_at,received_at) WHERE state IS NULL OR state!='processing'");
@@ -575,6 +626,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     createDemoUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,is_demo,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)'),
     listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<=?"),
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
+    queueBackupDeletion: db.prepare('INSERT OR IGNORE INTO backup_deletion_queue(account_ref,requested_at) VALUES(?,?)'),
+    listBackupDeletions: db.prepare('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
+    clearBackupDeletion: db.prepare('DELETE FROM backup_deletion_queue WHERE account_ref=?'),
+    claimWorkerLease: db.prepare(`INSERT INTO worker_leases(name,owner_token,expires_at) VALUES(?,?,?)
+      ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,expires_at=excluded.expires_at
+      WHERE worker_leases.expires_at<=?`),
+    renewWorkerLease: db.prepare('UPDATE worker_leases SET expires_at=? WHERE name=? AND owner_token=? AND expires_at>?'),
+    currentWorkerLease: db.prepare('SELECT 1 FROM worker_leases WHERE name=? AND owner_token=? AND expires_at>?'),
+    releaseWorkerLease: db.prepare('DELETE FROM worker_leases WHERE name=? AND owner_token=?'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE'),
     userById: db.prepare('SELECT * FROM users WHERE id = ?'),
     authIdentity: db.prepare('SELECT * FROM auth_identities WHERE provider=? AND subject=?'),
@@ -589,7 +649,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    session: db.prepare(`SELECT sessions.*, users.email, users.email_verified_at, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -612,6 +672,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listConversationExportPage: db.prepare(`SELECT *,rowid AS export_order FROM messages
+      WHERE user_id=? AND conversation_id=? AND (created_at,rowid)>(?,?)
+      ORDER BY created_at ASC,rowid ASC LIMIT ?`),
     listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
       (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
@@ -646,6 +709,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
     addImportJob: db.prepare('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'),
+    expireStaleImportJobs: db.prepare("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?"),
+    activeImportJob: db.prepare("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1"),
+    countRecentImportJobs: db.prepare('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?'),
     getImportJob: db.prepare('SELECT * FROM import_jobs WHERE id=? AND user_id=?'),
     listImportJobs: db.prepare('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5'),
     updateImportJob: db.prepare('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?'),
@@ -706,10 +772,19 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`),
     getProactiveState: db.prepare('SELECT * FROM proactive_state WHERE user_id=?'),
+    claimProactiveDay: db.prepare(`INSERT INTO proactive_slot_days(user_id,local_date,used_count) VALUES(?,?,1)
+      ON CONFLICT(user_id,local_date) DO UPDATE SET used_count=used_count+1 WHERE used_count<?`),
+    insertProactiveReservation: db.prepare("INSERT INTO proactive_slot_reservations(token,user_id,local_date,state,created_at) VALUES(?,?,?,'reserved',?)"),
+    commitProactiveReservation: db.prepare("UPDATE proactive_slot_reservations SET state='committed' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'"),
+    releaseProactiveReservation: db.prepare("UPDATE proactive_slot_reservations SET state='released' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'"),
+    releaseProactiveDay: db.prepare('UPDATE proactive_slot_days SET used_count=used_count-1 WHERE user_id=? AND local_date=? AND used_count>0'),
     upsertProactiveSlot: db.prepare(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
       ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
-      outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END`),
-    markOutreach: db.prepare('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?'),
+      outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
+      WHERE proactive_state.outreach_date IS DISTINCT FROM excluded.outreach_date OR proactive_state.outreach_count<?`),
+    markOutreach: db.prepare(`INSERT INTO proactive_state(user_id,last_outreach_at)
+      SELECT id,? FROM users WHERE id=?
+      ON CONFLICT(user_id) DO UPDATE SET last_outreach_at=excluded.last_outreach_at`),
     releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
       WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
     getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),
@@ -796,13 +871,20 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listCalendarFeeds: db.prepare('SELECT * FROM calendar_feeds WHERE user_id=? ORDER BY label COLLATE NOCASE'),
     deleteCalendarFeed: db.prepare('DELETE FROM calendar_feeds WHERE id=? AND user_id=?'),
     getTask: db.prepare('SELECT * FROM tasks WHERE id=? AND user_id=?'),
-    updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
-    updateTaskFields: db.prepare('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?'),
+    updateTask: db.prepare('UPDATE tasks SET status=?,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?'),
+    updateTaskFields: db.prepare("UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,status=CASE WHEN status='running' THEN CASE WHEN CAST(? AS TEXT) IS NULL OR CAST(? AS TEXT)<=CAST(? AS TEXT) THEN 'queued' ELSE 'scheduled' END ELSE status END,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?"),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id=? AND user_id=?'),
-    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')"),
+    claimTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING attempt_count"),
+    claimDueTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING *"),
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
-    completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?'),
-    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?"),
+    completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled','running','waiting_approval')"),
+    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running'"),
+    renewTaskLease: db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    activeTaskClaim: db.prepare("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status='running' AND tasks.attempt_count=? AND tasks.lease_expires_at>? AND users.disabled=0 AND users.moderation_blocked=0"),
+    deliverableTask: db.prepare("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status IN ('completed','scheduled','failed') AND tasks.attempt_count=? AND users.disabled=0 AND users.moderation_blocked=0"),
+    completeClaimedTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    failClaimedTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    releaseClaimedTask: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -812,19 +894,59 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listArtifacts: db.prepare('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200'),
     getArtifact: db.prepare('SELECT * FROM artifacts WHERE id=? AND user_id=?'),
     deleteArtifact: db.prepare('DELETE FROM artifacts WHERE id=? AND user_id=?'),
+    validPushSession: db.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id
+      WHERE s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`),
     addPush: db.prepare(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
       ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`),
-    listPush: db.prepare('SELECT * FROM push_subscriptions WHERE user_id=?'),
+    bindPush: db.prepare(`INSERT INTO push_session_bindings(endpoint,user_id,session_hash) VALUES(?,?,?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`),
+    listPush: db.prepare(`SELECT p.*,b.session_hash AS bound_session_hash FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE p.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`),
+    currentPush: db.prepare(`SELECT 1 FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE p.user_id=? AND p.endpoint=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`),
     deletePush: db.prepare('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?'),
-    deletePushById: db.prepare('DELETE FROM push_subscriptions WHERE id=?'),
+    deletePushById: db.prepare(`DELETE FROM push_subscriptions WHERE id=? AND EXISTS
+      (SELECT 1 FROM push_session_bindings b WHERE b.endpoint=push_subscriptions.endpoint AND b.session_hash=?)`),
     upsertApnsToken: db.prepare(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`),
-    listApnsTokens: db.prepare('SELECT * FROM apns_device_tokens WHERE user_id=?'),
+    clearOtherApnsOwners: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=? AND user_id<>?'),
+    bindApnsToken: db.prepare(`INSERT INTO apns_session_bindings(device_token,user_id,session_hash) VALUES(?,?,?)
+      ON CONFLICT(device_token) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`),
+    listApnsTokens: db.prepare(`SELECT a.*,b.session_hash AS bound_session_hash FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE a.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`),
+    currentApns: db.prepare(`SELECT 1 FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE a.user_id=? AND a.device_token=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`),
     deleteApnsToken: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=?'),
+    deleteApnsBinding: db.prepare('DELETE FROM apns_session_bindings WHERE device_token=? AND session_hash=?'),
     upsertSubscription: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
       expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
       original_transaction_id=excluded.original_transaction_id,last_event_signed_at=COALESCE(excluded.last_event_signed_at,subscriptions.last_event_signed_at),updated_at=excluded.updated_at`),
+    upsertSubscriptionNotification: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+      expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+      original_transaction_id=excluded.original_transaction_id,last_event_signed_at=excluded.last_event_signed_at,updated_at=excluded.updated_at
+      WHERE (subscriptions.app_account_token IS NULL OR subscriptions.app_account_token=excluded.app_account_token)
+        AND (subscriptions.last_event_signed_at IS NULL OR subscriptions.last_event_signed_at<excluded.last_event_signed_at)`),
+    insertSubscriptionIfAbsent: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING`),
+    updateSubscriptionIfUnchanged: db.prepare(`UPDATE subscriptions SET product_id=?,status=?,expires_at=?,app_account_token=?,environment=?,
+      original_transaction_id=?,last_event_signed_at=CASE WHEN ? IS NOT NULL AND (last_event_signed_at IS NULL OR last_event_signed_at<?)
+        THEN ? ELSE last_event_signed_at END,updated_at=?
+      WHERE user_id=? AND id=? AND product_id=? AND status=? AND expires_at IS ? AND app_account_token IS ?
+        AND environment=? AND original_transaction_id IS ? AND last_event_signed_at IS ?`),
     getSubscription: db.prepare('SELECT * FROM subscriptions WHERE user_id=?'),
     getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
     incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
@@ -837,6 +959,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     releaseNotification: db.prepare("DELETE FROM processed_notifications WHERE notification_id=? AND state='processing'"),
     pruneNotifications: db.prepare("DELETE FROM processed_notifications WHERE state='processed' AND received_at < datetime('now','-30 days')"),
     findUserByAppAccountToken: db.prepare('SELECT user_id FROM subscriptions WHERE app_account_token=?'),
+    findUserByPurchaseIntentToken: db.prepare("SELECT user_id FROM subscription_purchase_intents WHERE app_account_token=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1"),
     insertPurchaseIntent: db.prepare(`INSERT INTO subscription_purchase_intents(id,user_id,product_id,app_account_token,status,transaction_id,expires_at,created_at,completed_at)
       VALUES(?,?,?,?,'pending',NULL,?,?,NULL)`),
     getPurchaseIntent: db.prepare("SELECT * FROM subscription_purchase_intents WHERE user_id=? AND app_account_token=? AND product_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1"),
@@ -969,14 +1092,19 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    claimWorkerLease:(name,token,leaseMs=2*60_000)=>{const now=timestamp();return s.claimWorkerLease.run(name,token,new Date(Date.now()+leaseMs).toISOString(),now).changes>0;},
+    renewWorkerLease:(name,token,leaseMs=2*60_000)=>s.renewWorkerLease.run(new Date(Date.now()+leaseMs).toISOString(),name,token,timestamp()).changes>0,
+    isWorkerLeaseCurrent:(name,token)=>!!s.currentWorkerLease.get(name,token,timestamp()),
+    releaseWorkerLease:(name,token)=>s.releaseWorkerLease.run(name,token).changes>0,
     setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
-    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
+    createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,ownerApproved=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const apple=appleProofHash?db.prepare('DELETE FROM apple_signup_proofs WHERE token_hash=? AND email_hash=? AND expires_at>? RETURNING subject').get(appleProofHash,appleEmailHash,timestamp()):null;
         if(appleProofHash&&!apple)throw new Error('Apple proof expired');
         if(verificationHash && !s.useSignupVerificationToken.run(timestamp(),verificationHash,emailHash,timestamp()).changes) throw new Error('Verification expired');
         const count=s.countUsers.get().count;
+        if(count>0&&!verificationHash&&!apple&&!ownerApproved)throw new Error('Email proof required');
         if(count>0&&(environmentPaused||s.setting.get('signups_paused')?.value==='true'||(!automatic&&s.setting.get('registration_open')?.value!=='true')))throw new Error('Registration unavailable');
         const role=count===0?'owner':'member';
         const id=randomUUID(),now=timestamp();s.createUser.run(id,email,displayName,passwordHash,passwordSalt,role,now,now);
@@ -1025,10 +1153,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const row=s.getPwResetToken.get(hash,timestamp());
-        if(!row || !s.userById.get(row.user_id) || s.userById.get(row.user_id).disabled) { db.exec('ROLLBACK');return false; }
+        const user=row&&s.userById.get(row.user_id);
+        if(!user || user.disabled) { db.exec('ROLLBACK');return false; }
         if(!s.usePwResetToken.run(hash).changes) { db.exec('ROLLBACK');return false; }
-        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),row.user_id);
+        const now=timestamp();
+        s.updatePassword.run(passwordHash,passwordSalt,now,row.user_id);
         s.deleteUserSessions.run(row.user_id);
+        // A mailbox reset supersedes all previously issued offline recovery codes.
+        s.clearRecovery.run(row.user_id);
+        if(!user.email_verified_at){
+          // A prior registrant may have claimed this address without proving it.
+          // Remove alternate access and notification channels they could retain.
+          s.markUserEmailVerified.run(now,now,row.user_id);
+          db.prepare('DELETE FROM auth_identities WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM oauth_states WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM whatsapp_links WHERE user_id=?').run(row.user_id);
+          db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${row.user_id}:%`);
+          db.prepare('DELETE FROM push_subscriptions WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM apns_device_tokens WHERE user_id=?').run(row.user_id);
+          if(user.role==='owner')db.prepare('DELETE FROM door_tokens').run();
+        }
         db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(row.user_id);
         db.exec('COMMIT');return true;
       } catch(error) { db.exec('ROLLBACK');throw error; }
@@ -1040,16 +1184,28 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       s.linkAuthIdentity.run(provider, subject, userId, now, now);
       return s.authIdentity.get(provider, subject);
     },
+    linkAuthIdentityIfCurrent(provider,subject,userId,sessionHash,expectedPasswordHash,expectedPasswordSalt){return withImmediate(()=>{
+      const user=s.userById.get(userId),session=s.session.get(sessionHash,timestamp());
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt||session?.user_id!==userId)return false;
+      const now=timestamp();s.linkAuthIdentity.run(provider,subject,userId,now,now);
+      return true;
+    });},
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled(id, disabled) { return s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id, disabled?1:0).changes>0; },
     setModerationBlocked(id,blocked){return s.setModerationBlocked.run(blocked?1:0,blocked?1:0,timestamp(),id,blocked?0:1,blocked?0:1).changes>0;},
     markUserEmailVerified(id) { const now=timestamp();return s.markUserEmailVerified.run(now,now,id).changes>0; },
-    deleteUserAccount(userId) {
-      const account = s.userById.get(userId);
-      if (!account) return { deleted: false, successorId: null };
+    deleteUserAccount(userId,{sessionHash=null,expectedPasswordHash=null,expectedPasswordSalt=null}={}) {
       let successorId = null;
       db.exec('BEGIN IMMEDIATE');
       try {
+        const account=s.userById.get(userId);
+        if(!account){db.exec('ROLLBACK');return {deleted:false,successorId:null};}
+        if(expectedPasswordHash!==null){
+          const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+          if(account.password_hash!==expectedPasswordHash||account.password_salt!==expectedPasswordSalt||session?.user_id!==userId){
+            db.exec('ROLLBACK');return {deleted:false,successorId:null,staleCredentials:true};
+          }
+        }
         if (account.role === 'owner') {
           const successor = db.prepare(`SELECT id FROM users
             WHERE id<>? AND is_demo=0 AND disabled=0
@@ -1075,6 +1231,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         db.prepare('DELETE FROM settings WHERE instr(key, ?) > 0').run(userId);
         db.prepare('DELETE FROM access_requests WHERE lower(email)=lower(?)').run(account.email);
         db.prepare('DELETE FROM waitlist WHERE lower(email)=lower(?)').run(account.email);
+        s.queueBackupDeletion.run(userId,timestamp());
         s.deleteUser.run(userId);
         db.exec('COMMIT');
         return { deleted: true, successorId };
@@ -1084,7 +1241,21 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
     },
     claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
+    listPendingBackupDeletions:()=>s.listBackupDeletions.all(),
+    clearPendingBackupDeletion:(accountRef)=>s.clearBackupDeletion.run(accountRef).changes>0,
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
+    createPasswordSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,expectedPasswordHash,expectedPasswordSalt}) { return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt)return false;
+      s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    }); },
+    createAppleSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,identitySubject}){return withImmediate(()=>{
+      const user=s.userById.get(userId),identity=s.authIdentity.get('apple',identitySubject);
+      if(!user||user.disabled||user.moderation_blocked||identity?.user_id!==userId)return false;
+      s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    });},
     getSession: (tokenHash) => s.session.get(tokenHash, timestamp()),
     deleteSession: (tokenHash) => s.deleteSession.run(tokenHash),
     deleteUserSessions: (userId) => s.deleteUserSessions.run(userId),
@@ -1100,6 +1271,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         throw error;
       }
     },
+    replaceRecoveryCodesIfCurrent(userId,sessionHash,expectedPasswordHash,expectedPasswordSalt,hashes){return withImmediate(()=>{
+      const user=s.userById.get(userId),session=s.session.get(sessionHash,timestamp());
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt||session?.user_id!==userId)return false;
+      s.clearRecovery.run(userId);
+      for(const hash of hashes)s.addRecovery.run(randomUUID(),userId,hash,timestamp());
+      return true;
+    });},
     consumeRecoveryCode(hash,userId) { const row=s.recovery.get(hash); if(!row || (userId && row.user_id!==userId)) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
     getSetting: (key, fallback=null) => s.setting.get(key)?.value ?? fallback,
     setSetting(key,value) { s.setSetting.run(key,String(value),timestamp()); },
@@ -1114,17 +1292,34 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     acceptReplyJob(userId,conversationId,content,options={}){return withImmediate(()=>{
+      if(options.inboundSid){
+        const link=s.getWhatsAppLink.get(userId);
+        const user=db.prepare('SELECT disabled,moderation_blocked FROM users WHERE id=?').get(userId);
+        if(!link||link.phone_e164!==options.deliveryToPhone||link.verified_at!==options.deliveryLinkVerifiedAt||
+            !user||user.disabled===1||user.moderation_blocked===1)return null;
+        if(options.inboundLeaseToken){
+          if(!db.prepare(`UPDATE whatsapp_inbound_messages SET state='accepted',lease_token=NULL,lease_expires_at=NULL
+            WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>?`)
+            .run(options.inboundSid,options.inboundLeaseToken,timestamp()).changes)return null;
+        }else if(!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+          .run(options.inboundSid,timestamp()).changes)return null;
+      }
       const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
       s.addMessage.run(userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
       const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...options});
       s.touchConversation.run(timestamp(),conversationId,userId);
       return{userMessage,job};
     });},
-    acceptRegenerateReplyJob(userId,conversationId,userMessageId,targetMessageId,insertCreatedAt){return withImmediate(()=>{
+    acceptRegenerateReplyJob(userId,conversationId,userMessageId,targetMessageId,insertCreatedAt,quotaPolicy=null){return withImmediate(()=>{
       const userMessage=s.getMessage.get(userMessageId,userId);
       if(!userMessage||userMessage.conversation_id!==conversationId||userMessage.role!=='user')return null;
       const target=s.getMessage.get(targetMessageId,userId);
       if(!target||target.conversation_id!==conversationId||target.role!=='assistant')return null;
+      if(quotaPolicy?.enforced){
+        const prior=s.getDailyUsage.get(userId,quotaPolicy.day)?.count||0;
+        if(prior>=quotaPolicy.limit)return{quotaDenied:{...quotaPolicy,allowed:false,used:prior}};
+        s.incrementDailyUsage.run(userId,quotaPolicy.day,timestamp());
+      }
       s.deleteMessageRow.run(targetMessageId,userId);
       const job=insertReplyJob({userId,conversationId,userMessageId,kind:'regenerate',insertCreatedAt});
       s.touchConversation.run(timestamp(),conversationId,userId);
@@ -1193,6 +1388,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listPendingReplyDeliveries(limit=10){return db.prepare(`SELECT * FROM reply_jobs WHERE channel='whatsapp' AND status IN ('completed','interrupted')
       AND delivery_attempted_at IS NULL AND reply_message_id IS NOT NULL ORDER BY seq LIMIT ?`).all(Math.min(Math.max(limit,1),50));},
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
+    listConversationExportPage(userId,conversationId,after=null,limit=200){return s.listConversationExportPage.all(userId,conversationId,after?.created_at||'',after?.export_order||0,Math.min(Math.max(limit,1),200));},
     listConversationMessagesThrough(userId,conversationId,messageId,limit=60){return s.listConversationMessagesThrough.all(userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200)).reverse();},
     // Chat hot path: keep the SQLite and PostgreSQL adapters on one contract.
     // PostgreSQL resolves these independent reads concurrently inside its
@@ -1367,10 +1563,39 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
       return saved;
     },
-    createImportJob(userId,filename){const now=timestamp();const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;},
+    createImportJob(userId,filename){return withImmediate(()=>{
+      const now=timestamp();
+      s.expireStaleImportJobs.run(now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(s.activeImportJob.get(userId)||s.countRecentImportJobs.get(userId,new Date(Date.now()-24*60*60_000).toISOString()).count>=3)return null;
+      const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};
+      s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;
+    });},
     getImportJob:(userId,id)=>s.getImportJob.get(id,userId)||null,
     listImportJobs:(userId)=>s.listImportJobs.all(userId),
     updateImportJob(userId,id,patch={}){const cur=s.getImportJob.get(id,userId);if(!cur)return null;const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);return {...cur,...next};},
+    isImportJobActive(userId,id){
+      const row=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      return !!(row?.status==='processing'&&user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true');
+    },
+    updateImportJobIfCurrent(userId,id,patch={},allowInactive=false){return withImmediate(()=>{
+      const cur=s.getImportJob.get(id,userId);
+      if(cur?.status!=='processing')return null;
+      const user=s.userById.get(userId);
+      if(!allowInactive&&(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'))return null;
+      const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,
+        done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,
+        error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};
+      s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);
+      return{...cur,...next};
+    });},
+    addImportSuggestionIfCurrent(userId,id,content,options={}){return withImmediate(()=>{
+      const job=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      if(job?.status!=='processing'||!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const now=timestamp(),row={id:randomUUID(),user_id:userId,content:assertMemorySafe(content),created_at:now,
+        kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};
+      s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);
+      return row;
+    });},
     addFollowUp(userId,{description,dueDate,priority=2,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:validDateString(dueDate)||dueDate,status:'scheduled',priority:normalizePriority(priority),source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.priority,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===row.due_date);},
     listFollowUps:(userId)=>s.listFollowUps.all(userId),
     dueFollowUps:(userId,today,at=timestamp())=>s.dueFollowUps.all(userId,today,at),
@@ -1459,13 +1684,40 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimApproval(userId,id){const at=timestamp();const staleBefore=new Date(Date.now()-10*60_000).toISOString();if(!s.claimApproval.run(at,at,id,userId,staleBefore).changes)return null;return this.getApproval(userId,id);},
     resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     finishApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','failed'].includes(status))return null;const at=timestamp();if(!s.finishApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
+    executeDeleteApprovalIfCurrent(userId,approvalId){return withImmediate(()=>{
+      const raw=s.getApproval.get(approvalId,userId);
+      if(!raw||raw.status!=='pending'||raw.execution_started_at)return{status:'already'};
+      const approval=decodeApprovalRow(raw),{id,objectType}=approval.payload||{};
+      const target=objectType==='goal'?s.getGoal.get(id,userId):objectType==='task'?s.getTask.get(id,userId):objectType==='routine'?s.getRoutine.get(id,userId):null;
+      const recent=s.listMessages.all(userId,200);
+      const selected=currentDeleteApproval(approval,recent,target);
+      const now=timestamp();
+      if(!selected){
+        db.prepare("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run('Deletion request or target changed.',now,now,approvalId,userId);
+        return{status:'stale',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId))};
+      }
+      const deleted=selected.objectType==='goal'?s.deleteGoal.run(id,userId).changes:selected.objectType==='task'?s.deleteTask.run(id,userId).changes:s.deleteRoutine.run(id,userId).changes;
+      if(!deleted)throw new Error('Deletion target changed during transaction.');
+      const result={deleted:approval.kind,id:selected.id,title:selected.title};
+      db.prepare("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run(JSON.stringify(result),now,now,approvalId,userId);
+      return{status:'executed',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId)),result};
+    });},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
     getLastOutreachAt: (userId) => s.getProactiveState.get(userId)?.last_outreach_at || null,
-    claimProactiveSlot(userId,localDate,limit=3){const current=s.getProactiveState.get(userId);if(current?.outreach_date===localDate&&current.outreach_count>=limit)return false;s.upsertProactiveSlot.run(userId,localDate);return true;},
+    reserveProactiveSlot(userId,localDate,limit=3){return withImmediate(()=>{
+      if(s.claimProactiveDay.run(userId,localDate,limit).changes===0)return false;
+      const token=randomUUID();s.insertProactiveReservation.run(token,userId,localDate,timestamp());return token;
+    });},
+    claimProactiveSlot(userId,localDate,limit=3){const token=this.reserveProactiveSlot(userId,localDate,limit);
+      if(!token)return false;this.commitProactiveSlot(userId,localDate,token);return true;},
+    commitProactiveSlot:(userId,localDate,token)=>Boolean(token)&&s.commitProactiveReservation.run(token,userId,localDate).changes>0,
     markOutreach:(userId)=>s.markOutreach.run(timestamp(),userId).changes>0,
-    releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
+    releaseProactiveSlot:(userId,localDate,token)=>Boolean(token)&&withImmediate(()=>{
+      if(s.releaseProactiveReservation.run(token,userId,localDate).changes===0)return false;
+      s.releaseProactiveDay.run(userId,localDate);return true;
+    }),
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
     setBuddyName(userId,name){this.getPreferences(userId);const clean=String(name||'').trim().slice(0,40);if(!clean)throw new Error('Provide a name for your buddy (1-40 characters).');s.setBuddyName.run(clean,timestamp(),userId);return clean;},
@@ -1549,7 +1801,35 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
     getTimelineNarrative:(userId,monthKey)=>{const row=s.getTimelineNarrative.get(userId,monthKey);return row?row.narrative:null;},
+    getTimelineNarrativeRecord:(userId,monthKey)=>s.getTimelineNarrative.get(userId,monthKey)||null,
     setTimelineNarrative:(userId,monthKey,narrative)=>{s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());},
+    claimTimelineNarrative(userId,monthKey,freshAfter=null){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const cached=s.getTimelineNarrative.get(userId,monthKey);
+      if(cached&&(!freshAfter||cached.generated_at>freshAfter))return null;
+      const now=timestamp(),token=randomUUID();
+      const claimed=db.prepare(`INSERT INTO timeline_generation_leases(user_id,month_key,token,expires_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET month_key=excluded.month_key,token=excluded.token,expires_at=excluded.expires_at
+        WHERE timeline_generation_leases.expires_at<=?`).run(userId,monthKey,token,new Date(Date.now()+5*60_000).toISOString(),now);
+      return claimed.changes?token:null;
+    });},
+    isTimelineNarrativeLeaseActive(userId,monthKey,token){
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      return !!(user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true'
+        &&lease?.token===token&&lease.month_key===monthKey&&lease.expires_at>timestamp());
+    },
+    completeTimelineNarrative(userId,monthKey,token,narrative){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'
+        ||lease?.token!==token||lease.month_key!==monthKey||lease.expires_at<=timestamp())return false;
+      s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());
+      db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);
+      return true;
+    });},
+    releaseTimelineNarrative(userId,token){db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);},
     timelineMonthData(userId,monthKey){
       return {
         memories:s.timelineMemories.all(userId,monthKey),
@@ -1579,9 +1859,20 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteCalendarFeed: (userId, id) => s.deleteCalendarFeed.run(id, userId).changes > 0,
     getTask: (userId,id) => s.getTask.get(id,userId),
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
-    updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,now,id,userId);return s.getTask.get(id,userId);},
+    updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,nextSchedule,nextSchedule,now,now,id,userId);return s.getTask.get(id,userId);},
     deleteTask: (userId,id) => s.deleteTask.run(id,userId).changes>0,
-    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.run(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId).changes>0,
+    claimTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>s.claimTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId)?.attempt_count??null),
+    claimDueTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>{
+      const now=timestamp();
+      return s.claimDueTask.get(new Date(Date.now()+leaseMs).toISOString(),now,id,userId,now)||null;
+    }),
+    startTask(userId,id,leaseMs=2*60_000){return this.claimTask(userId,id,leaseMs)!==null;},
+    renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>s.renewTaskLease.run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
+    activeTaskClaim:(userId,id,attempt)=>Boolean(s.activeTaskClaim.get(id,userId,attempt,timestamp())),
+    deliverableTask:(userId,id,attempt)=>Boolean(s.deliverableTask.get(id,userId,attempt)),
+    completeClaimedTask:(userId,id,attempt,result,status='completed',scheduleAt=null)=>s.completeClaimedTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
+    failClaimedTask:(userId,id,attempt,message,error)=>s.failClaimedTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
+    releaseClaimedTask:(userId,id,attempt)=>{const current=timestamp();return s.releaseClaimedTask.run(current,current,id,userId,attempt).changes>0;},
     recoverStaleTasks(){const current=timestamp();return s.recoverTasks.run(current,current,current).changes;},
     completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
     failTask:(userId,id,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId).changes>0,
@@ -1593,16 +1884,45 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listArtifacts: (userId) => s.listArtifacts.all(userId),
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
     deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
-    savePush(userId,{endpoint,keys}) { s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp()); },
-    listPush: (userId) => s.listPush.all(userId),
+    savePush(userId,{endpoint,keys},sessionHash) { return withImmediate(()=>{
+      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
+      s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp());
+      s.bindPush.run(endpoint,userId,sessionHash);
+    }); },
+    listPush: (userId) => s.listPush.all(timestamp(),userId),
+    isPushRegistrationCurrent: (userId,endpoint,sessionHash) => Boolean(sessionHash&&s.currentPush.get(timestamp(),userId,endpoint,sessionHash)),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
-    deletePushById: (id) => s.deletePushById.run(id),
-    saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
-    listApnsTokens: (userId) => s.listApnsTokens.all(userId),
-    deleteApnsToken: (token) => s.deleteApnsToken.run(token),
+    deletePushById: (id,sessionHash) => s.deletePushById.run(id,sessionHash).changes>0,
+    saveApnsToken(userId,token,sessionHash) { return withImmediate(()=>{
+      if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
+      const now=timestamp();
+      s.clearOtherApnsOwners.run(token,userId);
+      s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now);
+      s.bindApnsToken.run(token,userId,sessionHash);
+    }); },
+    listApnsTokens: (userId) => s.listApnsTokens.all(timestamp(),userId),
+    isApnsRegistrationCurrent: (userId,token,sessionHash) => Boolean(sessionHash&&s.currentApns.get(timestamp(),userId,token,sessionHash)),
+    deleteApnsToken: (token,sessionHash) => withImmediate(()=>{
+      if(!sessionHash||!s.deleteApnsBinding.run(token,sessionHash).changes)return false;
+      s.deleteApnsToken.run(token);return true;
+    }),
     saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
       const now=timestamp();
       s.upsertSubscription.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken||null,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now);
+    },
+    applySubscriptionNotification(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt}) {
+      if(!appAccountToken||!lastEventSignedAt)throw new Error('Signed notification binding and date are required.');
+      const now=timestamp();
+      return s.upsertSubscriptionNotification.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now).changes>0;
+    },
+    saveSubscriptionIfUnchanged(userId,expected,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
+      const now=timestamp(),expiry=expiresAt||null,token=appAccountToken||null,origin=originalTransactionId||null,appEnvironment=environment||'production';
+      if(!expected)return s.insertSubscriptionIfAbsent.run(randomUUID(),userId,productId,status,expiry,token,appEnvironment,origin,lastEventSignedAt,now,now).changes>0;
+      if(expected.user_id!==userId)throw new Error('Subscription snapshot belongs to another account.');
+      return s.updateSubscriptionIfUnchanged.run(productId,status,expiry,token,appEnvironment,origin,
+        lastEventSignedAt,lastEventSignedAt,lastEventSignedAt,now,userId,expected.id,expected.product_id,
+        expected.status,expected.expires_at,expected.app_account_token,expected.environment,
+        expected.original_transaction_id,expected.last_event_signed_at).changes>0;
     },
     getSubscription: (userId) => s.getSubscription.get(userId)||null,
     getDailyUsageCount(userId,dayNy) { const row=s.getDailyUsage.get(userId,dayNy); return row?row.count:0; },
@@ -1622,7 +1942,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeNotification(notificationId) { return s.completeNotification.run(timestamp(),notificationId).changes>0; },
     releaseNotification(notificationId) { return s.releaseNotification.run(notificationId).changes>0; },
     pruneNotifications() { s.pruneNotifications.run(); },
-    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken); return row?row.user_id:null; },
+    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken)||s.findUserByPurchaseIntentToken.get(appAccountToken,timestamp()); return row?row.user_id:null; },
     createPurchaseIntent(userId,productId,appAccountToken,expiresAt) { const row={id:randomUUID(),user_id:userId,product_id:productId,app_account_token:appAccountToken,status:'pending',expires_at:expiresAt,created_at:timestamp()}; s.insertPurchaseIntent.run(row.id,row.user_id,row.product_id,row.app_account_token,row.expires_at,row.created_at); return row; },
     getPurchaseIntent(userId,appAccountToken,productId) { return s.getPurchaseIntent.get(userId,appAccountToken,productId,timestamp())||null; },
     completePurchaseIntent(id,transactionId) { return s.completePurchaseIntent.run(transactionId,timestamp(),id).changes>0; },
@@ -1632,6 +1952,77 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
+    issueWhatsAppLinkCode(userId,code,expiresAt) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const prior=s.setting.get(key)?.value;
+      if(prior&&new Date(prior.slice(prior.indexOf(':')+1)).valueOf()>Date.now())throw new Error('Link code collision');
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      s.setSetting.run(key,`${userId}:${expiresAt}`,timestamp());
+      return true;
+    });},
+    consumeWhatsAppLinkCode(code) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`;
+      const record=s.setting.get(key)?.value;
+      if(!record)return null;
+      db.prepare('DELETE FROM settings WHERE key=?').run(key);
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      return sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
+    });},
+    consumeAndLinkWhatsApp(code,phoneE164,inboundSid=null) { return withImmediate(()=>{
+      const key=`whatsapp_link_code_${code}`,record=s.setting.get(key)?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
+      const owner=db.prepare("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0").get(userId);
+      if(!owner)return null;
+      if(inboundSid&&!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+        .run(inboundSid,timestamp()).changes)return null;
+      db.prepare('DELETE FROM settings WHERE key=? AND value=?').run(key,record);
+      const now=timestamp();
+      s.linkWhatsApp.run(userId,phoneE164,now,now,now);
+      return userId;
+    });},
+    revokeWhatsAppLinkCodes(userId) { return db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`).changes; },
+    unlinkWhatsAppAndRevoke(userId) { return withImmediate(()=>{
+      db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${userId}:%`);
+      return s.unlinkWhatsApp.run(userId).changes>0;
+    });},
+    allowWhatsAppLinkAttempt(phone) { return withImmediate(()=>{
+      const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
+      const get=db.prepare('SELECT window_start,attempts FROM whatsapp_link_attempts WHERE subject=?');
+      const put=db.prepare(`INSERT INTO whatsapp_link_attempts(subject,window_start,attempts) VALUES(?,?,?)
+        ON CONFLICT(subject) DO UPDATE SET window_start=excluded.window_start,attempts=excluded.attempts`);
+      for(const [subject,limit] of [[phone,5],['*',30]]){
+        const previous=get.get(subject);
+        const sameWindow=previous&&previous.window_start>=cutoff;
+        const attempts=sameWindow?previous.attempts+1:1;
+        if(attempts>limit)return false;
+        put.run(subject,sameWindow?previous.window_start:now,attempts);
+      }
+      return true;
+    });},
+    claimWhatsAppInboundSid(sid) { return db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)').run(sid,timestamp()).changes>0; },
+    getWhatsAppInboundState(sid) { return db.prepare('SELECT state FROM whatsapp_inbound_messages WHERE sid=?').get(sid)?.state||null; },
+    claimWhatsAppInboundMedia(sid,leaseMs=90_000) { return withImmediate(()=>{
+      const now=timestamp(),row=db.prepare('SELECT state,lease_expires_at,attempts FROM whatsapp_inbound_messages WHERE sid=?').get(sid);
+      if(row?.state==='accepted'||row?.state==='failed')return{state:row.state};
+      if(row?.state==='processing'&&row.lease_expires_at>now)return{state:'busy'};
+      if(row&&row.attempts>=5){
+        db.prepare("UPDATE whatsapp_inbound_messages SET state='failed',lease_token=NULL,lease_expires_at=NULL WHERE sid=?").run(sid);
+        return{state:'failed'};
+      }
+      const token=randomUUID(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      if(row)db.prepare(`UPDATE whatsapp_inbound_messages SET state='processing',lease_token=?,lease_expires_at=?,attempts=attempts+1 WHERE sid=?`)
+        .run(token,expiresAt,sid);
+      else db.prepare(`INSERT INTO whatsapp_inbound_messages(sid,created_at,state,lease_token,lease_expires_at,attempts)
+        VALUES(?,?,'processing',?,?,1)`).run(sid,now,token,expiresAt);
+      return{state:'claimed',token};
+    });},
+    finishWhatsAppInboundMedia(sid,token,retryable=false) { return db.prepare(`UPDATE whatsapp_inbound_messages
+      SET state=CASE WHEN ?=1 AND attempts<5 THEN 'retryable' ELSE 'failed' END,lease_token=NULL,lease_expires_at=NULL
+      WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING state`)
+      .get(retryable?1:0,sid,token,timestamp())?.state||null; },
+    pruneWhatsAppInbound() { const cutoff=new Date(Date.now()-30*86400_000).toISOString();db.prepare('DELETE FROM whatsapp_inbound_messages WHERE created_at<?').run(cutoff);db.prepare('DELETE FROM whatsapp_link_attempts WHERE window_start<?').run(new Date(Date.now()-86400_000).toISOString()); },
     getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
     setWhatsAppLastInbound: (userId,at=timestamp()) => s.setWhatsAppLastInbound.run(at,userId).changes>0,

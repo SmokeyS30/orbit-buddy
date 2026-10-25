@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openDatabase } from '../src/database.js';
+import { createOrbitServer } from '../server.js';
 import {
   resolveRelativeDate, executeTool,
   toolCreateGoal, toolCreateTask, toolCreateRoutine,
@@ -11,14 +12,41 @@ import {
   toolDeleteGoal, toolDeleteTask, toolDeleteRoutine, toolConfirmDeleteApproval
 } from '../src/tools.js';
 
-// D2: chat-as-manager — in-chat updates (low-risk, fuzzy match) and deletion
-// (always confirm-in-chat: stage → explicit yes → execute).
+// D2: chat-as-manager — low-risk updates in chat; destructive changes use
+// server-owned approval cards and a separate authenticated button press.
 
 function fixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-manage-'));
   const db = openDatabase(path.join(directory, 'test.sqlite'));
   const user = db.createUser({ email: 'owner@example.com', displayName: 'Owner', passwordHash: 'hash', passwordSalt: 'salt', role: 'owner' });
-  return { db, user, ctx: { db, userId: user.id, timeZone: 'America/New_York', messageId: null } };
+  const conversation=db.ensureDefaultConversation(user.id);
+  const ctx={ db, userId: user.id, timeZone: 'America/New_York', messageId: null };
+  const turn=(message)=>{
+    const row=db.addMessage(user.id,conversation.id,'user',message);
+    return {...ctx,messageId:row.id,conversationId:conversation.id,userMessage:message};
+  };
+  const reply=(message)=>db.addMessage(user.id,conversation.id,'assistant',message);
+  return { db, user, ctx, turn, reply };
+}
+
+async function approvalApiFixture(t){
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-delete-api-'));
+  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test'}});
+  await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await app.close();fs.rmSync(directory,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  const registered=await fetch(`${base}/api/auth/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:'delete-owner@example.test',displayName:'Owner',password:'correct horse battery staple'})});
+  assert.equal(registered.status,201);
+  const account=await registered.json();
+  const cookie=registered.headers.get('set-cookie').split(';')[0];
+  const headers={Cookie:cookie,'X-Orbit-CSRF':account.csrf,'Content-Type':'application/json'};
+  const approve=(id,requestHeaders=headers)=>fetch(`${base}/api/approvals/${id}/approve`,{method:'POST',headers:requestHeaders,body:'{}'});
+  const stage=(goal,description)=>{
+    const conversation=app.db.ensureDefaultConversation(account.user.id);
+    const source=app.db.addMessage(account.user.id,conversation.id,'user',description);
+    return toolDeleteGoal({goalId:goal.id},{db:app.db,userId:account.user.id,messageId:source.id});
+  };
+  return{app,base,account,headers,approve,stage};
 }
 
 const THU = new Date('2026-10-15T12:00:00Z'); // Thursday 08:00 EDT
@@ -127,49 +155,237 @@ test('update_routine changes time and pauses by fuzzy title', () => {
   db.close();
 });
 
-test('delete_goal stages a request but deletes nothing until confirmed', () => {
-  const { db, user, ctx } = fixture();
+test('model cannot stage and confirm a deletion during one user turn', () => {
+  const {db,user,ctx,turn}=fixture();
+  const goal=toolCreateGoal({title:'Keep this goal'},ctx);
+  const first=turn('Delete Keep this goal');
+  const staged=toolDeleteGoal({title:'Keep this goal'},first);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},first),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  assert.equal(db.getApproval(user.id,staged.approvalId).status,'pending');
+  db.close();
+});
+
+test('delete confirmation rejects ambiguous, stale and cross-conversation replies', () => {
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Keep the goal'},ctx);
+  const staged=toolDeleteGoal({title:'Keep the goal'},turn('Delete Keep the goal'));
+  reply(`Confirm deletion: ${staged.preview}`);
+  const other=db.createConversation(user.id,'Another thread');
+  const cross=db.addMessage(user.id,other.id,'user','yes');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...ctx,messageId:cross.id}),/Chat cannot execute deletions/i);
+  const ambiguous=turn('yes, but keep the goal');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},ambiguous),/Chat cannot execute deletions/i);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/Chat cannot execute deletions/i,
+    'an unrelated intervening user turn invalidates the old preview');
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('delete confirmation requires a visible preview naming the target and deletion', () => {
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Keep the goal'},ctx);
+  const staged=toolDeleteGoal({title:'Keep the goal'},turn('Delete Keep the goal'));
+  reply('Sure, would you like help with that goal?');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('a negated deletion mention cannot turn a generic yes into consent',()=>{
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Gym'},ctx);
+  const staged=toolDeleteGoal({goalId:goal.id},turn('Could you delete Gym?'));
+  reply('I will not delete Gym. Would you like a reminder instead?');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('quoting a deletion request cannot turn a generic yes into consent',()=>{
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Gym'},ctx);
+  const staged=toolDeleteGoal({goalId:goal.id},turn('Delete Gym'));
+  reply('You said “Delete Gym,” but I have only noted that as a quote. Would you like a reminder?');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('yes to a reminder is not permission for an unrelated staged deletion',()=>{
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Gym'},ctx);
+  const staged=toolDeleteGoal({goalId:goal.id},turn('Help me with Gym'));
+  reply('Would you like a reminder to go to Gym instead?');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('an overlapping name and one generic yes cannot authorize two targets',()=>{
+  const {db,user,ctx,turn,reply}=fixture();
+  const gym=toolCreateGoal({title:'Gym'},ctx),shoes=toolCreateGoal({title:'Gym shoes'},ctx);
+  const source=turn('Delete Gym and Gym shoes');
+  const gymApproval=toolDeleteGoal({goalId:gym.id},source);
+  const shoesApproval=toolDeleteGoal({goalId:shoes.id},source);
+  reply(`Confirm deletion: ${shoesApproval.preview}`);
+  const yes=turn('yes');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:gymApproval.approvalId},yes),/Chat cannot execute deletions/i);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:shoesApproval.approvalId},yes),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,gym.id));assert.ok(db.getGoal(user.id,shoes.id));
+  db.close();
+});
+
+test('a newer cancellation withdraws an earlier deletion confirmation',()=>{
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Gym'},ctx);
+  const staged=toolDeleteGoal({goalId:goal.id},turn('Delete Gym'));
+  reply(`Confirm deletion: ${staged.preview}`);
+  const yes=turn('yes');
+  turn('No, cancel the deletion');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},yes),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('delete_goal stages a request that chat can never execute', () => {
+  const { db, user, ctx, turn, reply } = fixture();
   const created = toolCreateGoal({ title: 'Drop me' }, ctx);
-  const staged = toolDeleteGoal({ title: 'drop me' }, ctx);
+  const staged = toolDeleteGoal({ title: 'drop me' }, turn('Delete Drop me'));
   assert.ok(staged.approvalId);
   assert.match(staged.preview, /Drop me/);
   assert.match(staged.note, /NOT deleted/);
-  // The confirm-in-chat gate: staging alone must not delete.
+  // The server-owned approval card is the only destructive path.
   assert.ok(db.getGoal(user.id, created.id), 'goal must still exist before confirmation');
   const approval = db.getApproval(user.id, staged.approvalId);
   assert.equal(approval.kind, 'delete_goal');
   assert.equal(approval.status, 'pending');
-  const done = toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx);
-  assert.equal(done.deleted, true);
-  assert.equal(done.title, 'Drop me');
-  assert.equal(db.getGoal(user.id, created.id), null);
-  assert.equal(db.getApproval(user.id, staged.approvalId).status, 'executed');
+  reply(`Confirm deletion: ${staged.preview}`);
+  const confirmedTurn=turn('yes');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...confirmedTurn,regenerated:true}),/Chat cannot execute deletions/i);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},confirmedTurn),/Chat cannot execute deletions/i);
+  assert.ok(db.getGoal(user.id, created.id));
+  assert.equal(db.getApproval(user.id, staged.approvalId).status, 'pending');
   db.close();
 });
 
-test('confirm_delete_approval rejects double-confirm and unknown approvals', () => {
-  const { ctx } = fixture();
+test('confirm_delete_approval rejects even an explicit yes and an unknown approval', () => {
+  const { ctx, turn, reply } = fixture();
   const created = toolCreateGoal({ title: 'Drop me twice' }, ctx);
-  const staged = toolDeleteGoal({ title: 'drop me twice' }, ctx);
+  const staged = toolDeleteGoal({ title: 'drop me twice' }, turn('Delete Drop me twice'));
   assert.equal(created.title, 'Drop me twice');
-  toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx);
-  assert.throws(() => toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx), /already reviewed/);
-  assert.throws(() => toolConfirmDeleteApproval({ approvalId: '00000000-0000-0000-0000-000000000000' }, ctx), /No pending deletion/);
+  reply(`Confirm deletion: ${staged.preview}`);
+  const confirmedTurn=turn('yes, delete it');
+  assert.throws(() => toolConfirmDeleteApproval({ approvalId: staged.approvalId }, confirmedTurn), /Chat cannot execute deletions/i);
+  assert.throws(() => toolConfirmDeleteApproval({ approvalId: '00000000-0000-0000-0000-000000000000' }, confirmedTurn), /No pending deletion/);
 });
 
-test('delete_task and delete_routine follow the same confirm gate', () => {
-  const { db, user, ctx } = fixture();
+test('delete_task and delete_routine also cannot execute from chat', () => {
+  const { db, user, ctx, turn, reply } = fixture();
   const task = toolCreateTask({ title: 'Temp task', prompt: 'Do it' }, ctx);
-  const stagedTask = toolDeleteTask({ task: 'temp' }, ctx);
+  const stagedTask = toolDeleteTask({ task: 'temp' }, turn('Delete Temp task'));
   assert.ok(db.getTask(user.id, task.id), 'task must still exist before confirmation');
-  toolConfirmDeleteApproval({ approvalId: stagedTask.approvalId }, ctx);
-  assert.equal(db.getTask(user.id, task.id), undefined);
+  reply(`Confirm deletion: ${stagedTask.preview}`);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:stagedTask.approvalId},turn('yes')),/Chat cannot execute deletions/i);
+  assert.ok(db.getTask(user.id,task.id));
   const routine = toolCreateRoutine({ title: 'Temp routine', prompt: 'Run', kind: 'custom', cadence: 'daily', timeLocal: '09:00' }, ctx);
-  const stagedRoutine = toolDeleteRoutine({ routine: 'temp' }, ctx);
+  const stagedRoutine = toolDeleteRoutine({ routine: 'temp' }, turn('Delete Temp routine'));
   assert.ok(db.getRoutine(user.id, routine.id), 'routine must still exist before confirmation');
-  toolConfirmDeleteApproval({ approvalId: stagedRoutine.approvalId }, ctx);
-  assert.equal(db.getRoutine(user.id, routine.id), null);
+  reply(`Confirm deletion: ${stagedRoutine.preview}`);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:stagedRoutine.approvalId},turn('confirm deletion')),/Chat cannot execute deletions/i);
+  assert.ok(db.getRoutine(user.id,routine.id));
   db.close();
+});
+
+test('SQLite approval transaction deletes a task or routine once, only for its owner',()=>{
+  const {db,user,ctx,turn}=fixture();
+  const cases=[
+    {type:'task',created:toolCreateTask({title:'Synthetic task',prompt:'Do it'},ctx),stage:()=>toolDeleteTask({task:'synthetic task'},turn('Delete Synthetic task')),read:id=>db.getTask(user.id,id)},
+    {type:'routine',created:toolCreateRoutine({title:'Synthetic routine',prompt:'Run',kind:'custom',cadence:'daily',timeLocal:'09:00'},ctx),stage:()=>toolDeleteRoutine({routine:'synthetic routine'},turn('Delete Synthetic routine')),read:id=>db.getRoutine(user.id,id)}
+  ];
+  for(const entry of cases){
+    const staged=entry.stage();
+    assert.ok(entry.read(entry.created.id));
+    assert.equal(db.executeDeleteApprovalIfCurrent('another-user',staged.approvalId).status,'already');
+    assert.ok(entry.read(entry.created.id));
+    const result=db.executeDeleteApprovalIfCurrent(user.id,staged.approvalId);
+    assert.equal(result.status,'executed');
+    assert.equal(result.result.deleted,`delete_${entry.type}`);
+    assert.equal(entry.read(entry.created.id)==null,true);
+    assert.equal(db.executeDeleteApprovalIfCurrent(user.id,staged.approvalId).status,'already');
+  }
+  db.close();
+});
+
+test('the authenticated approval card deletes only its exact target once',async t=>{
+  const {app,base,account,headers,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id;
+  const gym=app.db.addGoal(userId,{title:'Gym'}),shoes=app.db.addGoal(userId,{title:'Gym shoes'});
+  const gymApproval=stage(gym,'Delete Gym');
+  const shoesApproval=stage(shoes,'Delete Gym shoes');
+  const snapshot=await fetch(`${base}/api/snapshot`,{headers:{Cookie:headers.Cookie}});
+  assert.equal(snapshot.status,200);
+  const cards=(await snapshot.json()).approvals;
+  assert.ok(cards.some(card=>card.id===shoesApproval.approvalId&&card.title.includes('Gym shoes')));
+  assert.equal((await approve(shoesApproval.approvalId,{Cookie:headers.Cookie,'Content-Type':'application/json'})).status,403);
+  assert.equal((await approve(shoesApproval.approvalId)).status,200);
+  assert.ok(app.db.getGoal(userId,gym.id));
+  assert.equal(app.db.getGoal(userId,shoes.id),null);
+  assert.equal(app.db.getApproval(userId,gymApproval.approvalId).status,'pending');
+  assert.equal((await approve(shoesApproval.approvalId)).status,409);
+});
+
+test('a newer cancellation invalidates the server-owned deletion card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  const source=app.db.getMessage(userId,app.db.getApproval(userId,staged.approvalId).source_message_id);
+  app.db.addMessage(userId,source.conversation_id,'user','yes');
+  app.db.addMessage(userId,source.conversation_id,'user','No, cancel the deletion');
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
+test('any newer chat turn invalidates a staged deletion card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  const source=app.db.getMessage(userId,app.db.getApproval(userId,staged.approvalId).source_message_id);
+  app.db.addMessage(userId,source.conversation_id,'user','Thanks, and what is next?');
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
+test('a cancellation in another conversation invalidates the deletion card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  const other=app.db.createConversation(userId,'Different thread');
+  app.db.addMessage(userId,other.id,'user','Cancel the Gym deletion');
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
+test('a renamed target cannot be deleted through its old approval card',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  app.db.updateGoal(userId,goal.id,{title:'Gym shoes'});
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+});
+
+test('a changed target with the same title invalidates its old deletion preview',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  app.db.updateGoal(userId,goal.id,{progress:50});
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
 });
 
 test('delete tools ask on ambiguity and stage nothing', () => {
