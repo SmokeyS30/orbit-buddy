@@ -35,9 +35,11 @@ test('phone and desktop tiers are untouched by the intermediate tier', () => {
   assert.match(desktop, /@media\(min-width:1400px\)\{\s*\.shell\{width:min\(1320px,calc\(100% - 48px\)\)\}/);
   assert.match(mobile, /@media\(max-width:760px\)/);
   assert.match(mobile, /@media\(max-width:380px\)/);
-  // The intermediate tier exists exactly once, so its rules cannot leak
-  // into phone or desktop widths through a second unbounded block.
-  assert.equal(desktop.split('@media(min-width:761px)').length - 1, 1);
+  // The bounded intermediate tier exists exactly once, so its rules
+  // cannot leak into phone or desktop widths through a second copy.
+  // (Stage 2 adds a separate, deliberately unbounded desk-mode block at
+  // the same 761px cutover — counted in test/duo-desk-mode.test.js.)
+  assert.equal(desktop.split('@media(min-width:761px) and (max-width:1023px)').length - 1, 1);
 });
 
 test('chat stays bottom-anchored in every tier', () => {
