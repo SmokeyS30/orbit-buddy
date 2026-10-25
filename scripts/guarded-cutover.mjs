@@ -13,6 +13,47 @@ function requireReady(app, revision) {
     throw new Error('Preflight requires one healthy ready revision.');
 }
 
+// Exercise the deployed workflow identity's complete revision and replica
+// reads before the first Azure mutation. A healthy current revision alone does
+// not prove that the identity can later verify old workers have drained.
+async function preflightInventory({ az, signal, previous }) {
+  stopped(signal);
+  const app = await az('show');
+  const current = await az('revision', previous.name);
+  requireReady(app, current);
+  if (current.image !== previous.image || current.hold !== previous.hold)
+    throw new Error('Current Azure revision changed during read-only preflight.');
+  const readNames = async () => {
+    const rows = await az('revisions'); // CLI adapter uses --all, including inactive revisions.
+    const names = Array.isArray(rows) ? rows.map(row => row?.name) : null;
+    if (!names?.length || names.some(name => typeof name !== 'string' || !name) ||
+        new Set(names).size !== names.length || !names.includes(previous.name))
+      throw new Error('Preflight revision inventory is unknown, incomplete, or malformed.');
+    return names;
+  };
+  const names = await readNames();
+  for (const name of names) {
+    stopped(signal);
+    const revision = await az('revision', name);
+    const replicas = await az('replicas', name);
+    if (revision?.name !== name || typeof revision.active !== 'boolean' ||
+        !Array.isArray(replicas) || replicas.some(row => typeof row !== 'string' || !row) ||
+        new Set(replicas).size !== replicas.length)
+      throw new Error('Preflight revision or replica state is unknown or malformed.');
+  }
+  stopped(signal);
+  const confirmed = await readNames();
+  if (confirmed.length !== names.length || confirmed.some(name => !names.includes(name)))
+    throw new Error('Preflight revision inventory changed before mutation.');
+  const after = await az('show');
+  const afterRevision = await az('revision', previous.name);
+  requireReady(after, afterRevision);
+  if (after.ready !== previous.name || afterRevision.image !== previous.image ||
+      afterRevision.hold !== previous.hold)
+    throw new Error('Current Azure revision changed during read-only preflight.');
+  return names;
+}
+
 async function readyRevision({ az, sleep, signal, image, hold, oldName, attempts, allowSame = false }) {
   for (let i = 0; i < attempts; i++) {
     stopped(signal);
@@ -149,6 +190,8 @@ export async function deployHeld(options) {
     if (before.ready !== previous.name || beforeRevision.image !== previous.image ||
         beforeRevision.hold !== previous.hold)
       throw new Error('Current Azure revision changed before deployment.');
+    await preflightInventory({ az, signal, previous });
+    stopped(signal);
     attempted = true;
     await az('updateHeld', desired);
     deployed = await readyRevision({ az, sleep, signal, image: desired, hold: true,
@@ -201,16 +244,14 @@ export async function openHeld(options) {
   if (prior.image !== image || prior.hold !== true)
     throw new Error('Only the exact healthy held image can be opened.');
   await publicReady({ fetchJson, fetchStatic, sleep, signal, sha, hold: true, attempts: publicAttempts });
-  const revisions = await az('revisions');
-  if (!Array.isArray(revisions) || !revisions.some(row => row.name === prior.name))
-    throw new Error('Revision inventory is unknown; hold remains closed.');
+  const revisions = await preflightInventory({ az, signal, previous: prior });
   let bootstrapFound = false;
   for (const revision of revisions) {
-    if (revision.name !== prior.name) {
-      const details = await az('revision', revision.name);
+    if (revision !== prior.name) {
+      const details = await az('revision', revision);
       if (details?.image === imageFor(bootstrapSha) && details.hold === true)
         bootstrapFound = true;
-      await retired({ az, sleep, signal, name: revision.name, attempts: drainAttempts });
+      await retired({ az, sleep, signal, name: revision, attempts: drainAttempts });
     }
   }
   if (!bootstrapFound) throw new Error('A retired held bootstrap guard revision is required before opening.');

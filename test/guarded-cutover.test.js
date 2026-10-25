@@ -48,8 +48,66 @@ test('held bootstrap verifies exact image, public hold, and two empty predecesso
   assert.equal(result.cutoverHold, true);
   assert.equal(state.revisions.old.active, false);
   assert.equal(state.revisions.old.replicas.length, 0);
-  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'old').length, 2);
+  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'old').length, 3);
   assert.equal(state.calls.filter(([op]) => op === 'updateOpen').length, 0);
+});
+
+test('held deployment probes all active and inactive replica reads before its first update', async () => {
+  const { state, options } = fixture();
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  await deployHeld({ ...options, sha: newSha });
+  const update = state.calls.findIndex(([op]) => op === 'updateHeld');
+  assert.ok(update > 0);
+  assert.ok(state.calls.slice(0, update).some(([op]) => op === 'revisions'));
+  for (const name of ['old', 'stale'])
+    assert.ok(state.calls.slice(0, update).some(([op, value]) => op === 'replicas' && value === name));
+});
+
+test('denied or malformed revision inventory stops before any held image mutation', async () => {
+  for (const response of [new Error('synthetic revision-list permission denied'), [],
+    [{ name: 'other' }], [{ name: 'old' }, { name: 'old' }]]) {
+    const { state, options } = fixture();
+    const az = async (op, value) => op === 'revisions'
+      ? response instanceof Error ? Promise.reject(response) : response
+      : options.az(op, value);
+    await assert.rejects(deployHeld({ ...options, az, sha: newSha }),
+      /permission denied|unknown, incomplete, or malformed/);
+    assert.equal(state.calls.some(([op]) => op.startsWith('update')), false);
+  }
+});
+
+test('denied, missing, or malformed replica data stops before held image mutation', async () => {
+  for (const response of [new Error('synthetic replica-list permission denied'), null, [null], ['same','same']]) {
+    const { state, options } = fixture();
+    state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+      active: false, health: 'Healthy', replicas: [] };
+    const az = async (op, value) => op === 'replicas' && value === 'stale'
+      ? response instanceof Error ? Promise.reject(response) : response
+      : options.az(op, value);
+    await assert.rejects(deployHeld({ ...options, az, sha: newSha }),
+      /permission denied|unknown or malformed/);
+    assert.equal(state.calls.some(([op]) => op.startsWith('update')), false);
+  }
+});
+
+test('unreadable revision details or inventory changes stop before held image mutation', async () => {
+  for (const fail of ['details', 'changed-list']) {
+    const { state, options } = fixture();
+    state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+      active: false, health: 'Healthy', replicas: [] };
+    let inventories = 0;
+    const az = async (op, value) => {
+      if (fail === 'details' && op === 'revision' && value === 'stale')
+        throw new Error('synthetic revision-show permission denied');
+      if (fail === 'changed-list' && op === 'revisions' && ++inventories === 2)
+        return [{ name: 'old' }];
+      return options.az(op, value);
+    };
+    await assert.rejects(deployHeld({ ...options, az, sha: newSha }),
+      /permission denied|inventory changed before mutation/);
+    assert.equal(state.calls.some(([op]) => op.startsWith('update')), false);
+  }
 });
 
 test('bootstrap failure never rolls back to an unguarded previous revision', async () => {
@@ -121,8 +179,22 @@ test('opening exact held image succeeds only after all predecessors retire', asy
   const result = await openHeld({ ...options, sha: newSha, bootstrapSha: oldSha });
   assert.equal(result.cutoverHold, false);
   assert.equal(state.revisions[result.revision].image, image(newSha));
-  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'stale').length, 4);
-  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'old').length, 2);
+  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'stale').length, 5);
+  assert.equal(state.calls.filter(([op, value]) => op === 'replicas' && value === 'old').length, 3);
+  const update = state.calls.findIndex(([op]) => op === 'updateOpen');
+  assert.ok(state.calls.slice(0, update).some(([op, value]) => op === 'replicas' && value === 'old'));
+  assert.ok(state.calls.slice(0, update).some(([op, value]) => op === 'replicas' && value === 'stale'));
+});
+
+test('denied current replica read prevents opening a held revision', async () => {
+  const { state, options } = fixture({ oldHold: true });
+  state.revisions.old.image = image(newSha);
+  state.revisions.stale = { name: 'stale', image: image(oldSha), hold: true,
+    active: false, health: 'Healthy', replicas: [] };
+  const az = async (op, value) => op === 'replicas' && value === 'old'
+    ? Promise.reject(new Error('synthetic current-replica permission denied')) : options.az(op, value);
+  await assert.rejects(openHeld({ ...options, az, sha: newSha, bootstrapSha: oldSha }), /permission denied/);
+  assert.equal(state.calls.some(([op]) => op.startsWith('update')), false);
 });
 
 test('inactive flag is required even when replica list is empty', async () => {
