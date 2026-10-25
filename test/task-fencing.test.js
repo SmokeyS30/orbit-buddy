@@ -153,6 +153,22 @@ test('disabled accounts cannot claim, renew, complete, or receive a task result'
   assert.equal(db.claimTask(user.id,task.id),null);
 });
 
+test('ten earlier blocked due tasks cannot hide a later eligible task in SQLite',t=>{
+  const {db}=fixture(t);
+  const oldDue=new Date(Date.now()-120_000).toISOString();
+  const laterDue=new Date(Date.now()-60_000).toISOString();
+  for(let i=0;i<10;i++){
+    const blocked=db.createUser({email:`blocked-${i}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    db.addTask(blocked.id,{title:`Blocked ${i}`,prompt:'Do not run',scheduleAt:oldDue});
+    assert.equal(i%2?db.setModerationBlocked(blocked.id,true):db.setUserDisabled(blocked.id,true),true);
+  }
+  const eligible=db.createUser({email:'eligible@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+  const task=db.addTask(eligible.id,{title:'Eligible',prompt:'Run',scheduleAt:laterDue});
+  const due=db.dueTasks();
+  assert.deepEqual(due.map(row=>row.id),[task.id]);
+  assert.equal(db.claimDueTask(eligible.id,task.id)?.id,task.id);
+});
+
 test('cancelling while model work is in flight discards its result and notifications',async t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-interleave-'));
   const model=createModelClient({NODE_ENV:'test'});
@@ -217,7 +233,12 @@ test('cancellation after completion blocks the next external notification',async
   const user=app.db.createUser({email:'delivery@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   let webSends=0,nativeSends=0;
-  app.push.notify=async()=>{webSends++;app.db.setTaskStatus(user.id,task.id,'cancelled');return{sent:1,failed:0};};
+  app.push.notify=async(_userId,_title,_body,_data,canDeliver)=>{
+    assert.equal(canDeliver(),true);
+    webSends++;app.db.setTaskStatus(user.id,task.id,'cancelled');
+    assert.equal(canDeliver(),false,'the per-device guard observes cancellation');
+    return{sent:1,failed:0};
+  };
   app.apns.notify=async()=>{nativeSends++;return{sent:1,failed:0};};
   await app.runDueTasks();
   assert.equal(webSends,1,'the first already-started provider send cannot be retracted');

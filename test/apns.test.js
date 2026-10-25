@@ -111,6 +111,23 @@ test('push targets the APNs production endpoint with provider auth', async () =>
   assert.ok(!JSON.stringify(payload).includes('secret-token'));
 });
 
+test('APNs checks task delivery eligibility before each device send',async()=>{
+  const {p8}=ecKeyPair();
+  const transport=fakeHttp2();
+  let allowed=true,sends=0;
+  const connect=url=>{
+    const session=transport.connect(url),request=session.request.bind(session);
+    session.request=headers=>{sends++;allowed=false;return request(headers);};
+    return session;
+  };
+  const db=mockDb([{device_token:'a'.repeat(64)},{device_token:'b'.repeat(64)}]).db;
+  const apns=createApnsService({APNS_KEY_P8:p8,APNS_KEY_ID:'KEY123',APNS_TEAM_ID:'TEAM456'},db,{connect});
+  const result=await apns.notify('synthetic-user','Task','Result',{},()=>allowed);
+  assert.equal(sends,1,'the second device is not contacted after eligibility is revoked');
+  assert.equal(result.sent,1);
+  apns.close();
+});
+
 test('provider token is cached across sends (not re-signed every push)', async () => {
   const { p8 } = ecKeyPair();
   const { connect, captured } = fakeHttp2();

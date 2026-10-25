@@ -15,11 +15,12 @@ export function createPushService(env, db) {
 
   return {
     configured, publicKey: configured ? publicKey : null,
-    async notify(userId, title, body, data = {}) {
+    async notify(userId, title, body, data = {}, canDeliver = () => true) {
       if (!configured) return { sent: 0, failed: 0 };
       let sent = 0; let failed = 0;
       const payload = JSON.stringify(genericPushPayload(data));
       for (const subscription of db.listPush(userId)) {
+        if (!canDeliver()) break;
         if(!db.isPushRegistrationCurrent(userId,subscription.endpoint,subscription.bound_session_hash))continue;
         try {
           await webpush.sendNotification({ endpoint: subscription.endpoint, keys: { p256dh: subscription.p256dh, auth: subscription.auth } }, payload, { TTL: 3600, urgency: 'normal' });
