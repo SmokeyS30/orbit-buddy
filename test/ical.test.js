@@ -7,6 +7,23 @@ const OCT = Date.UTC(2026, 9, 1);
 const NOV = Date.UTC(2026, 10, 1);
 const DEC = Date.UTC(2026, 11, 1);
 
+test('calendar parser rejects oversized event sets and subdaily recurrence rules',()=>{
+  const one=['BEGIN:VEVENT','UID:large','DTSTART:20261005T090000Z','SUMMARY:Large','END:VEVENT'].join('\n');
+  assert.throws(()=>parseIcs(Array.from({length:2001},(_,index)=>one.replace('UID:large',`UID:large-${index}`)).join('\n')),
+    /too many events/);
+  const secondly=one.replace('END:VEVENT','RRULE:FREQ=SECONDLY;COUNT=3600\nEND:VEVENT');
+  assert.throws(()=>parseIcs(secondly),/too complex/);
+  const invalidInterval=one.replace('END:VEVENT','RRULE:FREQ=DAILY;INTERVAL=0\nEND:VEVENT');
+  assert.throws(()=>parseIcs(invalidInterval),/too complex/);
+  assert.throws(()=>parseIcs(invalidInterval.replace('INTERVAL=0','INTERVAL=00')),/too complex/);
+});
+
+test('calendar recurrence expansion stops before materializing an excessive range',()=>{
+  const ics=['BEGIN:VEVENT','UID:daily-large','DTSTART:20200101T090000Z',
+    'RRULE:FREQ=DAILY;COUNT=6000','SUMMARY:Daily','END:VEVENT'].join('\n');
+  assert.throws(()=>expandEvents(parseIcs(ics),Date.UTC(2020,0,1),Date.UTC(2040,0,1),'UTC'),/too many occurrences/);
+});
+
 test('parseIcs handles TZID events, folding, and escaped text', () => {
   const ics = [
     'BEGIN:VCALENDAR',
