@@ -482,7 +482,7 @@ export function createModelClient(env = process.env) {
   // options.pinModel: route by model name even when the endpoint has a fixed
   // deployment (lets the luna fast-path actually hit the luna deployment on
   // Azure instead of the sol deployment).
-  const requestWithResilience = async (singleRequest, modelInput, modelName, { pinModel = false } = {}) => {
+  const requestWithResilience = async (singleRequest, modelInput, modelName, { pinModel = false, assertActive = () => {} } = {}) => {
     let lastError = null;
     for (const endpoint of requestEndpoints) {
       const endpointModel = pinModel
@@ -491,10 +491,13 @@ export function createModelClient(env = process.env) {
       let delayMs = RETRY_BASE_DELAY_MS;
       for (let attempt = 0; ; attempt += 1) {
         try {
+          await assertActive();
           const output = await singleRequest(endpoint, modelInput, endpointModel);
+          await assertActive();
           activeEndpointName = endpoint.name;
           return output;
         } catch (error) {
+          if (error?.code === 'REPLY_LEASE_LOST') throw error;
           error.classification = error?.classification || classifyModelError(error);
           lastError = error;
           const transient = FAILOVER_TRANSIENT_CLASSES.has(error.classification);
@@ -588,22 +591,22 @@ export function createModelClient(env = process.env) {
   // options: { tools } includes TOOL_DEFINITIONS in the payload,
   // { pinModel } routes by model name on fixed-deployment endpoints,
   // { extra } passes additional body params (e.g. max_output_tokens).
-  const requestModel = (modelInput, modelName, { tools = false, pinModel = false, extra = {} } = {}) =>
+  const requestModel = (modelInput, modelName, { tools = false, pinModel = false, extra = {}, assertActive } = {}) =>
     requestWithResilience(
       (endpoint, input, name) => requestModelOnce(endpoint, input, name, { tools, ...extra }),
-      modelInput, modelName, { pinModel }
+      modelInput, modelName, { pinModel, assertActive }
     );
-  const requestModelStream = (modelInput, modelName, onToken, { tools = false, pinModel = false, extra = {} } = {}) =>
+  const requestModelStream = (modelInput, modelName, onToken, { tools = false, pinModel = false, extra = {}, assertActive } = {}) =>
     requestWithResilience(
       (endpoint, input, name) => requestModelStreamOnce(endpoint, input, name, onToken, { tools, ...extra }),
-      modelInput, modelName, { pinModel }
+      modelInput, modelName, { pinModel, assertActive }
     );
 
   // Model fallback chain shared by respond() and respondChitchat().
   // updatePreferredModel decides whether a successful candidate becomes the
   // preferred model for subsequent turns (respond: yes for non-complex
   // routing; chitchat: never — luna must not become the chat default).
-  const callWithFallback = async (request, input, { candidates, routeTargetModel, updatePreferredModel = () => true }) => {
+  const callWithFallback = async (request, input, { candidates, routeTargetModel, updatePreferredModel = () => true, assertActive = () => {} }) => {
     // Only use the explicitly configured compatibility chain. The models
     // endpoint can contain dozens of specialized models that are not safe
     // drop-in replacements for a chat response.
@@ -614,7 +617,9 @@ export function createModelClient(env = process.env) {
     for (const candidate of modelCandidates) {
       selectedModel = candidate;
       try {
+        await assertActive();
         const output = await request(input, selectedModel);
+        await assertActive();
         if (updatePreferredModel(selectedModel)) preferredModel = selectedModel;
         const viaSecondary = activeEndpointName !== 'primary';
         const routeSucceeded = selectedModel === routeTargetModel && !viaSecondary;
@@ -625,6 +630,7 @@ export function createModelClient(env = process.env) {
         health.lastError = routeSucceeded ? null : `${unavailable.join(', ') || routeTargetModel} unavailable; using ${selectedModel}${viaSecondary ? ` via the ${activeEndpointName} region` : ''}.`;
         return { output, selectedModel };
       } catch (error) {
+        if (error?.code === 'REPLY_LEASE_LOST') throw error;
         error.classification = error?.classification || classifyModelError(error);
         // Rate limits are account-level: trying another model won't escape
         // a 429. Throw immediately so callers hit their rate_limit
@@ -727,7 +733,8 @@ export function createModelClient(env = process.env) {
     fallbackModels,
     diagnostics: () => ({ ...health }),
     checkConnection,
-    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null, emotionContext = null, relationalContext = null, membershipTier = 'included' }) {
+    async respond({ buddyName, userName, message, images = [], memories = [], goals = [], projects = [], history = [], conversationSummary = '', userTimeZone = 'America/New_York', taskMode = false, tools = false, toolContext = null, onToken = null, onTurn = null, needsBuddyName = false, needsAmbientAsk = false, writingVoice = null, offerWritingVoice = false, soulDirective = null, proactiveMemory = null, emotionContext = null, relationalContext = null, membershipTier = 'included', assertActive = () => {} }) {
+      await assertActive();
       if (!apiKey) {
         const prefix = taskMode ? 'I prepared a safe task outline' : `I’m ${buddyName}, running in demo mode`;
         return { text: `${prefix}. Add OPENAI_API_KEY to enable model-generated responses. Your request was: “${message.slice(0, 240)}”`, toolCalls: [] };
@@ -833,6 +840,7 @@ export function createModelClient(env = process.env) {
         callWithFallback(request, input, {
           candidates: [selectedModel, ...(useComplexModel ? [model] : []), ...fallbackModels],
           routeTargetModel,
+          assertActive,
           updatePreferredModel: (used) => !useComplexModel || used !== complexModel
         }).then(({ output, selectedModel: used }) => {
           selectedModel = used;
@@ -844,8 +852,8 @@ export function createModelClient(env = process.env) {
       const requestOutput = async (input, stream) => {
         const extra = membershipTier === 'unlimited' ? { max_output_tokens: 1000 } : {};
         const requestFn = stream
-          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools: tools ? availableToolDefinitions : false, extra })
-          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra });
+          ? (modelInput, modelName) => requestModelStream(modelInput, modelName, onToken, { tools: tools ? availableToolDefinitions : false, extra, assertActive })
+          : (modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra, assertActive });
         let failure;
         try {
           const output = await callModelWithFallback(requestFn, input);
@@ -857,13 +865,15 @@ export function createModelClient(env = process.env) {
           }
           return output;
         } catch (error) {
+          if (error?.code === 'REPLY_LEASE_LOST') throw error;
           failure = error;
         }
         let classification = failure?.classification || classifyModelError(failure);
         if (stream && ['request', 'stream'].includes(classification)) {
           try {
-            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra }), input);
+            return await callModelWithFallback((modelInput, modelName) => requestModel(modelInput, modelName, { tools: tools ? availableToolDefinitions : false, extra, assertActive }), input);
           } catch (error) {
+            if (error?.code === 'REPLY_LEASE_LOST') throw error;
             failure = error;
             classification = error?.classification || classifyModelError(error);
           }
@@ -876,6 +886,7 @@ export function createModelClient(env = process.env) {
           try {
             return await callModelWithFallback(requestFn, input);
           } catch (error) {
+            if (error?.code === 'REPLY_LEASE_LOST') throw error;
             failure = error;
             classification = error?.classification || classifyModelError(error);
           }
@@ -885,21 +896,26 @@ export function createModelClient(env = process.env) {
       };
       if (tools) {
         for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration += 1) {
+          await assertActive();
           if (onTurn) onTurn(iteration);
           const output = await requestOutput(modelInput,true);
+          await assertActive();
           lastOutput = output;
           const calls = output.filter((item) => item?.type === 'function_call');
           modelInput = [...modelInput, ...output];
           if (!calls.length) break;
           for (const call of calls) {
+            await assertActive();
             const args = parseArgs(call.arguments);
             toolCalls.push({ name: call.name, detail: summarizeToolCall(call.name, args) });
             let result;
             try {
               result = (await executeTool(call.name, args, env, toolContext)).result;
             } catch (error) {
+              if (error?.code === 'REPLY_LEASE_LOST') throw error;
               result = { error: String(error?.message || error).slice(0, 500) };
             }
+            await assertActive();
             modelInput.push({
               type: 'function_call_output',
               call_id: call.call_id,
@@ -909,6 +925,7 @@ export function createModelClient(env = process.env) {
         }
       } else {
         lastOutput = await requestOutput(modelInput,false);
+        await assertActive();
         modelInput = [...modelInput, ...lastOutput];
       }
       if (tools && !extractText({ output: lastOutput })) {
@@ -918,13 +935,16 @@ export function createModelClient(env = process.env) {
         const withTools = tools;
         tools = false;
         try {
+          await assertActive();
           lastOutput = await requestOutput(modelInput, true);
+          await assertActive();
           modelInput = [...modelInput, ...lastOutput];
         } finally {
           tools = withTools;
         }
       }
       const text = extractText({ output: lastOutput });
+      await assertActive();
       if (!text) throw new Error('The model returned no text output.');
       return { text, toolCalls };
     },
@@ -935,13 +955,14 @@ export function createModelClient(env = process.env) {
     // configured Luna deployment name for each Azure endpoint. Throws when
     // Luna cannot serve the request so the caller can retry on the full Sol
     // path — this method never fails the turn by itself.
-    async respondChitchat({ buddyName, userName, message, soulDirective = null, userTimeZone = 'America/New_York', onToken = null, onTurn = null }) {
+    async respondChitchat({ buddyName, userName, message, soulDirective = null, userTimeZone = 'America/New_York', onToken = null, onTurn = null, assertActive = () => {} }) {
+      await assertActive();
       if (!apiKey) {
         return { text: `I'm ${buddyName || 'Orbit'}, running in demo mode. Add OPENAI_API_KEY to enable model-generated responses. Your message was: “${String(message || '').slice(0, 240)}”`, toolCalls: [] };
       }
       if (onTurn) onTurn(0);
       const modelInput = buildChitchatPrompt({ buddyName, userName, message, soulDirective, userTimeZone });
-      const requestOptions = { pinModel: true, extra: { max_output_tokens: 150 } };
+      const requestOptions = { pinModel: true, extra: { max_output_tokens: 150 }, assertActive };
       const requestFn = onToken
         ? (input, modelName) => requestModelStream(input, modelName, onToken, requestOptions)
         : (input, modelName) => requestModel(input, modelName, requestOptions);
@@ -952,13 +973,16 @@ export function createModelClient(env = process.env) {
           // Sol path with tools, memories, history, and safety context intact.
           candidates: [lunaModel],
           routeTargetModel: lunaModel,
+          assertActive,
           // A luna reply must never become the preferred model for full turns.
           updatePreferredModel: () => false
         });
+        await assertActive();
         const chitchatText = extractText({ output });
         if (!chitchatText) throw new Error('The model returned no text output.');
         return { text: chitchatText, toolCalls: [] };
       } catch (error) {
+        if (error?.code === 'REPLY_LEASE_LOST') throw error;
         recordFailure(error);
         throw error;
       }

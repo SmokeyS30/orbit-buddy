@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 import { assertMemorySafe } from '../relational-intelligence.js';
+import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from '../reply-jobs.js';
 
 const { Pool } = pg;
 const timestamp = () => new Date().toISOString();
@@ -95,8 +96,14 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
 
   // Test connection
   const client = await pool.connect();
+  let migrationLockHeld=false;
   try {
     await client.query('SELECT 1');
+    // Multiple replicas may start together during a deployment. Serialize
+    // additive DDL so each checks the finished schema, not a rival's partial
+    // migration. PostgreSQL releases this session lock if the worker exits.
+    await client.query('SELECT pg_advisory_lock($1::bigint)',[6108403817]);
+    migrationLockHeld=true;
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
       ...signupSecuritySchema,
@@ -140,6 +147,10 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_job_id TEXT',
+      'CREATE SEQUENCE IF NOT EXISTS message_insert_order_seq',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS insert_order BIGINT',
+      "ALTER TABLE messages ALTER COLUMN insert_order SET DEFAULT nextval('message_insert_order_seq')",
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT \'legacy\'',
@@ -336,8 +347,39 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       "ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'processed'",
       'ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS completed_at TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
+      `CREATE TABLE IF NOT EXISTS reply_jobs (
+        seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        id TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        user_message_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('chat','regenerate')),
+        channel TEXT NOT NULL CHECK(channel IN ('web','whatsapp')),
+        status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','interrupted','cancelled')),
+        origin_instance TEXT,
+        requires_ephemeral INTEGER NOT NULL DEFAULT 0,
+        queued_at TEXT NOT NULL,
+        claimed_at TEXT,
+        lease_expires_at TEXT,
+        lease_token TEXT,
+        completed_at TEXT,
+        reply_message_id TEXT,
+        insert_created_at TEXT,
+        delivery_attempted_at TEXT,
+        delivery_to_phone TEXT,
+        delivery_link_verified_at TEXT
+      )`,
+      'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_to_phone TEXT',
+      'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_link_verified_at TEXT',
     ];
 const indexMigrations = [
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id)',
+      'CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(user_id,conversation_id,created_at DESC,insert_order DESC,id DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
@@ -365,8 +407,20 @@ const indexMigrations = [
     // Reports are required by the reporting routes. Surface a failed table
     // migration at startup instead of leaving those routes to fail later.
     await client.query('SELECT 1 FROM reports LIMIT 0');
+    await client.query('SELECT 1 FROM reply_jobs LIMIT 0');
+    await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
+    const ordering=await client.query(`SELECT column_default FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
+    if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
+      throw new Error('PostgreSQL message insertion ordering migration is incomplete.');
+    }
+    const uniqueness=await client.query(`SELECT pg_get_indexdef(to_regclass('public.idx_messages_reply_job')) AS definition`);
+    if(!/^CREATE UNIQUE INDEX /i.test(String(uniqueness.rows[0]?.definition||''))){
+      throw new Error('PostgreSQL reply job uniqueness migration is incomplete.');
+    }
   } finally {
-    client.release();
+    try{if(migrationLockHeld)await client.query('SELECT pg_advisory_unlock($1::bigint)',[6108403817]);}
+    finally{client.release();}
   }
 
   // Helper to run queries
@@ -633,13 +687,105 @@ const indexMigrations = [
       await run('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES (?, ?, ?, ?, ?, ?)', row.id, row.user_id, row.conversation_id, row.role, row.content, row.created_at);
       return row;
     },
+    acceptReplyJob: async (userId,conversationId,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
+      if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
+      // Serialize accepts for one conversation before allocating the global
+      // sequence. Otherwise a later seq can commit and run before an earlier
+      // uncommitted job becomes visible to claimers.
+      if(!await tGet('SELECT id FROM conversations WHERE id=? AND user_id=? FOR UPDATE',conversationId,userId))
+        throw new Error('Conversation not found.');
+      const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
+      await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)',
+        userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
+      const jobId=randomUUID(),queuedAt=timestamp();
+      const job=await tGet(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,origin_instance,requires_ephemeral,queued_at,lease_expires_at,delivery_to_phone,delivery_link_verified_at)
+        VALUES(?,?,?,?,'chat',?,?,?,?,?,?,?) RETURNING *`,jobId,userId,conversationId,userMessage.id,channel,originInstance,requiresEphemeral?1:0,queuedAt,
+        requiresEphemeral?new Date(Date.now()+REPLY_LEASE_MS).toISOString():null,deliveryToPhone,deliveryLinkVerifiedAt);
+      await tRun('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?',timestamp(),conversationId,userId);
+      return{userMessage,job};
+    }),
+    acceptRegenerateReplyJob: async (userId,conversationId,userMessageId,targetMessageId,insertCreatedAt)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      if(!await tGet('SELECT id FROM conversations WHERE id=? AND user_id=? FOR UPDATE',conversationId,userId))return null;
+      const userMessage=await tGet('SELECT * FROM messages WHERE id=? AND user_id=? AND conversation_id=? AND role=\'user\'',userMessageId,userId,conversationId);
+      const target=await tGet('SELECT * FROM messages WHERE id=? AND user_id=? AND conversation_id=? AND role=\'assistant\' FOR UPDATE',targetMessageId,userId,conversationId);
+      if(!userMessage||!target)return null;
+      await tRun('DELETE FROM messages WHERE id=? AND user_id=?',targetMessageId,userId);
+      const job=await tGet(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,queued_at,insert_created_at)
+        VALUES(?,?,?,?,'regenerate','web',?,?) RETURNING *`,randomUUID(),userId,conversationId,userMessageId,timestamp(),insertCreatedAt);
+      await tRun('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?',timestamp(),conversationId,userId);
+      return{userMessage,job};
+    }),
+    getReplyJob: async (id)=>get('SELECT * FROM reply_jobs WHERE id=?',id),
+    getConversationReplyJobState: async (userId,conversationId)=>get('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1',userId,conversationId),
+    cancelDisallowedReplyJobs: async ()=>(await run(`UPDATE reply_jobs j SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      FROM users u WHERE j.user_id=u.id AND j.status IN ('queued','running')
+      AND (u.disabled=1 OR u.moderation_blocked=1)`,timestamp())).changes,
+    cancelReplyJob: async (id,token)=>(await run(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE id=? AND status='running' AND lease_token=?`,timestamp(),id,token)).changes>0,
+    renewQueuedEphemeralReplyJobs: async (instanceId)=>(await run(`UPDATE reply_jobs SET lease_expires_at=? WHERE origin_instance=?
+      AND requires_ephemeral=1 AND status='queued'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),instanceId)).changes,
+    claimNextReplyJob: async (instanceId,leaseMs=REPLY_LEASE_MS)=>withTransaction(async ({get:tGet})=>{
+      const job=await tGet(`SELECT j.* FROM reply_jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.status='queued'
+        AND (j.requires_ephemeral=0 OR j.origin_instance=?)
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs active WHERE active.conversation_id=j.conversation_id AND active.status='running')
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs prior WHERE prior.conversation_id=j.conversation_id
+          AND prior.seq<j.seq AND prior.status IN ('queued','running'))
+        ORDER BY j.seq LIMIT 1 FOR UPDATE OF j,c SKIP LOCKED`,instanceId);
+      if(!job)return null;
+      const token=randomUUID(),claimedAt=timestamp(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      return tGet(`UPDATE reply_jobs SET status='running',claimed_at=?,lease_expires_at=?,lease_token=?
+        WHERE id=? AND status='queued' RETURNING *`,claimedAt,expiresAt,token,job.id);
+    }),
+    renewReplyJobLease: async (id,token,leaseMs=REPLY_LEASE_MS)=>(await run(`UPDATE reply_jobs SET lease_expires_at=?
+      WHERE id=? AND lease_token=? AND status='running' AND lease_expires_at>?`,new Date(Date.now()+leaseMs).toISOString(),id,token,timestamp())).changes>0,
+    releaseReplyJob: async (id,token)=>(await run(`UPDATE reply_jobs SET status='queued',claimed_at=NULL,
+      lease_expires_at=CASE WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
+      WHERE id=? AND lease_token=? AND status='running'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token)).changes>0,
+    completeReplyJob: async (id,token,content,insertCreatedAt=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const job=await tGet('SELECT * FROM reply_jobs WHERE id=? FOR UPDATE',id);
+      if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
+      const account=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',job.user_id);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        await tRun("UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL WHERE id=?",timestamp(),id);
+        return null;
+      }
+      const message={id:randomUUID(),user_id:job.user_id,conversation_id:job.conversation_id,role:'assistant',content,
+        created_at:insertCreatedAt||timestamp(),reply_job_id:id};
+      await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id) VALUES(?,?,?,?,?,?,?)',
+        message.id,message.user_id,message.conversation_id,message.role,message.content,message.created_at,id);
+      await tRun(`UPDATE reply_jobs SET status='completed',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=? AND lease_token=?`,
+        timestamp(),message.id,id,token);
+      return message;
+    }),
+    recoverExpiredReplyJobs: async (nowMs=Date.now())=>withTransaction(async ({all:tAll,get:tGet,run:tRun})=>{
+      const current=new Date(nowMs).toISOString();
+      const jobs=await tAll(`SELECT * FROM reply_jobs WHERE
+        (status='running' AND lease_expires_at<=?) OR
+        (status='queued' AND requires_ephemeral=1 AND lease_expires_at<=?)
+        ORDER BY seq FOR UPDATE SKIP LOCKED`,current,current);
+      for(const job of jobs){
+        await tRun(`INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id)
+          VALUES(?,?,?,'assistant',?,?,?) ON CONFLICT(reply_job_id) DO NOTHING`,randomUUID(),job.user_id,job.conversation_id,
+          REPLY_INTERRUPTED_TEXT,job.insert_created_at||current,job.id);
+        const reply=await tGet('SELECT id FROM messages WHERE reply_job_id=?',job.id);
+        await tRun(`UPDATE reply_jobs SET status='interrupted',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=?`,
+          current,reply?.id||null,job.id);
+      }
+      return jobs.length;
+    }),
+    markReplyDeliveryAttempted: async (id)=>(await run(`UPDATE reply_jobs SET delivery_attempted_at=? WHERE id=? AND channel='whatsapp'
+      AND status IN ('completed','interrupted') AND delivery_attempted_at IS NULL`,timestamp(),id)).changes>0,
+    listPendingReplyDeliveries: async (limit=10)=>all(`SELECT * FROM reply_jobs WHERE channel='whatsapp'
+      AND status IN ('completed','interrupted') AND delivery_attempted_at IS NULL AND reply_message_id IS NOT NULL
+      ORDER BY seq LIMIT ?`,Math.min(Math.max(limit,1),50)),
     async listConversationMessages(userId, conversationId, limit=60) {
-      return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
+      return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
     async listConversationMessagesThrough(userId, conversationId, messageId, limit=60) {
-      return (await all(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND (created_at,id)<=
-        (SELECT created_at,id FROM messages WHERE id=? AND user_id=? AND conversation_id=?)
-        ORDER BY created_at DESC,id DESC LIMIT ?`,userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200))).reverse();
+      return (await all(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND (created_at,COALESCE(insert_order,0),id)<=
+        (SELECT created_at,COALESCE(insert_order,0),id FROM messages WHERE id=? AND user_id=? AND conversation_id=?)
+        ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?`,userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200))).reverse();
     },
     // Chat hot path: one worker crossing, with independent PostgreSQL reads in
     // flight together. The synchronous wrapper otherwise serializes every
@@ -650,7 +796,7 @@ const indexMigrations = [
       let [conversation, history, preferences, summary, settingRows, countRow] = await Promise.all([
         get('SELECT * FROM conversations WHERE id=? AND user_id=?', conversationId, userId),
         historyLimit > 0
-          ? all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, limit)
+          ? all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, conversationId, limit)
           : Promise.resolve([]),
         get('SELECT * FROM user_preferences WHERE user_id=?', userId),
         get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId),
@@ -680,7 +826,7 @@ const indexMigrations = [
       };
     },
     async listMessages(userId, limit=60) {
-      return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
+      return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
     getReportSubmission: async (userId, submissionId) => get('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?', userId, submissionId),
     countRecentReports: async (userId, since) => Number((await get('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?', userId, since)).count),
@@ -709,7 +855,7 @@ const indexMigrations = [
     async deleteMessageTurn(userId, messageId) {
       const target = await get('SELECT * FROM messages WHERE id=? AND user_id=?', messageId, userId);
       if (!target) return null;
-      const ordered = await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at ASC, id ASC LIMIT 200', userId, target.conversation_id);
+      const ordered = await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at ASC, insert_order ASC NULLS FIRST, id ASC LIMIT 200', userId, target.conversation_id);
       const idx = ordered.findIndex((m) => m.id === messageId);
       const ids = [messageId];
       const prev = idx > 0 ? ordered[idx - 1] : null;
@@ -717,7 +863,11 @@ const indexMigrations = [
       if (target.role === 'assistant' && prev && prev.role === 'user') ids.push(prev.id);
       if (target.role === 'user' && next && next.role === 'assistant') ids.push(next.id);
       await withTransaction(async ({ run: tRun }) => {
-        for (const id of ids) await tRun('DELETE FROM messages WHERE id=? AND user_id=?', id, userId);
+        for (const id of ids){
+          await tRun(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+            WHERE user_id=? AND user_message_id=? AND status IN ('queued','running')`,timestamp(),userId,id);
+          await tRun('DELETE FROM messages WHERE id=? AND user_id=?', id, userId);
+        }
       });
       return ids;
     },

@@ -159,6 +159,9 @@ test('every table the Postgres adapter queries exists in postgres-schema.sql', (
   const schema = fs.readFileSync(new URL('../src/db/postgres-schema.sql', import.meta.url), 'utf8');
   const referenced = new Set();
   for (const m of pg.matchAll(/(?:INSERT INTO|UPDATE|DELETE FROM|FROM)\s+(\w+)/gi)) {
+    // PostgreSQL's FOR UPDATE OF / FOR UPDATE SKIP LOCKED are row-lock
+    // clauses; OF and SKIP are not table names being updated.
+    if (/^UPDATE\b/i.test(m[0]) && /\bFOR\s+$/i.test(pg.slice(Math.max(0,m.index-10),m.index))) continue;
     referenced.add(m[1].toLowerCase());
   }
   const defined = new Set([
