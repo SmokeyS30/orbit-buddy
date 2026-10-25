@@ -1006,7 +1006,7 @@ export function createOrbitServer(options={}) {
       const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,regenerated:replyJob?.kind==='regenerate',model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
         onTurn:onStreamTurn,onToken:onStreamToken,assertActive:assertReplyLease}));
       await assertReplyLease();
