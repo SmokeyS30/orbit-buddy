@@ -194,9 +194,20 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     return entitlement;
   }
 
-  async function fetchEntitlements(userId) {
+  // Validate the device JWS before using its account token to find a pending
+  // purchase. The token is only a lookup key; entitlement still requires the
+  // independent App Store transaction and status checks in verifyTransaction.
+  async function signedTransactionBinding(signedTransaction) {
     if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
-    const current = db.getSubscription(userId);
+    const { payload } = await verifySigned('transaction', signedTransaction);
+    if (!payload.transactionId || !PRODUCTS[payload.productId]) throw Object.assign(new Error('Unknown transaction product.'), { status: 400 });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(payload.appAccountToken || '')))
+      throw Object.assign(new Error('Transaction has no valid Orbit account binding.'), { status: 403 });
+    return { appAccountToken: payload.appAccountToken, productId: payload.productId };
+  }
+
+  async function fetchEntitlements(userId, current = db.getSubscription(userId)) {
+    if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
     if (!current?.original_transaction_id || !current?.app_account_token) return [];
     const preferred = current.environment === 'sandbox' ? runtime.sandbox : runtime.production;
     const entitlement = await resolveEntitlement(current.original_transaction_id, preferred);
@@ -217,12 +228,15 @@ export function createSubscriptionService(env, db, dependencies = {}) {
       if (!userId) { db.completeNotification(notificationId); return { ignored: true, reason: 'unknown account token' }; }
       const current = db.getSubscription(userId);
       const eventSignedAt = isoFromMillis(outer.signedDate);
+      if (!eventSignedAt) throw new Error('Notification missing signed date.');
       if (current?.last_event_signed_at && eventSignedAt && new Date(eventSignedAt) < new Date(current.last_event_signed_at)) {
         db.completeNotification(notificationId); return { ignored: true, reason: 'stale notification' };
       }
       const entitlement = await resolveEntitlement(txn.originalTransactionId || txn.transactionId, target);
       if (!entitlement || entitlement.appAccountToken !== txn.appAccountToken) throw new Error('Apple status did not match the notification account token.');
-      db.saveSubscription(userId, { ...entitlement, lastEventSignedAt: eventSignedAt || entitlement.signedAt });
+      if (!db.applySubscriptionNotification(userId, { ...entitlement, lastEventSignedAt: eventSignedAt })) {
+        db.completeNotification(notificationId); return { ignored: true, reason: 'stale notification' };
+      }
       try { db.addEvent(userId, 'subscription_updated', `Subscription ${entitlement.status}.`); } catch (_) {}
       db.completeNotification(notificationId);
       return { ok: true, status: entitlement.status };
@@ -285,7 +299,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
 
   return {
     enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT, BASIC_DAILY_LIMIT,
-    status, verifyTransaction, fetchEntitlements, handleNotification,
+    status, signedTransactionBinding, verifyTransaction, fetchEntitlements, handleNotification,
     isPaid, isComped, tier, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
   };
 }

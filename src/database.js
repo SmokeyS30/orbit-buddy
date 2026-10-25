@@ -825,6 +825,19 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
       expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
       original_transaction_id=excluded.original_transaction_id,last_event_signed_at=COALESCE(excluded.last_event_signed_at,subscriptions.last_event_signed_at),updated_at=excluded.updated_at`),
+    upsertSubscriptionNotification: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+      expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+      original_transaction_id=excluded.original_transaction_id,last_event_signed_at=excluded.last_event_signed_at,updated_at=excluded.updated_at
+      WHERE (subscriptions.app_account_token IS NULL OR subscriptions.app_account_token=excluded.app_account_token)
+        AND (subscriptions.last_event_signed_at IS NULL OR subscriptions.last_event_signed_at<excluded.last_event_signed_at)`),
+    insertSubscriptionIfAbsent: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING`),
+    updateSubscriptionIfUnchanged: db.prepare(`UPDATE subscriptions SET product_id=?,status=?,expires_at=?,app_account_token=?,environment=?,
+      original_transaction_id=?,last_event_signed_at=CASE WHEN ? IS NOT NULL AND (last_event_signed_at IS NULL OR last_event_signed_at<?)
+        THEN ? ELSE last_event_signed_at END,updated_at=?
+      WHERE user_id=? AND id=? AND product_id=? AND status=? AND expires_at IS ? AND app_account_token IS ?
+        AND environment=? AND original_transaction_id IS ? AND last_event_signed_at IS ?`),
     getSubscription: db.prepare('SELECT * FROM subscriptions WHERE user_id=?'),
     getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
     incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
@@ -837,6 +850,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     releaseNotification: db.prepare("DELETE FROM processed_notifications WHERE notification_id=? AND state='processing'"),
     pruneNotifications: db.prepare("DELETE FROM processed_notifications WHERE state='processed' AND received_at < datetime('now','-30 days')"),
     findUserByAppAccountToken: db.prepare('SELECT user_id FROM subscriptions WHERE app_account_token=?'),
+    findUserByPurchaseIntentToken: db.prepare("SELECT user_id FROM subscription_purchase_intents WHERE app_account_token=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1"),
     insertPurchaseIntent: db.prepare(`INSERT INTO subscription_purchase_intents(id,user_id,product_id,app_account_token,status,transaction_id,expires_at,created_at,completed_at)
       VALUES(?,?,?,?,'pending',NULL,?,?,NULL)`),
     getPurchaseIntent: db.prepare("SELECT * FROM subscription_purchase_intents WHERE user_id=? AND app_account_token=? AND product_id=? AND status='pending' AND expires_at>? ORDER BY created_at DESC LIMIT 1"),
@@ -1604,6 +1618,20 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const now=timestamp();
       s.upsertSubscription.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken||null,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now);
     },
+    applySubscriptionNotification(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt}) {
+      if(!appAccountToken||!lastEventSignedAt)throw new Error('Signed notification binding and date are required.');
+      const now=timestamp();
+      return s.upsertSubscriptionNotification.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now).changes>0;
+    },
+    saveSubscriptionIfUnchanged(userId,expected,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
+      const now=timestamp(),expiry=expiresAt||null,token=appAccountToken||null,origin=originalTransactionId||null,appEnvironment=environment||'production';
+      if(!expected)return s.insertSubscriptionIfAbsent.run(randomUUID(),userId,productId,status,expiry,token,appEnvironment,origin,lastEventSignedAt,now,now).changes>0;
+      if(expected.user_id!==userId)throw new Error('Subscription snapshot belongs to another account.');
+      return s.updateSubscriptionIfUnchanged.run(productId,status,expiry,token,appEnvironment,origin,
+        lastEventSignedAt,lastEventSignedAt,lastEventSignedAt,now,userId,expected.id,expected.product_id,
+        expected.status,expected.expires_at,expected.app_account_token,expected.environment,
+        expected.original_transaction_id,expected.last_event_signed_at).changes>0;
+    },
     getSubscription: (userId) => s.getSubscription.get(userId)||null,
     getDailyUsageCount(userId,dayNy) { const row=s.getDailyUsage.get(userId,dayNy); return row?row.count:0; },
     incrementDailyUsage(userId,dayNy) { s.incrementDailyUsage.run(userId,dayNy,timestamp()); },
@@ -1622,7 +1650,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeNotification(notificationId) { return s.completeNotification.run(timestamp(),notificationId).changes>0; },
     releaseNotification(notificationId) { return s.releaseNotification.run(notificationId).changes>0; },
     pruneNotifications() { s.pruneNotifications.run(); },
-    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken); return row?row.user_id:null; },
+    findUserByAppAccountToken(appAccountToken) { const row=s.findUserByAppAccountToken.get(appAccountToken)||s.findUserByPurchaseIntentToken.get(appAccountToken,timestamp()); return row?row.user_id:null; },
     createPurchaseIntent(userId,productId,appAccountToken,expiresAt) { const row={id:randomUUID(),user_id:userId,product_id:productId,app_account_token:appAccountToken,status:'pending',expires_at:expiresAt,created_at:timestamp()}; s.insertPurchaseIntent.run(row.id,row.user_id,row.product_id,row.app_account_token,row.expires_at,row.created_at); return row; },
     getPurchaseIntent(userId,appAccountToken,productId) { return s.getPurchaseIntent.get(userId,appAccountToken,productId,timestamp())||null; },
     completePurchaseIntent(id,transactionId) { return s.completePurchaseIntent.run(transactionId,timestamp(),id).changes>0; },

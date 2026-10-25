@@ -526,7 +526,7 @@ export function createOrbitServer(options={}) {
   const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
-  const subscriptions=createSubscriptionService(env,db);
+  const subscriptions=createSubscriptionService(env,db,options.subscriptionDependencies);
   const connectors=createConnectorService(env,db,encryptionKey);
   const transactionalEmail=options.sendEmail||sendResendEmail;
   const transactionalEmailConfigured=Boolean(options.sendEmail)||emailConfigured(env);
@@ -3625,13 +3625,16 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const body=await readJson(req);const signedTransaction=String(body.signedTransaction||'');const requestedToken=String(body.appAccountToken||'').trim();const requestedProduct=String(body.productId||'');
           if(!signedTransaction)throw Object.assign(new Error('Missing transaction.'),{status:400});
           if(requestedToken&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedToken))throw Object.assign(new Error('Invalid app account token.'),{status:400});
-          const current=db.getSubscription(userId);const intent=requestedToken?db.getPurchaseIntent(userId,requestedToken,requestedProduct):null;
+          const signedBinding=requestedToken?null:await subscriptions.signedTransactionBinding(signedTransaction);
+          const bindingToken=requestedToken||signedBinding.appAccountToken;
+          const current=db.getSubscription(userId);const intent=db.getPurchaseIntent(userId,bindingToken,requestedToken?requestedProduct:signedBinding.productId);
           if(requestedToken&&!intent)throw Object.assign(new Error('Purchase intent is missing or expired.'),{status:403});
-          const expectedToken=intent?.app_account_token||current?.app_account_token;
+          const expectedToken=intent?.app_account_token||(current?.app_account_token===bindingToken?current.app_account_token:null);
           if(!expectedToken)throw Object.assign(new Error('Purchase is not bound to this Orbit account.'),{status:403});
           const owner=db.findUserByAppAccountToken(expectedToken);if(owner&&owner!==userId)throw Object.assign(new Error('Purchase belongs to another Orbit account.'),{status:403});
           const result=await subscriptions.verifyTransaction(signedTransaction,{expectedAppAccountToken:expectedToken,expectedProductId:intent?.product_id});
-          db.saveSubscription(userId,{...result,lastEventSignedAt:result.signedAt});
+          if(!db.saveSubscriptionIfUnchanged(userId,current,{...result,lastEventSignedAt:result.signedAt}))
+            throw Object.assign(new Error('Subscription changed during verification. Please retry.'),{status:409});
           if(intent&&!db.completePurchaseIntent(intent.id,result.transactionId))throw Object.assign(new Error('Purchase intent was already consumed.'),{status:409});
           db.addEvent(userId,'subscription_verified','Subscription verified.');
           return json(res,200,{ok:true,transactionId:result.transactionId,product:result.productId,status:result.status,expiresAt:result.expiresAt});
@@ -3639,8 +3642,12 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/subscriptions/restore'){
           if(isDemoUser(user))throw Object.assign(new Error('Subscriptions are not available in demo mode.'),{status:403});
           if(userRateLimited(userId,'sub-restore',10))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
-          const entitlements=await subscriptions.fetchEntitlements(userId);
-          for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
+          const current=db.getSubscription(userId);
+          const entitlements=await subscriptions.fetchEntitlements(userId,current);
+          for(const entitlement of entitlements){
+            if(!db.saveSubscriptionIfUnchanged(userId,current,{...entitlement,lastEventSignedAt:entitlement.signedAt}))
+              throw Object.assign(new Error('Subscription changed during restore. Please retry.'),{status:409});
+          }
           return json(res,200,{ok:true,entitlements});
         }
         const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
