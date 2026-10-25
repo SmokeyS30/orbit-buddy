@@ -53,12 +53,12 @@ test('every push.notify call site has a matching apns.notify twin', () => {
   );
 });
 
-test('deliverProactive notifies both web push and APNs', () => {
+test('deliverProactive notifies both web push and APNs with the current delivery guard', () => {
   const idx = serverJs.indexOf('async function deliverProactive(');
   assert.ok(idx > -1, 'deliverProactive must exist');
   const body = serverJs.slice(idx, idx + 1500); // function is short; both calls are inside
-  assert.match(body, /push\.notify\(user\.id,buddyNameFor\(user\.id\),text,\{view:'today',conversationId:conversation\.id\}\)/);
-  assert.match(body, /apns\.notify\(user\.id,buddyNameFor\(user\.id\),text,\{view:'today',conversationId:conversation\.id\}\)/);
+  assert.match(body, /push\.notify\(user\.id,buddyNameFor\(user\.id\),text,\{view:'today',conversationId:conversation\.id\},\(\)=>canStartMoreProactiveDelivery\(user\.id\)\)/);
+  assert.match(body, /apns\.notify\(user\.id,buddyNameFor\(user\.id\),text,\{view:'today',conversationId:conversation\.id\},\(\)=>canStartMoreProactiveDelivery\(user\.id\)\)/);
 });
 
 test('door nudge notifies both web push and APNs', () => {
