@@ -71,7 +71,9 @@ test('pause during a follow-up model call leaves the item due and refunds its un
   await running;
   assert.ok(app.db.listFollowUps(user.id).some(row=>row.id===followUp.id),'follow-up remains scheduled');
   assert.equal(app.db.listEvents(user.id).filter(row=>row.type==='followup_sent').length,0);
-  assert.ok(app.db.claimProactiveSlot(user.id,'2026-10-28'),'unused slot was released');
+  for(let i=0;i<3;i++)
+    assert.equal(app.db.claimProactiveSlot(user.id,'2026-10-28'),true,`unused slot ${i+1} remains available`);
+  assert.equal(app.db.claimProactiveSlot(user.id,'2026-10-28'),false,'the daily cap still holds');
 });
 
 test('disable during a routine model call leaves the routine due',async t=>{
