@@ -535,7 +535,7 @@ export function toolCompleteTask(args = {}, ctx = null) {
   const title = cleanArg(args.title, 120, 'title');
   const task = findTask(db, userId, title);
   if (!task) throw new Error(`No incomplete task found matching "${title}".`);
-  db.completeTask(userId, task.id, 'Completed via chat.', 'completed', null);
+  if (!db.completeTaskByUser(userId, task.id, 'Completed via chat.')) throw new Error('Task changed before it could be completed. Please retry.');
   return { id: task.id, title: task.title, note: 'Task marked as complete — nagging stopped.' };
 }
 

@@ -1701,13 +1701,17 @@ const indexMigrations = [
       return get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
     },
     deleteTask: async (userId, id) => (await run('DELETE FROM tasks WHERE id=? AND user_id=?', id, userId)).changes > 0,
-    startTask: async (userId, id, leaseMs=2*60_000) => (await run("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId)).changes > 0,
+    // RETURNING binds the generation to this claim in the same atomic update.
+    startTask: async (userId, id, leaseMs=2*60_000) => (await get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId, timestamp()))?.attempt_count || null,
+    renewTaskLease: async (userId,id,attempt,leaseMs=2*60_000) => (await run("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp())).changes > 0,
     recoverStaleTasks: async () => {
       const current = timestamp();
       return (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)", current, current, current)).changes;
     },
-    completeTask: async (userId, id, result, status='completed', scheduleAt=null) => (await run('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?', status, result, scheduleAt, timestamp(), id, userId)).changes > 0,
-    failTask: async (userId, id, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?", message, String(error||'').slice(0, 1000), timestamp(), id, userId)).changes > 0,
+    // Explicit user completion revokes any active worker lease.
+    completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes > 0,
+    completeTask: async (userId, id, attempt, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", status, result, scheduleAt, timestamp(), id, userId, attempt, timestamp())).changes > 0,
+    failTask: async (userId, id, attempt, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", message, String(error||'').slice(0, 1000), timestamp(), id, userId, attempt, timestamp())).changes > 0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
 
@@ -1825,6 +1829,9 @@ const indexMigrations = [
         data.id || randomUUID(), userId, provider, data.accessEncrypted, data.refreshEncrypted || null, data.scopes || '', data.expiresAt || null, JSON.stringify(data.profile || {}), now, now);
     },
     listConnectors: async (userId) => all('SELECT id,provider,scopes,expires_at,profile_json,created_at,updated_at FROM connectors WHERE user_id=?', userId),
+    // Match the original credential revision; a refresh must never upsert.
+    refreshConnector: async (userId,provider,previous,data) => (await run('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted)).changes > 0,
+    deleteConnectorIfCurrent: async (userId,provider,previous) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',userId,provider,previous.id,previous.access_encrypted)).changes > 0,
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
     deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
 

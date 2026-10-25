@@ -810,10 +810,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
     updateTaskFields: db.prepare('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?'),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id=? AND user_id=?'),
-    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')"),
+    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count"),
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
-    completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?'),
-    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?"),
+    completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
+    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -1672,10 +1672,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
     updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,now,id,userId);return s.getTask.get(id,userId);},
     deleteTask: (userId,id) => s.deleteTask.run(id,userId).changes>0,
-    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.run(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId).changes>0,
+    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId,timestamp())?.attempt_count||null,
+    // The monotonically increasing attempt fences workers after recovery/restart.
+    renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?").run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
     recoverStaleTasks(){const current=timestamp();return s.recoverTasks.run(current,current,current).changes;},
-    completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
-    failTask:(userId,id,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId).changes>0,
+    // Explicit user completion is independent of a worker's lease and revokes it.
+    completeTaskByUser:(userId,id,result)=>db.prepare("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')").run(result,timestamp(),id,userId).changes>0,
+    completeTask: (userId,id,attempt,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
+    failTask:(userId,id,attempt,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
     dueTasks: () => s.dueTasks.all(timestamp()),
     addEvent(userId,type,message,detail=null) { const row={id:randomUUID(),user_id:userId,type,message,detail,created_at:timestamp()}; s.addEvent.run(row.id,row.user_id,row.type,row.message,row.detail,row.created_at); return row; },
     listEvents: (userId,limit=80) => s.listEvents.all(userId,Math.min(Math.max(limit,1),200)),
@@ -1720,6 +1724,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     prunePurchaseIntents() { s.prunePurchaseIntents.run(timestamp()); },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
+    // Encrypted access tokens use fresh random IVs, so they also identify the
+    // credential revision. Refreshes must never insert or mutate a replacement.
+    refreshConnector:(userId,provider,previous,data)=>db.prepare('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted).changes>0,
+    deleteConnectorIfCurrent:(userId,provider,previous)=>db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(userId,provider,previous.id,previous.access_encrypted).changes>0,
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
