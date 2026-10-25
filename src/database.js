@@ -841,6 +841,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     updateTaskFields: db.prepare("UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,status=CASE WHEN status='running' THEN CASE WHEN CAST(? AS TEXT) IS NULL OR CAST(? AS TEXT)<=CAST(? AS TEXT) THEN 'queued' ELSE 'scheduled' END ELSE status END,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?"),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id=? AND user_id=?'),
     claimTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING attempt_count"),
+    claimDueTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING *"),
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
     completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled','running','waiting_approval')"),
     failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running'"),
@@ -1738,6 +1739,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,nextSchedule,nextSchedule,now,now,id,userId);return s.getTask.get(id,userId);},
     deleteTask: (userId,id) => s.deleteTask.run(id,userId).changes>0,
     claimTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>s.claimTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId)?.attempt_count??null),
+    claimDueTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>{
+      const now=timestamp();
+      return s.claimDueTask.get(new Date(Date.now()+leaseMs).toISOString(),now,id,userId,now)||null;
+    }),
     startTask(userId,id,leaseMs=2*60_000){return this.claimTask(userId,id,leaseMs)!==null;},
     renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>s.renewTaskLease.run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
     activeTaskClaim:(userId,id,attempt)=>Boolean(s.activeTaskClaim.get(id,userId,attempt,timestamp())),
