@@ -1191,32 +1191,58 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     const link = db.getWhatsAppLink(userId);
     try {
       await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: text });
-      db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');
-      return true;
     } catch (error) {
       console.error('whatsapp proactive send failed', error && error.message);
-      db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));
+      if(canStartMoreProactiveDelivery(userId)){
+        try{db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));}catch{}
+      }
       return false; // fall back to push below
     }
+    // A provider-accepted send must never fall through to a second channel
+    // just because local event logging failed afterward.
+    if(canStartMoreProactiveDelivery(userId)){
+      try{db.addEvent(userId, 'whatsapp_proactive_sent', 'Sent proactive message via WhatsApp instead of push.');}catch{}
+    }
+    return true;
   }
-  async function deliverProactive(user,text,eventType,eventMessage){
+  function proactiveActionAllowed(userId){
     assertProactiveWorkerLease();
-    if(paused())return false;
-    const current=db.getUserById(user.id);
-    if(!current||current.disabled)return false;
+    const current=db.getUserById(userId);
+    return !paused()&&Boolean(current&&!current.disabled&&!current.moderation_blocked);
+  }
+  function assertProactiveAction(userId){
+    if(!proactiveActionAllowed(userId))throw Object.assign(new Error('Proactive action deferred.'),{code:'PROACTIVE_DEFERRED'});
+  }
+  async function proactiveRespond(user,options){
+    assertProactiveAction(user.id);
+    const result=await model.respond({...options,assertActive:()=>assertProactiveAction(user.id)});
+    assertProactiveAction(user.id);
+    return result;
+  }
+  function canStartMoreProactiveDelivery(userId){
+    try{return proactiveActionAllowed(userId);}catch(error){if(error.code==='PROACTIVE_LEASE_LOST')return false;throw error;}
+  }
+  async function deliverProactive(user,text,eventType,eventMessage,slot=null){
+    if(!proactiveActionAllowed(user.id))return false;
     const conversation=db.ensureDefaultConversation(user.id);
+    if(!proactiveActionAllowed(user.id))return false;
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
-    assertProactiveWorkerLease();
-    if(paused()||!db.getUserById(user.id))return false;
-    if(await tryWhatsAppProactive(user.id,text))return;
-    if(paused()||!db.getUserById(user.id))return false;
+    if(slot){db.commitProactiveSlot(user.id,slot.date,slot.token);slot.onRecorded?.();}
+    // The message is durable here. Provider failures must not refund its slot.
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
+    if(await tryWhatsAppProactive(user.id,text))return {recorded:true};
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
     // W4: notification tap deep-linking — the check-in lives in this conversation,
     // so carry its id in the push payload; the SW routes the tap straight to it.
-    await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
-    await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
+    try{await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});}
+    catch(error){console.error('proactive web push outcome unknown',error?.code||error?.name||'error');return {recorded:true};}
+    if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
+    try{await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});}
+    catch(error){console.error('proactive APNs push failed',error?.code||error?.name||'error');}
+    return {recorded:true};
   }
   // WhatsApp delivery for a completed scheduled task: only when the 24h window
   // is open. Outside the window (or if sending fails) we fall back to push so
@@ -1269,13 +1295,20 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       const today=todayInZone(preferences.time_zone,nowMs);
       for(const followUp of db.dueFollowUps(user.id,today)){
-        if(!db.claimProactiveSlot(user.id,today))break;
+        const token=db.reserveProactiveSlot(user.id,today);if(!token)break;
         const prompt=`Write a short, warm check-in message (1-2 sentences, plain text, no greeting header) asking how "${followUp.description}" went. Sound like a caring friend dropping by, not a notification. Do not mention that this is automated.`;
         try{
-          const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-          await deliverProactive(user,text,'followup_sent',`Checked in about “${followUp.description}”.`);
-          db.completeFollowUp(user.id,followUp.id);
-        }catch(error){db.failFollowUp(user.id,followUp.id,error.message);db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'followup_failed',`Could not check in about “${followUp.description}”.`,error.message);}
+          assertProactiveAction(user.id);
+          const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:()=>assertProactiveAction(user.id)});
+          assertProactiveAction(user.id);
+          const outcome=await deliverProactive(user,text,'followup_sent',`Checked in about “${followUp.description}”.`,{date:today,token,onRecorded:()=>db.completeFollowUp(user.id,followUp.id)});
+          if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,token);
+        }catch(error){
+          const released=db.releaseProactiveSlot(user.id,today,token);
+          if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+          if(error.code==='PROACTIVE_DEFERRED')continue;
+          if(released&&proactiveActionAllowed(user.id)){db.failFollowUp(user.id,followUp.id,error.message);db.addEvent(user.id,'followup_failed',`Could not check in about “${followUp.description}”.`,error.message);}
+        }
       }
     }
   }
@@ -1285,22 +1318,32 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
       const local=localDateTimeParts(preferences.time_zone,nowMs);
       for(const routine of dueRoutines(db.listRoutines(user.id),preferences.time_zone,nowMs)){
-        if(!db.claimProactiveSlot(user.id,local.date))break;
-        if(!db.claimRoutine(user.id,routine.id,local.date)){db.releaseProactiveSlot(user.id,local.date);continue;}
+        const token=db.reserveProactiveSlot(user.id,local.date);if(!token)break;
+        if(!db.claimRoutine(user.id,routine.id,local.date)){db.releaseProactiveSlot(user.id,local.date,token);continue;}
         try{
+          assertProactiveAction(user.id);
           const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone):'';
           const prompt=buildRoutinePrompt({routine,timeZone:preferences.time_zone,agenda,goals:db.listGoals(user.id),tasks:db.listTasks(user.id),followUps:db.listFollowUps(user.id),nowMs});
-          const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-          await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`);
-          db.completeRoutine(user.id,routine.id,local.date);
-          try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
-        }catch(error){db.failRoutine(user.id,routine.id,local.date,error.message);db.releaseProactiveSlot(user.id,local.date);db.addEvent(user.id,'routine_failed',`Could not run routine “${routine.title}”.`,error.message);}
+          const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:()=>assertProactiveAction(user.id)});
+          assertProactiveAction(user.id);
+          const outcome=await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`,{date:local.date,token,onRecorded:()=>{
+            db.completeRoutine(user.id,routine.id,local.date);
+            try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
+          }});
+          if(!outcome.recorded)db.releaseProactiveSlot(user.id,local.date,token);
+        }catch(error){
+          const released=db.releaseProactiveSlot(user.id,local.date,token);
+          if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+          if(error.code==='PROACTIVE_DEFERRED')continue; // existing routine lease expires; no new write under a paused account
+          if(released&&proactiveActionAllowed(user.id)){db.failRoutine(user.id,routine.id,local.date,error.message);db.addEvent(user.id,'routine_failed',`Could not run routine “${routine.title}”.`,error.message);}
+        }
       }
     }
   }
   async function runLearningCycle(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       const timeZone=preferences.time_zone||'America/New_York';
       const learningMemories=()=>db.listMemories(user.id).filter(isProactiveMemoryAllowed);
@@ -1337,7 +1380,7 @@ Respond with a JSON array of insights. Each insight: {"type":"preference"|"habit
 Only include genuine insights, not obvious restatements. Max 5 insights. If nothing meaningful, respond with [].`;
 
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         // Parse JSON array from response
         const jsonMatch=text.match(/\[[\s\S]*\]/);
         if(!jsonMatch)continue;
@@ -1420,7 +1463,7 @@ Look for:
 
 Respond with a JSON array, max 10. Each: {"type":"theme"|"evolution"|"goal"|"passion","content":"one clear sentence","confidence":0.6-0.9}
 Only include genuine insights. If nothing meaningful, respond with [].`;
-            const { text: deepText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: deepText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const dm=deepText.match(/\[[\s\S]*\]/);
             if(dm){
               const insights=JSON.parse(dm[0]);
@@ -1447,7 +1490,7 @@ ${memText}
 Examples: "says not a morning person but most productive before 9am", "says they hate planning but always feel better after organizing".
 
 Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what their behavior shows","gentleFraming":"how to lightly mention this, warmly"}. Only include genuine, well-supported contradictions. If none, respond with [].`;
-              const { text: contraText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: contraText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const cm2=contraText.match(/\[[\s\S]*\]/);
               if(cm2){
                 let contraSaved=0;
@@ -1495,7 +1538,7 @@ Recent user messages (note their style — questions? data? short? emotional?):
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough-love"|"calm"|"unknown","evidence":"one sentence on why"}. Use "unknown" if there isn't enough signal.`;
-            const { text: motText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: motText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const mm=motText.match(/\{[\s\S]*\}/);
             if(mm){
               const parsed=JSON.parse(mm[0]);
@@ -1524,7 +1567,7 @@ Recent messages:
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":"observed behavior"}],"drainers":[{"activity":"what","evidence":"observed behavior"}]}, max 3 each. If there is no real signal, respond with {"energizers":[],"drainers":[]}.`;
-            const { text: energyText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: energyText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const em2=energyText.match(/\{[\s\S]*\}/);
             if(em2){
               const parsed=JSON.parse(em2[0]);
@@ -1575,7 +1618,7 @@ Support styles:
 - "space": backing off, keeping it brief
 
 Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"questions"|"humor"|"space"|"unknown","confidence":0.0-1.0,"evidence":"one sentence on why"}. Use "unknown" if the signal is weak or mixed.`;
-            const { text: supText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: supText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const sm=supText.match(/\{[\s\S]*\}/);
             if(sm){
               const parsed=JSON.parse(sm[0]);
@@ -1606,7 +1649,7 @@ Identify:
 
 Respond with a single JSON object: {"merge":[[id_prefix1, id_prefix2, "merged content"]],"remove":[id_prefix],"strengthen":[{id: id_prefix, content: "strengthened content"}]}
 Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs changing, respond with {"merge":[],"remove":[],"strengthen":[]}.`;
-            const { text: conText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: conText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm3=conText.match(/\{[\s\S]*\}/);
             if(cm3){
               const ops=JSON.parse(cm3[0]);
@@ -1655,7 +1698,7 @@ Memories:
 ${memSample||'(none yet)'}
 
 Respond with a JSON array, max 3: {"question":"the natural question you'd ask","context":"why knowing this matters","priority":1-3}`;
-            const { text: curText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: curText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm=curText.match(/\[[\s\S]*\]/);
             if(cm){
               for(const gap of (Array.isArray(JSON.parse(cm[0]))?JSON.parse(cm[0]):[]).slice(0,3)){
@@ -1687,7 +1730,7 @@ Recent mentions:
 ${mentions}
 
 Respond with a single JSON object: {"summary":"one sentence on who this person is to the user and what's going on","sentiment":"positive"|"neutral"|"mixed"}`;
-              const { text: relText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: relText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const rm=relText.match(/\{[\s\S]*\}/);
               if(rm){
                 const parsed=JSON.parse(rm[0]);
@@ -1717,7 +1760,7 @@ ${behaviorParts.join('\n\n')}
 Examples of good predictions: "tends to slow down on Thursday afternoons — lighter check-ins then", "often abandons goals after 3 weeks — extra encouragement around week 3", "most creative late at night — suggest capturing ideas then".
 
 Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence":0.4-0.8,"suggestedAction":"what Orbit should do about it"}`;
-                const { text: predText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: predText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const pm=predText.match(/\[[\s\S]*\]/);
                 if(pm){
                   let predSaved=0;
@@ -1751,7 +1794,7 @@ Recent conversation:
 ${convoSample}
 
 Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"low","confidence":0.0-1.0,"notableShifts":"brief description of any significant change from their usual, or empty string"}. Only claim a tone if the evidence is reasonable; when unsure, use "steady".`;
-                const { text: emoText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: emoText }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const em=emoText.match(/\{[\s\S]*\}/);
                 if(em){
                   const parsed=JSON.parse(em[0]);
@@ -1900,7 +1943,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
       // Friendly check-ins only run in narrow, predictable local windows.
       // Meeting prep may still run outside them when an actual event is near.
       if(!checkinWindow&&!meetingCandidate)continue;
-      if(!db.claimProactiveSlot(user.id,today))continue;
+      const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
 
       // Let the AI decide: is now a good time? What kind of check-in?
       const meetingLine=meetingCandidate?`- "MEETING_PREP" if "${meetingCandidate.title}" starting at ${new Date(meetingCandidate.startMs).toLocaleTimeString('en-US',{timeZone,hour:'numeric',minute:'2-digit'})} could use a prep briefing (only if prep would genuinely help — skip for routine/generic blocks)\n`:'';
@@ -1924,13 +1967,13 @@ ${windowLine}${meetingLine}- "SKIP" if now is not a good time for any proactive 
 Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
 
       try{
-        const { text: decision }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text: decision }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const decisionClean=decision.trim().toUpperCase();
 
         const expectedDecision={morning:'MORNING',afternoon:'CHECKIN',evening:'EVENING'}[checkinWindow]||null;
         const allowedDecision=decisionClean==='MEETING_PREP'?Boolean(meetingCandidate):decisionClean===expectedDecision;
         if(decisionClean==='SKIP'||!allowedDecision){
-          db.releaseProactiveSlot(user.id,today);
+          db.releaseProactiveSlot(user.id,today,slotToken);
           continue;
         }
 
@@ -2215,16 +2258,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}${emoGuide}`;
         }
 
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
-        db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`,{date:today,token:slotToken,onRecorded:()=>{
+          db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
+          db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
+        }});
+        if(!outcome.recorded){db.releaseProactiveSlot(user.id,today,slotToken);continue;}
         if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
         if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
         if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
         if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
       }catch(error){
-        db.releaseProactiveSlot(user.id,today);
+        db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code==='PROACTIVE_DEFERRED')continue;
         // Silent skip on rate limits — the worker retries in 5 min; don't pollute the Reliability tab
         if(error.classification==='rate_limit')return;
         db.addEvent(user.id,'smart_checkin_failed','Could not send smart check-in.',error.message);
@@ -2237,13 +2284,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
       const lastOutreach=db.getLastOutreachAt(user.id);if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<24*3600_000)continue;
-      const today=todayInZone(preferences.time_zone,nowMs);if(!db.claimProactiveSlot(user.id,today))continue;
+      const today=todayInZone(preferences.time_zone,nowMs);const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
       const prompt=`Write a short, warm check-in (1-2 sentences, plain text) for someone you have not heard from in a couple of days. Sound like a friend popping by, not a notification. You may gently reference something from their memories if one fits naturally; otherwise keep it simple. Do not mention that this is automated.`;
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
-        db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.');
-      }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.',{date:today,token:slotToken,onRecorded:()=>db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString())});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
+      }catch(error){db.releaseProactiveSlot(user.id,today,slotToken);if(error.code==='PROACTIVE_LEASE_LOST')throw error;if(error.code!=='PROACTIVE_DEFERRED')db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
     }
   }
   let proactiveBusy=false,proactiveLeaseToken=null,proactiveLeaseAlive=false;
@@ -2268,14 +2315,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(lastActive&&nowMs-lastActive<4*3600_000)continue;
 
       const today=todayInZone(timeZone,nowMs);
-      if(!db.claimProactiveSlot(user.id,today))continue;
+      const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
 
       const sinceISO=new Date(nowMs-7*24*3600_000).toISOString();
       const tasks=db.listTasksCompletedSince(user.id,sinceISO);
       const checkins=db.listGoalCheckinsSince(user.id,sinceISO);
       const memories=db.listMemoriesSince(user.id,sinceISO).filter((m)=>m.source!=='registration'); // L3: the registration-seeded name memory is onboarding scaffolding, not week activity
       const userMessages=db.listMessages(user.id,200).filter((m)=>m.created_at>=sinceISO&&m.role==='user');
-      if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today);continue;}
+      if(!tasks.length&&!checkins.length&&!memories.length&&!userMessages.length){db.releaseProactiveSlot(user.id,today,slotToken);continue;}
 
       try{
         const parts=[];
@@ -2284,12 +2331,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(memories.length)parts.push(`New memories: ${memories.slice(0,8).map((m)=>m.content.slice(0,120)).join('; ')}`);
         parts.push(`Messages sent this week: ${userMessages.length}`);
         const prompt=`Write a warm weekly review for ${user.display_name||'the user'} (4-6 sentences, plain text). Celebrate their wins, note goal progress, observe one interesting pattern if you see one, and offer one concrete suggestion for next week. Sound like a caring friend, not a status report. Do not mention that this is automated.\n\nThis week's activity:\n${parts.join('\n')}`;
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`weekly_review_last_${user.id}`,weekKey);
-        await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.');
+        const { text }=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.',{date:today,token:slotToken,onRecorded:()=>db.setSetting(`weekly_review_last_${user.id}`,weekKey)});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
       }catch(error){
-        db.releaseProactiveSlot(user.id,today);
-        db.addEvent(user.id,'weekly_review_failed','Could not send the weekly review.',error.message);
+        db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code!=='PROACTIVE_DEFERRED')db.addEvent(user.id,'weekly_review_failed','Could not send the weekly review.',error.message);
       }
     }
   }
@@ -2312,9 +2360,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(lastUserMsg&&nowMs-new Date(lastUserMsg).valueOf()<60*60_000)continue;
 
       const today=todayInZone(timeZone,nowMs);
+      let slotToken=null;
       try{
+        assertProactiveAction(user.id);
         const {searchEmails}=await import('./src/gmail.js');
         const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:'is:unread newer_than:2h',max:10});
+        assertProactiveAction(user.id);
         const candidates=(res.emails||[]).filter((e)=>{
           const from=String(e.from||'');
           const subj=String(e.subject||'');
@@ -2326,17 +2377,20 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
         // Let the AI decide if any are truly urgent
         const decidePrompt=`You are triaging unread emails from the last 2 hours for ${user.display_name||'the user'}. Be very conservative — only flag something as urgent if it's a direct question needing a timely reply, time-sensitive (deadline today/tomorrow), or from a real person about something important. Newsletters, promos, receipts, and FYIs are NOT urgent.\n\nEmails:\n${candidates.map((e,i)=>`${i+1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet.slice(0,150)}`).join('\n')}\n\nRespond with ONLY the number of the single most urgent email (e.g. "2"), or "NONE" if nothing is urgent enough to interrupt them.`;
-        const {text:decision}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const {text:decision}=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const pick=parseInt(decision.trim(),10);
         if(!Number.isInteger(pick)||pick<1||pick>candidates.length)continue;
         const urgent=candidates[pick-1];
 
-        if(!db.claimProactiveSlot(user.id,today))continue;
+        slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
         const genPrompt=`Write a brief heads-up (2 sentences, plain text) about an urgent email for ${user.display_name||'the user'}. Summarize what it's about and suggest one concrete action (e.g. reply, check the attachment). Sound natural, not alarming. Do not mention that this is automated.\n\nFrom: ${urgent.from}\nSubject: ${urgent.subject}\nPreview: ${urgent.snippet.slice(0,200)}`;
-        const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
-        db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
-        await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
+        const {text}=await proactiveRespond(user,{buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const outcome=await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`,{date:today,token:slotToken,onRecorded:()=>db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString())});
+        if(!outcome.recorded)db.releaseProactiveSlot(user.id,today,slotToken);
       }catch(error){
+        if(slotToken)db.releaseProactiveSlot(user.id,today,slotToken);
+        if(error.code==='PROACTIVE_LEASE_LOST')throw error;
+        if(error.code==='PROACTIVE_DEFERRED')continue;
         // Silent skip on rate limits — the worker retries in 5 min
         if(error.classification==='rate_limit')return;
         // Distinct event for Gmail auth failures so Edward gets an actionable message
@@ -2371,9 +2425,15 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     const heartbeat=setInterval(()=>{
       try{if(!db.renewWorkerLease('proactive',token))proactiveLeaseAlive=false;}
       catch{proactiveLeaseAlive=false;}
-    },30_000);
+    },env.NODE_ENV==='test'&&Number.isInteger(options.proactiveHeartbeatMs)?Math.max(1,options.proactiveHeartbeatMs):30_000);
     heartbeat.unref();
-    try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
+    try{
+      for(const stage of [runFollowUps,runRoutines,runQuietNudges,runSmartCheckins,runEmailTriage,runWeeklyReview,runLearningCycle,runProjectRadar,runStudyCoaching,runProactiveMemory,runMemoryConnections]){
+        assertProactiveWorkerLease();
+        if(paused())break;
+        await stage(nowMs);
+      }
+    }
     catch(error){console.error('Proactive worker stopped after an account or database change:',error?.code||error?.name||'error');}
     finally{clearInterval(heartbeat);try{db.releaseWorkerLease('proactive',token);}catch{}proactiveBusy=false;proactiveLeaseToken=null;proactiveLeaseAlive=false;}
   }
@@ -2389,8 +2449,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         await deliverRadarFindings({
           db,surfaced:poll.surfaced,nowMs,
           isQuiet:(prefs)=>isQuietHours(prefs,nowMs),
-          deliver:async({user,finding,text})=>{
-            await deliverProactive(user,text,'radar_checkin_sent',`Project radar: ${finding.title}`);
+          deliver:async({user,finding,text,slotToken,localDate})=>{
+            return deliverProactive(user,text,'radar_checkin_sent',`Project radar: ${finding.title}`,{date:localDate,token:slotToken});
           },
         });
       }
@@ -2412,12 +2472,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const today=todayInZone(timeZone,nowMs);
         if(db.getSetting(`proactive_memory_pushed_${user.id}`)===today)continue;
         try{
+          let slotToken=null;
           const sent=await runProactiveMemoryPush({
-            db,model,user,timeZone,nowMs,
+            db,model:{respond:(options)=>proactiveRespond(user,options)},user,timeZone,nowMs,
             buddyName:buddyNameFor(user.id),
-            claimSlot:()=>db.claimProactiveSlot(user.id,today),
-            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage),
+            claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
+            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage,{date:today,token:slotToken}),
           });
           if(sent>0)db.setSetting(`proactive_memory_pushed_${user.id}`,today);
         }catch(error){console.error('proactive memory user failed',user.id,error&&error.message);}
@@ -2440,12 +2501,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const today=todayInZone(timeZone,nowMs);
         if(db.getSetting(`memory_connections_pushed_${user.id}`)===today)continue;
         try{
+          let slotToken=null;
           const sent=await runMemoryConnectionPush({
-            db,model,user,timeZone,nowMs,
+            db,model:{respond:(options)=>proactiveRespond(user,options)},user,timeZone,nowMs,
             buddyName:buddyNameFor(user.id),
-            claimSlot:()=>db.claimProactiveSlot(user.id,today),
-            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage),
+            claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
+            releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
+            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage,{date:today,token:slotToken}),
           });
           if(sent>0)db.setSetting(`memory_connections_pushed_${user.id}`,today);
         }catch(error){console.error('memory connections user failed',user.id,error&&error.message);}
@@ -2483,6 +2545,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(error){console.error('study coaching failed',error&&error.message);}
   }
   async function runStudyCoachingForUser(user,timeZone,today,nowMs){
+    async function sendStudyNudge(text,eventMessage,mark){
+      const token=db.reserveProactiveSlot(user.id,today);if(!token)return false;
+      try{
+        const outcome=await deliverProactive(user,text,'study_nudge_sent',eventMessage,{date:today,token,onRecorded:mark});
+        if(!outcome.recorded){db.releaseProactiveSlot(user.id,today,token);return false;}
+        return true;
+      }catch(error){db.releaseProactiveSlot(user.id,today,token);if(error.code==='PROACTIVE_LEASE_LOST')throw error;return false;}
+    }
     // At most one study nudge per pass; pre-session nudges take priority.
     let events=[];
     let feeds=[];
@@ -2497,13 +2567,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(upcoming){
       const key=`study_pre_${user.id}_${upcoming.startMs}`;
       if(db.getSetting(key)!==today){
-        if(!db.claimProactiveSlot(user.id,today))return;
         const mins=Math.max(1,Math.round((upcoming.startMs-nowMs)/60000));
         const exam=normalizeStudyExam(upcoming.title);
         const quizBit=exam?` Want a warm-up quiz? Just say "quiz me on ${exam}".`:'';
-        await deliverProactive(user,`Heads up: "${upcoming.title}" starts in about ${mins} min.${quizBit}`,'study_nudge_sent',`Pre-session study nudge for "${upcoming.title}".`);
-        db.setSetting(key,today);
-        db.setSetting(`study_nudged_${user.id}`,today);
+        await sendStudyNudge(`Heads up: "${upcoming.title}" starts in about ${mins} min.${quizBit}`,`Pre-session study nudge for "${upcoming.title}".`,()=>{
+          db.setSetting(key,today);db.setSetting(`study_nudged_${user.id}`,today);
+        });
         return;
       }
     }
@@ -2512,12 +2581,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     if(recent){
       const key=`study_post_${user.id}_${recent.startMs}`;
       if(db.getSetting(key)!==today){
-        if(!db.claimProactiveSlot(user.id,today))return;
         const exam=normalizeStudyExam(recent.title);
         const quizBit=exam?` Say "quiz me on ${exam}" for a quick review quiz to lock it in.`:' Want a quick review quiz to lock it in? Just say the word.';
-        await deliverProactive(user,`How did "${recent.title}" go?${quizBit}`,'study_nudge_sent',`Post-session study nudge for "${recent.title}".`);
-        db.setSetting(key,today);
-        db.setSetting(`study_nudged_${user.id}`,today);
+        await sendStudyNudge(`How did "${recent.title}" go?${quizBit}`,`Post-session study nudge for "${recent.title}".`,()=>{
+          db.setSetting(key,today);db.setSetting(`study_nudged_${user.id}`,today);
+        });
         return;
       }
     }
@@ -2529,11 +2597,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const lastSuggest=db.getSetting(`study_suggest_${user.id}`)||'';
       if(lastSuggest<studyDateMinus(7,today)){
         const slots=findFreeStudySlots(events,timeZone,today,nowMs,{days:7,minMinutes:60,maxSlots:3});
-        if(slots.length>=2&&db.claimProactiveSlot(user.id,today)){
+        if(slots.length>=2){
           const lines=slots.map((s)=>`• ${s.label}`).join('\n');
-          await deliverProactive(user,`I don't see any study time on your calendar for the next week. How about one of these?\n${lines}\nReply with one that works (or a time that suits you better) and I'll add it — I won't schedule anything without your yes.`,'study_nudge_sent','Suggested study slots from calendar gaps.');
-          db.setSetting(`study_suggest_${user.id}`,today);
-          db.setSetting(`study_nudged_${user.id}`,today);
+          await sendStudyNudge(`I don't see any study time on your calendar for the next week. How about one of these?\n${lines}\nReply with one that works (or a time that suits you better) and I'll add it — I won't schedule anything without your yes.`,'Suggested study slots from calendar gaps.',()=>{
+            db.setSetting(`study_suggest_${user.id}`,today);db.setSetting(`study_nudged_${user.id}`,today);
+          });
           return;
         }
         if(slots.length<2)db.setSetting(`study_suggest_${user.id}`,today); // no usable gaps: don't retry for a week
@@ -2545,10 +2613,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     const lastActive=getLastStudyActivity(db,user.id);
     const lastIdle=db.getSetting(`study_idle_${user.id}`)||'';
     if(lastActive&&nowMs-new Date(lastActive).valueOf()>=3*86400_000&&lastIdle<studyDateMinus(3,today)){
-      if(!db.claimProactiveSlot(user.id,today))return;
-      await deliverProactive(user,`It's been a few days since your last quiz — no pressure, but a quick warm-up keeps things fresh. Say "quiz me" and pick an exam whenever you feel like it.`,'study_nudge_sent','Idle study re-engagement nudge.');
-      db.setSetting(`study_idle_${user.id}`,today);
-      db.setSetting(`study_nudged_${user.id}`,today);
+      await sendStudyNudge(`It's been a few days since your last quiz — no pressure, but a quick warm-up keeps things fresh. Say "quiz me" and pick an exam whenever you feel like it.`,'Idle study re-engagement nudge.',()=>{
+        db.setSetting(`study_idle_${user.id}`,today);db.setSetting(`study_nudged_${user.id}`,today);
+      });
     }
   }
 

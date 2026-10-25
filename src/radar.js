@@ -331,15 +331,17 @@ export async function deliverRadarFindings({ db, surfaced = [], nowMs = Date.now
       if (db.radarFindingDelivered(finding.key, user.id)) continue; // never twice
       const sentToday = Number(db.getSetting(countKey) || 0);
       if (sentToday >= RADAR_MAX_RADAR_CHECKINS_PER_DAY) break;
-      if (!db.claimProactiveSlot(user.id, today)) break; // shared daily outreach budget
+      const slotToken = db.reserveProactiveSlot ? db.reserveProactiveSlot(user.id, today) : db.claimProactiveSlot(user.id, today);
+      if (!slotToken) break; // shared daily outreach budget
       try {
         const text = composeRadarCheckin(finding);
-        await deliver({ user, finding, text });
+        const outcome = await deliver({ user, finding, text, slotToken, localDate: today });
+        if (outcome === false || outcome?.recorded === false) { db.releaseProactiveSlot(user.id, today, slotToken); continue; }
         db.markRadarFindingDelivered(finding.key, user.id);
         db.setSetting(countKey, String(sentToday + 1));
         delivered.push({ userId: user.id, key: finding.key });
       } catch (error) {
-        db.releaseProactiveSlot(user.id, today);
+        db.releaseProactiveSlot(user.id, today, slotToken);
         db.addEvent(user.id, 'radar_checkin_failed', `Could not send project-radar check-in for ${finding.title}.`, String((error && error.message) || error).slice(0, 200));
       }
     }

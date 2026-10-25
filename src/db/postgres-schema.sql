@@ -456,6 +456,17 @@ CREATE TABLE IF NOT EXISTS proactive_state (
   outreach_count INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS proactive_slot_days (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  local_date TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(user_id,local_date)
+);
+CREATE TABLE IF NOT EXISTS proactive_slot_reservations (
+  token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  local_date TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','committed','released')),
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_preferences (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   time_zone TEXT NOT NULL DEFAULT 'America/New_York',
