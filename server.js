@@ -1756,14 +1756,18 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
       if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
       const chunks=chunkMessages(extracted.messages,20);
       if(!chunks.length)throw new Error('Nothing substantial to learn from in this export.');
-      // Cap chunks to bound cost on huge exports
-      const work=chunks.slice(0,60);
+      // Each user can start at most three imports a day; bound one import's
+      // model work too, even when the uploaded export is very large.
+      const work=chunks.slice(0,20);
       db.updateImportJob(userId,id,{total_chunks:work.length});
       const prefs=db.getPreferences(userId);
       const timeZone=prefs.time_zone||'America/New_York';
       const user=db.getUserById(userId);
       let added=0;
       for(let i=0;i<work.length;i++){
+        const currentUser=db.getUserById(userId);
+        if(paused()||!currentUser||currentUser.disabled||isDemoUser(currentUser))throw new Error('Import stopped because AI work is paused or this account is unavailable.');
+        if(db.getImportJob(userId,id)?.status!=='processing')return;
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
@@ -1776,6 +1780,8 @@ ${convoText}
 
 Respond with a JSON array of insights, max 6: [{"content":"brief clear fact","kind":"fact"|"preference"|"goal"|"relationship"|"decision","confidence":0.0-1.0}]
 Only include what's clearly supported — skip one-off questions, transient topics, and anything uncertain. If nothing durable, respond with [].`});
+          const activeUser=db.getUserById(userId);
+          if(paused()||!activeUser||activeUser.disabled||isDemoUser(activeUser)||db.getImportJob(userId,id)?.status!=='processing')throw new Error('Import stopped before applying this model result.');
           const jm=text.match(/\[[\s\S]*\]/);
           if(jm){
             const insights=JSON.parse(jm[0]);
@@ -1793,7 +1799,11 @@ Only include what's clearly supported — skip one-off questions, transient topi
               }
             }
           }
-        }catch(e){/* one bad chunk shouldn't kill the job */}
+        }catch(e){
+          const latestUser=db.getUserById(userId);
+          if(paused()||!latestUser||latestUser.disabled||isDemoUser(latestUser))throw e;
+          // One malformed or failed chunk should not discard the whole import.
+        }
         db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
       }
       db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
@@ -3143,14 +3153,18 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const curKey=`${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}`;
           const monthLabel=(key)=>{const[y,m]=key.split('-').map(Number);return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'});};
           const out=[];
+          let modelNarratives=0;
           for(let i=0;i<months;i++){
             const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));
             const key=`${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
             const data=db.timelineMonthData(userId,key);
             const activity=data.memories.length+data.conversations.length+data.goalsCreated.length+data.goalsCompleted.length+data.checkins;
             if(!activity)continue;
-            let narrative=db.getTimelineNarrative(userId,key);
-            if(!narrative||key===curKey){
+            const cached=db.getTimelineNarrativeRecord(userId,key);
+            let narrative=cached?.narrative||null;
+            const freshCurrent=key===curKey&&narrative&&new Date(cached.generated_at).valueOf()>Date.now()-6*60*60_000;
+            if((!narrative||(key===curKey&&!freshCurrent))&&!paused()&&!isDemoUser(user)&&modelNarratives<1){
+              modelNarratives++;
               const facts=[];
               if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
               if(data.goalsCompleted.length)facts.push(`Completed ${data.goalsCompleted.length} goals: ${data.goalsCompleted.map((g)=>g.title).join(', ')}`);
@@ -3160,11 +3174,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               try{
                 const prefs=db.getPreferences(userId);
                 const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
-                narrative=text.trim().slice(0,1200)||null;
-                if(narrative)db.setTimelineNarrative(userId,key,narrative);
-              }catch(e){narrative=null;}
-              if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
+                const generated=text.trim().slice(0,1200);
+                if(generated){narrative=generated;db.setTimelineNarrative(userId,key,narrative);}
+              }catch(e){/* keep the last cached narrative when generation fails */}
             }
+            if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
             const highlights=[];
             for(const g of data.goalsCompleted.slice(0,3))highlights.push(`Completed "${g.title}"`);
             for(const g of data.goalsCreated.slice(0,2))highlights.push(`Started "${g.title}"`);
@@ -3323,6 +3337,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
+          const quota=subscriptions.consumeQuota(userId,user);
+          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
           const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt);
           if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
           scheduleReplyPump();
@@ -3482,6 +3498,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{jobs:db.listImportJobs(userId)});
         }
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
+          if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
+          if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3503,6 +3521,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const extracted=extractMessages(parsed);
           if(!extracted||!extracted.messages.length)throw Object.assign(new Error('No conversation messages found. Upload a ChatGPT export (conversations.json) or a {messages:[...]} file.'),{status:422});
           const job=db.createImportJob(userId,filename);
+          if(!job)throw Object.assign(new Error('An import is already running or the daily import limit was reached. Try again later.'),{status:429});
           db.addEvent(userId,'import_started',`Started analyzing ${extracted.messages.length} imported messages.`);
           // Process in background — raw export lives in memory only, never persisted.
           setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));

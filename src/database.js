@@ -595,7 +595,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -652,6 +652,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
     addImportJob: db.prepare('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'),
+    expireStaleImportJobs: db.prepare("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?"),
+    activeImportJob: db.prepare("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1"),
+    countRecentImportJobs: db.prepare('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?'),
     getImportJob: db.prepare('SELECT * FROM import_jobs WHERE id=? AND user_id=?'),
     listImportJobs: db.prepare('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5'),
     updateImportJob: db.prepare('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?'),
@@ -1424,7 +1427,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
       return saved;
     },
-    createImportJob(userId,filename){const now=timestamp();const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;},
+    createImportJob(userId,filename){return withImmediate(()=>{
+      const now=timestamp();
+      s.expireStaleImportJobs.run(now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(s.activeImportJob.get(userId)||s.countRecentImportJobs.get(userId,new Date(Date.now()-24*60*60_000).toISOString()).count>=3)return null;
+      const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};
+      s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;
+    });},
     getImportJob:(userId,id)=>s.getImportJob.get(id,userId)||null,
     listImportJobs:(userId)=>s.listImportJobs.all(userId),
     updateImportJob(userId,id,patch={}){const cur=s.getImportJob.get(id,userId);if(!cur)return null;const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);return {...cur,...next};},
@@ -1606,6 +1615,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
     getTimelineNarrative:(userId,monthKey)=>{const row=s.getTimelineNarrative.get(userId,monthKey);return row?row.narrative:null;},
+    getTimelineNarrativeRecord:(userId,monthKey)=>s.getTimelineNarrative.get(userId,monthKey)||null,
     setTimelineNarrative:(userId,monthKey,narrative)=>{s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());},
     timelineMonthData(userId,monthKey){
       return {
