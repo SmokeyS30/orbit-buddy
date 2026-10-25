@@ -115,10 +115,12 @@ test('SQLite link consumption and phone binding roll back together on phone conf
     const b=db.createUser({email:'owner-b@example.test',displayName:'B',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
     const expiry=new Date(Date.now()+60_000).toISOString();
     db.issueWhatsAppLinkCode(a.id,'111111',expiry);
-    assert.equal(db.consumeAndLinkWhatsApp('111111','+15551234567'),a.id);
+    assert.equal(db.consumeAndLinkWhatsApp('111111','+15551234567','SMsuccessful-link'),a.id);
+    assert.equal(db.claimWhatsAppInboundSid('SMsuccessful-link'),false,'link and SID commit together');
     db.issueWhatsAppLinkCode(b.id,'222222',expiry);
-    assert.throws(()=>db.consumeAndLinkWhatsApp('222222','+15551234567'),/UNIQUE/);
+    assert.throws(()=>db.consumeAndLinkWhatsApp('222222','+15551234567','SMfailed-link'),/UNIQUE/);
     assert.ok(db.getSetting('whatsapp_link_code_222222'),'failed bind preserves code');
+    assert.equal(db.claimWhatsAppInboundSid('SMfailed-link'),true,'failed bind also rolls back SID claim');
     assert.equal(db.consumeAndLinkWhatsApp('222222','+15551234568'),b.id);
     db.issueWhatsAppLinkCode(b.id,'333333',expiry);
     assert.equal(db.unlinkWhatsAppAndRevoke(b.id),true);
