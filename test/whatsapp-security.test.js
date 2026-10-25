@@ -318,6 +318,13 @@ test('PostgreSQL concurrent code collision cannot overwrite another owner, and r
     await b.issueWhatsAppLinkCode(second.id,'555555',expiry);
     assert.equal((await blocker.query("SELECT value FROM settings WHERE key='whatsapp_link_code_555555'")).rows[0].value.split(':')[0],second.id,
       'expired collision key may be safely reused');
+    await a.linkWhatsApp(first.id,'+15551234567');
+    await b.issueWhatsAppLinkCode(second.id,'666666',expiry);
+    await assert.rejects(b.consumeAndLinkWhatsApp('666666','+15551234567','SMpg-failed-link'),
+      /whatsapp_links_phone_e164_key/);
+    assert.equal(await a.claimWhatsAppInboundSid('SMpg-failed-link'),true,'PG conflict rolls back inbound SID');
+    assert.ok((await blocker.query("SELECT value FROM settings WHERE key='whatsapp_link_code_666666'")).rows[0]);
+    await a.unlinkWhatsAppAndRevoke(first.id);
 
     await a.issueWhatsAppLinkCode(first.id,'444444',expiry);
     await blocker.query('BEGIN');
