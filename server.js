@@ -1242,10 +1242,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
     // W4: notification tap deep-linking — the check-in lives in this conversation,
     // so carry its id in the push payload; the SW routes the tap straight to it.
-    try{await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});}
+    try{await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id},()=>canStartMoreProactiveDelivery(user.id));}
     catch(error){console.error('proactive web push outcome unknown',error?.code||error?.name||'error');return {recorded:true};}
     if(!canStartMoreProactiveDelivery(user.id))return {recorded:true};
-    try{await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});}
+    try{await apns.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id},()=>canStartMoreProactiveDelivery(user.id));}
     catch(error){console.error('proactive APNs push failed',error?.code||error?.name||'error');}
     return {recorded:true};
   }
