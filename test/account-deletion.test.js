@@ -69,7 +69,8 @@ test('account deletion removes its encrypted server archives and retains unrelat
   assert.equal((await response.json()).backupCleanupPending,false);
   assert.equal(fs.existsSync(ownArchive),false);
   assert.equal(fs.existsSync(unrelated),true);
-  assert.deepEqual(app.db.listPendingBackupDeletions(),[]);
+  assert.equal(app.db.listPendingBackupDeletions()[0]?.account_ref,auth.user.id,
+    'the deletion tombstone remains for late writers');
 });
 
 test('unavailable backup mount leaves a durable deletion retry instead of reporting cleanup complete',async t=>{
@@ -89,7 +90,33 @@ test('unavailable backup mount leaves a durable deletion retry instead of report
   fs.writeFileSync(archive,'synthetic encrypted archive');
   assert.deepEqual(await cleanupDeletedUserBackups({db:app.db,dataDir:directory,backupDir}),{cleaned:1,failed:0});
   assert.equal(fs.existsSync(archive),false);
-  assert.deepEqual(app.db.listPendingBackupDeletions(),[]);
+  assert.equal(app.db.listPendingBackupDeletions()[0]?.account_ref,auth.user.id,
+    'a successful scan retains the deletion tombstone');
+});
+
+test('late final and temporary archives are removed after a backup writer stops',async t=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-delete-late-'));
+  const backupDir=path.join(directory,'backups');fs.mkdirSync(backupDir);
+  const app=createOrbitServer({dataDir:directory,env:{NODE_ENV:'test',BACKUP_DIR:backupDir}});
+  t.after(async()=>{await app.close();fs.rmSync(directory,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'late-delete@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+  assert.equal(app.db.deleteUserAccount(user.id).deleted,true);
+  assert.deepEqual(await cleanupDeletedUserBackups({db:app.db,dataDir:directory,backupDir}),{cleaned:1,failed:0});
+  assert.equal(app.db.listPendingBackupDeletions()[0]?.account_ref,user.id);
+
+  const interrupted={async:{
+    exportUser:async()=>({version:6,messages:[{content:'synthetic private data'}]}),
+    getUserById:async()=>{throw new Error('synthetic process stopped after rename');},
+  }};
+  await assert.rejects(writeAutomatedBackup({db:interrupted,userId:user.id,backupDir,passphrase:'synthetic backup passphrase'}),/synthetic process stopped/);
+  assert.equal(fs.readdirSync(backupDir).filter(name=>name.endsWith('.orbitbackup')).length,1);
+  const ownTemp=path.join(backupDir,`orbit-${user.id}-synthetic.orbitbackup.12345678-1234-1234-1234-123456789abc.tmp`);
+  const unrelated=path.join(backupDir,'orbit-unrelated-synthetic.orbitbackup.12345678-1234-1234-1234-123456789abc.tmp');
+  fs.writeFileSync(ownTemp,'synthetic partial archive');fs.writeFileSync(unrelated,'unrelated fixture');
+  assert.deepEqual(await cleanupDeletedUserBackups({db:app.db,dataDir:directory,backupDir}),{cleaned:1,failed:0});
+  assert.deepEqual(fs.readdirSync(backupDir),[path.basename(unrelated)]);
+  assert.equal(app.db.listPendingBackupDeletions()[0]?.account_ref,user.id);
+  assert.deepEqual(await cleanupDeletedUserBackups({db:app.db,dataDir:directory,backupDir}),{cleaned:1,failed:0});
 });
 
 test('deleting the owner transfers ownership to the oldest active member',async(t)=>{

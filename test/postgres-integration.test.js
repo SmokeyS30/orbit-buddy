@@ -706,18 +706,18 @@ test('PostgreSQL account deletion commits backup cleanup intent atomically',asyn
   assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
   await ensureSchema();
   const {openPostgres}=await import('../src/db/postgres-adapter.js');
-  const db=await openPostgres(DATABASE_URL);
+  let db=await openPostgres(DATABASE_URL);
   let user;
   try{
     user=await db.createUser({email:`backup-delete-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
     assert.equal((await db.deleteUserAccount(user.id)).deleted,true);
     assert.equal(await db.getUserById(user.id),null);
     assert.ok((await db.listPendingBackupDeletions()).some(row=>row.account_ref===user.id));
-    assert.equal(await db.clearPendingBackupDeletion(user.id),true);
-    assert.equal((await db.listPendingBackupDeletions()).some(row=>row.account_ref===user.id),false);
+    await db.close();
+    db=await openPostgres(DATABASE_URL);
+    assert.ok((await db.listPendingBackupDeletions()).some(row=>row.account_ref===user.id));
   }finally{
-    if(user&&await db.getUserById(user.id))await db.deleteUserAccount(user.id);
-    if(user)await db.clearPendingBackupDeletion(user.id);
+    if(user)await db.run('DELETE FROM backup_deletion_queue WHERE account_ref=?',user.id);
     await db.close();
   }
 });

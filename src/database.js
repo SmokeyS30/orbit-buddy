@@ -628,7 +628,6 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteUser: db.prepare('DELETE FROM users WHERE id=?'),
     queueBackupDeletion: db.prepare('INSERT OR IGNORE INTO backup_deletion_queue(account_ref,requested_at) VALUES(?,?)'),
     listBackupDeletions: db.prepare('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
-    clearBackupDeletion: db.prepare('DELETE FROM backup_deletion_queue WHERE account_ref=?'),
     claimWorkerLease: db.prepare(`INSERT INTO worker_leases(name,owner_token,expires_at) VALUES(?,?,?)
       ON CONFLICT(name) DO UPDATE SET owner_token=excluded.owner_token,expires_at=excluded.expires_at
       WHERE worker_leases.expires_at<=?`),
@@ -1240,7 +1239,6 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
     listPendingBackupDeletions:()=>s.listBackupDeletions.all(),
-    clearPendingBackupDeletion:(accountRef)=>s.clearBackupDeletion.run(accountRef).changes>0,
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
     createPasswordSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,expectedPasswordHash,expectedPasswordSalt}) { return withImmediate(()=>{
       const user=s.userById.get(userId);

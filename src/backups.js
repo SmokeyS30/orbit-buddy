@@ -31,11 +31,12 @@ export async function writeAutomatedBackup({ db, userId, dataDir, backupDir, pas
   return file;
 }
 
-// Only deletions that create a queue row are cleaned here. Previously orphaned
-// archives require a separate reviewed cleanup decision.
+// The queue row is a durable tombstone. A backup writer can rename a file and
+// then crash before its post-rename account check; repeating this scan on every
+// backup pass removes that late file. Previously orphaned archives without a
+// tombstone require a separate reviewed cleanup decision.
 export async function cleanupDeletedUserBackups({db,dataDir,backupDir,accountRef=null}){
   const list=db.async?.listPendingBackupDeletions?.bind(db.async)||db.listPendingBackupDeletions.bind(db);
-  const clear=db.async?.clearPendingBackupDeletion?.bind(db.async)||db.clearPendingBackupDeletion.bind(db);
   const getUser=db.async?.getUserById?.bind(db.async)||db.getUserById.bind(db);
   const directory=backupDir||path.join(dataDir,'backups');
   let cleaned=0,failed=0;
@@ -47,11 +48,15 @@ export async function cleanupDeletedUserBackups({db,dataDir,backupDir,accountRef
       try{files=fs.readdirSync(directory);}
       catch(error){if(error.code==='ENOENT'&&!backupDir)files=[];else throw error;}
       for(const name of files){
-        if(!name.startsWith(`orbit-${userId}-`)||!name.endsWith('.orbitbackup'))continue;
+        if(!name.startsWith(`orbit-${userId}-`))continue;
+        // Also remove our exact temporary-file form after an interrupted write.
+        // No recursive traversal or deletion of other accounts' files.
+        const final=name.endsWith('.orbitbackup');
+        const temporary=/\.orbitbackup\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.tmp$/i.test(name);
+        if(!final&&!temporary)continue;
         try{fs.unlinkSync(path.join(directory,name));}
         catch(error){if(error.code!=='ENOENT')throw error;}
       }
-      await clear(userId);
       cleaned++;
     }catch{failed++;}
   }

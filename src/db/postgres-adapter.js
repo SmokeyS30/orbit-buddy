@@ -705,7 +705,6 @@ const indexMigrations = [
       });
     },
     listPendingBackupDeletions: async()=>all('SELECT account_ref FROM backup_deletion_queue ORDER BY requested_at'),
-    clearPendingBackupDeletion: async(accountRef)=>(await run('DELETE FROM backup_deletion_queue WHERE account_ref=?',accountRef)).changes>0,
     async claimOrphans(userId) {
       await run('UPDATE messages SET user_id=? WHERE user_id IS NULL', userId);
       await run('UPDATE memories SET user_id=? WHERE user_id IS NULL', userId);
