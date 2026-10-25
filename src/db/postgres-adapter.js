@@ -1664,6 +1664,22 @@ const indexMigrations = [
         environment || 'production', originalTransactionId || null, lastEventSignedAt, now, now);
       return applied.changes>0;
     },
+    saveSubscriptionIfUnchanged: async (userId, expected, { productId, status, expiresAt, appAccountToken, environment, originalTransactionId, lastEventSignedAt = null }) => {
+      const now=timestamp(),expiry=expiresAt||null,token=appAccountToken||null,origin=originalTransactionId||null,appEnvironment=environment||'production';
+      if(!expected)return (await run(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING`,randomUUID(),userId,productId,status,expiry,token,appEnvironment,origin,lastEventSignedAt,now,now)).changes>0;
+      if(expected.user_id!==userId)throw new Error('Subscription snapshot belongs to another account.');
+      const applied=await run(`UPDATE subscriptions SET product_id=?,status=?,expires_at=?,app_account_token=?,environment=?,
+        original_transaction_id=?,last_event_signed_at=CASE WHEN CAST(? AS TEXT) IS NOT NULL AND (last_event_signed_at IS NULL OR last_event_signed_at<?)
+          THEN ? ELSE last_event_signed_at END,updated_at=?
+        WHERE user_id=? AND id=? AND product_id=? AND status=? AND expires_at IS NOT DISTINCT FROM ?
+          AND app_account_token IS NOT DISTINCT FROM ? AND environment=?
+          AND original_transaction_id IS NOT DISTINCT FROM ? AND last_event_signed_at IS NOT DISTINCT FROM ?`,
+        productId,status,expiry,token,appEnvironment,origin,lastEventSignedAt,lastEventSignedAt,lastEventSignedAt,now,
+        userId,expected.id,expected.product_id,expected.status,expected.expires_at,expected.app_account_token,
+        expected.environment,expected.original_transaction_id,expected.last_event_signed_at);
+      return applied.changes>0;
+    },
     getSubscription: async (userId) => (await get('SELECT * FROM subscriptions WHERE user_id=?', userId)) || null,
     getDailyUsageCount: async (userId, dayNy) => {
       const row = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);

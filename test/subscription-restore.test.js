@@ -11,18 +11,19 @@ import { openPostgres } from '../src/db/postgres-adapter.js';
 const PRODUCT='com.smokeys30.orbitbuddy.standard.monthly';
 const password='correct horse battery staple';
 
-async function fixture(t){
+async function fixture(t,options={}){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-subscription-restore-'));
   let token=null,appleCalls=0;
   const txn=()=>({transactionId:'synthetic-txn',originalTransactionId:'synthetic-orig',productId:PRODUCT,appAccountToken:token,
-    bundleId:'com.smokeys30.orbitbuddy',expiresDate:Date.now()+30*86400_000,signedDate:Date.now(),environment:Environment.SANDBOX});
+    bundleId:'com.smokeys30.orbitbuddy',expiresDate:Date.now()+30*86400_000,signedDate:options.transactionSignedDate||Date.now(),environment:Environment.SANDBOX});
   const verifier={
     async verifyAndDecodeTransaction(input){if(!['device','server','status','notification-txn'].includes(input))throw new Error('Invalid synthetic signature');return txn();},
-    async verifyAndDecodeNotification(input){if(input!=='notification')throw new Error('Invalid synthetic notification');return{notificationUUID:'synthetic-notification',signedDate:Date.now(),data:{signedTransactionInfo:'notification-txn'}};},
+    async verifyAndDecodeNotification(input){if(input!=='notification')throw new Error('Invalid synthetic notification');return{notificationUUID:'synthetic-notification',signedDate:options.notificationSignedDate||Date.now(),data:{signedTransactionInfo:'notification-txn'}};},
   };
   const client={
     async getTransactionInfo(){appleCalls++;return{signedTransactionInfo:'server'};},
-    async getAllSubscriptionStatuses(){appleCalls++;return{data:[{lastTransactions:[{status:Status.ACTIVE,signedTransactionInfo:'status'}]}]};},
+    async getAllSubscriptionStatuses(){appleCalls++;return options.getStatuses
+      ?options.getStatuses():{data:[{lastTransactions:[{status:Status.ACTIVE,signedTransactionInfo:'status'}]}]};},
   };
   const sent=[];
   const app=createOrbitServer({dataDir:directory,
@@ -102,4 +103,60 @@ test('PostgreSQL finds only the owning account from an active pending purchase i
     await db.deleteUserAccount(other.id);
     await db.close();
   }
+});
+
+test('pending verify response cannot replace a newer signed revocation',async t=>{
+  const oldDate=Date.parse('2026-10-19T11:00:00.000Z');
+  const newDate=Date.parse('2026-10-19T12:00:00.000Z');
+  let releaseOld,enteredOld;
+  const entered=new Promise(resolve=>{enteredOld=resolve;});
+  const blocked=new Promise(resolve=>{releaseOld=resolve;});
+  let calls=0;
+  const statuses=status=>({data:[{lastTransactions:[{status,signedTransactionInfo:'status'}]}]});
+  const fx=await fixture(t,{transactionSignedDate:oldDate,notificationSignedDate:newDate,
+    getStatuses:async()=>{calls++;if(calls===1){enteredOld();await blocked;return statuses(Status.ACTIVE);}
+      return statuses(Status.REVOKED);}});
+  fx.app.db.saveSubscription(fx.owner.id,{productId:PRODUCT,status:'active',appAccountToken:fx.token,
+    originalTransactionId:'synthetic-orig',lastEventSignedAt:'2026-10-19T10:00:00.000Z'});
+  const verifying=fetch(`${fx.base}/api/subscriptions/verify`,{method:'POST',headers:fx.headers(fx.owner),
+    body:JSON.stringify({signedTransaction:'device'})});
+  let verifyResponse;
+  try{
+    await entered;
+    const notification=await fetch(`${fx.base}/api/subscriptions/apple-notifications`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({signedPayload:'notification'})});
+    assert.equal(notification.status,200);
+    assert.equal(fx.app.db.getSubscription(fx.owner.id).status,'revoked');
+  }finally{releaseOld();}
+  verifyResponse=await verifying;
+  assert.equal(verifyResponse.status,409,'a stale verifier must retry instead of overwriting the newer notification');
+  assert.equal(fx.app.db.getSubscription(fx.owner.id).status,'revoked');
+  assert.equal(fx.app.db.getSubscription(fx.owner.id).last_event_signed_at,new Date(newDate).toISOString());
+});
+
+test('pending restore response cannot replace a newer signed revocation',async t=>{
+  const oldDate=Date.parse('2026-10-19T11:00:00.000Z');
+  const newDate=Date.parse('2026-10-19T12:00:00.000Z');
+  let releaseOld,enteredOld;
+  const entered=new Promise(resolve=>{enteredOld=resolve;});
+  const blocked=new Promise(resolve=>{releaseOld=resolve;});
+  let calls=0;
+  const statuses=status=>({data:[{lastTransactions:[{status,signedTransactionInfo:'status'}]}]});
+  const fx=await fixture(t,{transactionSignedDate:oldDate,notificationSignedDate:newDate,
+    getStatuses:async()=>{calls++;if(calls===1){enteredOld();await blocked;return statuses(Status.ACTIVE);}
+      return statuses(Status.REVOKED);}});
+  fx.app.db.saveSubscription(fx.owner.id,{productId:PRODUCT,status:'active',appAccountToken:fx.token,
+    originalTransactionId:'synthetic-orig',lastEventSignedAt:'2026-10-19T10:00:00.000Z'});
+  const restoring=fetch(`${fx.base}/api/subscriptions/restore`,{method:'POST',headers:fx.headers(fx.owner),body:'{}'});
+  try{
+    await entered;
+    const notification=await fetch(`${fx.base}/api/subscriptions/apple-notifications`,{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({signedPayload:'notification'})});
+    assert.equal(notification.status,200);
+    assert.equal(fx.app.db.getSubscription(fx.owner.id).status,'revoked');
+  }finally{releaseOld();}
+  const restored=await restoring;
+  assert.equal(restored.status,409);
+  assert.equal(fx.app.db.getSubscription(fx.owner.id).status,'revoked');
+  assert.equal(fx.app.db.getSubscription(fx.owner.id).last_event_signed_at,new Date(newDate).toISOString());
 });

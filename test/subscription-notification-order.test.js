@@ -62,6 +62,20 @@ async function checkReverseCompletion(dbOld,dbNew,userId,token){
   assert.equal(await dbOld.applySubscriptionNotification(userId,{productId,status:'active',appAccountToken:randomUUID(),
     originalTransactionId:'synthetic-other',lastEventSignedAt:new Date(newer+60_000).toISOString()}),false,
     'a later callback cannot replace a different account binding');
+  const snapshot=await dbOld.getSubscription(userId);
+  const laterSignedAt=new Date(newer+120_000).toISOString();
+  assert.equal(await dbNew.applySubscriptionNotification(userId,{productId,status:'active',appAccountToken:token,
+    originalTransactionId:'synthetic-original',lastEventSignedAt:laterSignedAt}),true);
+  const staleResult={productId,status:'revoked',appAccountToken:token,originalTransactionId:'synthetic-original',
+    lastEventSignedAt:new Date(older).toISOString()};
+  assert.equal(await dbOld.saveSubscriptionIfUnchanged(userId,snapshot,staleResult),false,
+    'a verifier that started before a notification cannot undo it');
+  assert.equal(await dbOld.saveSubscriptionIfUnchanged(userId,null,staleResult),false,
+    'a first-purchase insert cannot replace an account row created meanwhile');
+  const fresh=await dbOld.getSubscription(userId);
+  assert.equal(await dbOld.saveSubscriptionIfUnchanged(userId,fresh,{...staleResult,status:'active'}),true);
+  assert.equal((await dbOld.getSubscription(userId)).last_event_signed_at,laterSignedAt,
+    'a fresh status check must not move the signed event marker backward');
 }
 
 test('SQLite older signed notification cannot overwrite a newer event after a delayed status response',async()=>{
