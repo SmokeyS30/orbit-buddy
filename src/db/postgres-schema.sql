@@ -403,6 +403,13 @@ CREATE TABLE IF NOT EXISTS timeline_cache (
   PRIMARY KEY (user_id, month_key)
 );
 
+CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  month_key TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 DROP TABLE IF EXISTS automation_tokens;
 
 CREATE TABLE IF NOT EXISTS conversations (
