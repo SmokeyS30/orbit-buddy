@@ -31,3 +31,36 @@
   .messages{max-height:520px}
   .message{max-width:78%}
 }
+
+/* --- Duo desk mode (stage 2): glanceable briefing panel beside the chat ---
+   From 761px up (the stage-1 unfolded tier and everything above it), the
+   Today view becomes a two-column desk layout: the existing briefing
+   surface — masthead, briefing cards (weather, today's calendar agenda,
+   focus, open loops), the systems line, and the "While you were away"
+   catch-up card that carries Orbit's check-ins — sits in a glanceable,
+   independently scrolling column next to the conversation panel instead
+   of stacked above it. Nothing is re-rendered or re-fetched:
+   renderBriefing() and the catch-up card already target #today-briefing,
+   so desk mode is pure placement of the existing DOM. Pure width-based
+   CSS, like stage 1, so fold/unfold adapts live with no reload and no
+   device detection. Below 761px nothing changes: the phone tier stacks
+   exactly as before.
+   The query is deliberately unbounded above: the Duo's exact unfolded
+   CSS width is unverified and may land at or above 1024px, so capping
+   desk mode at 1023px could keep it from ever appearing on the device
+   it is for. On true desktop widths the same placement is an
+   enhancement, not a regression: briefing and check-ins stay glanceable
+   beside the chat instead of scrolling away above it, and no content,
+   control, or chat behavior is removed or reordered. */
+@media(min-width:761px){
+  #today.view.active{display:grid;grid-template-columns:minmax(300px,400px) minmax(0,1fr);grid-template-areas:"hero hero" "desk chat";column-gap:18px;align-items:start}
+  #today>.hero-card{grid-area:hero}
+  #today>#today-briefing{grid-area:desk;max-height:calc(100dvh - 150px);overflow-y:auto;padding-right:6px}
+  #today>.conversation-panel{grid-area:chat}
+  #today-briefing .briefing-masthead h2{font-size:30px}
+  #today-briefing .briefing-grid{grid-template-columns:1fr}
+}
+@media print{
+  #today.view.active{display:block}
+  #today>#today-briefing{max-height:none;overflow:visible;padding-right:0}
+}
