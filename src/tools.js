@@ -853,7 +853,7 @@ function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
     payload: { id, title, objectType },
     sourceMessageId: ctx?.messageId || null
   });
-  db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for in-chat confirmation.`);
+  db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for approval in Approvals.`);
   return {
     approvalId: approval.id, objectType, id, title, preview,
     note: 'NOT deleted — this staged a request in Approvals. Show the exact target and consequences. Ask the user to open Approvals and press Approve & delete on that specific card, or Reject. A chat reply such as yes cannot delete anything.'
