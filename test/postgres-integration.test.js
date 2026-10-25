@@ -375,6 +375,66 @@ test('PostgreSQL task attempts fence stale and cancelled worker completions',asy
   }
 });
 
+test('PostgreSQL claim returns its own attempt across a two-connection reclaim barrier',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const first=await openPostgres(DATABASE_URL);
+  const second=await openPostgres(DATABASE_URL);
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  let user;
+  try{
+    user=await first.createUser({email:`task-claim-${suffix}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await first.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+    let resumeFirst,claimReached;
+    const paused=new Promise(resolve=>{claimReached=resolve;});
+    const firstCaller=first.claimTask(user.id,task.id,-1000).then(attempt=>{
+      claimReached();
+      return new Promise(resolve=>{resumeFirst=()=>resolve(attempt);});
+    });
+    await paused;
+    assert.equal(await second.recoverStaleTasks(),1);
+    const newer=await second.claimTask(user.id,task.id);
+    resumeFirst();
+    const original=await firstCaller;
+    assert.ok(newer>original,'the paused caller receives its own earlier claim token');
+    assert.equal(await first.activeTaskClaim(user.id,task.id,original),false);
+    assert.equal(await first.completeClaimedTask(user.id,task.id,original,'stale'),false);
+    assert.equal(await second.completeClaimedTask(user.id,task.id,newer,'current'),true);
+    assert.equal((await second.getTask(user.id,task.id)).result,'current');
+  }finally{
+    if(user)await first.deleteUserAccount(user.id);
+    await first.close();await second.close();
+  }
+});
+
+test('PostgreSQL task edits and account disable invalidate a running claim',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await db.createUser({email:`task-edit-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await db.addTask(user.id,{title:'Original',prompt:'Original prompt'});
+    const first=await db.claimTask(user.id,task.id);
+    const edited=await db.updateTask(user.id,task.id,{prompt:'Revised prompt'});
+    assert.equal(edited.status,'queued');
+    assert.equal(await db.activeTaskClaim(user.id,task.id,first),false);
+    const second=await db.claimTask(user.id,task.id);
+    assert.ok(second>first);
+    await db.setUserDisabled(user.id,true);
+    assert.equal(await db.renewTaskLease(user.id,task.id,second),false);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,second,'stale'),false);
+    assert.equal(await db.deliverableTask(user.id,task.id,second),false);
+    await db.setTaskStatus(user.id,task.id,'queued');
+    assert.equal(await db.claimTask(user.id,task.id),null);
+  }finally{
+    if(user)await db.deleteUserAccount(user.id);
+    await db.close();
+  }
+});
+
 test('PostgreSQL sync wrapper: fails fast with bad connection string', async () => {
   // Must throw promptly, not hang for 30s. readyTimeoutMs=3000 in the
   // connection string makes the wrapper fail fast.
