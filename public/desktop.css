@@ -15,3 +15,19 @@
   .shell{width:100%;padding:0}
   body{background:#fff;color:#000}
 }
+
+/* --- Duo unfolded / intermediate tier (761-1023px) ---
+   Fills the gap between the phone layout (max-width:760px) and the desktop
+   tier (min-width:1024px): the unfolded foldable width and large Split View
+   panes. Pure width-based, so fold/unfold adapts live with no reload.
+   Two-pane structure is kept, scaled down from the desktop tier; the tab bar
+   wraps instead of scrolling, exactly as it does from 1024px up. */
+@media(min-width:761px) and (max-width:1023px){
+  .shell{width:calc(100% - 40px);padding-left:max(0px,env(safe-area-inset-left));padding-right:max(0px,env(safe-area-inset-right))}
+  .tabs{overflow:visible;flex-wrap:wrap}
+  .tab{flex:1 1 auto;min-width:90px}
+  .hero-card{grid-template-columns:240px 1fr;padding:34px 40px}
+  .form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .messages{max-height:520px}
+  .message{max-width:78%}
+}
