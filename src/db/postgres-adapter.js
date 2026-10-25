@@ -1581,6 +1581,10 @@ const indexMigrations = [
     },
     deleteTask: async (userId, id) => (await run('DELETE FROM tasks WHERE id=? AND user_id=?', id, userId)).changes > 0,
     claimTask: async (userId, id, leaseMs=2*60_000) => (await get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING attempt_count", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId))?.attempt_count??null,
+    claimDueTask: async (userId,id,leaseMs=2*60_000) => {
+      const now=timestamp();
+      return get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING *",new Date(Date.now()+leaseMs).toISOString(),now,id,userId,now);
+    },
     async startTask(userId,id,leaseMs=2*60_000){return (await this.claimTask(userId,id,leaseMs))!==null;},
     recoverStaleTasks: async () => {
       const current = timestamp();

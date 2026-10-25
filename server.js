@@ -1114,10 +1114,11 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     if(workerBusy||paused())return;workerBusy=true;
     try{
       db.recoverStaleTasks();
-      for(const task of db.dueTasks()){
+      for(const candidate of db.dueTasks()){
         if(paused())break;
-        const attempt=db.claimTask(task.user_id,task.id);
-        if(!Number.isInteger(attempt))continue;
+        const task=db.claimDueTask(candidate.user_id,candidate.id);
+        if(!task)continue;
+        const attempt=task.attempt_count;
         let leaseAlive=true;
         const assertTaskActive=()=>{
           if(paused()){

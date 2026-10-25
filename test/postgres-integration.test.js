@@ -296,6 +296,35 @@ test('PostgreSQL claim returns its own attempt across a two-connection reclaim b
   }
 });
 
+test('PostgreSQL claim rejects a newly future task and returns its current row after rescheduling',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const first=await openPostgres(DATABASE_URL);
+  const second=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await first.createUser({email:`task-due-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await first.addTask(user.id,{title:'Original',prompt:'Original prompt'});
+    const stale=(await first.dueTasks()).find(row=>row.id===task.id);
+    assert.ok(stale);
+    const future=new Date(Date.now()+60_000).toISOString();
+    await second.updateTask(user.id,task.id,{prompt:'Future prompt',scheduleAt:future});
+    assert.equal(await first.claimDueTask(stale.user_id,stale.id),null,'claim rechecks the due time atomically');
+    const current=await second.updateTask(user.id,task.id,{title:'Current title',prompt:'Current prompt',
+      scheduleAt:new Date(Date.now()-1000).toISOString(),recurrence:'daily'});
+    const claimed=await first.claimDueTask(stale.user_id,stale.id);
+    assert.equal(claimed?.prompt,current.prompt);
+    assert.equal(claimed?.title,current.title);
+    assert.equal(claimed?.recurrence,current.recurrence);
+    assert.equal(claimed?.schedule_at,current.schedule_at);
+    assert.ok(claimed.attempt_count>stale.attempt_count);
+  }finally{
+    if(user)await first.deleteUserAccount(user.id);
+    await first.close();await second.close();
+  }
+});
+
 test('PostgreSQL task edits and account disable invalidate a running claim',async()=>{
   assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
   await ensureSchema();
