@@ -945,7 +945,7 @@ function validDateStr(value) {
   return `${y}-${mo}-${d}`;
 }
 
-import { searchEmails, readEmail } from './gmail.js';
+import { searchEmails, readEmail, getTrashPreview } from './gmail.js';
 import { learnWritingVoice } from './writing-voice.js';
 
 function gmailContext(ctx, tool) {
@@ -986,15 +986,14 @@ export async function toolGmailRead(args = {}, ctx = null) {
 }
 
 export async function toolGmailDelete(args = {}, ctx = null) {
-  const { db, userId } = gmailContext(ctx, 'gmail_delete');
+  const { db, userId, gmail } = gmailContext(ctx, 'gmail_delete');
   const id = cleanArg(args.id, 100, 'id');
-  const subject = args.subject ? cleanArg(args.subject, 300, 'subject') : null;
-  const from = args.from ? cleanArg(args.from, 300, 'from') : null;
+  const preview=await getTrashPreview(()=>gmail.getToken(),{id});
   const approval = db.addApproval(userId, {
     kind: 'gmail_delete',
-    title: `Move “${subject || 'email'}” to trash`,
-    summary: from ? `From ${from}` : `Gmail message ${id}`,
-    payload: { id, subject, from },
+    title: `Move “${preview.subject}” to trash`,
+    summary: `From ${preview.from}; Gmail ${preview.mailbox}; ID ${preview.id}${preview.date?`; ${preview.date}`:''}${preview.snippet?`; ${preview.snippet}`:''}`,
+    payload: { id, preview },
     sourceMessageId: ctx?.messageId || null
   });
   return { ...approval, note: 'Email prepared for approval. Nothing is moved until the user approves it in Approvals.' };
@@ -1650,13 +1649,13 @@ export const TOOL_DEFINITIONS = [
   {
     type: 'function',
     name: 'gmail_delete',
-    description: 'Prepare a request to move an email to trash (recoverable for 30 days). This creates an approval item and never moves mail immediately. Use the message ID, subject, and sender returned by Gmail search.',
+    description: 'Prepare a request to move one email to trash (recoverable for 30 days). Give the exact message ID from Gmail search. Orbit fetches the authoritative sender, subject, mailbox, and preview from Gmail for an approval card; model-supplied subject and sender are ignored. Nothing moves until the user approves the card.',
     parameters: {
       type: 'object',
       properties: {
         id: { type: 'string', description: 'Gmail message ID of the email to trash.' },
-        subject: { type: 'string', description: 'Email subject shown to the user during approval.' },
-        from: { type: 'string', description: 'Email sender shown to the user during approval.' }
+        subject: { type: 'string', description: 'Optional search hint; the verified Gmail metadata controls the approval.' },
+        from: { type: 'string', description: 'Optional search hint; the verified Gmail metadata controls the approval.' }
       },
       required: ['id'],
       additionalProperties: false
