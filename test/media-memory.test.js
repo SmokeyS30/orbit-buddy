@@ -36,6 +36,20 @@ test('expired WhatsApp media releases its reservation',()=>{
   assert.equal(mediaBytesReserved(),initial);
 });
 
+test('outbound WhatsApp staging compacts a sliced buffer before retaining it',()=>{
+  const backing=Buffer.alloc(2*1024*1024,1),small=backing.subarray(0,1024);
+  const initial=mediaBytesReserved();
+  const id=stageWhatsAppMedia('wa-sliced',{bytes:small,mimeType:'image/png'});
+  try{
+    const retained=peekWhatsAppMedia(id).bytes;
+    assert.equal(retained.length,small.length);
+    assert.equal(retained.buffer.byteLength,retained.length);
+    assert.notEqual(retained.buffer,backing.buffer);
+    assert.equal(mediaBytesReserved(),initial+small.length);
+  }finally{clearWhatsAppMediaForUser('wa-sliced');}
+  assert.equal(mediaBytesReserved(),initial);
+});
+
 test('active upload admission is bounded by user and process and releases idempotently',()=>{
   const releases=[];
   try{

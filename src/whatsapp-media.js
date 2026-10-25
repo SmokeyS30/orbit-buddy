@@ -11,7 +11,7 @@
 // fetch inside the window) and expiry is never extended on fetch.
 
 import { randomUUID, createHmac, timingSafeEqual } from 'node:crypto';
-import { reserveMediaBytes } from './media-memory.js';
+import { reserveRetainedMediaBuffer } from './media-memory.js';
 
 /** Signed media URLs live this long (Twilio may retry inside the window). */
 export const WHATSAPP_MEDIA_TTL_MS = 15 * 60_000;
@@ -71,10 +71,12 @@ export function stageWhatsAppMedia(userId, { bytes, mimeType }, nowMs = Date.now
   if (owned >= MAX_STAGED_WHATSAPP_MEDIA) {
     throw Object.assign(new Error('Too many staged media files. Wait for the current send to finish.'), { status: 429 });
   }
-  const releaseBudget=reserveMediaBytes(buf.length);
-  const mediaId = randomUUID();
-  staged.set(mediaId, { userId, bytes: buf, mimeType: type, createdAt: nowMs, releaseBudget });
-  return mediaId;
+  const {bytes:retained,releaseBudget}=reserveRetainedMediaBuffer(buf);
+  try{
+    const mediaId = randomUUID();
+    staged.set(mediaId, { userId, bytes: retained, mimeType: type, createdAt: nowMs, releaseBudget });
+    return mediaId;
+  }catch(error){releaseBudget();throw error;}
 }
 
 /**

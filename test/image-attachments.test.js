@@ -38,6 +38,25 @@ test('staged attachment bytes have a process-wide admission limit',()=>{
   }
 });
 
+test('a tiny multipart image does not retain a large padded request buffer',()=>{
+  const boundary='retained-backing';
+  const header=Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="tiny.png"\r\nContent-Type: image/png\r\n\r\n`);
+  const middle=Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="padding"\r\n\r\n`);
+  const raw=Buffer.concat([header,PNG_1PX,middle,Buffer.alloc(2*1024*1024,0x70),Buffer.from(`\r\n--${boundary}--\r\n`)]);
+  const parsed=parseMultipartImage(raw,`multipart/form-data; boundary=${boundary}`);
+  assert.equal(parsed.bytes.buffer,raw.buffer,'the parser initially returns a view of the entire request');
+  const initial=mediaBytesReserved();
+  const id=stageAttachment('padded-request',{bytes:parsed.bytes,mimeType:parsed.mimeType});
+  try{
+    const retained=peekAttachment('padded-request',id).bytes;
+    assert.equal(retained.length,PNG_1PX.length);
+    assert.equal(retained.buffer.byteLength,retained.length,'staging must retain only the charged image allocation');
+    assert.notEqual(retained.buffer,raw.buffer);
+    assert.equal(mediaBytesReserved(),initial+PNG_1PX.length);
+  }finally{takeAttachment('padded-request',id);}
+  assert.equal(mediaBytesReserved(),initial);
+});
+
 // --- processImageInput ---
 
 test('processImageInput builds the Responses API input_image block', () => {
