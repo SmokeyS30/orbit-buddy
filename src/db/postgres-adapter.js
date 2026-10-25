@@ -781,6 +781,15 @@ const indexMigrations = [
     acceptReplyJob: async (userId,conversationId,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
       const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
       if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
+      if(options.inboundSid){
+        const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+        const link=await tGet('SELECT phone_e164,verified_at FROM whatsapp_links WHERE user_id=? FOR UPDATE',userId);
+        if(!user||user.disabled===1||user.moderation_blocked===1||!link||
+          link.phone_e164!==deliveryToPhone||link.verified_at!==deliveryLinkVerifiedAt)return null;
+        const claimed=await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
+          ON CONFLICT(sid) DO NOTHING RETURNING sid`,options.inboundSid,timestamp());
+        if(!claimed)return null;
+      }
       // Serialize accepts for one conversation before allocating the global
       // sequence. Otherwise a later seq can commit and run before an earlier
       // uncommitted job becomes visible to claimers.
@@ -1973,11 +1982,12 @@ const indexMigrations = [
     issueWhatsAppLinkCode: async (userId,code,expiresAt) => withTransaction(async ({get:tGet,run:tRun}) => {
       if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))throw new Error('Account not found');
       const key=`whatsapp_link_code_${code}`;
-      const prior=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
-      if(prior&&new Date(prior.slice(prior.indexOf(':')+1)).valueOf()>Date.now())throw new Error('Link code collision');
       await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
-      await tRun(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`,key,`${userId}:${expiresAt}`,timestamp());
+      const issued=await tGet(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
+        WHERE substring(settings.value from position(':' in settings.value)+1)<?
+        RETURNING value`,key,`${userId}:${expiresAt}`,timestamp(),timestamp());
+      if(!issued)throw new Error('Link code collision');
       return true;
     }),
     consumeWhatsAppLinkCode: async (code) => withTransaction(async ({get:tGet}) => {
@@ -1989,7 +1999,28 @@ const indexMigrations = [
       const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
       return taken&&sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
     }),
+    consumeAndLinkWhatsApp: async (code,phoneE164) => withTransaction(async ({get:tGet}) => {
+      const key=`whatsapp_link_code_${code}`;
+      const record=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
+      if(!record)return null;
+      const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
+      if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
+      const owner=await tGet("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0 FOR UPDATE",userId);
+      if(!owner)return null;
+      const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
+      if(!taken)return null;
+      const now=timestamp();
+      await tGet(`INSERT INTO whatsapp_links(user_id,phone_e164,verified_at,last_inbound_at,created_at)
+        VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET phone_e164=excluded.phone_e164,
+        verified_at=excluded.verified_at,created_at=excluded.created_at RETURNING user_id`,userId,phoneE164,now,now,now);
+      return userId;
+    }),
     revokeWhatsAppLinkCodes: async (userId) => (await run("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`)).changes,
+    unlinkWhatsAppAndRevoke: async (userId) => withTransaction(async ({get:tGet,run:tRun}) => {
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
+      await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
+      return (await tRun('DELETE FROM whatsapp_links WHERE user_id=?',userId)).changes>0;
+    }),
     allowWhatsAppLinkAttempt: async (phone) => withTransaction(async ({get:tGet}) => {
       const now=timestamp(),cutoff=new Date(Date.now()-10*60_000).toISOString();
       for(const [subject,limit] of [[phone,5],['*',30]]){
