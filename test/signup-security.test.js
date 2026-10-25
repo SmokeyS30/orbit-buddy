@@ -9,7 +9,7 @@ import {generateKeyPair,exportJWK,exportPKCS8,createLocalJWKSet,SignJWT} from 'j
 import { createOrbitServer } from '../server.js';
 import { DatabaseSync } from 'node:sqlite';
 import { openDatabase } from '../src/database.js';
-import { hashToken } from '../src/security.js';
+import { hashToken, makeRecoveryCodes } from '../src/security.js';
 import { verifyAppAssertion,verifyAppAttestation } from '../src/app-attest.js';
 
 const password='correct horse battery staple';
@@ -228,16 +228,20 @@ test('email reset reclaims an unverified pre-registered account and revokes its 
   const {app,request}=await fixture(t,{SIGNUP_RISK_MODE:'enforce',PUBLIC_BASE_URL:'https://test.orbit.example'},
     {sendEmail:async(_env,message)=>{sent.push(message);return true;}});
   const email='claimed@example.com';
-  const registered=await request('/api/auth/register',{email,displayName:'Pre-registered',password});
-  assert.equal(registered.status,201);
+  // Simulate a legacy unverified account: new member signup now requires
+  // mailbox proof, but existing accounts still need safe email reclamation.
+  const legacy=app.db.createUser({email,displayName:'Pre-registered',passwordHash:'legacy-hash',passwordSalt:'legacy-salt',role:'member'});
   assert.equal(app.db.getUserByEmail(email).email_verified_at,null);
-  const userId=registered.body.user.id;
-  const oldCode=registered.body.recoveryCodes[0];
+  const userId=legacy.id;
+  const oldCode=makeRecoveryCodes(1)[0];
+  app.db.replaceRecoveryCodes(userId,[hashToken(oldCode)]);
+  const legacySession=hashToken('synthetic-legacy-session');
+  app.db.createSession({tokenHash:legacySession,userId,csrfToken:'synthetic',expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic-test'});
   app.db.linkAuthIdentity('apple','pre-registration-subject',userId);
   app.db.linkWhatsApp(userId,'+15555550001');
   app.db.setSetting('whatsapp_link_code_123456',`${userId}:${new Date(Date.now()+60_000).toISOString()}`);
-  app.db.savePush(userId,{endpoint:'https://push.example.test/pre-registered',keys:{p256dh:'key',auth:'auth'}});
-  app.db.saveApnsToken(userId,'synthetic-pre-registration-token');
+  app.db.savePush(userId,{endpoint:'https://push.example.test/pre-registered',keys:{p256dh:'key',auth:'auth'}},legacySession);
+  app.db.saveApnsToken(userId,'synthetic-pre-registration-token',legacySession);
   assert.equal((await request('/api/auth/forgot-password',{email})).status,200);
   const resetUrl=new URL(sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
   assert.equal((await request('/api/auth/reset-password',{

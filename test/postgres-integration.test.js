@@ -505,10 +505,12 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     const recoveryHash='recovery-'+suffix;
     await db.replaceRecoveryCodes(reclaim.id,[recoveryHash]);
     await db.linkAuthIdentity('apple','reclaim-'+suffix,reclaim.id);
-    await db.linkWhatsApp(reclaim.id,'+15555550000');
+    await db.linkWhatsApp(reclaim.id,`+1555${String(Date.now()).slice(-8)}${Math.floor(Math.random()*10)}`);
     await db.setSetting(`whatsapp_link_code_${suffix}`,`${reclaim.id}:${expiry}`);
-    await db.savePush(reclaim.id,{endpoint:`https://push.example.test/${suffix}`,keys:{p256dh:'key',auth:'auth'}});
-    await db.saveApnsToken(reclaim.id,'synthetic-'+suffix);
+    const reclaimSession=`reclaim-session-${suffix}`;
+    await db.createSession({tokenHash:reclaimSession,userId:reclaim.id,csrfToken:'synthetic',expiresAt:expiry,userAgent:'synthetic-test'});
+    await db.savePush(reclaim.id,{endpoint:`https://push.example.test/${suffix}`,keys:{p256dh:'key',auth:'auth'}},reclaimSession);
+    await db.saveApnsToken(reclaim.id,'synthetic-'+suffix,reclaimSession);
     await db.addPasswordResetToken('reset-'+suffix,reclaim.id,expiry);
     assert.equal(await db.finishPasswordReset('reset-'+suffix,'mailbox-owner','salt'),true);
     assert.ok((await db.getUserById(reclaim.id)).email_verified_at);

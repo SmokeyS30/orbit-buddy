@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
+import { hashToken } from '../src/security.js';
 
 test('waitlist owner routes enforce sessions and CSRF and keep settings distinct from row updates',async t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-waitlist-admin-'));
@@ -19,7 +20,12 @@ test('waitlist owner routes enforce sessions and CSRF and keep settings distinct
   };
   const owner=await register('owner@example.test');
   app.db.setSetting('registration_open','true');
-  const member=await register('member@example.test');
+  // Member registration now requires mailbox proof; a synthetic existing
+  // member suffices to exercise authorization on these admin routes.
+  const memberUser=app.db.createUser({email:'member@example.test',displayName:'Member',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'});
+  const memberToken='synthetic-waitlist-member-session';
+  const member={cookie:`orbit_session=${memberToken}`,csrf:'synthetic-csrf'};
+  app.db.createSession({tokenHash:hashToken(memberToken),userId:memberUser.id,csrfToken:member.csrf,expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic-test'});
   app.db.addWaitlistEntry({id:'wl_synthetic',email:'waiting@example.test',name:'Waiting'});
   const ownerHeaders={Cookie:owner.cookie,'X-Orbit-CSRF':owner.csrf,'Content-Type':'application/json'};
   const memberHeaders={Cookie:member.cookie,'X-Orbit-CSRF':member.csrf,'Content-Type':'application/json'};
