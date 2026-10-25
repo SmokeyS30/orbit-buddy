@@ -192,12 +192,21 @@ test('Gmail writes happen only after a server-side approval', async (t) => {
     payload: { to: 'person@example.com', subject: 'Release update', body: 'Orbit is ready.' }
   });
   let gmailCalls = 0;
+  let gmailReads = 0;
   const originalFetch = global.fetch;
   global.fetch = async (url, options) => {
     if(String(url).includes('gmail.googleapis.com')){
-      gmailCalls += 1;
-      assert.equal(options.method, 'POST');
-      return { ok: true, json: async () => ({ id: 'gmail-message-1' }) };
+      if(options.method==='POST'){
+        gmailCalls += 1;
+        return { ok: true, json: async () => ({ id: 'gmail-message-1' }) };
+      }
+      gmailReads += 1;
+      if(String(url).endsWith('/profile'))return {ok:true,json:async()=>({emailAddress:'owner@example.com'})};
+      if(String(url).includes('/messages/gmail-message-2?'))return {ok:true,json:async()=>({
+        id:'gmail-message-2',threadId:'thread-2',historyId:'history-2',labelIds:['INBOX'],snippet:'Old note',
+        payload:{headers:[{name:'From',value:'sender@example.com'},{name:'Subject',value:'Old note'},{name:'Date',value:'2026-10-25'}]}
+      })};
+      throw new Error(`Unexpected synthetic Gmail read: ${url}`);
     }
     return originalFetch(url, options);
   };
@@ -220,11 +229,22 @@ test('Gmail writes happen only after a server-side approval', async (t) => {
     payload: { id: 'gmail-message-2', subject: 'Old note', from: 'sender@example.com' }
   });
   const deleted = await fetch(`${base}/api/approvals/${deleteApproval.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
-  assert.equal(deleted.status, 200);
-  const deletedBody = await deleted.json();
+  assert.equal(deleted.status, 409, 'legacy deletion approvals without a verified preview fail closed');
+  assert.equal(gmailCalls, 1);
+  assert.equal(gmailReads, 0);
+  const verifiedPreview={id:'gmail-message-2',mailbox:'owner@example.com',threadId:'thread-2',historyId:'history-2',
+    from:'sender@example.com',subject:'Old note',date:'2026-10-25',snippet:'Old note'};
+  const verified=app.db.addApproval(userId,{
+    kind:'gmail_delete',title:'Move “Old note” to trash',summary:'From sender@example.com',
+    payload:{id:'gmail-message-2',preview:verifiedPreview}
+  });
+  const approvedDelete = await fetch(`${base}/api/approvals/${verified.id}/approve`, { method: 'POST', headers: authHeaders(auth), body: '{}' });
+  assert.equal(approvedDelete.status, 200);
+  const deletedBody = await approvedDelete.json();
   assert.equal(deletedBody.approval.status, 'executed');
   assert.equal(deletedBody.approval.result.trashed, true);
   assert.equal(gmailCalls, 2);
+  assert.equal(gmailReads, 2);
 });
 
 test('CSRF is enforced and background work produces a saved artifact', async (t) => {
