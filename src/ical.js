@@ -1,4 +1,5 @@
 import rrulePkg from 'rrule';
+import { Worker } from 'node:worker_threads';
 import { fetchPublicBytes } from './net.js';
 
 const { rrulestr } = rrulePkg;
@@ -9,6 +10,10 @@ const FEED_MAX_EVENTS = 2000;
 const RANGE_MAX_INSTANCES = 5000;
 const EVENT_MAX_PROPERTIES = 1000;
 const EVENT_MAX_EXDATES = 5000;
+const EXPANSION_TIMEOUT_MS = 1500;
+const EXPANSION_TOTAL_MS = 3000;
+const MAX_EXPANSION_WORKERS = 4;
+let activeExpansionWorkers = 0;
 export const DEFAULT_ZONE = 'America/New_York';
 
 // ---------------------------------------------------------------------------
@@ -66,6 +71,43 @@ function parseDuration(value) {
   return ((((weeks * 7 + days) * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
 }
 
+function validateRule(raw) {
+  // RRULE is a structured property, not ICS TEXT. Unescaping TEXT here can
+  // introduce new RRULE lines after the parser has checked the original line.
+  if (typeof raw !== 'string' || raw.length > 500 || !/^[A-Za-z0-9,;=+-]+$/.test(raw))
+    throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  const fields = new Map();
+  for (const part of raw.toUpperCase().split(';')) {
+    const match = /^([A-Z]+)=([A-Z0-9,+-]+)$/.exec(part);
+    if (!match || fields.has(match[1]))
+      throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+    fields.set(match[1], match[2]);
+  }
+  if (!/^(DAILY|WEEKLY|MONTHLY|YEARLY)$/.test(fields.get('FREQ') || '') ||
+    [...fields.keys()].some((key) => !new Set([
+      'FREQ', 'INTERVAL', 'COUNT', 'UNTIL', 'BYDAY', 'BYMONTHDAY',
+      'BYYEARDAY', 'BYWEEKNO', 'BYMONTH', 'BYSETPOS', 'WKST'
+    ]).has(key)))
+    throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  for (const key of ['INTERVAL', 'COUNT']) {
+    if (fields.has(key) && (!/^[1-9]\d*$/.test(fields.get(key)) || Number(fields.get(key)) > 10000))
+      throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  }
+  if (fields.has('UNTIL') && !/^\d{8}(T\d{6}Z?)?$/.test(fields.get('UNTIL')))
+    throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  if (fields.has('WKST') && !/^(MO|TU|WE|TH|FR|SA|SU)$/.test(fields.get('WKST')))
+    throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  if (fields.has('BYDAY') && !/^([+-]?\d{0,2})?(MO|TU|WE|TH|FR|SA|SU)(,([+-]?\d{0,2})?(MO|TU|WE|TH|FR|SA|SU))*$/.test(fields.get('BYDAY')))
+    throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  const ranges = { BYMONTH: 12, BYMONTHDAY: 31, BYYEARDAY: 366, BYWEEKNO: 53, BYSETPOS: 366 };
+  for (const [key, limit] of Object.entries(ranges)) {
+    if (fields.has(key) && fields.get(key).split(',').some((part) =>
+      !/^[+-]?[1-9]\d*$/.test(part) || Math.abs(Number(part)) > limit || (key === 'BYMONTH' && Number(part) < 0)))
+      throw Object.assign(new Error('That calendar recurrence is too complex.'), { status: 400 });
+  }
+  return raw.toUpperCase();
+}
+
 function finishEvent(props) {
   const find = (name) => props.find((p) => p.name === name) || null;
   const get = (name) => {
@@ -82,7 +124,7 @@ function finishEvent(props) {
     dtstart,
     dtend: parseDateValue(get('DTEND')?.value, get('DTEND')?.params),
     duration: parseDuration(get('DURATION')?.value),
-    rrule: get('RRULE')?.value || null,
+    rrule: find('RRULE')?.value || null,
     exdates: props.filter((p) => p.name === 'EXDATE').flatMap((p) =>
       String(p.value).split(',').map((v) => parseDateValue(v, p.params)).filter(Boolean)
     ),
@@ -101,16 +143,10 @@ export function parseIcs(text) {
         if(current.filter(property=>property.name==='EXDATE').reduce((n,property)=>n+String(property.value).split(',').length,0)>EVENT_MAX_EXDATES){
           throw Object.assign(new Error('That calendar recurrence is too complex.'),{status:400});
         }
+        if(current.filter(property=>property.name==='RRULE').length>1)
+          throw Object.assign(new Error('That calendar recurrence is too complex.'),{status:400});
         const event=finishEvent(current);
-        if(event.rrule){
-          const rule=event.rrule.toUpperCase();
-          const interval=/(?:^|;)INTERVAL=([^;]+)/.exec(rule)?.[1];
-          if(rule.length>500||/(?:^|;)(?:BYSECOND|BYMINUTE|BYHOUR)=/.test(rule)||
-            /(?:^|;)FREQ=(?:SECONDLY|MINUTELY|HOURLY)(?:;|$)/.test(rule)||
-            interval!==undefined&&(!/^[1-9][0-9]*$/.test(interval)||Number(interval)>10_000)){
-            throw Object.assign(new Error('That calendar recurrence is too complex.'),{status:400});
-          }
-        }
+        if(event.rrule)event.rrule=validateRule(event.rrule);
         if(events.length>=FEED_MAX_EVENTS)throw Object.assign(new Error('That calendar has too many events.'),{status:400});
         events.push(event);
       }
@@ -288,6 +324,46 @@ export function expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone = DE
     .sort((a, b) => a.startMs - b.startMs);
 }
 
+// rrule's between() callback counts emitted dates, not internal skipped days.
+// An impossible rule can therefore keep the event loop busy without producing
+// a single date. Isolate feed expansion and terminate it at a wall-clock bound.
+export function expandEventsWithDeadline(vevents, rangeStartMs, rangeEndMs, defaultZone = DEFAULT_ZONE, timeoutMs = EXPANSION_TIMEOUT_MS) {
+  if (!vevents.some((event) => event?.rrule))
+    return Promise.resolve(expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone));
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+    return Promise.reject(Object.assign(new Error('Calendar expansion took too long.'), { status: 400 }));
+  if (activeExpansionWorkers >= MAX_EXPANSION_WORKERS)
+    return Promise.reject(Object.assign(new Error('Calendar expansion is busy.'), { status: 503 }));
+  activeExpansionWorkers += 1;
+  return new Promise((resolve, reject) => {
+    let worker;
+    try {
+      worker = new Worker(new URL('./ical-expand-worker.js', import.meta.url), {
+        workerData: { vevents, rangeStartMs, rangeEndMs, defaultZone }, execArgv: []
+      });
+    } catch (error) {
+      activeExpansionWorkers -= 1;
+      reject(error);
+      return;
+    }
+    let settled = false;
+    const finish = (error, events) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate().catch(() => {}).finally(() => { activeExpansionWorkers -= 1; });
+      if (error) reject(error);
+      else resolve(events);
+    };
+    const timer = setTimeout(() => finish(Object.assign(new Error('Calendar expansion took too long.'), { status: 400 })), timeoutMs);
+    worker.once('message', (result) => finish(result.error ? Object.assign(new Error(result.error), { status: result.status || 400 }) : null, result.events));
+    worker.once('error', (error) => finish(error));
+    worker.once('exit', (code) => {
+      if (code !== 0) finish(new Error(`Calendar expansion worker exited (${code}).`));
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Feed fetching with caching
 // ---------------------------------------------------------------------------
@@ -334,11 +410,23 @@ export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, de
   const feeds = db.listCalendarFeeds(userId);
   const events = [];
   const feedErrors = [];
+  let expansionBudgetMs = EXPANSION_TOTAL_MS;
   for (const feed of feeds) {
+    if (expansionBudgetMs <= 0) {
+      feedErrors.push({ label: feed.label, error: 'Calendar expansion took too long.' });
+      break;
+    }
     const { vevents, error } = await getFeedVevents(feed);
     if (error) feedErrors.push({ label: feed.label, error });
     try{
-      const expanded=expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone);
+      const started = performance.now();
+      let expanded;
+      try {
+        expanded=await expandEventsWithDeadline(vevents,rangeStartMs,rangeEndMs,defaultZone,
+          Math.min(EXPANSION_TIMEOUT_MS,expansionBudgetMs));
+      } finally {
+        expansionBudgetMs -= performance.now() - started;
+      }
       if(events.length+expanded.length>RANGE_MAX_INSTANCES){
         feedErrors.push({label:feed.label,error:'Too many calendar occurrences in this range.'});
         break;

@@ -77,3 +77,31 @@ test('calendar feed responses stop reading at their own byte limit',async t=>{
   await assert.rejects(()=>fetchFeedText('https://93.184.216.34/calendar.ics'),/too large/);
   assert.equal(cancelled,true);
 });
+
+test('the fetch deadline includes the first DNS lookup',async t=>{
+  const original=global.fetch;
+  let requests=0,release;
+  global.fetch=async()=>{requests++;return new Response('unexpected');};
+  t.after(()=>{global.fetch=original;});
+  const resolve=()=>new Promise(done=>{release=()=>done([{address:'93.184.216.34',family:4}]);});
+  await assert.rejects(()=>fetchPublicBytes('https://synthetic.invalid/',{maxBytes:100,resolve,timeoutMs:40}),/timed out/);
+  release();
+  await new Promise(done=>setImmediate(done));
+  assert.equal(requests,0,'late DNS completion cannot start a fetch');
+});
+
+test('the fetch deadline includes redirect DNS and blocks a late second fetch',async t=>{
+  const original=global.fetch;
+  let requests=0,release,lookups=0;
+  global.fetch=async()=>{requests++;return new Response(null,{status:302,headers:{Location:'https://next.invalid/'}});};
+  t.after(()=>{global.fetch=original;});
+  const resolve=()=>{
+    lookups++;
+    if(lookups===1)return Promise.resolve([{address:'93.184.216.34',family:4}]);
+    return new Promise(done=>{release=()=>done([{address:'93.184.216.34',family:4}]);});
+  };
+  await assert.rejects(()=>fetchPublicBytes('https://first.invalid/',{maxBytes:100,resolve,timeoutMs:40}),/timed out/);
+  release();
+  await new Promise(done=>setImmediate(done));
+  assert.equal(requests,1,'late redirect resolution cannot start a second fetch');
+});
