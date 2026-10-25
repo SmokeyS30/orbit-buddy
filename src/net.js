@@ -74,7 +74,7 @@ export async function assertPublicUrl(raw,resolve=lookup) {
   return url.toString();
 }
 
-async function readBoundedResponse(response,maxBytes,sizeError){
+async function readBoundedResponse(response,maxBytes,sizeError,signal){
   const claimed=Number(response.headers?.get?.('content-length'));
   if(Number.isFinite(claimed)&&claimed>maxBytes){await response.body?.cancel?.();throw new Error(sizeError);}
   if(!response.body?.getReader){
@@ -86,6 +86,8 @@ async function readBoundedResponse(response,maxBytes,sizeError){
   const reader=response.body.getReader();
   const chunks=[];
   let size=0;
+  const onAbort=()=>{reader.cancel().catch(()=>{});};
+  signal.addEventListener('abort',onAbort,{once:true});
   try{
     while(true){
       const {done,value}=await reader.read();
@@ -94,39 +96,63 @@ async function readBoundedResponse(response,maxBytes,sizeError){
       if(size>maxBytes){await reader.cancel();throw new Error(sizeError);}
       chunks.push(value);
     }
-  }finally{reader.releaseLock();}
+  }finally{signal.removeEventListener('abort',onAbort);reader.releaseLock();}
   return Buffer.concat(chunks,size);
+}
+
+function beforeDeadline(action,signal){
+  const timeout=()=>new Error('That request timed out.');
+  if(signal.aborted)return Promise.reject(timeout());
+  return new Promise((resolve,reject)=>{
+    const onAbort=()=>{signal.removeEventListener('abort',onAbort);reject(timeout());};
+    signal.addEventListener('abort',onAbort,{once:true});
+    Promise.resolve().then(()=>{
+      if(signal.aborted)throw timeout();
+      return action();
+    }).then(value=>{
+      signal.removeEventListener('abort',onAbort);
+      if(signal.aborted)reject(timeout());else resolve(value);
+    },error=>{
+      signal.removeEventListener('abort',onAbort);
+      reject(signal.aborted?timeout():error);
+    });
+  });
 }
 
 export async function fetchPublicBytes(raw,{
   headers={},maxBytes,maxRedirects=5,sizeError='That response is too large.',
   contentTypePattern=null,contentTypeError='That URL did not return readable text.',
-  networkErrorPrefix='Could not fetch that URL',resolve=lookup
+  networkErrorPrefix='Could not fetch that URL',resolve=lookup,timeoutMs=FETCH_TIMEOUT_MS
 }={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<=0)throw new Error('A positive response limit is required.');
-  let current=await assertPublicUrl(raw,resolve);
+  if(!Number.isSafeInteger(timeoutMs)||timeoutMs<=0||timeoutMs>FETCH_TIMEOUT_MS)
+    throw new Error('Invalid request timeout.');
+  // The same deadline covers DNS validation, socket connection, every redirect
+  // lookup and body reads. DNS resolvers do not accept AbortSignal, so race the
+  // lookup and refuse to start another request after the deadline.
+  const signal=AbortSignal.timeout(timeoutMs);
+  let current=await beforeDeadline(()=>assertPublicUrl(raw,resolve),signal);
   const agent=new Agent({connect:{lookup:createPublicLookup(resolve)},maxResponseSize:maxBytes});
-  const signal=AbortSignal.timeout(FETCH_TIMEOUT_MS);
   try{
     for(let hop=0;hop<=maxRedirects;hop++){
       let response;
       try{
-        response=await globalThis.fetch(current,{headers,redirect:'manual',dispatcher:agent,signal});
+        response=await beforeDeadline(()=>globalThis.fetch(current,{headers,redirect:'manual',dispatcher:agent,signal}),signal);
       }catch(error){throw new Error(`${networkErrorPrefix}: ${error.message}`);}
       if(response.status>=300&&response.status<400){
         const location=response.headers?.get?.('location');
-        await response.body?.cancel?.();
+        await beforeDeadline(()=>response.body?.cancel?.(),signal);
         if(!location)throw new Error('That redirect had no target.');
         if(hop===maxRedirects)throw new Error('That URL redirected too many times.');
-        current=await assertPublicUrl(new URL(location,current).toString(),resolve);
+        current=await beforeDeadline(()=>assertPublicUrl(new URL(location,current).toString(),resolve),signal);
         continue;
       }
       if(contentTypePattern&&!contentTypePattern.test(response.headers?.get?.('content-type')||'')){
-        await response.body?.cancel?.();
+        await beforeDeadline(()=>response.body?.cancel?.(),signal);
         throw new Error(contentTypeError);
       }
-      const buffer=await readBoundedResponse(response,maxBytes,sizeError);
+      const buffer=await beforeDeadline(()=>readBoundedResponse(response,maxBytes,sizeError,signal),signal);
       return {url:current,status:response.status,ok:response.ok,headers:response.headers,buffer};
     }
-  }finally{await agent.close();}
+  }finally{agent.destroy().catch(()=>{});}
 }

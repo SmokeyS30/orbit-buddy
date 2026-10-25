@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseIcs, expandEvents, zonedWallToUtcMs, wallPartsInZone, dayStartMs, DEFAULT_ZONE } from '../src/ical.js';
+import { parseIcs, expandEvents, expandEventsWithDeadline, zonedWallToUtcMs, wallPartsInZone, dayStartMs, DEFAULT_ZONE } from '../src/ical.js';
 
 const ZONE = 'America/New_York';
 const OCT = Date.UTC(2026, 9, 1);
@@ -16,6 +16,27 @@ test('calendar parser rejects oversized event sets and subdaily recurrence rules
   const invalidInterval=one.replace('END:VEVENT','RRULE:FREQ=DAILY;INTERVAL=0\nEND:VEVENT');
   assert.throws(()=>parseIcs(invalidInterval),/too complex/);
   assert.throws(()=>parseIcs(invalidInterval.replace('INTERVAL=0','INTERVAL=00')),/too complex/);
+});
+
+test('RRULE remains one validated property after ICS text decoding',()=>{
+  const head='BEGIN:VEVENT\nUID:injected\nDTSTART:20260101T090000Z\n';
+  assert.throws(()=>parseIcs(`${head}RRULE:FREQ=DAILY\\nRRULE:FREQ=SECONDLY;COUNT=3\nEND:VEVENT`),/too complex/);
+  assert.throws(()=>parseIcs(`${head}RRULE:FREQ=DAILY;FREQ=SECONDLY\nEND:VEVENT`),/too complex/);
+  assert.throws(()=>parseIcs(`${head}RRULE:FREQ=DAILY;BYSECOND=1\nEND:VEVENT`),/too complex/);
+  assert.equal(parseIcs(`${head}RRULE:FREQ=WEEKLY;BYDAY=MO,WE\nEND:VEVENT`)[0].rrule,'FREQ=WEEKLY;BYDAY=MO,WE');
+});
+
+test('an impossible old RRULE cannot occupy the request event loop',async()=>{
+  const ics='BEGIN:VEVENT\nUID:impossible\nDTSTART:18000101T090000Z\nRRULE:FREQ=DAILY;BYMONTH=2;BYMONTHDAY=30\nEND:VEVENT';
+  const events=parseIcs(ics);
+  const start=performance.now();
+  let timerFired=false;
+  setTimeout(()=>{timerFired=true;},25);
+  await assert.rejects(()=>expandEventsWithDeadline(events,Date.UTC(2026,0,1),Date.UTC(2026,0,8),'UTC',250),/took too long/);
+  assert.equal(timerFired,true,'recurrence work must not block the main event loop');
+  assert.ok(performance.now()-start<2000,'the worker must be terminated at its deadline');
+  const normal=parseIcs('BEGIN:VEVENT\nUID:normal\nDTSTART:20260101T090000Z\nRRULE:FREQ=DAILY;COUNT=2\nEND:VEVENT');
+  assert.equal((await expandEventsWithDeadline(normal,Date.UTC(2026,0,1),Date.UTC(2026,0,4),'UTC')).length,2);
 });
 
 test('calendar recurrence expansion stops before materializing an excessive range',()=>{
