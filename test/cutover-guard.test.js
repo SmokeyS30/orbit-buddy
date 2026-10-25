@@ -61,3 +61,30 @@ test('held revision keeps chat and health available while task, proactive and co
   await new Promise(resolve=>setImmediate(resolve));
   assert.ok(app.db.listTasks(user.id).some(row=>row.title==='Route-triggered'&&row.status==='queued'));
 });
+
+test('open composed revision serves chat, binds OAuth to the initiating session, and runs due tasks', async t => {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-cutover-open-'));
+  const model=createModelClient({ NODE_ENV:'test' });
+  model.respond=async()=>({text:'Synthetic response',toolCalls:[]});
+  const app=createOrbitServer({dataDir:dir,modelClient:model,env:{NODE_ENV:'test',ORBIT_CUTOVER_HOLD:'false',
+    OPENAI_MODEL:'gpt-6-luna',DATA_ENCRYPTION_KEY:'synthetic-only-32-character-key-123',
+    GMAIL_CLIENT_ID:'synthetic-id',GMAIL_CLIENT_SECRET:'synthetic-secret'}});
+  await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  const user=app.db.createUser({email:'synthetic-open@example.test',displayName:'Synthetic',passwordHash:'test',passwordSalt:'test',role:'owner'});
+  const token='synthetic-open-session',csrf='synthetic-open-csrf';
+  app.db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,
+    expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic'});
+  const headers={Cookie:`orbit_session=${token}`,'X-Orbit-CSRF':csrf,'Content-Type':'application/json'};
+  assert.equal((await (await fetch(base+'/healthz')).json()).cutoverHold,false);
+  assert.equal((await fetch(base+'/api/chat',{method:'POST',headers,body:JSON.stringify({message:'Synthetic hello'})})).status,202);
+  const begin=await fetch(base+'/api/connectors/gmail/begin',{method:'POST',headers});
+  assert.equal(begin.status,200);
+  const state=new URL((await begin.json()).url).searchParams.get('state');
+  const bound=app.db.consumeOauthState(hashToken(state));
+  assert.equal(bound.session_hash,hashToken(token));
+  const task=app.db.addTask(user.id,{title:'Synthetic due task',prompt:'Synthetic prompt'});
+  await app.runDueTasks();
+  assert.equal(app.db.getTask(user.id,task.id).status,'completed');
+});
