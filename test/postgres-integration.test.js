@@ -7,7 +7,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
+import { Worker } from 'node:worker_threads';
+import { createSyncPgAdapter, waitForPgResponse } from '../src/db/sync-pg-wrapper.mjs';
 import { toolDeleteGoal,toolConfirmDeleteApproval } from '../src/tools.js';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -40,6 +41,42 @@ test('PostgreSQL deletion tool remains unable to execute after a later yes',asyn
   }finally{
     if(userId)db.deleteUserAccount(userId);
     db.close();
+  }
+});
+
+test('a late successful-call notification cannot complete the next synchronous call',async()=>{
+  const resultBuffer=new SharedArrayBuffer(16),controlBuffer=new SharedArrayBuffer(4);
+  const result=new Int32Array(resultBuffer),control=new Int32Array(controlBuffer);
+  const worker=new Worker(`
+    const {workerData}=require('node:worker_threads');
+    const result=new Int32Array(workerData.result),control=new Int32Array(workerData.control);
+    Atomics.wait(control,0,0);
+    Atomics.wait(control,0,1,30); // second response follows the old notification
+    Atomics.store(result,1,42);
+    Atomics.store(result,0,1);
+    Atomics.notify(result,0,1);
+  `,{eval:true,workerData:{result:resultBuffer,control:controlBuffer}});
+  const originalWait=Atomics.wait;
+  let oldWake=false;
+  try{
+    Atomics.store(result,0,1); // prior call finished, before its notify
+    assert.equal(waitForPgResponse(result,100),true);
+    Atomics.store(result,0,0); // next call reuses the buffer
+    Atomics.wait=(array,index,expected,timeout)=>{
+      if(array===result&&!oldWake){
+        oldWake=true;
+        Atomics.notify(result,0,1); // delayed notification from prior call
+        Atomics.store(control,0,1);Atomics.notify(control,0,1);
+        return 'ok'; // the old notify wakes this call with FLAG still zero
+      }
+      return originalWait(array,index,expected,timeout);
+    };
+    assert.equal(waitForPgResponse(result,1000),true);
+    assert.equal(oldWake,true);
+    assert.equal(Atomics.load(result,1),42,'only the new response completes the call');
+  }finally{
+    Atomics.wait=originalWait;
+    await worker.terminate();
   }
 });
 
