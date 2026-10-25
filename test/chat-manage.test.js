@@ -358,6 +358,16 @@ test('a renamed target cannot be deleted through its old approval card',async t=
   assert.ok(app.db.getGoal(userId,goal.id));
 });
 
+test('a changed target with the same title invalidates its old deletion preview',async t=>{
+  const {app,account,approve,stage}=await approvalApiFixture(t);
+  const userId=account.user.id,goal=app.db.addGoal(userId,{title:'Gym'});
+  const staged=stage(goal,'Delete Gym');
+  app.db.updateGoal(userId,goal.id,{progress:50});
+  assert.equal((await approve(staged.approvalId)).status,409);
+  assert.ok(app.db.getGoal(userId,goal.id));
+  assert.equal(app.db.getApproval(userId,staged.approvalId).status,'rejected');
+});
+
 test('delete tools ask on ambiguity and stage nothing', () => {
   const { db, user, ctx } = fixture();
   toolCreateRoutine({ title: 'Gym stretch', prompt: 'Stretch', kind: 'custom', cadence: 'daily', timeLocal: '09:00' }, ctx);
