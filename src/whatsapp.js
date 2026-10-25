@@ -88,7 +88,7 @@ export async function sendWhatsAppText({ accountSid, authToken, fromNumber, toPh
     body: form.toString(),
   });
   if (!response.ok) {
-    throw new Error(`Twilio send failed (${response.status})`);
+    throw Object.assign(new Error(`Twilio send failed (${response.status})`),{status:response.status});
   }
   const data = await response.json().catch(() => ({}));
   return data.sid || null;

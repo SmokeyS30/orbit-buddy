@@ -838,6 +838,41 @@ test('deliverProactive: window closed skips WhatsApp, push still fires', async (
   } finally { restore(); }
 });
 
+test('deliverProactive: ambiguous WhatsApp outcome never starts a second channel',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const original=globalThis.fetch;
+  const pushes=[];stubPush(app,pushes);
+  globalThis.fetch=async url=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')throw new Error('synthetic response lost after send');
+    return original(url);
+  };
+  try{
+    const outcome=await app.deliverProactive(app.db.getUserById(userId),'Synthetic check-in','test','Synthetic test');
+    assert.equal(outcome.recorded,true);
+    assert.equal(pushes.length,0,'the provider might have accepted the WhatsApp message');
+    assert.ok(app.db.listEvents(userId).some(event=>event.type==='whatsapp_send_uncertain'));
+  }finally{globalThis.fetch=original;}
+});
+
+test('deliverProactive: explicit WhatsApp 4xx rejection permits push fallback',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const original=globalThis.fetch;
+  const pushes=[];stubPush(app,pushes);
+  globalThis.fetch=async url=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')return{ok:false,status:400};
+    return original(url);
+  };
+  try{
+    const outcome=await app.deliverProactive(app.db.getUserById(userId),'Synthetic check-in','test','Synthetic test');
+    assert.equal(outcome.recorded,true);
+    assert.equal(pushes.length,1);
+  }finally{globalThis.fetch=original;}
+});
+
 test('deliverProactive: no WhatsApp link and non-owner fall back to push', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base);
@@ -877,16 +912,53 @@ test('runDueTasks: whatsapp-channel task delivered via WhatsApp when window open
   assert.equal(task.delivery_channel, 'whatsapp');
   const sent = []; const restore = stubTwilio(sent);
   const pushes = []; stubPush(app, pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
   try {
     await app.runDueTasks();
     assert.ok(sent.some((s) => s.body.includes('whatsapp%3A%2B15085551234')), 'reminder went out via WhatsApp');
     assert.equal(pushes.length, 0, 'no duplicate push');
+    assert.equal(apnsCalls,0,'WhatsApp replaces APNs for this task too');
     assert.equal(app.db.getTask(userId, task.id).status, 'completed');
     const convo = app.db.ensureDefaultConversation(userId);
     const messages = app.db.listConversationMessages(userId, convo.id, 8);
     assert.ok(messages.some((m) => m.role === 'assistant' && app.db.getTask(userId, task.id).result && m.content.includes(app.db.getTask(userId, task.id).result.slice(0, 20))), 'result written to the conversation');
     assert.ok(app.db.listEvents(userId).some((e) => e.type === 'task_delivered_whatsapp'), 'delivery event recorded');
   } finally { restore(); }
+});
+
+test('runDueTasks: ambiguous WhatsApp outcome never triggers web push or APNs',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  const task=dueTask(app,userId);
+  const original=globalThis.fetch;const pushes=[];stubPush(app,pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
+  globalThis.fetch=async(url,options)=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')throw new Error('synthetic response lost');
+    return original(url,options);
+  };
+  try{
+    await app.runDueTasks();
+    assert.equal(app.db.getTask(userId,task.id).status,'completed');
+    assert.equal(pushes.length,0);
+    assert.equal(apnsCalls,0);
+    assert.ok(app.db.listEvents(userId).some(event=>event.type==='whatsapp_send_uncertain'));
+  }finally{globalThis.fetch=original;}
+});
+
+test('runDueTasks: explicit WhatsApp rejection falls back to web push and APNs',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base);
+  app.db.setWhatsAppLastInbound(userId,new Date().toISOString());
+  dueTask(app,userId);
+  const original=globalThis.fetch;const pushes=[];stubPush(app,pushes);
+  let apnsCalls=0;app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
+  globalThis.fetch=async(url,options)=>{
+    if(new URL(String(url)).hostname==='api.twilio.com')return{ok:false,status:400};
+    return original(url,options);
+  };
+  try{await app.runDueTasks();assert.equal(pushes.length,1);assert.equal(apnsCalls,1);}
+  finally{globalThis.fetch=original;}
 });
 
 test('runDueTasks: whatsapp-channel task falls back to push when window closed', async (t) => {

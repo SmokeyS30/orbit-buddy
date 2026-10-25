@@ -67,10 +67,11 @@ export function parseRepoListEnv(value) {
  * discover the owner's most recently pushed non-fork, non-archived repos and
  * take the top few. Discovery is one cheap request per poll.
  */
-export async function resolveWatchRepos({ token, owner, env = process.env, fetchImpl = fetch } = {}) {
+export async function resolveWatchRepos({ token, owner, env = process.env, fetchImpl = fetch, assertActive = () => {} } = {}) {
   const configured = parseRepoListEnv(env[RADAR_REPOS_ENV]);
   if (configured.length) return configured.slice(0, RADAR_MAX_REPOS);
   const login = String(env[RADAR_OWNER_ENV] || owner || RADAR_DEFAULT_OWNER).replace(/^@/, '').trim() || RADAR_DEFAULT_OWNER;
+  await assertActive();
   const { data } = await ghGet(`/users/${encodeURIComponent(login)}/repos?per_page=100&sort=pushed`, token, { fetchImpl });
   return (Array.isArray(data) ? data : [])
     .filter((r) => r && !r.fork && !r.archived && typeof r.full_name === 'string')
@@ -227,16 +228,20 @@ export function composeRadarCheckin(finding) {
 // ---------------------------------------------------------------------------
 
 /** Fetch the radar sources for one repo (all GET). Returns raw API payloads. */
-export async function pollRepo({ owner, repo, token, fetchImpl = fetch }) {
+export async function pollRepo({ owner, repo, token, fetchImpl = fetch, assertActive = () => {} }) {
   const full = `${owner}/${repo}`;
   const enc = encodeURIComponent;
+  await assertActive();
   const { data: info } = await ghGet(`/repos/${enc(owner)}/${enc(repo)}`, token, { fetchImpl });
   const defaultBranch = info?.default_branch || 'main';
+  await assertActive();
   const { data: runsData } = await ghGet(
     `/repos/${enc(owner)}/${enc(repo)}/actions/runs?per_page=10&branch=${enc(defaultBranch)}`, token, { fetchImpl });
   // Dependabot alerts need the security_events scope; 403/404 → skipped quietly.
+  await assertActive();
   const { data: alerts } = await ghGet(
     `/repos/${enc(owner)}/${enc(repo)}/dependabot/alerts?state=open&per_page=10`, token, { fetchImpl });
+  await assertActive();
   const { data: prs } = await ghGet(
     `/repos/${enc(owner)}/${enc(repo)}/pulls?state=closed&per_page=10&sort=updated&direction=desc`, token, { fetchImpl });
   return {
@@ -253,7 +258,7 @@ export async function pollRepo({ owner, repo, token, fetchImpl = fetch }) {
  * new ones. Returns { skipped, checked, surfaced, errors }. Never throws for
  * per-repo failures — one bad repo must not sink the others.
  */
-export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), fetchImpl = fetch } = {}) {
+export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), fetchImpl = fetch, assertActive = () => {} } = {}) {
   const summary = { skipped: null, checked: 0, surfaced: [], errors: [] };
   const token = env[RADAR_TOKEN_ENV];
   if (!token) return { ...summary, skipped: 'no-token' };
@@ -266,13 +271,16 @@ export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), 
 
   let repos;
   try {
-    repos = await resolveWatchRepos({ token, env, fetchImpl });
+    await assertActive();
+    repos = await resolveWatchRepos({ token, env, fetchImpl, assertActive });
   } catch (error) {
+    if(error?.code==='PROACTIVE_DEFERRED'||error?.code==='PROACTIVE_LEASE_LOST')throw error;
     db.setSetting('radar_last_error', String((error && error.message) || error).slice(0, 200));
     db.setSetting('radar_last_error_at', String(nowMs));
     return { ...summary, skipped: 'discovery-failed' };
   }
   if (!repos.length) {
+    await assertActive();
     db.setSetting('radar_last_poll', String(nowMs));
     return { ...summary, skipped: 'no-repos' };
   }
@@ -281,7 +289,9 @@ export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), 
     const [owner, repo] = String(full).split('/');
     if (!owner || !repo) continue;
     try {
-      const { fullName, defaultBranch, runs, alerts, prs } = await pollRepo({ owner, repo, token, fetchImpl });
+      await assertActive();
+      const { fullName, defaultBranch, runs, alerts, prs } = await pollRepo({ owner, repo, token, fetchImpl, assertActive });
+      await assertActive();
       summary.checked++;
       const knownFailures = new Set(
         (db.listRadarUnrecoveredFailures(fullName) || []).map((r) => `${r.workflow}|${r.branch}`));
@@ -292,11 +302,13 @@ export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), 
         summary.surfaced.push(f);
       }
     } catch (error) {
+      if(error?.code==='PROACTIVE_DEFERRED'||error?.code==='PROACTIVE_LEASE_LOST')throw error;
       // One repo failing (rate limit, renamed, transient) never sinks the poll.
       summary.errors.push({ repo: full, error: String((error && error.message) || error).slice(0, 160) });
     }
   }
 
+  await assertActive();
   db.setSetting('radar_last_poll', String(nowMs));
   try { db.setSetting('radar_last_error', ''); } catch { /* best effort */ }
   return summary;

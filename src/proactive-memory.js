@@ -347,18 +347,23 @@ export async function runProactiveMemoryPush({ db, model, user, timeZone, nowMs,
     return 0;
   }
   try {
-    const outcome=await deliver(text, `Proactively surfaced a timely memory (${top.reason}).`);
+    let surfaced=false;
+    const record=()=>{
+      db.recordMemorySurfacing(user.id, {
+        memoryId: top.memory.id,
+        occurrenceKey: top.occurrenceKey,
+        kind: 'date',
+        via: 'proactive',
+        reason: top.reason,
+        contentSnapshot: top.memory.content,
+        memoryCreatedAt: top.memory.created_at,
+      });
+      db.addEvent(user.id, 'memory_surfaced_proactive', `Volunteered a timely memory proactively (${top.reason}).`);
+      surfaced=true;
+    };
+    const outcome=await deliver(text, `Proactively surfaced a timely memory (${top.reason}).`,record);
     if(outcome===false||outcome?.recorded===false){try{releaseSlot();}catch{}return 0;}
-    db.recordMemorySurfacing(user.id, {
-      memoryId: top.memory.id,
-      occurrenceKey: top.occurrenceKey,
-      kind: 'date',
-      via: 'proactive',
-      reason: top.reason,
-      contentSnapshot: top.memory.content,
-      memoryCreatedAt: top.memory.created_at,
-    });
-    db.addEvent(user.id, 'memory_surfaced_proactive', `Volunteered a timely memory proactively (${top.reason}).`);
+    if(!surfaced)record(); // compatible with injected legacy delivery callbacks
     return 1;
   } catch (error) {
     console.error('proactive memory deliver failed', error && error.message);
