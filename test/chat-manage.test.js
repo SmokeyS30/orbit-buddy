@@ -18,7 +18,14 @@ function fixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-manage-'));
   const db = openDatabase(path.join(directory, 'test.sqlite'));
   const user = db.createUser({ email: 'owner@example.com', displayName: 'Owner', passwordHash: 'hash', passwordSalt: 'salt', role: 'owner' });
-  return { db, user, ctx: { db, userId: user.id, timeZone: 'America/New_York', messageId: null } };
+  const conversation=db.ensureDefaultConversation(user.id);
+  const ctx={ db, userId: user.id, timeZone: 'America/New_York', messageId: null };
+  const turn=(message)=>{
+    const row=db.addMessage(user.id,conversation.id,'user',message);
+    return {...ctx,messageId:row.id,conversationId:conversation.id,userMessage:message};
+  };
+  const reply=(message)=>db.addMessage(user.id,conversation.id,'assistant',message);
+  return { db, user, ctx, turn, reply };
 }
 
 const THU = new Date('2026-10-15T12:00:00Z'); // Thursday 08:00 EDT
@@ -127,10 +134,47 @@ test('update_routine changes time and pauses by fuzzy title', () => {
   db.close();
 });
 
+test('model cannot stage and confirm a deletion during one user turn', () => {
+  const {db,user,ctx,turn}=fixture();
+  const goal=toolCreateGoal({title:'Keep this goal'},ctx);
+  const first=turn('Delete Keep this goal');
+  const staged=toolDeleteGoal({title:'Keep this goal'},first);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},first),/fresh explicit confirmation/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  assert.equal(db.getApproval(user.id,staged.approvalId).status,'pending');
+  db.close();
+});
+
+test('delete confirmation rejects ambiguous, stale and cross-conversation replies', () => {
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Keep the goal'},ctx);
+  const staged=toolDeleteGoal({title:'Keep the goal'},turn('Delete Keep the goal'));
+  reply(`Confirm deletion: ${staged.preview}`);
+  const other=db.createConversation(user.id,'Another thread');
+  const cross=db.addMessage(user.id,other.id,'user','yes');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...ctx,messageId:cross.id}),/fresh explicit confirmation/i);
+  const ambiguous=turn('yes, but keep the goal');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},ambiguous),/fresh explicit confirmation/i);
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/fresh explicit confirmation/i,
+    'an unrelated intervening user turn invalidates the old preview');
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
+test('delete confirmation requires a visible preview naming the target and deletion', () => {
+  const {db,user,ctx,turn,reply}=fixture();
+  const goal=toolCreateGoal({title:'Keep the goal'},ctx);
+  const staged=toolDeleteGoal({title:'Keep the goal'},turn('Delete Keep the goal'));
+  reply('Sure, would you like help with that goal?');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},turn('yes')),/fresh explicit confirmation/i);
+  assert.ok(db.getGoal(user.id,goal.id));
+  db.close();
+});
+
 test('delete_goal stages a request but deletes nothing until confirmed', () => {
-  const { db, user, ctx } = fixture();
+  const { db, user, ctx, turn, reply } = fixture();
   const created = toolCreateGoal({ title: 'Drop me' }, ctx);
-  const staged = toolDeleteGoal({ title: 'drop me' }, ctx);
+  const staged = toolDeleteGoal({ title: 'drop me' }, turn('Delete Drop me'));
   assert.ok(staged.approvalId);
   assert.match(staged.preview, /Drop me/);
   assert.match(staged.note, /NOT deleted/);
@@ -139,7 +183,10 @@ test('delete_goal stages a request but deletes nothing until confirmed', () => {
   const approval = db.getApproval(user.id, staged.approvalId);
   assert.equal(approval.kind, 'delete_goal');
   assert.equal(approval.status, 'pending');
-  const done = toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx);
+  reply(`Confirm deletion: ${staged.preview}`);
+  const confirmedTurn=turn('yes');
+  assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...confirmedTurn,regenerated:true}),/fresh explicit confirmation/i);
+  const done = toolConfirmDeleteApproval({ approvalId: staged.approvalId }, confirmedTurn);
   assert.equal(done.deleted, true);
   assert.equal(done.title, 'Drop me');
   assert.equal(db.getGoal(user.id, created.id), null);
@@ -148,26 +195,30 @@ test('delete_goal stages a request but deletes nothing until confirmed', () => {
 });
 
 test('confirm_delete_approval rejects double-confirm and unknown approvals', () => {
-  const { ctx } = fixture();
+  const { ctx, turn, reply } = fixture();
   const created = toolCreateGoal({ title: 'Drop me twice' }, ctx);
-  const staged = toolDeleteGoal({ title: 'drop me twice' }, ctx);
+  const staged = toolDeleteGoal({ title: 'drop me twice' }, turn('Delete Drop me twice'));
   assert.equal(created.title, 'Drop me twice');
-  toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx);
-  assert.throws(() => toolConfirmDeleteApproval({ approvalId: staged.approvalId }, ctx), /already reviewed/);
-  assert.throws(() => toolConfirmDeleteApproval({ approvalId: '00000000-0000-0000-0000-000000000000' }, ctx), /No pending deletion/);
+  reply(`Confirm deletion: ${staged.preview}`);
+  const confirmedTurn=turn('yes, delete it');
+  toolConfirmDeleteApproval({ approvalId: staged.approvalId }, confirmedTurn);
+  assert.throws(() => toolConfirmDeleteApproval({ approvalId: staged.approvalId }, confirmedTurn), /already reviewed/);
+  assert.throws(() => toolConfirmDeleteApproval({ approvalId: '00000000-0000-0000-0000-000000000000' }, confirmedTurn), /No pending deletion/);
 });
 
 test('delete_task and delete_routine follow the same confirm gate', () => {
-  const { db, user, ctx } = fixture();
+  const { db, user, ctx, turn, reply } = fixture();
   const task = toolCreateTask({ title: 'Temp task', prompt: 'Do it' }, ctx);
-  const stagedTask = toolDeleteTask({ task: 'temp' }, ctx);
+  const stagedTask = toolDeleteTask({ task: 'temp' }, turn('Delete Temp task'));
   assert.ok(db.getTask(user.id, task.id), 'task must still exist before confirmation');
-  toolConfirmDeleteApproval({ approvalId: stagedTask.approvalId }, ctx);
+  reply(`Confirm deletion: ${stagedTask.preview}`);
+  toolConfirmDeleteApproval({ approvalId: stagedTask.approvalId }, turn('yes'));
   assert.equal(db.getTask(user.id, task.id), undefined);
   const routine = toolCreateRoutine({ title: 'Temp routine', prompt: 'Run', kind: 'custom', cadence: 'daily', timeLocal: '09:00' }, ctx);
-  const stagedRoutine = toolDeleteRoutine({ routine: 'temp' }, ctx);
+  const stagedRoutine = toolDeleteRoutine({ routine: 'temp' }, turn('Delete Temp routine'));
   assert.ok(db.getRoutine(user.id, routine.id), 'routine must still exist before confirmation');
-  toolConfirmDeleteApproval({ approvalId: stagedRoutine.approvalId }, ctx);
+  reply(`Confirm deletion: ${stagedRoutine.preview}`);
+  toolConfirmDeleteApproval({ approvalId: stagedRoutine.approvalId }, turn('confirm deletion'));
   assert.equal(db.getRoutine(user.id, routine.id), null);
   db.close();
 });

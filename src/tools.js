@@ -895,12 +895,39 @@ export function toolDeleteRoutine(args = {}, ctx = null) {
   return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine.id, routine.title, preview);
 }
 
+function hasFreshDeleteConfirmation(ctx, approval, userId) {
+  if(ctx?.regenerated)return false;
+  const sourceId=approval.source_message_id;
+  const currentId=ctx?.messageId;
+  if(!sourceId||!currentId||sourceId===currentId)return false;
+  const source=ctx.db.getMessage(userId,sourceId);
+  const current=ctx.db.getMessage(userId,currentId);
+  if(!source||!current||source.role!=='user'||current.role!=='user'||source.conversation_id!==current.conversation_id)return false;
+  const text=String(current.content||'').trim().replace(/[.!]+$/,'').trim().toLocaleLowerCase();
+  const title=String(approval.payload?.title||'').trim().toLocaleLowerCase();
+  const explicit=/^(?:yes|yes please|yes,? delete it|confirm(?: the)? deletion|delete it)$/.test(text)
+    ||(title&&[`yes, delete ${title}`,`delete ${title}`,`confirm delete ${title}`].includes(text));
+  if(!explicit)return false;
+  const recent=ctx.db.listConversationMessagesThrough(userId,current.conversation_id,currentId,200);
+  if(recent.at(-1)?.id!==currentId)return false;
+  const earlierUsers=recent.filter(row=>row.role==='user');
+  if(earlierUsers.at(-2)?.id!==sourceId)return false;
+  const sourceIndex=recent.findIndex(row=>row.id===sourceId);
+  if(sourceIndex<0)return false;
+  return recent.slice(sourceIndex+1,-1).some(row=>{
+    if(row.role!=='assistant')return false;
+    const preview=String(row.content||'').toLocaleLowerCase();
+    return preview.includes(title)&&/delet|remov/.test(preview);
+  });
+}
+
 export function toolConfirmDeleteApproval(args = {}, ctx = null) {
   const { db, userId } = writeContext(ctx, 'confirm_delete_approval');
   const approvalId = cleanArg(args.approvalId, 80, 'approvalId');
   const approval = db.getApproval(userId, approvalId);
   if (!approval || !DELETE_APPROVAL_KINDS.includes(approval.kind)) throw new Error('No pending deletion found for that approval.');
   if (approval.status !== 'pending') throw new Error('That deletion request was already reviewed — nothing to confirm.');
+  if (!hasFreshDeleteConfirmation(ctx,approval,userId)) throw new Error('Deletion requires a fresh explicit confirmation after the preview in this conversation. Nothing was deleted.');
   const claimed = db.claimApproval(userId, approval.id);
   if (!claimed) throw new Error('That deletion request is already being handled.');
   const { id, title, objectType } = claimed.payload || {};
