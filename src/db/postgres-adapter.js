@@ -630,7 +630,7 @@ const indexMigrations = [
 
     // --- Sessions ---
     createSession: async ({ tokenHash, userId, csrfToken, expiresAt, userAgent }) => { await run('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)', tokenHash, userId, csrfToken, expiresAt, timestamp(), userAgent || null); },
-    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`, tokenHash, timestamp()),
     deleteSession: async (tokenHash) => { await run('DELETE FROM sessions WHERE token_hash=?', tokenHash); },
     deleteUserSessions: async (userId) => { await run('DELETE FROM sessions WHERE user_id=?', userId); },
@@ -1020,12 +1020,17 @@ const indexMigrations = [
     },
 
     // --- Import jobs ---
-    async createImportJob(userId, filename) {
+    async createImportJob(userId, filename) { return withTransaction(async ({query:tQuery,get:tGet,run:tRun})=>{
+      await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[userId]);
       const now = timestamp();
+      await tRun("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?",
+        now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(await tGet("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1",userId))return null;
+      if(Number((await tGet('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?',userId,new Date(Date.now()-24*60*60_000).toISOString())).count)>=3)return null;
       const row = { id: randomUUID(), user_id: userId, filename: String(filename||'').slice(0, 200), status: 'processing', total_chunks: 0, done_chunks: 0, suggestions_added: 0, error: null, created_at: now, updated_at: now };
-      await run('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.user_id, row.filename, row.status, row.total_chunks, row.done_chunks, row.suggestions_added, row.error, row.created_at, row.updated_at);
+      await tRun('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.user_id, row.filename, row.status, row.total_chunks, row.done_chunks, row.suggestions_added, row.error, row.created_at, row.updated_at);
       return row;
-    },
+    }); },
     getImportJob: async (userId, id) => (await get('SELECT * FROM import_jobs WHERE id=? AND user_id=?', id, userId)) || null,
     listImportJobs: async (userId) => all('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 5', userId),
     async updateImportJob(userId, id, patch={}) {
@@ -1530,6 +1535,7 @@ const indexMigrations = [
       const row = await get('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?', userId, monthKey);
       return row ? row.narrative : null;
     },
+    getTimelineNarrativeRecord: async (userId, monthKey) => get('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?',userId,monthKey),
     setTimelineNarrative: async (userId, monthKey, narrative) => {
       await run(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
         ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`, userId, monthKey, narrative, timestamp());
