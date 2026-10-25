@@ -1291,9 +1291,9 @@ const indexMigrations = [
         const { id, objectType } = approval.payload || {};
         const table = DELETE_APPROVAL_TABLES[objectType];
         const target = table ? await tGet(`SELECT * FROM ${table} WHERE id=? AND user_id=? FOR UPDATE`, id, userId) : null;
-        // messages has no user FK or common write lock. SHARE blocks INSERT,
-        // UPDATE and DELETE until this short transaction commits, including
-        // new user turns from other application replicas.
+        // messages has no user FK or common write lock. SHARE blocks message
+        // writes until this short transaction commits, including newer chat
+        // turns on separate application replicas.
         await tQuery('LOCK TABLE messages IN SHARE MODE');
         const recent = await tAll('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC, insert_order DESC NULLS LAST, id DESC LIMIT 200', userId);
         const selected = currentDeleteApproval(approval, recent, target);
