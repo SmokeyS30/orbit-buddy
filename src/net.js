@@ -122,7 +122,8 @@ function beforeDeadline(action,signal){
 export async function fetchPublicBytes(raw,{
   headers={},maxBytes,maxRedirects=5,sizeError='That response is too large.',
   contentTypePattern=null,contentTypeError='That URL did not return readable text.',
-  networkErrorPrefix='Could not fetch that URL',resolve=lookup,timeoutMs=FETCH_TIMEOUT_MS
+  networkErrorPrefix='Could not fetch that URL',resolve=lookup,timeoutMs=FETCH_TIMEOUT_MS,
+  assertActive=null
 }={}){
   if(!Number.isSafeInteger(maxBytes)||maxBytes<=0)throw new Error('A positive response limit is required.');
   if(!Number.isSafeInteger(timeoutMs)||timeoutMs<=0||timeoutMs>FETCH_TIMEOUT_MS)
@@ -131,10 +132,11 @@ export async function fetchPublicBytes(raw,{
   // lookup and body reads. DNS resolvers do not accept AbortSignal, so race the
   // lookup and refuse to start another request after the deadline.
   const signal=AbortSignal.timeout(timeoutMs);
-  let current=await beforeDeadline(()=>assertPublicUrl(raw,resolve),signal);
+  let current=await beforeDeadline(()=>{assertActive?.();return assertPublicUrl(raw,resolve);},signal);
   const agent=new Agent({connect:{lookup:createPublicLookup(resolve)},maxResponseSize:maxBytes});
   try{
     for(let hop=0;hop<=maxRedirects;hop++){
+      assertActive?.();
       let response;
       try{
         response=await beforeDeadline(()=>globalThis.fetch(current,{headers,redirect:'manual',dispatcher:agent,signal}),signal);
@@ -144,7 +146,7 @@ export async function fetchPublicBytes(raw,{
         await beforeDeadline(()=>response.body?.cancel?.(),signal);
         if(!location)throw new Error('That redirect had no target.');
         if(hop===maxRedirects)throw new Error('That URL redirected too many times.');
-        current=await beforeDeadline(()=>assertPublicUrl(new URL(location,current).toString(),resolve),signal);
+        current=await beforeDeadline(()=>{assertActive?.();return assertPublicUrl(new URL(location,current).toString(),resolve);},signal);
         continue;
       }
       if(contentTypePattern&&!contentTypePattern.test(response.headers?.get?.('content-type')||'')){

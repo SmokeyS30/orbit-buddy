@@ -1153,7 +1153,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           taskMessage=taskMessage.replace(/\s*check (?:today'?s|the) calendar first[^.]*\./gi,'').replace(/\s*suppress (?:this reminder )?if[^.]*\./gi,'').trim();
           if(/^\[nudge\]\s*morning briefing/i.test(task.title||'')){
             assertTaskActive();
-            try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
+            try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone,{assertActive:assertTaskActive});if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
           assertTaskActive();
           const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
@@ -1336,7 +1336,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         if(!db.claimRoutine(user.id,routine.id,local.date)){db.releaseProactiveSlot(user.id,local.date,token);continue;}
         try{
           assertProactiveAction(user.id);
-          const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone):'';
+          const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone,{assertActive:()=>assertProactiveAction(user.id)}):'';
           const prompt=buildRoutinePrompt({routine,timeZone:preferences.time_zone,agenda,goals:db.listGoals(user.id),tasks:db.listTasks(user.id),followUps:db.listFollowUps(user.id),nowMs});
           const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:()=>assertProactiveAction(user.id)});
           assertProactiveAction(user.id);
@@ -1941,7 +1941,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
       // Meeting prep: check for upcoming events in the next 90 minutes
       let meetingCandidate=null;
       try{
-        const {events}=await getEventsForRange(db,user.id,nowMs,nowMs+90*60_000,timeZone);
+        const {events}=await getEventsForRange(db,user.id,nowMs,nowMs+90*60_000,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
         const genericTitle=/^(lunch|break|focus|focus time|ooo|out of office|busy|personal|dentist|appointment)$/i;
         for(const e of events){
           if(e.allDay)continue;
@@ -2027,6 +2027,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Fetch real weather and calendar data so the briefing has actual details
           let weatherCtx='';
           try{
+            assertProactiveAction(user.id);
             const wxRes=await fetch('https://api.open-meteo.com/v1/forecast?latitude=41.76&longitude=-70.08&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min&temperature_unit=fahrenheit&timezone=auto&forecast_days=1',{signal:AbortSignal.timeout(10000)});
             const wx=await wxRes.json();
             const cur=wx.current||{};
@@ -2039,7 +2040,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           }catch(e){weatherCtx='';}
           let calCtx='';
           try{
-            const agenda=await getBriefingAgenda(db,user.id,1,timeZone);
+            const agenda=await getBriefingAgenda(db,user.id,1,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
             if(agenda)calCtx=`Today's calendar:\n${agenda}`;
           }catch(e){calCtx='';}
           const contextParts=[];
@@ -2206,7 +2207,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         }else if(decisionClean==='EVENING'){
           let tomorrowCtx='';
           try{
-            const agenda=await getBriefingAgenda(db,user.id,2,timeZone);
+            const agenda=await getBriefingAgenda(db,user.id,2,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
             if(agenda)tomorrowCtx=`\n\nCalendar data (today + tomorrow):\n${agenda}\nUse this for the tomorrow preview if anything is scheduled.`;
           }catch(e){}
           genPrompt=`Write a warm evening check-in (2-3 sentences, plain text). Briefly recap the day, offer gentle encouragement about goals. Be supportive, not guilt-trippy. Sound like a caring friend. Do not mention that this is automated.${tomorrowCtx}${emoGuide}`;
@@ -2231,6 +2232,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             if(db.getConnector(user.id,'gmail')){
               const {searchEmails}=await import('./src/gmail.js');
               const q=mc.title.split(/\s+/).slice(0,4).join(' ');
+              assertProactiveAction(user.id);
               const res=await searchEmails(()=>connectors.getValidToken(user.id,'gmail'),{query:q,max:3});
               if(res.emails?.length)emailCtx=`Recent related emails:\n${res.emails.map((e)=>`- From ${e.from}: "${e.subject}" (${e.snippet.slice(0,100)})`).join('\n')}`;
             }
@@ -2428,6 +2430,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(db.getUserById(userId)?.role!=='owner')return '';
       if(!db.getConnector(userId,'gmail'))return '';
       const {searchEmails}=await import('./src/gmail.js');
+      assertProactiveAction(userId);
       const res=await searchEmails(()=>connectors.getValidToken(userId,'gmail'),{query:'is:unread newer_than:24h',max:10});
       const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
       const items=(res.emails||[]).filter((e)=>!NEWSLETTER_RE.test(String(e.from||''))&&!/unsubscribe/i.test(String(e.subject||'')));
@@ -2584,7 +2587,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     let events=[];
     let feeds=[];
     try{
-      const range=await getEventsForRange(db,user.id,nowMs-2*3600_000,nowMs+7*86400_000,timeZone);
+      const range=await getEventsForRange(db,user.id,nowMs-2*3600_000,nowMs+7*86400_000,timeZone,{assertActive:()=>assertProactiveAction(user.id)});
       events=range.events||[];
       feeds=range.feeds||[];
     }catch{events=[];feeds=[];}

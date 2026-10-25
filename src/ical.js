@@ -377,26 +377,29 @@ export function normalizeFeedUrl(url) {
   return text.replace(/^webcals?:\/\//i, 'https://');
 }
 
-export async function fetchFeedText(url) {
+export async function fetchFeedText(url,{assertActive=null}={}) {
   const response=await fetchPublicBytes(normalizeFeedUrl(url),{
     headers:{'User-Agent':'orbit-buddy/1.0 (calendar reader)',Accept:'text/calendar'},
     maxBytes:FEED_MAX_BYTES,sizeError:'That calendar feed is too large.',
-    networkErrorPrefix:'Could not fetch that calendar'
+    networkErrorPrefix:'Could not fetch that calendar',assertActive
   });
   if (!response.ok) throw new Error(`Calendar fetch failed (HTTP ${response.status}).`);
   return response.buffer.toString('utf8');
 }
 
-export async function getFeedVevents(feed) {
+export async function getFeedVevents(feed,{assertActive=null}={}) {
+  assertActive?.();
   const cached = feedCache.get(feed.id);
   const now = Date.now();
   if (cached && now - cached.fetchedAt < FEED_TTL_MS) return cached;
   const entry = { fetchedAt: now, vevents: cached?.vevents || [], error: null };
   try {
-    entry.vevents = parseIcs(await fetchFeedText(feed.url));
+    entry.vevents = parseIcs(await fetchFeedText(feed.url,{assertActive}));
   } catch (error) {
+    assertActive?.();
     entry.error = String(error?.message || error).slice(0, 200);
   }
+  assertActive?.();
   feedCache.set(feed.id, entry);
   return entry;
 }
@@ -406,17 +409,20 @@ export function dropFeedCache(feedId) {
 }
 
 // Merges events across all of the user's feeds for [rangeStartMs, rangeEndMs).
-export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, defaultZone = DEFAULT_ZONE) {
+export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, defaultZone = DEFAULT_ZONE,{assertActive=null}={}) {
+  assertActive?.();
   const feeds = db.listCalendarFeeds(userId);
   const events = [];
   const feedErrors = [];
   let expansionBudgetMs = EXPANSION_TOTAL_MS;
   for (const feed of feeds) {
+    assertActive?.();
     if (expansionBudgetMs <= 0) {
       feedErrors.push({ label: feed.label, error: 'Calendar expansion took too long.' });
       break;
     }
-    const { vevents, error } = await getFeedVevents(feed);
+    const { vevents, error } = await getFeedVevents(feed,{assertActive});
+    assertActive?.();
     if (error) feedErrors.push({ label: feed.label, error });
     try{
       const started = performance.now();
@@ -427,6 +433,7 @@ export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, de
       } finally {
         expansionBudgetMs -= performance.now() - started;
       }
+      assertActive?.();
       if(events.length+expanded.length>RANGE_MAX_INSTANCES){
         feedErrors.push({label:feed.label,error:'Too many calendar occurrences in this range.'});
         break;
@@ -435,6 +442,7 @@ export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, de
         events.push({ ...event, calendar: feed.label, feedId: feed.id });
       }
     }catch(expansionError){
+      assertActive?.();
       feedErrors.push({label:feed.label,error:String(expansionError?.message||expansionError).slice(0,200)});
     }
   }
@@ -473,10 +481,10 @@ function addDaysStr(dateStr, n) {
 }
 
 // Today's + tomorrow's agenda as prompt-ready text, or '' when there's nothing to show.
-export async function getBriefingAgenda(db, userId, days = 2, timeZone = DEFAULT_ZONE) {
+export async function getBriefingAgenda(db, userId, days = 2, timeZone = DEFAULT_ZONE,options={}) {
   const zone = validZone(timeZone) || DEFAULT_ZONE;
   const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: zone });
-  const { events, feeds } = await getEventsForRange(db, userId, dayStartMs(todayStr, 0, zone), dayStartMs(todayStr, days, zone), zone);
+  const { events, feeds } = await getEventsForRange(db, userId, dayStartMs(todayStr, 0, zone), dayStartMs(todayStr, days, zone), zone,options);
   if (!feeds.length || !events.length) return '';
   return formatBriefingAgenda(events, zone, todayStr);
 }

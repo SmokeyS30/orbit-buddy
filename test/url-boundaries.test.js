@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { assertPublicUrl,fetchPublicBytes } from '../src/net.js';
 import { toolFetchUrl } from '../src/tools.js';
-import { fetchFeedText } from '../src/ical.js';
+import { fetchFeedText,getEventsForRange } from '../src/ical.js';
 
 test('URL validation rejects IPv4-mapped IPv6 private targets',async()=>{
   await assert.rejects(()=>assertPublicUrl('http://[::ffff:127.0.0.1]/'),/not publicly reachable/);
@@ -104,4 +104,38 @@ test('the fetch deadline includes redirect DNS and blocks a late second fetch',a
   release();
   await new Promise(done=>setImmediate(done));
   assert.equal(requests,1,'late redirect resolution cannot start a second fetch');
+});
+
+test('revoked calendar work cannot fetch another feed after the first response',async t=>{
+  const original=global.fetch;
+  let requests=0,active=true;
+  global.fetch=async()=>{
+    requests++;
+    active=false;
+    return new Response('BEGIN:VCALENDAR\nEND:VCALENDAR');
+  };
+  t.after(()=>{global.fetch=original;});
+  const db={listCalendarFeeds:()=>[
+    {id:'paused-calendar-a',label:'A',url:'https://93.184.216.34/a.ics'},
+    {id:'paused-calendar-b',label:'B',url:'https://93.184.216.34/b.ics'},
+  ]};
+  const assertActive=()=>{if(!active)throw Object.assign(new Error('Paused'),{code:'PROACTIVE_DEFERRED'});};
+  await assert.rejects(()=>getEventsForRange(db,'synthetic',0,86_400_000,'UTC',{assertActive}),
+    {code:'PROACTIVE_DEFERRED'});
+  assert.equal(requests,1);
+});
+
+test('revoked work cannot follow a public calendar redirect',async t=>{
+  const original=global.fetch;
+  let requests=0,active=true;
+  global.fetch=async()=>{
+    requests++;
+    active=false;
+    return new Response(null,{status:302,headers:{Location:'https://93.184.216.34/next.ics'}});
+  };
+  t.after(()=>{global.fetch=original;});
+  const assertActive=()=>{if(!active)throw Object.assign(new Error('Paused'),{code:'PROACTIVE_DEFERRED'});};
+  await assert.rejects(()=>fetchFeedText('https://93.184.216.34/first.ics',{assertActive}),
+    {code:'PROACTIVE_DEFERRED'});
+  assert.equal(requests,1);
 });
