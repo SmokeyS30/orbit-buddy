@@ -1060,8 +1060,11 @@ const indexMigrations = [
         WHERE j.id=? AND j.user_id=? AND j.status='processing' AND u.disabled=0 AND u.moderation_blocked=0 AND u.is_demo=0`,id,userId);
       return !!row&&(await get("SELECT value FROM settings WHERE key='system_paused'"))?.value!=='true';
     },
-    updateImportJobIfCurrent: async (userId,id,patch={},allowInactive=false)=>withTransaction(async ({get:tGet,run:tRun})=>{
+    updateImportJobIfCurrent: async (userId,id,patch={},allowInactive=false)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
       if(!allowInactive){
+        // Pausing uses an UPSERT; a row lock alone cannot fence it when the
+        // setting has never been stored. The short table lock also covers that case.
+        await tQuery('LOCK TABLE settings IN SHARE MODE');
         const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
         if(!user||user.disabled||user.moderation_blocked||user.is_demo
           ||(await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
@@ -1075,7 +1078,8 @@ const indexMigrations = [
         next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);
       return{...cur,...next};
     }),
-    addImportSuggestionIfCurrent: async (userId,id,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
+    addImportSuggestionIfCurrent: async (userId,id,content,options={})=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
       const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
       if(!user||user.disabled||user.moderation_blocked||user.is_demo)return null;
       if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
@@ -1587,7 +1591,8 @@ const indexMigrations = [
       await run(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
         ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`, userId, monthKey, narrative, timestamp());
     },
-    claimTimelineNarrative: async (userId,monthKey,freshAfter=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
+    claimTimelineNarrative: async (userId,monthKey,freshAfter=null)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
       const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
       if(!user||user.disabled||user.moderation_blocked||user.is_demo)return null;
       if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
@@ -1606,7 +1611,8 @@ const indexMigrations = [
         &&(await get("SELECT value FROM settings WHERE key='system_paused'"))?.value!=='true'
         &&lease?.token===token&&lease.month_key===monthKey&&lease.expires_at>timestamp());
     },
-    completeTimelineNarrative: async (userId,monthKey,token,narrative)=>withTransaction(async ({get:tGet,run:tRun})=>{
+    completeTimelineNarrative: async (userId,monthKey,token,narrative)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
       const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
       if(!user||user.disabled||user.moderation_blocked||user.is_demo)return false;
       if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return false;
