@@ -13,9 +13,10 @@ function normalizedIp(value){
 export function clientIpForRateLimit(req,{trustIngress=false}={}){
   const socket=normalizedIp(req.socket?.remoteAddress)||'unknown';
   if(!trustIngress)return socket;
-  // Azure Container Apps appends the connecting peer as the rightmost
-  // X-Forwarded-For entry. Earlier values and CF-Connecting-IP can be supplied
-  // by an internet client to the DNS-only origin.
+  // Deployment prerequisite: verify the only public path is through ingress
+  // and that ingress appends its observed peer as the rightmost X-Forwarded-For
+  // entry. This is a trust boundary, not something app code can prove. Earlier
+  // values and CF-Connecting-IP may be supplied by an internet client.
   const forwarded=req.headers?.['x-forwarded-for'];
   const ingressIp=normalizedIp(Array.isArray(forwarded)?forwarded.at(-1)?.split(',').at(-1):String(forwarded||'').split(',').at(-1));
   return ingressIp||socket;

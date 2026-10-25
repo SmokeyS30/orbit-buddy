@@ -30,3 +30,18 @@ test('anonymous reset rate limit cannot be evaded by rotating client-supplied IP
     assert.equal(response.status,i===11?429:400,`request ${i}`);
   }
 });
+
+test('production mode keys anonymous limits on a synthetic ingress-appended rightmost IP',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-ip-prod-limit-'));
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'production',MAINTENANCE_MODE:'0'}});
+  await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const base=`http://127.0.0.1:${app.server.address().port}`;
+  for(let i=1;i<=11;i++){
+    const response=await fetch(`${base}/api/auth/reset-password`,{
+      method:'POST',headers:{'Content-Type':'application/json','cf-connecting-ip':`203.0.113.${i}`,
+        'x-forwarded-for':`198.51.100.${i}, 192.0.2.42`},body:'{}',
+    });
+    assert.equal(response.status,i===11?429:400,`request ${i}`);
+  }
+});
