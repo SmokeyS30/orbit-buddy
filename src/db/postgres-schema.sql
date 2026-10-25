@@ -583,7 +583,9 @@ CREATE TABLE IF NOT EXISTS whatsapp_links (
 );
 
 CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (
-  sid TEXT PRIMARY KEY, created_at TEXT NOT NULL
+  sid TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'accepted', lease_token TEXT, lease_expires_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (
