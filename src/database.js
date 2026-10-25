@@ -205,16 +205,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     );
     CREATE TABLE IF NOT EXISTS push_subscriptions (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL,
-      session_hash TEXT
+      endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS apns_device_tokens (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       device_token TEXT NOT NULL, platform TEXT NOT NULL DEFAULT 'ios',
       apns_environment TEXT NOT NULL DEFAULT 'production',
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-      session_hash TEXT,
       UNIQUE(user_id, device_token)
+    );
+    CREATE TABLE IF NOT EXISTS push_session_bindings (
+      endpoint TEXT PRIMARY KEY REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS apns_session_bindings (
+      device_token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS subscriptions (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -549,10 +557,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'writing_voice_offered', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'approvals', 'execution_started_at', 'TEXT');
   ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
-  // Existing registrations have no session proof and stay stored but cannot
-  // receive private notifications until their app reconnects and registers.
-  ensureColumn(db, 'push_subscriptions', 'session_hash', 'TEXT');
-  ensureColumn(db, 'apns_device_tokens', 'session_hash', 'TEXT');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_push_bindings_user ON push_session_bindings(user_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_apns_bindings_user ON apns_session_bindings(user_id)');
   ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
   ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
   db.exec("UPDATE processed_notifications SET state='processed',completed_at=COALESCE(completed_at,received_at) WHERE state IS NULL OR state!='processing'");
@@ -853,19 +859,42 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listArtifacts: db.prepare('SELECT id,task_id,name,mime_type,size_bytes,created_at FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200'),
     getArtifact: db.prepare('SELECT * FROM artifacts WHERE id=? AND user_id=?'),
     deleteArtifact: db.prepare('DELETE FROM artifacts WHERE id=? AND user_id=?'),
-    validPushSession: db.prepare('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?'),
-    addPush: db.prepare(`INSERT INTO push_subscriptions(id,user_id,endpoint,p256dh,auth,created_at,session_hash) VALUES(?,?,?,?,?,?,?)
-      ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,session_hash=excluded.session_hash,created_at=excluded.created_at`),
-    listPush: db.prepare(`SELECT p.* FROM push_subscriptions p JOIN sessions s ON s.token_hash=p.session_hash
-      AND s.user_id=p.user_id AND s.expires_at>? WHERE p.user_id=?`),
+    validPushSession: db.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id
+      WHERE s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`),
+    addPush: db.prepare(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`),
+    bindPush: db.prepare(`INSERT INTO push_session_bindings(endpoint,user_id,session_hash) VALUES(?,?,?)
+      ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`),
+    listPush: db.prepare(`SELECT p.*,b.session_hash AS bound_session_hash FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE p.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`),
+    currentPush: db.prepare(`SELECT 1 FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE p.user_id=? AND p.endpoint=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`),
     deletePush: db.prepare('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?'),
-    deletePushById: db.prepare('DELETE FROM push_subscriptions WHERE id=?'),
-    revokeApnsTokenOwners: db.prepare('UPDATE apns_device_tokens SET session_hash=NULL WHERE device_token=?'),
-    upsertSessionApnsToken: db.prepare(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at,session_hash)
-      VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at,session_hash=excluded.session_hash`),
-    listApnsTokens: db.prepare(`SELECT a.* FROM apns_device_tokens a JOIN sessions s ON s.token_hash=a.session_hash
-      AND s.user_id=a.user_id AND s.expires_at>? WHERE a.user_id=?`),
+    deletePushById: db.prepare(`DELETE FROM push_subscriptions WHERE id=? AND EXISTS
+      (SELECT 1 FROM push_session_bindings b WHERE b.endpoint=push_subscriptions.endpoint AND b.session_hash=?)`),
+    upsertApnsToken: db.prepare(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`),
+    clearOtherApnsOwners: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=? AND user_id<>?'),
+    bindApnsToken: db.prepare(`INSERT INTO apns_session_bindings(device_token,user_id,session_hash) VALUES(?,?,?)
+      ON CONFLICT(device_token) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`),
+    listApnsTokens: db.prepare(`SELECT a.*,b.session_hash AS bound_session_hash FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE a.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`),
+    currentApns: db.prepare(`SELECT 1 FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE a.user_id=? AND a.device_token=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`),
     deleteApnsToken: db.prepare('DELETE FROM apns_device_tokens WHERE device_token=?'),
+    deleteApnsBinding: db.prepare('DELETE FROM apns_session_bindings WHERE device_token=? AND session_hash=?'),
     upsertSubscription: db.prepare(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
       expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
@@ -1727,21 +1756,28 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listArtifacts: (userId) => s.listArtifacts.all(userId),
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
     deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
-    savePush(userId,{endpoint,keys},sessionHash) {
+    savePush(userId,{endpoint,keys},sessionHash) { return withImmediate(()=>{
       if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
-      s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp(),sessionHash);
-    },
+      s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp());
+      s.bindPush.run(endpoint,userId,sessionHash);
+    }); },
     listPush: (userId) => s.listPush.all(timestamp(),userId),
+    isPushRegistrationCurrent: (userId,endpoint,sessionHash) => Boolean(sessionHash&&s.currentPush.get(timestamp(),userId,endpoint,sessionHash)),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
-    deletePushById: (id) => s.deletePushById.run(id),
+    deletePushById: (id,sessionHash) => s.deletePushById.run(id,sessionHash).changes>0,
     saveApnsToken(userId,token,sessionHash) { return withImmediate(()=>{
       if(!sessionHash||!s.validPushSession.get(sessionHash,userId,timestamp()))throw new Error('Push registration requires an active session.');
       const now=timestamp();
-      s.revokeApnsTokenOwners.run(token);
-      s.upsertSessionApnsToken.run(randomUUID(),userId,token,'ios','production',now,now,sessionHash);
+      s.clearOtherApnsOwners.run(token,userId);
+      s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now);
+      s.bindApnsToken.run(token,userId,sessionHash);
     }); },
     listApnsTokens: (userId) => s.listApnsTokens.all(timestamp(),userId),
-    deleteApnsToken: (token) => s.deleteApnsToken.run(token),
+    isApnsRegistrationCurrent: (userId,token,sessionHash) => Boolean(sessionHash&&s.currentApns.get(timestamp(),userId,token,sessionHash)),
+    deleteApnsToken: (token,sessionHash) => withImmediate(()=>{
+      if(!sessionHash||!s.deleteApnsBinding.run(token,sessionHash).changes)return false;
+      s.deleteApnsToken.run(token);return true;
+    }),
     saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {
       const now=timestamp();
       s.upsertSubscription.run(randomUUID(),userId,productId,status,expiresAt||null,appAccountToken||null,environment||'production',originalTransactionId||null,lastEventSignedAt,now,now);

@@ -52,24 +52,46 @@ test('deliverProactive push payload carries the conversation id', async (t) => {
   assert.ok(app.db.listConversationMessages(user.id, convo.id, 8).some((m) => m.content.includes('how is the studying going')), 'message still lands in the conversation');
 });
 
-test('push wire payload passes data through verbatim (conversationId in and out)', async () => {
+test('web push wire payload omits private text, action tokens, and record ids', async () => {
   const keys = webpush.generateVAPIDKeys();
   const captured = [];
   const original = webpush.sendNotification;
   webpush.sendNotification = async (_sub, payload) => { captured.push(JSON.parse(payload)); };
   try {
-    const db = { listPush: () => [{ id: 's1', endpoint: 'https://push.example.com/x', p256dh: 'p', auth: 'a' }], deletePushById: () => {} };
+    const db = { listPush: () => [{ id: 's1', endpoint: 'https://push.example.com/x', p256dh: 'p', auth: 'a',bound_session_hash:'synthetic-session' }], isPushRegistrationCurrent:()=>true, deletePushById: () => {} };
     const svc = createPushService({ VAPID_PUBLIC_KEY: keys.publicKey, VAPID_PRIVATE_KEY: keys.privateKey, VAPID_SUBJECT: 'mailto:test@example.com' }, db);
-    await svc.notify('u1', 'Orbit', 'hello', { view: 'today', conversationId: 'conv-123' });
-    assert.deepEqual(captured[0].data, { view: 'today', conversationId: 'conv-123' });
+    await svc.notify('u1', 'Private task', 'Private result', { view: 'today', conversationId: 'conv-123',taskId:'task-123',doorToken:'secret-token',doorAction:true });
+    assert.deepEqual(captured[0].data, { view: 'today' });
     assert.equal(captured[0].title, 'Orbit');
-    // Notifications without a conversation omit the field cleanly — no nulls, no crash.
+    assert.equal(captured[0].body,'Open Orbit to see your update.');
+    assert.ok(!JSON.stringify(captured[0]).includes('Private'));
+    assert.ok(!JSON.stringify(captured[0]).includes('secret-token'));
     await svc.notify('u1', 'Orbit', 'hi', { view: 'safety' });
     assert.deepEqual(captured[1].data, { view: 'safety' });
-    assert.ok(!('conversationId' in captured[1].data), 'no conversationId key when the event has none');
+    await svc.notify('u1','Orbit','hi',{view:'untrusted',email:'private@example.test'});
+    assert.deepEqual(captured[2].data,{view:'today'});
   } finally {
     webpush.sendNotification = original;
   }
+});
+
+test('logout or account switch after listing skips web push provider send', async () => {
+  const keys = webpush.generateVAPIDKeys();
+  let providerCalled = false;
+  const original = webpush.sendNotification;
+  webpush.sendNotification = async () => { providerCalled = true; };
+  try {
+    const db = {
+      listPush: () => [{ id: 'old', endpoint: 'https://push.example.test/device', p256dh: 'key', auth: 'auth', bound_session_hash: 'old-session' }],
+      isPushRegistrationCurrent: (userId, endpoint, sessionHash) => {
+        assert.deepEqual([userId, endpoint, sessionHash], ['user-1', 'https://push.example.test/device', 'old-session']);
+        return false;
+      },
+    };
+    const svc = createPushService({ VAPID_PUBLIC_KEY: keys.publicKey, VAPID_PRIVATE_KEY: keys.privateKey }, db);
+    assert.deepEqual(await svc.notify('user-1', 'Private', 'Private'), { sent: 0, failed: 0 });
+    assert.equal(providerCalled, false);
+  } finally { webpush.sendNotification = original; }
 });
 
 test('snapshot ?conversation= selects the thread; unknown ids fall back to default', async (t) => {

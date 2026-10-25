@@ -290,8 +290,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   endpoint TEXT NOT NULL UNIQUE,
   p256dh TEXT NOT NULL,
   auth TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  session_hash TEXT
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS apns_device_tokens (
@@ -302,8 +301,19 @@ CREATE TABLE IF NOT EXISTS apns_device_tokens (
   apns_environment TEXT NOT NULL DEFAULT 'production',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  session_hash TEXT,
   UNIQUE(user_id, device_token)
+);
+
+CREATE TABLE IF NOT EXISTS push_session_bindings (
+  endpoint TEXT PRIMARY KEY REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS apns_session_bindings (
+  device_token TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS subscriptions (

@@ -316,8 +316,16 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         updated_at TEXT NOT NULL,
         UNIQUE(user_id, device_token)
       )`,
-      'ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS session_hash TEXT',
-      'ALTER TABLE apns_device_tokens ADD COLUMN IF NOT EXISTS session_hash TEXT',
+      `CREATE TABLE IF NOT EXISTS push_session_bindings (
+        endpoint TEXT PRIMARY KEY REFERENCES push_subscriptions(endpoint) ON DELETE CASCADE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+      )`,
+      `CREATE TABLE IF NOT EXISTS apns_session_bindings (
+        device_token TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE
+      )`,
       `CREATE TABLE IF NOT EXISTS subscriptions (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
@@ -404,6 +412,8 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_soul_history_user ON soul_history(user_id, version DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memory_surfacing_user ON memory_surfacing(user_id, surfaced_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_apns_tokens_user ON apns_device_tokens(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_push_bindings_user ON push_session_bindings(user_id)',
+      'CREATE INDEX IF NOT EXISTS idx_apns_bindings_user ON apns_session_bindings(user_id)',
       'CREATE INDEX IF NOT EXISTS idx_daily_usage_day ON daily_usage(day_ny)',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL',
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL',
@@ -421,8 +431,8 @@ const indexMigrations = [
     await client.query('SELECT 1 FROM reports LIMIT 0');
     await client.query('SELECT 1 FROM reply_jobs LIMIT 0');
     await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
-    await client.query('SELECT session_hash FROM push_subscriptions LIMIT 0');
-    await client.query('SELECT session_hash FROM apns_device_tokens LIMIT 0');
+    await client.query('SELECT endpoint,session_hash FROM push_session_bindings LIMIT 0');
+    await client.query('SELECT device_token,session_hash FROM apns_session_bindings LIMIT 0');
     const ordering=await client.query(`SELECT column_default FROM information_schema.columns
       WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
     if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
@@ -1743,32 +1753,58 @@ const indexMigrations = [
     deleteArtifact: async (userId, id) => { const r = await run('DELETE FROM artifacts WHERE id=? AND user_id=?', id, userId); return (r.rowCount||r.changes||0)>0; },
 
     // --- Push subscriptions ---
-    savePush: async (userId, { endpoint, keys }, sessionHash) => {
-      if(!sessionHash||!(await get('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp())))
+    savePush: async (userId, { endpoint, keys }, sessionHash) => withTransaction(async ({get:tGet,run:tRun}) => {
+      if(!sessionHash||!(await tGet(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE
+        s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`,sessionHash,userId,timestamp())))
         throw new Error('Push registration requires an active session.');
-      await run(`INSERT INTO push_subscriptions(id,user_id,endpoint,p256dh,auth,created_at,session_hash) VALUES(?,?,?,?,?,?,?)
-        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth,session_hash=excluded.session_hash,created_at=excluded.created_at`,
-        randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp(),sessionHash);
-    },
-    listPush: async (userId) => all(`SELECT p.* FROM push_subscriptions p JOIN sessions s ON s.token_hash=p.session_hash
-      AND s.user_id=p.user_id AND s.expires_at>? WHERE p.user_id=?`,timestamp(),userId),
+      await tRun(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`, randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp());
+      await tRun(`INSERT INTO push_session_bindings(endpoint,user_id,session_hash) VALUES(?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`,endpoint,userId,sessionHash);
+    }),
+    listPush: async (userId) => all(`SELECT p.*,b.session_hash AS bound_session_hash FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE p.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`,timestamp(),userId),
+    isPushRegistrationCurrent: async (userId,endpoint,sessionHash) => Boolean(sessionHash&&await get(`SELECT 1 FROM push_subscriptions p JOIN push_session_bindings b
+      ON b.endpoint=p.endpoint AND b.user_id=p.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE p.user_id=? AND p.endpoint=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=p.user_id AND u.disabled=0 AND u.moderation_blocked=0)`,timestamp(),userId,endpoint,sessionHash)),
     deletePush: async (userId, endpoint) => { await run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, userId); },
-    deletePushById: async (id) => { await run('DELETE FROM push_subscriptions WHERE id=?', id); },
+    deletePushById: async (id,sessionHash) => (await run(`DELETE FROM push_subscriptions WHERE id=? AND EXISTS
+      (SELECT 1 FROM push_session_bindings b WHERE b.endpoint=push_subscriptions.endpoint AND b.session_hash=?)`,id,sessionHash)).changes>0,
 
     // --- APNs device tokens (native iOS push) ---
     saveApnsToken: async (userId, token, sessionHash) => withTransaction(async ({query:tQuery,get:tGet,run:tRun}) => {
       await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[token]);
-      if(!sessionHash||!(await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp())))
+      if(!sessionHash||!(await tGet(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE
+        s.token_hash=? AND s.user_id=? AND s.expires_at>? AND u.disabled=0 AND u.moderation_blocked=0`,sessionHash,userId,timestamp())))
         throw new Error('Push registration requires an active session.');
       const now = timestamp();
-      await tRun('UPDATE apns_device_tokens SET session_hash=NULL WHERE device_token=?',token);
-      await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at,session_hash)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at,session_hash=excluded.session_hash`,
-        randomUUID(), userId, token, 'ios', 'production', now, now,sessionHash);
+      await tRun('DELETE FROM apns_device_tokens WHERE device_token=? AND user_id<>?',token,userId);
+      await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,
+        randomUUID(), userId, token, 'ios', 'production', now, now);
+      await tRun(`INSERT INTO apns_session_bindings(device_token,user_id,session_hash) VALUES(?,?,?)
+        ON CONFLICT(device_token) DO UPDATE SET user_id=excluded.user_id,session_hash=excluded.session_hash`,token,userId,sessionHash);
     }),
-    listApnsTokens: async (userId) => all(`SELECT a.* FROM apns_device_tokens a JOIN sessions s ON s.token_hash=a.session_hash
-      AND s.user_id=a.user_id AND s.expires_at>? WHERE a.user_id=?`,timestamp(),userId),
-    deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
+    listApnsTokens: async (userId) => all(`SELECT a.*,b.session_hash AS bound_session_hash FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>? WHERE a.user_id=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`,timestamp(),userId),
+    isApnsRegistrationCurrent: async (userId,token,sessionHash) => Boolean(sessionHash&&await get(`SELECT 1 FROM apns_device_tokens a JOIN apns_session_bindings b
+      ON b.device_token=a.device_token AND b.user_id=a.user_id JOIN sessions s
+      ON s.token_hash=b.session_hash AND s.user_id=b.user_id AND s.expires_at>?
+      WHERE a.user_id=? AND a.device_token=? AND b.session_hash=?
+      AND EXISTS (SELECT 1 FROM users u WHERE u.id=a.user_id AND u.disabled=0 AND u.moderation_blocked=0)
+      AND NOT EXISTS (SELECT 1 FROM apns_device_tokens other WHERE other.device_token=a.device_token AND other.user_id<>a.user_id)`,timestamp(),userId,token,sessionHash)),
+    deleteApnsToken: async (token,sessionHash) => withTransaction(async ({query:tQuery,run:tRun})=>{
+      await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[token]);
+      if(!sessionHash||!(await tRun('DELETE FROM apns_session_bindings WHERE device_token=? AND session_hash=?',token,sessionHash)).changes)return false;
+      await tRun('DELETE FROM apns_device_tokens WHERE device_token=?',token);return true;
+    }),
 
     // --- Subscriptions (StoreKit 2) ---
     saveSubscription: async (userId, { productId, status, expiresAt, appAccountToken, environment, originalTransactionId, lastEventSignedAt = null }) => {
