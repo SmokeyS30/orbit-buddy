@@ -379,6 +379,12 @@ export async function toolDeepResearch(args = {}, env = process.env) {
     } catch { /* skip failed searches */ }
     if (seenUrls.size >= 4) break;
   }
+  // This tool promises multi-source reading. Search snippets alone cannot
+  // support a completed research answer, especially if every page fetch fails.
+  if(!results.some((item)=>item.query&&item.search!=='No results found.'))
+    throw new Error('Research incomplete: no search sources were available. Please try again later.');
+  if(!results.some((item)=>item.url&&item.content))
+    throw new Error('Research incomplete: no source pages could be read. Please try again later or provide specific sources.');
   let out = `# Research: ${topic}\n\n`;
   for (const r of results) {
     if (r.query) out += `## Search: ${r.query}\n${r.search}\n\n`;
