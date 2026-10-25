@@ -350,11 +350,6 @@ function writeContext(ctx, tool) {
   return ctx;
 }
 
-function extractResearchUrls(text) {
-  const urlRegex = /https?:\/\/[^\s)"']+/g;
-  return [...new Set(String(text).match(urlRegex) || [])];
-}
-
 export async function toolDeepResearch(args = {}, env = process.env) {
   const topic = String(args.topic || '').trim().slice(0, 200);
   if (!topic) throw new Error('A research topic is required.');
@@ -365,13 +360,19 @@ export async function toolDeepResearch(args = {}, env = process.env) {
   for (const query of queries) {
     try {
       const searchResult = await toolWebSearch({ query }, env);
-      results.push({ query, search: String(searchResult).slice(0, 5000) });
-      for (const url of extractResearchUrls(searchResult).slice(0, 2)) {
+      const hits=Array.isArray(searchResult?.results)?searchResult.results.filter((hit)=>/^https?:\/\//i.test(String(hit?.url||''))).slice(0,5):[];
+      const summary=hits.length
+        ?hits.map((hit,index)=>`${index+1}. ${String(hit.title||'Untitled').slice(0,200)}\n${String(hit.url).slice(0,1000)}\n${String(hit.snippet||'').slice(0,280)}`).join('\n\n')
+        :searchResult?.answer?`${String(searchResult.answer).slice(0,4500)}${searchResult.source?`\nSource: ${String(searchResult.source).slice(0,1000)}`:''}`
+          :String(searchResult?.note||'No results found.');
+      results.push({ query, search: summary.slice(0, 5000) });
+      const sourceUrls=hits.length?hits.map((hit)=>String(hit.url)):searchResult?.source?[String(searchResult.source)]:[];
+      for (const url of sourceUrls.filter((value)=>/^https?:\/\//i.test(value)).slice(0, 2)) {
         if (seenUrls.has(url) || seenUrls.size >= 4) continue;
         seenUrls.add(url);
         try {
           const content = await toolFetchUrl({ url });
-          results.push({ url, content: String(content).slice(0, 8000) });
+          results.push({ url, content: String(content.text||'').slice(0, 8000) });
         } catch { /* skip failed fetches */ }
       }
     } catch { /* skip failed searches */ }
