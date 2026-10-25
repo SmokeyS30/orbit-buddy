@@ -168,7 +168,9 @@ test('every table the Postgres adapter queries exists in postgres-schema.sql', (
     ...[...schema.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
     ...[...pg.matchAll(/CREATE TABLE IF NOT EXISTS\s+(\w+)/gi)].map((m) => m[1].toLowerCase()),
   ]);
-  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'information_schema', 'text', 'context', 'today', 'existing', 'values']);
+  // EXCLUDED is PostgreSQL's proposed-row pseudo table in an UPSERT, not a
+  // persisted table that belongs in the fresh database schema.
+  const keywords = new Set(['select', 'where', 'order', 'group', 'by', 'set', 'sqlite', 'sqlite_master', 'information_schema', 'text', 'context', 'today', 'existing', 'values', 'excluded']);
   const missing = [...referenced].filter((t) => !defined.has(t) && !keywords.has(t));
   assert.deepEqual(missing, [], `adapter tables missing from postgres-schema.sql: ${missing.join(', ')}`);
 });
