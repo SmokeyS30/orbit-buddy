@@ -2828,8 +2828,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const twilioSend=(toPhone,text)=>sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone,body:text});
         // Linking: a 6-digit code texted to Orbit's number links the sender's phone.
         if(/^\d{6}$/.test(body)&&!(from&&db.getUserByWhatsApp(from))){
+          if(inboundSid&&db.getWhatsAppInboundState(inboundSid))return json(res,200,{ok:true,deduped:true});
+          if(!from)return json(res,200,{ok:true,ignored:true});
+          if(!db.allowWhatsAppLinkAttempt(from))return json(res,429,{ok:false,linkRateLimited:true});
           if(inboundSid&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
-          if(!from||!db.allowWhatsAppLinkAttempt(from))return json(res,200,{ok:true,linkRateLimited:true});
           try{
             const linkUserId=db.consumeAndLinkWhatsApp(body,from);
             if(linkUserId){
@@ -2850,8 +2852,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const waUserId=link.user_id;
         const waUser=db.getUserById(waUserId);
         if(!waUser||waUser.disabled===1||waUser.moderation_blocked===1)return json(res,200,{ok:true,ignored:true});
-        if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
-        if(paused())return json(res,200,{ok:true,paused:true});
+        if(inboundSid&&['accepted','failed'].includes(db.getWhatsAppInboundState(inboundSid)))
+          return json(res,200,{ok:true,deduped:true});
+        if(paused())return json(res,503,{ok:false,paused:true});
+        if(userRateLimited(waUserId,'whatsapp'))return json(res,429,{ok:false,rateLimited:true});
         db.setWhatsAppLastInbound(waUserId);
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
@@ -2874,6 +2878,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Voice notes (audio/ogg): download, transcribe with Whisper, feed the
           // transcript into the normal pipeline. Audio is never stored.
           if(isAudioContentType(mediaContentType)&&mediaUrl){
+            const mediaClaim=db.claimWhatsAppInboundMedia(inboundSid);
+            if(mediaClaim.state==='busy')return json(res,503,{ok:false,retry:true});
+            if(mediaClaim.state!=='claimed')return json(res,200,{ok:true,deduped:true});
             let transcript=null;
             let releaseUpload=null;
             try{
@@ -2883,19 +2890,24 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }catch(e){
               console.error('whatsapp voice note failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE';
+              const permanent=tooLong||/Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,!permanent);
+              if(finished==='retryable')return json(res,503,{ok:false,retry:true});
+              if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,tooLong
                 ?'That voice note is a bit long for me — try keeping it under a few minutes and I’ll give it a listen.'
                 :'I couldn’t quite grab that voice note — mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }finally{releaseUpload?.();}
             if(!transcript){
+              db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,false);
               try{await twilioSend(from,'I listened but couldn’t quite make out what you said — mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
             const accepted=db.acceptReplyJob(waUserId,conversation.id,voiceMessage,
-              {channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid});
-            if(!accepted)return json(res,200,{ok:true,deduped:true});
+              {channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid,inboundLeaseToken:mediaClaim.token});
+            if(!accepted)return json(res,503,{ok:false,retry:true});
             scheduleReplyPump();
             return json(res,200,{ok:true,voiceNote:true});
           }
@@ -2905,6 +2917,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Only the first image is handled (Twilio may send several); image
           // bytes stay in memory and are never stored or logged.
           if(isImageContentType(mediaContentType)&&mediaUrl){
+            const mediaClaim=db.claimWhatsAppInboundMedia(inboundSid);
+            if(mediaClaim.state==='busy')return json(res,503,{ok:false,retry:true});
+            if(mediaClaim.state!=='claimed')return json(res,200,{ok:true,deduped:true});
             let imageBlock=null,releaseImage=null;
             try{
               const releaseUpload=acquireAttachmentUpload(waUserId);
@@ -2916,6 +2931,11 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             }catch(e){
               console.error('whatsapp image failed',e.code||e.message);
               const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
+              const permanent=tooLong||[400,415].includes(e.status)||
+                /Invalid Twilio media URL|Twilio media redirected/.test(String(e.message||''));
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,!permanent);
+              if(finished==='retryable')return json(res,503,{ok:false,retry:true});
+              if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,tooLong
                 ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
                 :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
@@ -2924,8 +2944,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
             try{
               const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
-                {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid});
-              if(!accepted)return json(res,200,{ok:true,deduped:true});
+                {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at,inboundSid,inboundLeaseToken:mediaClaim.token});
+              if(!accepted)return json(res,503,{ok:false,retry:true});
               ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:caption||'Look at this.',images:[imageBlock],releaseMedia:releaseImage,createdAt:Date.now()});
               releaseImage=null;
               scheduleReplyPump();

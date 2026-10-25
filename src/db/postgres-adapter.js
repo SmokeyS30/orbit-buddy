@@ -209,6 +209,10 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         created_at TEXT NOT NULL
       )`,
       'CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (sid TEXT PRIMARY KEY, created_at TEXT NOT NULL)',
+      "ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'accepted'",
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS lease_token TEXT',
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS lease_expires_at TEXT',
+      'ALTER TABLE whatsapp_inbound_messages ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0',
       'CREATE TABLE IF NOT EXISTS whatsapp_link_attempts (subject TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL)',
       `CREATE TABLE IF NOT EXISTS radar_findings (
         finding_key TEXT PRIMARY KEY,
@@ -439,6 +443,7 @@ const indexMigrations = [
     await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
     await client.query('SELECT endpoint,session_hash FROM push_session_bindings LIMIT 0');
     await client.query('SELECT device_token,session_hash FROM apns_session_bindings LIMIT 0');
+    await client.query('SELECT state,lease_token,lease_expires_at,attempts FROM whatsapp_inbound_messages LIMIT 0');
     const ordering=await client.query(`SELECT column_default FROM information_schema.columns
       WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
     if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
@@ -786,8 +791,12 @@ const indexMigrations = [
         const link=await tGet('SELECT phone_e164,verified_at FROM whatsapp_links WHERE user_id=? FOR UPDATE',userId);
         if(!user||user.disabled===1||user.moderation_blocked===1||!link||
           link.phone_e164!==deliveryToPhone||link.verified_at!==deliveryLinkVerifiedAt)return null;
-        const claimed=await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
-          ON CONFLICT(sid) DO NOTHING RETURNING sid`,options.inboundSid,timestamp());
+        const claimed=options.inboundLeaseToken
+          ?await tGet(`UPDATE whatsapp_inbound_messages SET state='accepted',lease_token=NULL,lease_expires_at=NULL
+            WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING sid`,
+            options.inboundSid,options.inboundLeaseToken,timestamp())
+          :await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
+            ON CONFLICT(sid) DO NOTHING RETURNING sid`,options.inboundSid,timestamp());
         if(!claimed)return null;
       }
       // Serialize accepts for one conversation before allocating the global
@@ -2034,6 +2043,25 @@ const indexMigrations = [
       return true;
     }),
     claimWhatsAppInboundSid: async (sid) => (await run('INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?) ON CONFLICT(sid) DO NOTHING',sid,timestamp())).changes>0,
+    getWhatsAppInboundState: async (sid) => (await get('SELECT state FROM whatsapp_inbound_messages WHERE sid=?',sid))?.state||null,
+    claimWhatsAppInboundMedia: async (sid,leaseMs=90_000) => withTransaction(async ({get:tGet,run:tRun}) => {
+      const now=timestamp(),token=randomUUID(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      const inserted=await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at,state,lease_token,lease_expires_at,attempts)
+        VALUES(?,?,'processing',?,?,1) ON CONFLICT(sid) DO NOTHING RETURNING sid`,sid,now,token,expiresAt);
+      if(inserted)return{state:'claimed',token};
+      const row=await tGet('SELECT state,lease_expires_at,attempts FROM whatsapp_inbound_messages WHERE sid=? FOR UPDATE',sid);
+      if(row?.state==='accepted'||row?.state==='failed')return{state:row.state};
+      if(row?.state==='processing'&&row.lease_expires_at>now)return{state:'busy'};
+      if(row?.attempts>=5){
+        await tRun("UPDATE whatsapp_inbound_messages SET state='failed',lease_token=NULL,lease_expires_at=NULL WHERE sid=?",sid);
+        return{state:'failed'};
+      }
+      await tRun(`UPDATE whatsapp_inbound_messages SET state='processing',lease_token=?,lease_expires_at=?,attempts=attempts+1 WHERE sid=?`,token,expiresAt,sid);
+      return{state:'claimed',token};
+    }),
+    finishWhatsAppInboundMedia: async (sid,token,retryable=false) => (await get(`UPDATE whatsapp_inbound_messages
+      SET state=CASE WHEN ?=1 AND attempts<5 THEN 'retryable' ELSE 'failed' END,lease_token=NULL,lease_expires_at=NULL
+      WHERE sid=? AND state='processing' AND lease_token=? AND lease_expires_at>? RETURNING state`,retryable?1:0,sid,token,timestamp()))?.state||null,
     pruneWhatsAppInbound: async () => {await run('DELETE FROM whatsapp_inbound_messages WHERE created_at<?',new Date(Date.now()-30*86400_000).toISOString());await run('DELETE FROM whatsapp_link_attempts WHERE window_start<?',new Date(Date.now()-86400_000).toISOString());},
     getWhatsAppLink: async (userId) => (await get('SELECT * FROM whatsapp_links WHERE user_id=?', userId)) || null,
     getUserByWhatsApp: async (phoneE164) => (await get('SELECT * FROM whatsapp_links WHERE phone_e164=?', phoneE164)) || null,

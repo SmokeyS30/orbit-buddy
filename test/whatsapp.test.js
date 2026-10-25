@@ -271,6 +271,21 @@ test('linked user text gets a WhatsApp reply through the chat pipeline', async (
   }
 });
 
+test('paused WhatsApp webhook asks for redelivery without burning the SID', async (t) => {
+  const { app, base } = await serverFixture(); t.after(() => app.close());
+  await linkOwnerDirectly(app,base,'owner-pause@example.test');
+  const sent=[];const restore=stubTwilio(sent);t.after(restore);
+  const params={From:WA_FROM,Body:'hello after pause',MessageSid:'SMpause-synthetic'};
+  app.db.setSetting('system_paused','true');
+  const paused=await webhookPost(base,params);
+  assert.equal(paused.status,503);
+  assert.equal(app.db.getWhatsAppInboundState(params.MessageSid),null);
+  app.db.setSetting('system_paused','false');
+  const accepted=await webhookPost(base,params);
+  assert.equal(accepted.status,200);
+  assert.equal(app.db.getWhatsAppInboundState(params.MessageSid),'accepted');
+});
+
 test('deferred WhatsApp replies stay bound to the accepting link and enabled account', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base);
@@ -651,29 +666,43 @@ test('webhook: inbound image is downloaded and fed through the vision pipeline',
   }
 });
 
-test('webhook: failed image download gets the retry reply and no pipeline run', async (t) => {
+test('webhook: transient image download failure permits the same signed SID to retry once', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const { userId } = await linkOwnerDirectly(app, base, 'owner-img2@example.com');
   const sent = [];
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+  let mediaCalls=0;
   const origFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
-    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return { ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' };
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) {
+      mediaCalls++;
+      return mediaCalls===1
+        ?{ ok: false, status: 500, headers: { get: () => null }, text: async () => 'boom' }
+        :mediaResponse(png,{contentType:'image/png'});
+    }
     if (u?.hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
     return origFetch(url, opts);
   };
   try {
-    const hook = await webhookPost(base, {
+    const params = {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'image/png',
       MediaUrl0: mediaUrl(mediaMessageSid('5'),'d'),
       Body: '', MessageSid: mediaMessageSid('5'),
-    });
-    assert.equal(hook.status, 200);
-    assert.deepEqual(await hook.json(), { ok: true, image: false });
-    assert.ok(sent.some((b) => decodeForm(b).includes('mind sending it again')), 'expected the polite retry reply');
+    };
+    const hook = await webhookPost(base, params);
+    assert.equal(hook.status, 503);
+    assert.deepEqual(await hook.json(), { ok: false, retry: true });
+    assert.equal(sent.length,0,'transient failure does not send duplicate failure replies');
     const msgs = userMessages(app, userId).filter((m) => m.role === 'user');
     assert.ok(!msgs.some((m) => m.content === WHATSAPP_IMAGE_STORED_MESSAGE), 'no image message stored on download failure');
+    const retry=await webhookPost(base,params);
+    assert.equal(retry.status,200);
+    assert.deepEqual(await retry.json(),{ok:true,image:true});
+    const duplicate=await webhookPost(base,params);
+    assert.deepEqual(await duplicate.json(),{ok:true,deduped:true});
+    assert.equal(mediaCalls,2,'accepted image is not downloaded again');
   } finally {
     globalThis.fetch = origFetch;
   }

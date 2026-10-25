@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createHmac,randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 import { createOrbitServer } from '../server.js';
 import { openDatabase } from '../src/database.js';
@@ -84,7 +85,7 @@ test('signed WhatsApp link guesses are bounded per sender and across the service
   assert.equal((await replay.json()).deduped,true);
   let response;
   for(let index=0;index<5;index++)response=await fx.webhook({From:phone,Body:'000000',MessageSid:`SMsynthetic-${index}`});
-  assert.equal(response.status,200);
+  assert.equal(response.status,429);
   assert.equal((await response.json()).linkRateLimited,true);
 });
 
@@ -148,6 +149,50 @@ test('SQLite inbound SID is committed only with its accepted reply job',()=>{
   }finally{db.close();fs.rmSync(dir,{recursive:true,force:true});}
 });
 
+test('SQLite media lease fences stale retries and commits with its reply job',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-media-lease-'));
+  const db=openDatabase(path.join(dir,'test.sqlite'));
+  try{
+    const user=db.createUser({email:'media-lease@example.test',displayName:'Owner',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+    const conversation=db.ensureDefaultConversation(user.id);
+    const link=db.linkWhatsApp(user.id,'+15551234567');
+    const sid='SMsynthetic-lease';
+    const first=db.claimWhatsAppInboundMedia(sid);
+    assert.equal(first.state,'claimed');
+    assert.equal(db.claimWhatsAppInboundMedia(sid).state,'busy');
+    assert.equal(db.finishWhatsAppInboundMedia(sid,first.token,true),'retryable');
+    const second=db.claimWhatsAppInboundMedia(sid);
+    assert.equal(second.state,'claimed');
+    const options={channel:'whatsapp',deliveryToPhone:link.phone_e164,deliveryLinkVerifiedAt:link.verified_at,
+      inboundSid:sid};
+    assert.equal(db.acceptReplyJob(user.id,conversation.id,'stale',
+      {...options,inboundLeaseToken:first.token}),null);
+    const accepted=db.acceptReplyJob(user.id,conversation.id,'current',
+      {...options,inboundLeaseToken:second.token});
+    assert.ok(accepted.job.id);
+    assert.equal(db.claimWhatsAppInboundMedia(sid).state,'accepted');
+    assert.equal(db.finishWhatsAppInboundMedia(sid,second.token,true),null);
+    assert.equal(db.acceptReplyJob(user.id,conversation.id,'duplicate',
+      {...options,inboundLeaseToken:second.token}),null);
+  }finally{db.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('SQLite old inbound SID ledger upgrades additively and preserves deduplication',()=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-migration-'));
+  const file=path.join(dir,'old.sqlite');
+  const old=new DatabaseSync(file);
+  old.exec("CREATE TABLE whatsapp_inbound_messages(sid TEXT PRIMARY KEY,created_at TEXT NOT NULL); INSERT INTO whatsapp_inbound_messages VALUES('SMlegacy','2026-01-01T00:00:00.000Z')");
+  old.close();
+  try{
+    const db=openDatabase(file);
+    assert.equal(db.claimWhatsAppInboundMedia('SMlegacy').state,'accepted');
+    db.close();
+    const again=openDatabase(file);
+    assert.equal(again.claimWhatsAppInboundMedia('SMlegacy').state,'accepted');
+    again.close();
+  }finally{fs.rmSync(dir,{recursive:true,force:true});}
+});
+
 test('PostgreSQL link consume and inbound SID claim are atomic across connections',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
@@ -191,6 +236,30 @@ test('PostgreSQL inbound SID and reply job commit together across connections',a
   }finally{await a.deleteUserAccount(user.id);await a.close();await b.close();}
 });
 
+test('PostgreSQL media claim and retry lease are fenced across connections',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const a=await openPostgres(url),b=await openPostgres(url);
+  const suffix=randomUUID(),sid=`SMmedia${suffix.replaceAll('-','')}`;
+  const user=await a.createUser({email:`wa-lease-${suffix}@example.test`,displayName:'Owner',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
+  try{
+    const conversation=await a.ensureDefaultConversation(user.id);
+    const link=await a.linkWhatsApp(user.id,'+1555'+suffix.replaceAll('-','').slice(0,8));
+    const [first,second]=await Promise.all([a.claimWhatsAppInboundMedia(sid),b.claimWhatsAppInboundMedia(sid)]);
+    assert.deepEqual([first.state,second.state].sort(),['busy','claimed']);
+    const owned=first.state==='claimed'?first:second;
+    assert.equal(await a.finishWhatsAppInboundMedia(sid,owned.token,true),'retryable');
+    const retry=await b.claimWhatsAppInboundMedia(sid);
+    assert.equal(retry.state,'claimed');
+    const options={channel:'whatsapp',deliveryToPhone:link.phone_e164,deliveryLinkVerifiedAt:link.verified_at,inboundSid:sid};
+    assert.equal(await a.acceptReplyJob(user.id,conversation.id,'stale',
+      {...options,inboundLeaseToken:owned.token}),null);
+    assert.ok((await b.acceptReplyJob(user.id,conversation.id,'current',
+      {...options,inboundLeaseToken:retry.token})).job.id);
+    assert.equal((await a.claimWhatsAppInboundMedia(sid)).state,'accepted');
+  }finally{await a.deleteUserAccount(user.id);await a.close();await b.close();}
+});
+
 test('PostgreSQL concurrent code collision cannot overwrite another owner, and revoked code cannot bind late',async()=>{
   const testUrl=process.env.TEST_DATABASE_URL;
   assert.ok(testUrl,'TEST_DATABASE_URL must point at disposable PostgreSQL');
@@ -204,8 +273,14 @@ test('PostgreSQL concurrent code collision cannot overwrite another owner, and r
     await admin.query(`CREATE DATABASE ${database}`);
     blocker=new pg.Client({connectionString:isolatedUrl.href,ssl:false});
     await blocker.connect();
-    await blocker.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));
+    const currentSchema=fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8');
+    const oldInboundTable=`CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages (\n  sid TEXT PRIMARY KEY, created_at TEXT NOT NULL\n);`;
+    const priorSchema=currentSchema.replace(/CREATE TABLE IF NOT EXISTS whatsapp_inbound_messages \(\n[^;]+\);/,oldInboundTable);
+    assert.notEqual(priorSchema,currentSchema,'exercise migration from the old two-column inbound table');
+    await blocker.query(priorSchema);
+    await blocker.query("INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES('SMlegacy','2026-01-01T00:00:00.000Z')");
     a=await openPostgres(isolatedUrl.href);b=await openPostgres(isolatedUrl.href);
+    assert.equal((await a.claimWhatsAppInboundMedia('SMlegacy')).state,'accepted','old SIDs remain deduplicated after migration');
     const first=await a.createUser({email:'first@example.test',displayName:'First',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
     const second=await b.createUser({email:'second@example.test',displayName:'Second',passwordHash:'hash',passwordSalt:'salt',role:'owner'});
     const expiry=new Date(Date.now()+60_000).toISOString();
@@ -236,6 +311,11 @@ test('PostgreSQL concurrent code collision cannot overwrite another owner, and r
     const loser=winner===first.id?second.id:first.id;
     const loserOld=loser===first.id?'111111':'222222';
     assert.equal((await blocker.query('SELECT value FROM settings WHERE key=$1',[`whatsapp_link_code_${loserOld}`])).rows[0].value.split(':')[0],loser);
+    await blocker.query("INSERT INTO settings(key,value,updated_at) VALUES('whatsapp_link_code_555555',$1,$2)",
+      [`${first.id}:2020-01-01T00:00:00.000Z`,'2020-01-01T00:00:00.000Z']);
+    await b.issueWhatsAppLinkCode(second.id,'555555',expiry);
+    assert.equal((await blocker.query("SELECT value FROM settings WHERE key='whatsapp_link_code_555555'")).rows[0].value.split(':')[0],second.id,
+      'expired collision key may be safely reused');
 
     await a.issueWhatsAppLinkCode(first.id,'444444',expiry);
     await blocker.query('BEGIN');
