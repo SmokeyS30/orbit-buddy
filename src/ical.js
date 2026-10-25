@@ -1,10 +1,14 @@
 import rrulePkg from 'rrule';
-import { assertPublicUrl, FETCH_TIMEOUT_MS } from './net.js';
+import { fetchPublicBytes } from './net.js';
 
 const { rrulestr } = rrulePkg;
 
 export const FEED_TTL_MS = 15 * 60_000;
 const FEED_MAX_BYTES = 1_000_000;
+const FEED_MAX_EVENTS = 2000;
+const RANGE_MAX_INSTANCES = 5000;
+const EVENT_MAX_PROPERTIES = 1000;
+const EVENT_MAX_EXDATES = 5000;
 export const DEFAULT_ZONE = 'America/New_York';
 
 // ---------------------------------------------------------------------------
@@ -93,13 +97,32 @@ export function parseIcs(text) {
     if (!line) continue;
     if (line === 'BEGIN:VEVENT') { current = []; continue; }
     if (line === 'END:VEVENT') {
-      if (current) events.push(finishEvent(current));
+      if (current) {
+        if(current.filter(property=>property.name==='EXDATE').reduce((n,property)=>n+String(property.value).split(',').length,0)>EVENT_MAX_EXDATES){
+          throw Object.assign(new Error('That calendar recurrence is too complex.'),{status:400});
+        }
+        const event=finishEvent(current);
+        if(event.rrule){
+          const rule=event.rrule.toUpperCase();
+          const interval=/(?:^|;)INTERVAL=([^;]+)/.exec(rule)?.[1];
+          if(rule.length>500||/(?:^|;)(?:BYSECOND|BYMINUTE|BYHOUR)=/.test(rule)||
+            /(?:^|;)FREQ=(?:SECONDLY|MINUTELY|HOURLY)(?:;|$)/.test(rule)||
+            interval!==undefined&&(!/^[1-9][0-9]*$/.test(interval)||Number(interval)>10_000)){
+            throw Object.assign(new Error('That calendar recurrence is too complex.'),{status:400});
+          }
+        }
+        if(events.length>=FEED_MAX_EVENTS)throw Object.assign(new Error('That calendar has too many events.'),{status:400});
+        events.push(event);
+      }
       current = null;
       continue;
     }
     if (current) {
       const prop = parseProperty(line);
-      if (prop) current.push(prop);
+      if (prop) {
+        if(current.length>=EVENT_MAX_PROPERTIES)throw Object.assign(new Error('That calendar event is too complex.'),{status:400});
+        current.push(prop);
+      }
     }
   }
   return events;
@@ -203,7 +226,7 @@ function expandSingle(ev, dp, defaultZone) {
   return [toInstance(ev, startMs, !!dp.allDay, eventDurationMs(ev, dp, defaultZone))];
 }
 
-function expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs) {
+function expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs,remaining=RANGE_MAX_INSTANCES) {
   const dp = ev.dtstart;
   const zone = dp.allDay ? 'UTC' : (validZone(dp.tzid) || defaultZone);
   const durationMs = eventDurationMs(ev, dp, defaultZone);
@@ -225,7 +248,13 @@ function expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs) {
   const lo = new Date(Math.max(0, rangeStartMs - padMs));
   const hi = new Date(rangeEndMs + padMs);
   const out = [];
-  for (const occ of set.between(lo, hi)) {
+  let overLimit=false;
+  const occurrences=set.between(lo,hi,false,(_date,index)=>{
+    if(index>=remaining){overLimit=true;return false;}
+    return true;
+  });
+  if(overLimit)throw Object.assign(new Error('That calendar has too many occurrences in this range.'),{status:400});
+  for (const occ of occurrences) {
     const wall = {
       y: occ.getUTCFullYear(), mo: occ.getUTCMonth() + 1, d: occ.getUTCDate(),
       h: occ.getUTCHours(), mi: occ.getUTCMinutes(), s: occ.getUTCSeconds()
@@ -242,15 +271,17 @@ export function expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone = DE
   for (const ev of vevents) {
     if (!ev || ev.status === 'CANCELLED' || !ev.uid || !ev.dtstart) continue;
     if (ev.recurrenceId) { overrides.push(ev); continue; }
-    const instances = ev.rrule ? expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs) : expandSingle(ev, ev.dtstart, defaultZone);
+    const instances = ev.rrule ? expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs,RANGE_MAX_INSTANCES-out.length) : expandSingle(ev, ev.dtstart, defaultZone);
     for (const inst of instances) out.push(inst);
+    if(out.length>RANGE_MAX_INSTANCES)throw Object.assign(new Error('That calendar has too many occurrences in this range.'),{status:400});
   }
   for (const ov of overrides) {
     const ridMs = datePropToUtcMs(ov.recurrenceId, defaultZone);
-    const expanded = ov.rrule ? expandRecurring(ov, defaultZone, rangeStartMs, rangeEndMs) : expandSingle(ov, ov.dtstart, defaultZone);
+    const expanded = ov.rrule ? expandRecurring(ov, defaultZone, rangeStartMs, rangeEndMs,RANGE_MAX_INSTANCES-out.length) : expandSingle(ov, ov.dtstart, defaultZone);
     const idx = ridMs == null ? -1 : out.findIndex((e) => e.uid === ov.uid && e.instanceStartMs === ridMs);
     if (idx !== -1) out.splice(idx, 1, ...expanded);
     else for (const e of expanded) out.push(e);
+    if(out.length>RANGE_MAX_INSTANCES)throw Object.assign(new Error('That calendar has too many occurrences in this range.'),{status:400});
   }
   return out
     .filter((e) => e.endMs > rangeStartMs && e.startMs < rangeEndMs)
@@ -271,31 +302,13 @@ export function normalizeFeedUrl(url) {
 }
 
 export async function fetchFeedText(url) {
-  let current = await assertPublicUrl(normalizeFeedUrl(url));
-  let response = null;
-  for (let hop = 0; hop < 6; hop += 1) {
-    try {
-      response = await fetch(current, {
-        headers: { 'User-Agent': 'orbit-buddy/1.0 (calendar reader)', Accept: 'text/calendar' },
-        redirect: 'manual',
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-      });
-    } catch (error) {
-      throw new Error(`Could not fetch that calendar: ${error.message}`);
-    }
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      if (!location) throw new Error('That calendar redirect had no target.');
-      // Re-check after redirects: a public URL must not bounce into the private network.
-      current = await assertPublicUrl(new URL(location, current).toString());
-      continue;
-    }
-    break;
-  }
+  const response=await fetchPublicBytes(normalizeFeedUrl(url),{
+    headers:{'User-Agent':'orbit-buddy/1.0 (calendar reader)',Accept:'text/calendar'},
+    maxBytes:FEED_MAX_BYTES,sizeError:'That calendar feed is too large.',
+    networkErrorPrefix:'Could not fetch that calendar'
+  });
   if (!response.ok) throw new Error(`Calendar fetch failed (HTTP ${response.status}).`);
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > FEED_MAX_BYTES) throw new Error('That calendar feed is too large.');
-  return buffer.toString('utf8');
+  return response.buffer.toString('utf8');
 }
 
 export async function getFeedVevents(feed) {
@@ -324,8 +337,17 @@ export async function getEventsForRange(db, userId, rangeStartMs, rangeEndMs, de
   for (const feed of feeds) {
     const { vevents, error } = await getFeedVevents(feed);
     if (error) feedErrors.push({ label: feed.label, error });
-    for (const event of expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone)) {
-      events.push({ ...event, calendar: feed.label, feedId: feed.id });
+    try{
+      const expanded=expandEvents(vevents, rangeStartMs, rangeEndMs, defaultZone);
+      if(events.length+expanded.length>RANGE_MAX_INSTANCES){
+        feedErrors.push({label:feed.label,error:'Too many calendar occurrences in this range.'});
+        break;
+      }
+      for (const event of expanded) {
+        events.push({ ...event, calendar: feed.label, feedId: feed.id });
+      }
+    }catch(expansionError){
+      feedErrors.push({label:feed.label,error:String(expansionError?.message||expansionError).slice(0,200)});
     }
   }
   events.sort((a, b) => a.startMs - b.startMs);
