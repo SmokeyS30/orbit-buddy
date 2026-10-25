@@ -117,6 +117,20 @@ test('model retry guard rejects new model work after account disable',async t=>{
   assert.equal(app.db.listEvents(user.id).filter(row=>row.type==='followup_sent').length,0);
 });
 
+test('pause during background learning does not write failure events or advance its period',async t=>{
+  const pending=deferredModel();
+  const {app,user}=fixture(t,pending.respond);
+  const conversation=app.db.ensureDefaultConversation(user.id);
+  for(let i=0;i<3;i++)app.db.addMessage(user.id,conversation.id,'user',`Synthetic preference and recent activity ${i}`);
+  const running=app.runProactiveChecks(Date.now());
+  try{await pending.started;app.db.setSetting('system_paused','true');}
+  finally{pending.release();}
+  await running;
+  assert.equal(app.db.getSetting(`last_learning_${user.id}`),null);
+  assert.equal(app.db.getSetting(`deep_learning_last_${user.id}`),null);
+  assert.equal(app.db.listEvents(user.id).filter(row=>row.type==='auto_learn_failed').length,0);
+});
+
 test('expired and reclaimed proactive lease fences old follow-up state changes',async t=>{
   const pending=deferredModel();
   const {app,user,dbPath}=fixture(t,pending.respond);

@@ -1171,7 +1171,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           // is never silently dropped.
           const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
           if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-          if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
+          if(!whatsappSent&&canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
         }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
         finally{clearInterval(heartbeat);}
       }
@@ -1194,9 +1194,12 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     } catch (error) {
       console.error('whatsapp proactive send failed', error && error.message);
       if(canStartMoreProactiveDelivery(userId)){
-        try{db.addEvent(userId, 'whatsapp_send_failed', 'Could not send proactive WhatsApp message.', String(error && error.message || error).slice(0, 200));}catch{}
+        const rejected=Number(error?.status)>=400&&Number(error?.status)<500;
+        try{db.addEvent(userId, rejected?'whatsapp_send_failed':'whatsapp_send_uncertain', rejected?'Could not send proactive WhatsApp message.':'WhatsApp send outcome is unknown; no second channel was attempted.', String(error && error.message || error).slice(0, 200));}catch{}
       }
-      return false; // fall back to push below
+      // A timeout or provider 5xx can follow acceptance. Sending push too may
+      // duplicate a private message, so fall back only on confirmed rejection.
+      return Number(error?.status)>=400&&Number(error?.status)<500?false:true;
     }
     // A provider-accepted send must never fall through to a second channel
     // just because local event logging failed afterward.
@@ -1213,6 +1216,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   function assertProactiveAction(userId){
     if(!proactiveActionAllowed(userId))throw Object.assign(new Error('Proactive action deferred.'),{code:'PROACTIVE_DEFERRED'});
   }
+  function isProactiveStop(error){return error?.code==='PROACTIVE_DEFERRED'||error?.code==='PROACTIVE_LEASE_LOST';}
   async function proactiveRespond(user,options){
     assertProactiveAction(user.id);
     const result=await model.respond({...options,assertActive:()=>assertProactiveAction(user.id)});
@@ -1250,24 +1254,32 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   // conversation so the web app keeps a record.
   async function tryWhatsAppTaskResult(task, result) {
     if (!tryWhatsAppDeliveryGate(task.user_id)) return false;
+    const link = db.getWhatsAppLink(task.user_id);
     try {
-      const link = db.getWhatsAppLink(task.user_id);
       await sendWhatsAppText({ accountSid: env.TWILIO_ACCOUNT_SID, authToken: env.TWILIO_AUTH_TOKEN, fromNumber: env.TWILIO_WHATSAPP_NUMBER, toPhone: link.phone_e164, body: result });
+    } catch (error) {
+      console.error('whatsapp task delivery failed', error && error.message);
+      const rejected=Number(error?.status)>=400&&Number(error?.status)<500;
+      if(tryWhatsAppDeliveryGate(task.user_id)){
+        try{db.addEvent(task.user_id,rejected?'whatsapp_send_failed':'whatsapp_send_uncertain',rejected?'Could not send WhatsApp task result.':'WhatsApp task send outcome is unknown; no second channel was attempted.',String(error && error.message || error).slice(0,200));}catch{}
+      }
+      return !rejected;
+    }
+    // Twilio accepted the send. A later local database error must not cause
+    // fallback through web push or APNs and duplicate the task result.
+    try{
+      if(!tryWhatsAppDeliveryGate(task.user_id))return true;
       const conversation = db.ensureDefaultConversation(task.user_id);
       db.addMessage(task.user_id, conversation.id, 'assistant', result);
       db.touchConversation(task.user_id, conversation.id);
       db.addEvent(task.user_id, 'task_delivered_whatsapp', `Delivered task result via WhatsApp: “${task.title}”.`);
-      return true;
-    } catch (error) {
-      console.error('whatsapp task delivery failed', error && error.message);
-      db.addEvent(task.user_id, 'whatsapp_send_failed', 'Could not send WhatsApp task result.', String(error && error.message || error).slice(0, 200));
-      return false; // fall back to push
-    }
+    }catch(error){console.error('whatsapp task receipt recording failed',error?.code||error?.name||'error');}
+    return true;
   }
   function tryWhatsAppDeliveryGate(userId) {
     if (!whatsappConfigured(env)) return false;
     const owner = db.getUserById(userId);
-    if (!owner || owner.role !== 'owner') return false; // WhatsApp linking is owner-only
+    if (!owner || owner.role !== 'owner' || owner.disabled || owner.moderation_blocked || paused()) return false; // WhatsApp linking is owner-only
     const link = db.getWhatsAppLink(userId);
     return Boolean(link?.phone_e164) && isWindowOpen(link.last_inbound_at);
   }
@@ -1292,6 +1304,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       const today=todayInZone(preferences.time_zone,nowMs);
       for(const followUp of db.dueFollowUps(user.id,today)){
@@ -1315,6 +1328,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   async function runRoutines(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
       const local=localDateTimeParts(preferences.time_zone,nowMs);
       for(const routine of dueRoutines(db.listRoutines(user.id),preferences.time_zone,nowMs)){
@@ -1353,10 +1367,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
       if(lastLearned&&lastLearned.slice(0,10)===today)continue;
 
       // Memory decay: fade relevance of unused memories (runs once daily per user)
-      try{db.applyMemoryDecay(user.id);}catch(e){}
+      try{db.applyMemoryDecay(user.id);}catch(e){if(isProactiveStop(e))throw e;}
       // Memory v2 backstop: auto-save suggestions past the review window even for
       // quiet users (runs once daily per user alongside decay).
-      try{const n=db.autoApproveMemorySuggestions(user.id,MEMORY_AUTO_SAVE_MINUTES);if(n>0)db.addEvent(user.id,'memory_added',`Auto-saved ${n} suggested ${n===1?'memory':'memories'} after the review window.`);}catch(e){}
+      try{const n=db.autoApproveMemorySuggestions(user.id,MEMORY_AUTO_SAVE_MINUTES);if(n>0)db.addEvent(user.id,'memory_added',`Auto-saved ${n} suggested ${n===1?'memory':'memories'} after the review window.`);}catch(e){if(isProactiveStop(e))throw e;}
       // Get recent messages (last 24h, up to 40)
       const messages=db.listMessages(user.id,40);
       const cutoff=nowMs-24*3600_000;
@@ -1408,8 +1422,9 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
         db.setSetting(`last_learning_${user.id}`,new Date(nowMs).toISOString());
         if(saved>0)db.addEvent(user.id,'auto_learned',`Learned ${saved} new insight${saved>1?'s':''} about the user.`);
         // Track people mentioned in recent conversation for gentle nudges later
-        try{for(const name of extractPersonNames(convoText))db.trackPersonMention(user.id,name);}catch(e){}
+        try{for(const name of extractPersonNames(convoText))db.trackPersonMention(user.id,name);}catch(e){if(isProactiveStop(e))throw e;}
       }catch(error){
+        if(isProactiveStop(error))throw error;
         db.addEvent(user.id,'auto_learn_failed','Could not run learning cycle.',error.message);
       }
 
@@ -1433,7 +1448,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
           }
           if(rhythmsAdded>0)db.addEvent(user.id,'ambient_rhythm',`Noticed ${rhythmsAdded} chat rhythm${rhythmsAdded>1?'s':''}.`);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Could not detect chat rhythms.',error.message);}
 
       // --- D4 passive rhythm detection: conversation starts and task
       // creations clustered by (day-of-week × time bucket). Same permission
@@ -1441,7 +1456,7 @@ Only include genuine insights, not obvious restatements. Max 5 insights. If noth
       // any suggestion/nudge/briefing code path.
       try{
         applyActivityRhythmDetection(db,user,{nowMs,timeZone});
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Could not detect activity rhythms.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Could not detect activity rhythms.',error.message);}
 
       // --- Monthly deep dive: mine full history for long arcs ---
       try{
@@ -1504,11 +1519,11 @@ Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what
                 }
                 if(contraSaved>0)db.addEvent(user.id,'auto_learned',`Noticed ${contraSaved} gentle contradiction${contraSaved>1?'s':''}.`);
               }
-            }catch(e){}
+            }catch(e){if(isProactiveStop(e))throw e;}
           }
           db.setSetting(`deep_mining_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Deep dive failed.',error.message);}
 
       // --- Monthly: motivational profiling — what approach works best? ---
       try{
@@ -1549,7 +1564,7 @@ Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough
           }
           db.setSetting(`motivation_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Motivation profiling failed.',error.message);}
 
       // --- Monthly: energy mapping — what energizes vs drains them? ---
       try{
@@ -1581,7 +1596,7 @@ Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":
                 const existing=db.listRelevantMemories(user.id,content,3);
                 if(!existing.some((m)=>String(m.source||'')==='auto-energy')){
                   db.addMemory(user.id,content,{kind:'fact',source:'auto-energy',confidence:0.55});
-                  try{const prof=db.getEmotionalProfile(user.id);db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){}
+                  try{const prof=db.getEmotionalProfile(user.id);db.setEmotionalProfile(user.id,prof.support_style,content,prof.evidence);}catch(e2){if(isProactiveStop(e2))throw e2;}
                   db.addEvent(user.id,'auto_learned','Mapped what energizes vs drains them.');
                 }
               }
@@ -1589,7 +1604,7 @@ Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":
           }
           db.setSetting(`energy_map_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Energy mapping failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Energy mapping failed.',error.message);}
 
       // --- Monthly: support style — what helps when they're struggling? ---
       try{
@@ -1629,7 +1644,7 @@ Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"
           }
           db.setSetting(`support_style_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Support style learning failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Support style learning failed.',error.message);}
 
       // --- Monthly: memory consolidation — merge, prune, strengthen ---
       try{
@@ -1683,7 +1698,7 @@ Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs chan
           }
           db.setSetting(`consolidation_last_${user.id}`,monthKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Memory consolidation failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Memory consolidation failed.',error.message);}
 
       // --- Weekly: curiosity gaps, pattern detection, relationship depth ---
       try{
@@ -1705,7 +1720,7 @@ Respond with a JSON array, max 3: {"question":"the natural question you'd ask","
                 db.addCuriosityGap(user.id,gap);
               }
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 2. Pattern detection: when is the user active?
           try{
@@ -1716,7 +1731,7 @@ Respond with a JSON array, max 3: {"question":"the natural question you'd ask","
               if(existing.some((m)=>(m.source||'')==='auto-pattern'&&m.content.toLowerCase().includes(p.label.toLowerCase().slice(0,20))))continue;
               db.addMemory(user.id,content,{kind:'fact',source:'auto-pattern',confidence:0.6});
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 3. Relationship depth: enrich context for recently-mentioned people
           try{
@@ -1737,7 +1752,7 @@ Respond with a single JSON object: {"summary":"one sentence on who this person i
                 if(parsed.summary&&typeof parsed.summary==='string')db.updatePersonContext(user.id,name,parsed.summary,parsed.sentiment);
               }
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 4. Predictive insights: what does this user likely need?
           try{
@@ -1778,7 +1793,7 @@ Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence
               }
               db.setSetting(`predictions_last_${user.id}`,weekKey);
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           // 5. Emotional baseline: how have they been feeling this week?
           try{
@@ -1821,11 +1836,11 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
               }
               db.setSetting(`emotion_baseline_last_${user.id}`,weekKey);
             }
-          }catch(e){}
+          }catch(e){if(isProactiveStop(e))throw e;}
 
           db.setSetting(`deep_learning_last_${user.id}`,weekKey);
         }
-      }catch(error){db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
+      }catch(error){if(isProactiveStop(error))throw error;db.addEvent(user.id,'auto_learn_failed','Weekly deep learning failed.',error.message);}
     }
   }
 
@@ -1903,6 +1918,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
   async function runSmartCheckins(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -1943,6 +1959,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
       // Friendly check-ins only run in narrow, predictable local windows.
       // Meeting prep may still run outside them when an actual event is near.
       if(!checkinWindow&&!meetingCandidate)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const slotToken=db.reserveProactiveSlot(user.id,today);if(!slotToken)continue;
 
       // Let the AI decide: is now a good time? What kind of check-in?
@@ -2262,12 +2279,12 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const outcome=await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`,{date:today,token:slotToken,onRecorded:()=>{
           db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
           db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
+          if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
+          if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
+          if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
+          if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
         }});
         if(!outcome.recorded){db.releaseProactiveSlot(user.id,today,slotToken);continue;}
-        if(decisionClean==='MEETING_PREP'&&meetingCandidate)db.setSetting(meetingCandidate.prepKey,'1');
-        if(nudgedPerson)db.markPersonNudged(user.id,nudgedPerson);
-        if(askedGapId)db.markCuriosityGapAsked(user.id,askedGapId);
-        if(surfacedContraId)db.setSetting(`contradiction_surfaced_${user.id}_${surfacedContraId}`,new Date(nowMs).toISOString());
       }catch(error){
         db.releaseProactiveSlot(user.id,today,slotToken);
         if(error.code==='PROACTIVE_LEASE_LOST')throw error;
@@ -2281,6 +2298,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runQuietNudges(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
       const lastOutreach=db.getLastOutreachAt(user.id);if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<24*3600_000)continue;
@@ -2301,6 +2319,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runWeeklyReview(nowMs){
     for(const user of db.listUsers()){
       if(user.disabled)continue;
+      if(!proactiveActionAllowed(user.id))continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -2346,6 +2365,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
     for(const user of db.listUsers()){
       if(user.disabled||user.role!=='owner')continue;
+      if(!proactiveActionAllowed(user.id))continue;
       let gmailRow=null;
       try{gmailRow=db.getConnector(user.id,'gmail');}catch(e){}
       if(!gmailRow)continue;
@@ -2444,7 +2464,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   // the rest of the proactive loop.
   async function runProjectRadar(nowMs){
     try{
-      const poll=await runRadarPoll({db,env,nowMs});
+      const poll=await runRadarPoll({db,env,nowMs,assertActive:()=>{
+        assertProactiveWorkerLease();
+        if(paused())throw Object.assign(new Error('Proactive action deferred.'),{code:'PROACTIVE_DEFERRED'});
+      }});
       if(poll.surfaced.length){
         await deliverRadarFindings({
           db,surfaced:poll.surfaced,nowMs,
@@ -2466,6 +2489,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled||isDemoUser(user))continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2478,7 +2502,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             buddyName:buddyNameFor(user.id),
             claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
             releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage,{date:today,token:slotToken}),
+            deliver:(text,eventMessage,onRecorded)=>deliverProactive(user,text,'memory_proactive_sent',eventMessage,{date:today,token:slotToken,onRecorded}),
           });
           if(sent>0)db.setSetting(`proactive_memory_pushed_${user.id}`,today);
         }catch(error){console.error('proactive memory user failed',user.id,error&&error.message);}
@@ -2495,6 +2519,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled||isDemoUser(user))continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2507,7 +2532,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             buddyName:buddyNameFor(user.id),
             claimSlot:()=>{slotToken=db.reserveProactiveSlot(user.id,today);return slotToken;},
             releaseSlot:()=>{try{db.releaseProactiveSlot(user.id,today,slotToken);}catch{}},
-            deliver:(text,eventMessage)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage,{date:today,token:slotToken}),
+            deliver:(text,eventMessage,onRecorded)=>deliverProactive(user,text,'memory_connection_proactive_sent',eventMessage,{date:today,token:slotToken,onRecorded}),
           });
           if(sent>0)db.setSetting(`memory_connections_pushed_${user.id}`,today);
         }catch(error){console.error('memory connections user failed',user.id,error&&error.message);}
@@ -2532,6 +2557,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try{
       for(const user of db.listUsers()){
         if(user.disabled)continue;
+        if(!proactiveActionAllowed(user.id))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2546,6 +2572,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runStudyCoachingForUser(user,timeZone,today,nowMs){
     async function sendStudyNudge(text,eventMessage,mark){
+      if(!proactiveActionAllowed(user.id))return false;
       const token=db.reserveProactiveSlot(user.id,today);if(!token)return false;
       try{
         const outcome=await deliverProactive(user,text,'study_nudge_sent',eventMessage,{date:today,token,onRecorded:mark});
@@ -2561,6 +2588,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       events=range.events||[];
       feeds=range.feeds||[];
     }catch{events=[];feeds=[];}
+    if(!proactiveActionAllowed(user.id))return;
     const studyEvents=findStudyEvents(events);
     // 1. Pre-session nudge: study session starting within 45 minutes.
     const upcoming=studyEvents.find((e)=>e.startMs>nowMs&&e.startMs-nowMs<=45*60_000);
