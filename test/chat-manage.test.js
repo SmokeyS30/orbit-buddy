@@ -297,6 +297,26 @@ test('delete_task and delete_routine also cannot execute from chat', () => {
   db.close();
 });
 
+test('SQLite approval transaction deletes a task or routine once, only for its owner',()=>{
+  const {db,user,ctx,turn}=fixture();
+  const cases=[
+    {type:'task',created:toolCreateTask({title:'Synthetic task',prompt:'Do it'},ctx),stage:()=>toolDeleteTask({task:'synthetic task'},turn('Delete Synthetic task')),read:id=>db.getTask(user.id,id)},
+    {type:'routine',created:toolCreateRoutine({title:'Synthetic routine',prompt:'Run',kind:'custom',cadence:'daily',timeLocal:'09:00'},ctx),stage:()=>toolDeleteRoutine({routine:'synthetic routine'},turn('Delete Synthetic routine')),read:id=>db.getRoutine(user.id,id)}
+  ];
+  for(const entry of cases){
+    const staged=entry.stage();
+    assert.ok(entry.read(entry.created.id));
+    assert.equal(db.executeDeleteApprovalIfCurrent('another-user',staged.approvalId).status,'already');
+    assert.ok(entry.read(entry.created.id));
+    const result=db.executeDeleteApprovalIfCurrent(user.id,staged.approvalId);
+    assert.equal(result.status,'executed');
+    assert.equal(result.result.deleted,`delete_${entry.type}`);
+    assert.equal(entry.read(entry.created.id)==null,true);
+    assert.equal(db.executeDeleteApprovalIfCurrent(user.id,staged.approvalId).status,'already');
+  }
+  db.close();
+});
+
 test('the authenticated approval card deletes only its exact target once',async t=>{
   const {app,base,account,headers,approve,stage}=await approvalApiFixture(t);
   const userId=account.user.id;
