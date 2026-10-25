@@ -1167,12 +1167,17 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     }
   }
   async function deliverProactive(user,text,eventType,eventMessage){
+    if(paused())return false;
+    const current=db.getUserById(user.id);
+    if(!current||current.disabled)return false;
     const conversation=db.ensureDefaultConversation(user.id);
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
     db.addEvent(user.id,eventType,eventMessage);
     db.markOutreach(user.id);
+    if(paused()||!db.getUserById(user.id))return false;
     if(await tryWhatsAppProactive(user.id,text))return;
+    if(paused()||!db.getUserById(user.id))return false;
     // W4: notification tap deep-linking — the check-in lives in this conversation,
     // so carry its id in the push payload; the SW routes the tap straight to it.
     await push.notify(user.id,buddyNameFor(user.id),text,{view:'today',conversationId:conversation.id});
@@ -2319,6 +2324,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused())return;proactiveBusy=true;
     try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
+    catch(error){console.error('Proactive worker stopped after an account or database change:',error?.code||error?.name||'error');}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
