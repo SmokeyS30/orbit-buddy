@@ -1,0 +1,48 @@
+name: Open verified held cutover
+
+concurrency:
+  group: orbit-buddy-production
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Exact merged main SHA whose held image was verified
+        required: true
+        type: string
+      guard_bootstrap_sha:
+        description: Exact first held guard SHA; it must differ from release_sha
+        required: true
+        type: string
+
+jobs:
+  open-held:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the requested image to equal checked-out main
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          test "$RELEASE_SHA" = "$(git rev-parse HEAD)"
+          test "$RELEASE_SHA" = "$GITHUB_SHA"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Log in to Azure with the existing OIDC identity
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Verify retired replicas then open this exact image
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          GUARD_BOOTSTRAP_SHA: ${{ inputs.guard_bootstrap_sha }}
+        run: node scripts/guarded-containerapp.mjs open-held

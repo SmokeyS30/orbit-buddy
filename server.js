@@ -19,6 +19,7 @@ import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
+import { cutoverHeld, cutoverUnavailable } from './src/cutover-guard.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
@@ -513,6 +514,7 @@ export function applyActivityRhythmDetection(db,user,{nowMs,timeZone}={}){
 
 export function createOrbitServer(options={}) {
   const env=options.env||process.env;
+  const cutoverHold=cutoverHeld(env);
   const emailLinkOrigin=authLinkOrigin(env);
   const defaultBuddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
@@ -527,7 +529,7 @@ export function createOrbitServer(options={}) {
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
-  const connectors=createConnectorService(env,db,encryptionKey);
+  const connectors=createConnectorService(env,db,encryptionKey,{cutoverHold});
   const transactionalEmail=options.sendEmail||sendResendEmail;
   const transactionalEmailConfigured=Boolean(options.sendEmail)||emailConfigured(env);
 
@@ -600,6 +602,7 @@ export function createOrbitServer(options={}) {
   const signupPause=()=>signupsPaused(env)||db.getSetting('signups_paused','false')==='true';
   const registrationOpen=()=>db.getSetting('registration_open','false')==='true';
   async function checkDoorLeftOpen(){
+    if(cutoverHold)return;
     db.pruneDoorTokens();
     if(!registrationOpen())return;
     const openedAt=db.getSetting('registration_opened_at');
@@ -1111,7 +1114,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||closing||paused())return;workerBusy=true;
+    if(workerBusy||closing||paused()||cutoverHold)return;workerBusy=true;
     try{
       db.recoverStaleTasks();
       for(const task of db.dueTasks()){
@@ -1174,6 +1177,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     }
   }
   async function deliverProactive(user,text,eventType,eventMessage){
+    if(cutoverHold)return false;
     const conversation=db.ensureDefaultConversation(user.id);
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
@@ -2326,7 +2330,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(e){return '';}
   }
   async function runProactiveChecks(nowMs=Date.now()){
-    if(proactiveBusy||paused())return;proactiveBusy=true;
+    if(proactiveBusy||paused()||cutoverHold)return;proactiveBusy=true;
     try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
     finally{proactiveBusy=false;}
   }
@@ -2572,7 +2576,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       let dbState='ready';const dbDriver=db.driver||'unknown';
       try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
       const ok=dbState==='ready';
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',database:{driver:dbDriver,state:dbState}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',cutoverHold,database:{driver:dbDriver,state:dbState}});
     }
     if(url.pathname==='/healthz'){
       const modelStatus=model.diagnostics();
@@ -2581,7 +2585,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
       const backup=backupStatus();
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),cutoverHold,ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
     }
     // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
     // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
@@ -3053,7 +3057,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
 
       const callback=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/callback$/);
-      if(req.method==='GET'&&callback){const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
+      if(req.method==='GET'&&callback){if(cutoverHold)throw cutoverUnavailable();const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
 
       if(url.pathname.startsWith('/api/')){
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
@@ -3680,8 +3684,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
           return json(res,200,{ok:true,entitlements});
         }
-        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
-        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(cutoverHold)throw cutoverUnavailable();if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
+        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(cutoverHold)throw cutoverUnavailable();if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='DELETE'&&url.pathname==='/api/account'){
@@ -3775,7 +3779,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
   return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();if(!cutoverHold)setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
       if(workerTimer)clearInterval(workerTimer);
