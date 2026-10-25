@@ -628,11 +628,11 @@ export function createOrbitServer(options={}) {
     if(approval.kind!==`delete_${objectType}`||!id||!title||!approval.source_message_id)return null;
     const source=db.getMessage(userId,approval.source_message_id);
     if(!source||source.role!=='user'||!source.conversation_id)return null;
-    const recent=db.listConversationMessages(userId,source.conversation_id,200);
+    const recent=db.listMessages(userId,200);
     const sourceIndex=recent.findIndex(row=>row.id===source.id);
     if(sourceIndex<0)return null;
-    // A later chat turn changes the context of this request. Require a new
-    // card instead of guessing whether a reply confirms or cancels deletion.
+    // A later chat turn in any conversation changes the context of this
+    // request. Require a new card instead of guessing its meaning.
     if(recent.slice(sourceIndex+1).some(row=>row.role==='user'))return null;
     const target=objectType==='goal'?db.getGoal(userId,id):objectType==='task'?db.getTask(userId,id):objectType==='routine'?db.getRoutine(userId,id):null;
     return target?.title===title?target:null;
