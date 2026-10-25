@@ -37,10 +37,7 @@ test('SQLite fresh-account proactive delivery records the outreach cooldown',asy
 test('PostgreSQL fresh-account proactive delivery records the outreach cooldown',async t=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
-  const setup=new pg.Client({connectionString:url,ssl:url.includes('sslmode=disable')?false:true});
-  await setup.connect();
-  try{await setup.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));}
-  finally{await setup.end();}
+  // npm test prepares the shared schema before parallel test files start.
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-fresh-outreach-pg-'));
   const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',DATABASE_URL:url}});
   let user;
@@ -100,10 +97,7 @@ test('SQLite opening the pre-ledger state preserves its daily cap exactly once',
 test('PostgreSQL daily proactive reservations are date and token isolated across connections',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
-  const setup=new pg.Client({connectionString:url,ssl:url.includes('sslmode=disable')?false:true});
-  await setup.connect();
-  try{await setup.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));}
-  finally{await setup.end();}
+  // Avoid raw schema DDL racing the adapter's migration advisory lock.
   const a=await openPostgres(url),b=await openPostgres(url);
   let user;
   try{
