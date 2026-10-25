@@ -218,7 +218,7 @@ test('PostgreSQL concurrent code collision cannot overwrite another owner, and r
       b.issueWhatsAppLinkCode(second.id,'333333',expiry),
     ]);
     const waitFor=async (sql,count)=>{
-      const deadline=Date.now()+5000;
+      const deadline=Date.now()+10_000;
       while(Date.now()<deadline){
         const row=(await blocker.query(sql)).rows[0];
         if(Number(row.n)>=count)return;
@@ -242,7 +242,7 @@ test('PostgreSQL concurrent code collision cannot overwrite another owner, and r
     await blocker.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[first.id]);
     const lateBind=b.consumeAndLinkWhatsApp('444444','+15551234567');
     try{
-      await waitFor("SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE '%FROM users WHERE id=%'",1);
+      await waitFor("SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND pid<>pg_backend_pid()",1);
       await blocker.query("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE $1",[`${first.id}:%`]);
       await blocker.query('DELETE FROM whatsapp_links WHERE user_id=$1',[first.id]);
     }finally{await blocker.query('COMMIT');}

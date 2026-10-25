@@ -1985,7 +1985,7 @@ const indexMigrations = [
       await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${userId}:%`);
       const issued=await tGet(`INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at
-        WHERE substring(settings.value from position(':' in settings.value)+1)<?
+        WHERE right(settings.value,24)<?
         RETURNING value`,key,`${userId}:${expiresAt}`,timestamp(),timestamp());
       if(!issued)throw new Error('Link code collision');
       return true;
