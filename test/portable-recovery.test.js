@@ -15,6 +15,20 @@ import { createOrbitServer } from '../server.js';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 
 const now='2026-10-24T12:00:00.000Z';
+async function assertPgSessionsClosed(admin,name){
+  // pool.end() closes client sockets, but the server may need a short moment
+  // to remove their backends from pg_stat_activity under concurrent CI load.
+  // Keep the plain DROP DATABASE gate: a persistent connection still fails.
+  const deadline=Date.now()+2000;
+  let active;
+  do{
+    active=await admin.query('SELECT pid,state,backend_type FROM pg_stat_activity WHERE datname=$1',[name]);
+    if(active.rowCount===0)return;
+    if(Date.now()>=deadline)break;
+    await new Promise(resolve=>setTimeout(resolve,25));
+  }while(true);
+  assert.equal(active.rowCount,0,`all application and test connections must close before dropping the temporary backup database: ${JSON.stringify(active.rows)}`);
+}
 function sampleRow(entry,userId,prefix){
   const values={id:`${prefix}-${entry.table}`,user_id:userId,label:'Birthday',month:10,day:24,year:2026,type:'birthday',
     notes:'Call Alex',gift_nag:1,gift_done:0,item_type:'goal',item_id:'goal-1',date:'2026-10-24',record_json:'{}',version:1,
@@ -201,8 +215,7 @@ test('PostgreSQL portable recovery restores a full synthetic bundle into an isol
     if(source)await source.close();
     if(target)await target.close();
     if(created){
-      const active=await admin.query('SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname=$1',[name]);
-      assert.equal(active.rows[0].count,0,'all application and test connections must close before dropping the temporary backup database');
+      await assertPgSessionsClosed(admin,name);
       await admin.query(`DROP DATABASE ${name}`);
     }
     await admin.end();
@@ -276,8 +289,7 @@ test('PostgreSQL manual API exports over 10 MiB and waits for a slow transaction
     if(app)await app.close();
     if(sql)await sql.end();
     if(created){
-      const active=await admin.query('SELECT COUNT(*)::int AS count FROM pg_stat_activity WHERE datname=$1',[name]);
-      assert.equal(active.rows[0].count,0,'all application and test connections must close before dropping the temporary backup database');
+      await assertPgSessionsClosed(admin,name);
       await admin.query(`DROP DATABASE ${name}`);
     }
     await admin.end();
