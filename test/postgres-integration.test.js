@@ -467,6 +467,26 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     const appleUser=await db.createSignupAccount({email:`apple-${suffix}@example.com`,displayName:'Apple',passwordHash:'unusable-random',passwordSalt:'salt',appleProofHash:'apple-'+suffix,appleEmailHash:'email-'+suffix,automatic:true});
     assert.equal((await db.getAuthIdentity('apple','apple-'+suffix)).user_id,appleUser.id);
     assert.ok(appleUser.email_verified_at);
+    const reclaim=await db.createUser({email:`reclaim-${suffix}@example.com`,displayName:'Pre-registered',passwordHash:'old',passwordSalt:'salt',role:'member'});
+    const recoveryHash='recovery-'+suffix;
+    await db.replaceRecoveryCodes(reclaim.id,[recoveryHash]);
+    await db.linkAuthIdentity('apple','reclaim-'+suffix,reclaim.id);
+    await db.linkWhatsApp(reclaim.id,'+15555550000');
+    await db.setSetting(`whatsapp_link_code_${suffix}`,`${reclaim.id}:${expiry}`);
+    await db.savePush(reclaim.id,{endpoint:`https://push.example.test/${suffix}`,keys:{p256dh:'key',auth:'auth'}});
+    await db.saveApnsToken(reclaim.id,'synthetic-'+suffix);
+    await db.addPasswordResetToken('reset-'+suffix,reclaim.id,expiry);
+    assert.equal(await db.finishPasswordReset('reset-'+suffix,'mailbox-owner','salt'),true);
+    assert.ok((await db.getUserById(reclaim.id)).email_verified_at);
+    assert.equal(await db.getAuthIdentity('apple','reclaim-'+suffix),null);
+    assert.equal(await db.getWhatsAppLink(reclaim.id),null);
+    assert.equal(await db.getSetting(`whatsapp_link_code_${suffix}`),null);
+    assert.equal((await db.listPush(reclaim.id)).length,0);
+    assert.equal((await db.listApnsTokens(reclaim.id)).length,0);
+    assert.equal(await db.finishRecovery(reclaim.id,recoveryHash,'attacker','salt',[]),false);
+    await db.addPasswordResetToken('verified-reset-'+suffix,appleUser.id,expiry);
+    assert.equal(await db.finishPasswordReset('verified-reset-'+suffix,'verified-owner','salt'),true);
+    assert.equal((await db.getAuthIdentity('apple','apple-'+suffix)).user_id,appleUser.id,'verified Apple identity remains linked');
     await db.addAppleSignupProof('collision-'+suffix,'apple-'+suffix,'email2-'+suffix,expiry);
     await assert.rejects(db.createSignupAccount({email:`apple-collision-${suffix}@example.com`,displayName:'Collision',passwordHash:'random',passwordSalt:'salt',appleProofHash:'collision-'+suffix,appleEmailHash:'email2-'+suffix,automatic:true}));
     assert.ok(await db.getAppleSignupProof('collision-'+suffix,'email2-'+suffix),'identity collision rolls back proof consumption');
@@ -475,6 +495,7 @@ test('signup security PostgreSQL upgrades, concurrent claims and rollback preser
     await assert.rejects(db.createSignupAccount({email:`paused-${suffix}@example.com`,displayName:'Paused',passwordHash:'random',passwordSalt:'salt',automatic:true}));
     await db.setSignupPause(false);
     await db.deleteUserAccount(appleUser.id);
+    await db.deleteUserAccount(reclaim.id);
     await db.deleteUserAccount(user.id);await db.deleteUserAccount(other.id);
   } finally { await db.close(); }
 });

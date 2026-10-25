@@ -573,9 +573,22 @@ const indexMigrations = [
       if(!user || user.disabled) return false;
       const fresh=await tGet('SELECT token_hash FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?',hash,timestamp());
       if(!fresh)return false;
+      const now=timestamp();
       await tRun('UPDATE password_reset_tokens SET used=1 WHERE user_id=?',row.user_id);
-      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,timestamp(),row.user_id);
-      await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);return true;
+      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,now,row.user_id);
+      await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);
+      await tRun('DELETE FROM recovery_codes WHERE user_id=?',row.user_id);
+      if(!user.email_verified_at){
+        await tRun('UPDATE users SET email_verified_at=? WHERE id=?',now,row.user_id);
+        await tRun('DELETE FROM auth_identities WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM oauth_states WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM whatsapp_links WHERE user_id=?',row.user_id);
+        await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${row.user_id}:%`);
+        await tRun('DELETE FROM push_subscriptions WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM apns_device_tokens WHERE user_id=?',row.user_id);
+        if(user.role==='owner')await tRun('DELETE FROM door_tokens');
+      }
+      return true;
     }),
     getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
     hasAuthIdentityForUser: async (provider, userId) => !!(await get('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1', provider, userId)),
