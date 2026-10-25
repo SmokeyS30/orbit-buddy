@@ -194,6 +194,18 @@ export function createSubscriptionService(env, db, dependencies = {}) {
     return entitlement;
   }
 
+  // Validate the device JWS before using its account token to find a pending
+  // purchase. The token is only a lookup key; entitlement still requires the
+  // independent App Store transaction and status checks in verifyTransaction.
+  async function signedTransactionBinding(signedTransaction) {
+    if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
+    const { payload } = await verifySigned('transaction', signedTransaction);
+    if (!payload.transactionId || !PRODUCTS[payload.productId]) throw Object.assign(new Error('Unknown transaction product.'), { status: 400 });
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(payload.appAccountToken || '')))
+      throw Object.assign(new Error('Transaction has no valid Orbit account binding.'), { status: 403 });
+    return { appAccountToken: payload.appAccountToken, productId: payload.productId };
+  }
+
   async function fetchEntitlements(userId) {
     if (!purchaseReady) throw Object.assign(new Error('Subscriptions are not ready.'), { status: 503 });
     const current = db.getSubscription(userId);
@@ -285,7 +297,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
 
   return {
     enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT, BASIC_DAILY_LIMIT,
-    status, verifyTransaction, fetchEntitlements, handleNotification,
+    status, signedTransactionBinding, verifyTransaction, fetchEntitlements, handleNotification,
     isPaid, isComped, tier, consumeQuota, runDailyReset, nyDayKey, nextResetUtc,
   };
 }
