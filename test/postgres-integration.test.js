@@ -8,8 +8,33 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
+import { toolDeleteGoal,toolConfirmDeleteApproval } from '../src/tools.js';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
+
+test('PostgreSQL deletion tool requires a later explicit user turn and visible preview',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const db=createSyncPgAdapter(DATABASE_URL);
+  let userId=null;
+  try{
+    const user=db.createUser({email:`delete-gate-${Date.now()}-${Math.random()}@example.com`,displayName:'Delete gate',passwordHash:'test',passwordSalt:'test',role:'member'});
+    userId=user.id;
+    const conversation=db.createConversation(userId,'Delete gate');
+    const goal=db.addGoal(userId,{title:'Private goal'});
+    const first=db.addMessage(userId,conversation.id,'user','Delete Private goal');
+    const context={db,userId,messageId:first.id};
+    const staged=toolDeleteGoal({title:'Private goal'},context);
+    assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},context),/fresh explicit confirmation/i);
+    db.addMessage(userId,conversation.id,'assistant',`Confirm deletion: ${staged.preview}`);
+    const next=db.addMessage(userId,conversation.id,'user','yes, delete it');
+    assert.equal(toolConfirmDeleteApproval({approvalId:staged.approvalId},{...context,messageId:next.id}).deleted,true);
+    assert.equal(db.getGoal(userId,goal.id),null);
+  }finally{
+    if(userId)db.deleteUserAccount(userId);
+    db.close();
+  }
+});
 
 // Apply schema idempotently before tests. Uses a direct pg Pool (not the
 // sync wrapper) so schema setup doesn't depend on the code under test.
