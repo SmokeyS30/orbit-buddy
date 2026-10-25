@@ -1025,10 +1025,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       db.exec('BEGIN IMMEDIATE');
       try {
         const row=s.getPwResetToken.get(hash,timestamp());
-        if(!row || !s.userById.get(row.user_id) || s.userById.get(row.user_id).disabled) { db.exec('ROLLBACK');return false; }
+        const user=row&&s.userById.get(row.user_id);
+        if(!user || user.disabled) { db.exec('ROLLBACK');return false; }
         if(!s.usePwResetToken.run(hash).changes) { db.exec('ROLLBACK');return false; }
-        s.updatePassword.run(passwordHash,passwordSalt,timestamp(),row.user_id);
+        const now=timestamp();
+        s.updatePassword.run(passwordHash,passwordSalt,now,row.user_id);
         s.deleteUserSessions.run(row.user_id);
+        // A mailbox reset supersedes all previously issued offline recovery codes.
+        s.clearRecovery.run(row.user_id);
+        if(!user.email_verified_at){
+          // A prior registrant may have claimed this address without proving it.
+          // Remove alternate access and notification channels they could retain.
+          s.markUserEmailVerified.run(now,now,row.user_id);
+          db.prepare('DELETE FROM auth_identities WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM oauth_states WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM whatsapp_links WHERE user_id=?').run(row.user_id);
+          db.prepare("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?").run(`${row.user_id}:%`);
+          db.prepare('DELETE FROM push_subscriptions WHERE user_id=?').run(row.user_id);
+          db.prepare('DELETE FROM apns_device_tokens WHERE user_id=?').run(row.user_id);
+          if(user.role==='owner')db.prepare('DELETE FROM door_tokens').run();
+        }
         db.prepare('UPDATE password_reset_tokens SET used=1 WHERE user_id=?').run(row.user_id);
         db.exec('COMMIT');return true;
       } catch(error) { db.exec('ROLLBACK');throw error; }
@@ -1040,16 +1056,28 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       s.linkAuthIdentity.run(provider, subject, userId, now, now);
       return s.authIdentity.get(provider, subject);
     },
+    linkAuthIdentityIfCurrent(provider,subject,userId,sessionHash,expectedPasswordHash,expectedPasswordSalt){return withImmediate(()=>{
+      const user=s.userById.get(userId),session=s.session.get(sessionHash,timestamp());
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt||session?.user_id!==userId)return false;
+      const now=timestamp();s.linkAuthIdentity.run(provider,subject,userId,now,now);
+      return true;
+    });},
     updatePassword(id, passwordHash, passwordSalt) { s.updatePassword.run(passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled(id, disabled) { return s.setUserDisabled.run(disabled ? 1 : 0, timestamp(), id, disabled?1:0).changes>0; },
     setModerationBlocked(id,blocked){return s.setModerationBlocked.run(blocked?1:0,blocked?1:0,timestamp(),id,blocked?0:1,blocked?0:1).changes>0;},
     markUserEmailVerified(id) { const now=timestamp();return s.markUserEmailVerified.run(now,now,id).changes>0; },
-    deleteUserAccount(userId) {
-      const account = s.userById.get(userId);
-      if (!account) return { deleted: false, successorId: null };
+    deleteUserAccount(userId,{sessionHash=null,expectedPasswordHash=null,expectedPasswordSalt=null}={}) {
       let successorId = null;
       db.exec('BEGIN IMMEDIATE');
       try {
+        const account=s.userById.get(userId);
+        if(!account){db.exec('ROLLBACK');return {deleted:false,successorId:null};}
+        if(expectedPasswordHash!==null){
+          const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+          if(account.password_hash!==expectedPasswordHash||account.password_salt!==expectedPasswordSalt||session?.user_id!==userId){
+            db.exec('ROLLBACK');return {deleted:false,successorId:null,staleCredentials:true};
+          }
+        }
         if (account.role === 'owner') {
           const successor = db.prepare(`SELECT id FROM users
             WHERE id<>? AND is_demo=0 AND disabled=0
@@ -1085,6 +1113,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     claimOrphans(userId) { s.claimMessages.run(userId); s.claimMemories.run(userId); s.claimTasks.run(userId); s.claimEvents.run(userId); adoptOrphanMessages(db, userId); },
     createSession({ tokenHash, userId, csrfToken, expiresAt, userAgent }) { s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent || null); },
+    createPasswordSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,expectedPasswordHash,expectedPasswordSalt}) { return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt)return false;
+      s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    }); },
+    createAppleSessionIfCurrent({tokenHash,userId,csrfToken,expiresAt,userAgent,identitySubject}){return withImmediate(()=>{
+      const user=s.userById.get(userId),identity=s.authIdentity.get('apple',identitySubject);
+      if(!user||user.disabled||user.moderation_blocked||identity?.user_id!==userId)return false;
+      s.createSession.run(tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    });},
     getSession: (tokenHash) => s.session.get(tokenHash, timestamp()),
     deleteSession: (tokenHash) => s.deleteSession.run(tokenHash),
     deleteUserSessions: (userId) => s.deleteUserSessions.run(userId),
@@ -1100,6 +1140,13 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         throw error;
       }
     },
+    replaceRecoveryCodesIfCurrent(userId,sessionHash,expectedPasswordHash,expectedPasswordSalt,hashes){return withImmediate(()=>{
+      const user=s.userById.get(userId),session=s.session.get(sessionHash,timestamp());
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt||session?.user_id!==userId)return false;
+      s.clearRecovery.run(userId);
+      for(const hash of hashes)s.addRecovery.run(randomUUID(),userId,hash,timestamp());
+      return true;
+    });},
     consumeRecoveryCode(hash,userId) { const row=s.recovery.get(hash); if(!row || (userId && row.user_id!==userId)) return null; return s.useRecovery.run(timestamp(),row.id).changes ? row : null; },
     getSetting: (key, fallback=null) => s.setting.get(key)?.value ?? fallback,
     setSetting(key,value) { s.setSetting.run(key,String(value),timestamp()); },
@@ -1594,10 +1641,22 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getArtifact: (userId,id) => s.getArtifact.get(id,userId),
     deleteArtifact: (userId,id) => s.deleteArtifact.run(id,userId).changes>0,
     savePush(userId,{endpoint,keys}) { s.addPush.run(randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp()); },
+    savePushIfCurrent(userId,subscription,sessionHash) { return withImmediate(()=>{
+      const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+      if(session?.user_id!==userId||session.disabled||session.moderation_blocked)return false;
+      s.addPush.run(randomUUID(),userId,subscription.endpoint,subscription.keys.p256dh,subscription.keys.auth,timestamp());
+      return true;
+    }); },
     listPush: (userId) => s.listPush.all(userId),
     deletePush: (userId,endpoint) => s.deletePush.run(endpoint,userId),
     deletePushById: (id) => s.deletePushById.run(id),
     saveApnsToken(userId,token) { const now=timestamp(); s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now); },
+    saveApnsTokenIfCurrent(userId,token,sessionHash) { return withImmediate(()=>{
+      const session=sessionHash?s.session.get(sessionHash,timestamp()):null;
+      if(session?.user_id!==userId||session.disabled||session.moderation_blocked)return false;
+      const now=timestamp();s.upsertApnsToken.run(randomUUID(),userId,token,'ios','production',now,now);
+      return true;
+    }); },
     listApnsTokens: (userId) => s.listApnsTokens.all(userId),
     deleteApnsToken: (token) => s.deleteApnsToken.run(token),
     saveSubscription(userId,{productId,status,expiresAt,appAccountToken,environment,originalTransactionId,lastEventSignedAt=null}) {

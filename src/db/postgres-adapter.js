@@ -573,9 +573,22 @@ const indexMigrations = [
       if(!user || user.disabled) return false;
       const fresh=await tGet('SELECT token_hash FROM password_reset_tokens WHERE token_hash=? AND used=0 AND expires_at>?',hash,timestamp());
       if(!fresh)return false;
+      const now=timestamp();
       await tRun('UPDATE password_reset_tokens SET used=1 WHERE user_id=?',row.user_id);
-      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,timestamp(),row.user_id);
-      await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);return true;
+      await tRun('UPDATE users SET password_hash=?,password_salt=?,updated_at=? WHERE id=?',passwordHash,passwordSalt,now,row.user_id);
+      await tRun('DELETE FROM sessions WHERE user_id=?',row.user_id);
+      await tRun('DELETE FROM recovery_codes WHERE user_id=?',row.user_id);
+      if(!user.email_verified_at){
+        await tRun('UPDATE users SET email_verified_at=? WHERE id=?',now,row.user_id);
+        await tRun('DELETE FROM auth_identities WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM oauth_states WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM whatsapp_links WHERE user_id=?',row.user_id);
+        await tRun("DELETE FROM settings WHERE key LIKE 'whatsapp_link_code_%' AND value LIKE ?",`${row.user_id}:%`);
+        await tRun('DELETE FROM push_subscriptions WHERE user_id=?',row.user_id);
+        await tRun('DELETE FROM apns_device_tokens WHERE user_id=?',row.user_id);
+        if(user.role==='owner')await tRun('DELETE FROM door_tokens');
+      }
+      return true;
     }),
     getAuthIdentity: async (provider, subject) => get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject),
     hasAuthIdentityForUser: async (provider, userId) => !!(await get('SELECT 1 FROM auth_identities WHERE provider=? AND user_id=? LIMIT 1', provider, userId)),
@@ -584,15 +597,28 @@ const indexMigrations = [
       await run('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)', provider, subject, userId, now, now);
       return get('SELECT * FROM auth_identities WHERE provider=? AND subject=?', provider, subject);
     },
+    linkAuthIdentityIfCurrent: async (provider,subject,userId,sessionHash,expectedPasswordHash,expectedPasswordSalt)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT password_hash,password_salt,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      const now=timestamp();await tRun('INSERT INTO auth_identities(provider,subject,user_id,created_at,updated_at) VALUES(?,?,?,?,?)',provider,subject,userId,now,now);
+      return true;
+    }),
     updatePassword: async (id, passwordHash, passwordSalt) => { await run('UPDATE users SET password_hash=?, password_salt=?, updated_at=? WHERE id=?', passwordHash, passwordSalt, timestamp(), id); },
     setUserDisabled: async (id, disabled) => (await run('UPDATE users SET disabled=?, updated_at=? WHERE id=? AND (?=1 OR moderation_blocked=0)', disabled ? 1 : 0, timestamp(), id,disabled?1:0)).changes>0,
     setModerationBlocked: async (id,blocked) => (await run("UPDATE users SET disabled=?,moderation_blocked=?,updated_at=? WHERE id=? AND role='member' AND disabled=? AND moderation_blocked=?",blocked?1:0,blocked?1:0,timestamp(),id,blocked?0:1,blocked?0:1)).changes>0,
 
     markUserEmailVerified: async (id) => { const now=timestamp();return (await run('UPDATE users SET email_verified_at=?,updated_at=? WHERE id=? AND email_verified_at IS NULL',now,now,id)).changes>0; },
-    async deleteUserAccount(userId) {
+    async deleteUserAccount(userId,{sessionHash=null,expectedPasswordHash=null,expectedPasswordSalt=null}={}) {
       return withTransaction(async ({ get: tGet, all: tAll, run: tRun }) => {
-        const account = await tGet('SELECT * FROM users WHERE id=?', userId);
+        const account = await tGet('SELECT * FROM users WHERE id=? FOR UPDATE', userId);
         if (!account) return { deleted: false, successorId: null };
+        if(expectedPasswordHash!==null){
+          const session=sessionHash?await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp()):null;
+          if(account.password_hash!==expectedPasswordHash||account.password_salt!==expectedPasswordSalt||!session)
+            return {deleted:false,successorId:null,staleCredentials:true};
+        }
         let successorId = null;
         if (account.role === 'owner') {
           const successor = await tGet(`SELECT id FROM users
@@ -630,6 +656,20 @@ const indexMigrations = [
 
     // --- Sessions ---
     createSession: async ({ tokenHash, userId, csrfToken, expiresAt, userAgent }) => { await run('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)', tokenHash, userId, csrfToken, expiresAt, timestamp(), userAgent || null); },
+    createPasswordSessionIfCurrent: async ({tokenHash,userId,csrfToken,expiresAt,userAgent,expectedPasswordHash,expectedPasswordSalt})=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT password_hash,password_salt,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt)return false;
+      await tRun('INSERT INTO sessions VALUES(?,?,?,?,?,?)',tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    }),
+    createAppleSessionIfCurrent: async ({tokenHash,userId,csrfToken,expiresAt,userAgent,identitySubject})=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked)return false;
+      const identity=await tGet("SELECT user_id FROM auth_identities WHERE provider='apple' AND subject=?",identitySubject);
+      if(identity?.user_id!==userId)return false;
+      await tRun('INSERT INTO sessions VALUES(?,?,?,?,?,?)',tokenHash,userId,csrfToken,expiresAt,timestamp(),userAgent||null);
+      return true;
+    }),
     getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`, tokenHash, timestamp()),
     deleteSession: async (tokenHash) => { await run('DELETE FROM sessions WHERE token_hash=?', tokenHash); },
@@ -643,6 +683,15 @@ const indexMigrations = [
         for (const hash of hashes) await tRun('INSERT INTO recovery_codes VALUES (?, ?, ?, NULL, ?)', randomUUID(), userId, hash, timestamp());
       });
     },
+    replaceRecoveryCodesIfCurrent: async (userId,sessionHash,expectedPasswordHash,expectedPasswordSalt,hashes)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT password_hash,password_salt,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.password_hash!==expectedPasswordHash||user.password_salt!==expectedPasswordSalt)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      await tRun('DELETE FROM recovery_codes WHERE user_id=?',userId);
+      for(const hash of hashes)await tRun('INSERT INTO recovery_codes VALUES(?,?,?,NULL,?)',randomUUID(),userId,hash,timestamp());
+      return true;
+    }),
     async consumeRecoveryCode(hash,userId) {
       const row = await get('SELECT * FROM recovery_codes WHERE code_hash=? AND used_at IS NULL', hash);
       if (!row || (userId && row.user_id!==userId)) return null;
@@ -1627,6 +1676,15 @@ const indexMigrations = [
       await run(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
         ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`, randomUUID(), userId, endpoint, keys.p256dh, keys.auth, timestamp());
     },
+    savePushIfCurrent: async (userId,{endpoint,keys},sessionHash)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||!sessionHash)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      await tRun(`INSERT INTO push_subscriptions VALUES(?,?,?,?,?,?)
+        ON CONFLICT(endpoint) DO UPDATE SET user_id=excluded.user_id,p256dh=excluded.p256dh,auth=excluded.auth`,randomUUID(),userId,endpoint,keys.p256dh,keys.auth,timestamp());
+      return true;
+    }),
     listPush: async (userId) => all('SELECT * FROM push_subscriptions WHERE user_id=?', userId),
     deletePush: async (userId, endpoint) => { await run('DELETE FROM push_subscriptions WHERE endpoint=? AND user_id=?', endpoint, userId); },
     deletePushById: async (id) => { await run('DELETE FROM push_subscriptions WHERE id=?', id); },
@@ -1638,6 +1696,16 @@ const indexMigrations = [
         VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,
         randomUUID(), userId, token, 'ios', 'production', now, now);
     },
+    saveApnsTokenIfCurrent: async (userId,token,sessionHash)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||!sessionHash)return false;
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>?',sessionHash,userId,timestamp());
+      if(!session)return false;
+      const now=timestamp();
+      await tRun(`INSERT INTO apns_device_tokens(id,user_id,device_token,platform,apns_environment,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,device_token) DO UPDATE SET updated_at=excluded.updated_at`,randomUUID(),userId,token,'ios','production',now,now);
+      return true;
+    }),
     listApnsTokens: async (userId) => all('SELECT * FROM apns_device_tokens WHERE user_id=?', userId),
     deleteApnsToken: async (token) => { await run('DELETE FROM apns_device_tokens WHERE device_token=?', token); },
 
