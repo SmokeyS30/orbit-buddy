@@ -22,6 +22,7 @@ import { signupSecuritySchema } from '../signup-security-schema.js';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
+import { currentDeleteApproval, decodeApprovalRow, DELETE_APPROVAL_TABLES } from '../delete-approval.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 import { assertMemorySafe } from '../relational-intelligence.js';
 import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from '../portable-recovery.js';
@@ -1277,6 +1278,36 @@ const indexMigrations = [
       const at = timestamp();
       if (!(await run("UPDATE approvals SET status=?,result_json=?,last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending' AND execution_started_at IS NOT NULL", status, result ? JSON.stringify(result) : null, error ? String(error).slice(0, 1000) : null, at, at, id, userId)).changes) return null;
       return this.getApproval(userId, id);
+    },
+    async executeDeleteApprovalIfCurrent(userId, approvalId) {
+      return withTransaction(async ({ query: tQuery, get: tGet, all: tAll, run: tRun }) => {
+        // A concurrent editor, chat turn or reviewer must commit either before
+        // this decision is read or after the deletion is committed. Avoid a
+        // late destructive write if an overloaded database cannot get locks.
+        await tQuery("SET LOCAL lock_timeout = '5000ms'");
+        const raw = await tGet('SELECT * FROM approvals WHERE id=? AND user_id=? FOR UPDATE', approvalId, userId);
+        if (!raw || raw.status !== 'pending' || raw.execution_started_at) return { status: 'already' };
+        const approval = decodeApprovalRow(raw);
+        const { id, objectType } = approval.payload || {};
+        const table = DELETE_APPROVAL_TABLES[objectType];
+        const target = table ? await tGet(`SELECT * FROM ${table} WHERE id=? AND user_id=? FOR UPDATE`, id, userId) : null;
+        // messages has no user FK or common write lock. SHARE blocks INSERT,
+        // UPDATE and DELETE until this short transaction commits, including
+        // new user turns from other application replicas.
+        await tQuery('LOCK TABLE messages IN SHARE MODE');
+        const recent = await tAll('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC, insert_order DESC NULLS LAST, id DESC LIMIT 200', userId);
+        const selected = currentDeleteApproval(approval, recent, target);
+        const now = timestamp();
+        if (!selected) {
+          await tRun("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'", 'Deletion request or target changed.', now, now, approvalId, userId);
+          return { status: 'stale', approval: decodeApprovalRow(await tGet('SELECT * FROM approvals WHERE id=? AND user_id=?', approvalId, userId)) };
+        }
+        const deleted = await tRun(`DELETE FROM ${table} WHERE id=? AND user_id=?`, id, userId);
+        if (!deleted.changes) throw new Error('Deletion target changed during transaction.');
+        const result = { deleted: approval.kind, id: selected.id, title: selected.title };
+        await tRun("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'", JSON.stringify(result), now, now, approvalId, userId);
+        return { status: 'executed', approval: decodeApprovalRow(await tGet('SELECT * FROM approvals WHERE id=? AND user_id=?', approvalId, userId)), result };
+      });
     },
 
     // --- Proactive / nudges ---

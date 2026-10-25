@@ -31,6 +31,12 @@ test('PostgreSQL deletion tool remains unable to execute after a later yes',asyn
     assert.throws(()=>toolConfirmDeleteApproval({approvalId:staged.approvalId},{...context,messageId:next.id}),/Chat cannot execute deletions/i);
     assert.ok(db.getGoal(userId,goal.id));
     assert.equal(db.getApproval(userId,staged.approvalId).status,'pending');
+    assert.equal(db.executeDeleteApprovalIfCurrent(userId,staged.approvalId).status,'stale');
+    assert.ok(db.getGoal(userId,goal.id));
+    const second=db.addMessage(userId,conversation.id,'user','Delete the exact goal now');
+    const refreshed=toolDeleteGoal({title:'Private goal'},{...context,messageId:second.id});
+    assert.equal(db.executeDeleteApprovalIfCurrent(userId,refreshed.approvalId).status,'executed');
+    assert.equal(db.getGoal(userId,goal.id),null);
   }finally{
     if(userId)db.deleteUserAccount(userId);
     db.close();
