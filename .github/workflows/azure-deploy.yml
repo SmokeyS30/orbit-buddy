@@ -94,6 +94,18 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
+      # Read only. The PostgreSQL server is externally managed; this reports
+      # its actual PITR window without changing retention, redundancy or cost.
+      # RBAC may not allow this query, in which case the deployment still runs
+      # and the unavailable inspection must be reported separately.
+      - name: Inspect PostgreSQL PITR configuration
+        continue-on-error: true
+        run: |
+          az postgres flexible-server show \
+            --resource-group orbit-buddy-rg --name orbit-buddy-pg \
+            --query '{state:state,retentionDays:backup.backupRetentionDays,earliestRestoreDate:backup.earliestRestoreDate,geoRedundantBackup:backup.geoRedundantBackup}' \
+            --output json
+
       - name: Deploy, verify and roll back on failure
         env:
           RELEASE_SHA: ${{ github.sha }}

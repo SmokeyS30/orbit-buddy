@@ -260,7 +260,7 @@ test('automation endpoints are gone', async (t) => {
   assert.equal((await fetch(`${base}/api/automation/memories`, { method: 'POST', headers: authHeaders(auth), body: JSON.stringify({}) })).status, 404);
 });
 
-test('only the owner can restore a backup and restoration leaves work paused', async (t) => {
+test('only the owner can restore a large backup request and restoration leaves work paused', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   const owner = await register(base);
   const opened = await fetch(`${base}/api/admin/registration`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ open: true }) });
@@ -271,7 +271,8 @@ test('only the owner can restore a backup and restoration leaves work paused', a
   const payload = await exported.text();
   const blocked = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(member), body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE' }) });
   assert.equal(blocked.status, 403);
-  const restored = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(owner), body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE' }) });
+  const restored = await fetch(`${base}/api/backups/restore`, { method: 'POST', headers: authHeaders(owner),
+    body: JSON.stringify({ payload, passphrase: 'a separate backup passphrase', confirm: 'RESTORE', padding: 'x'.repeat(13*1024*1024) }) });
   assert.equal(restored.status, 200);
   assert.equal((await restored.json()).paused, true);
 });

@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
 import { assertMemorySafe } from './relational-intelligence.js';
+import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from './portable-recovery.js';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './reply-jobs.js';
 
 const timestamp = () => new Date().toISOString();
@@ -1705,14 +1706,44 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteSignupVerificationToken(tokenHash) { return s.deleteSignupVerificationToken.run(tokenHash).changes>0; },
     cleanSignupVerificationTokens() { s.cleanSignupVerificationTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) {
+      const user=s.userById.get(userId);
+      if(!user)throw new Error('Backup user not found.');
+      this.getPreferences(userId); // Create defaults before opening a read snapshot.
+      db.exec('BEGIN');
+      try{
+        const bundle={version:6,exportedAt:timestamp(),user:{id:user.id,email:user.email,display_name:user.display_name},
+          conversations:s.listConversations.all(userId),
+          messages:db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at,rowid').all(userId),
+          memories:db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY created_at,id').all(userId),
+          memorySuggestions:db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at,id').all(userId),
+          followUps:db.prepare('SELECT * FROM follow_ups WHERE user_id=? ORDER BY created_at,id').all(userId),
+          goals:s.listGoals.all(userId),
+          goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),
+          routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),
+          projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),
+          approvals:db.prepare('SELECT * FROM approvals WHERE user_id=? ORDER BY created_at,id').all(userId),
+          preferences:this.getPreferences(userId),
+          conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),
+          calendarFeeds:this.listCalendarFeeds(userId),
+          tasks:db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at,id').all(userId),
+          events:db.prepare('SELECT * FROM events WHERE user_id=? ORDER BY created_at,id').all(userId),
+          artifacts:db.prepare('SELECT * FROM artifacts WHERE user_id=? ORDER BY created_at,id').all(userId)};
+        for(const entry of PORTABLE_USER_TABLES){
+          bundle[entry.key]=db.prepare(`SELECT ${entry.columns.join(',')} FROM ${entry.table} WHERE user_id=?`).all(userId);
+        }
+        db.exec('COMMIT');
+        return bundle;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
     restoreUser(userId, bundle) {
-      if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4,5,6].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
-        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`),
+        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,
+          last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
         suggestion: db.prepare('INSERT OR IGNORE INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)'),
         followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)'),
         goal: db.prepare('INSERT OR IGNORE INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'),
@@ -1723,8 +1754,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         approval: db.prepare('INSERT OR IGNORE INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'),
         summary: db.prepare('INSERT OR IGNORE INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?)'),
         calendar: db.prepare('INSERT OR IGNORE INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?)'),
-        task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+        task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,
+          created_at,updated_at,attempt_count,lease_expires_at,last_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
         event: db.prepare('INSERT OR IGNORE INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?)'),
         artifact: db.prepare('INSERT OR IGNORE INTO artifacts(id,user_id,task_id,name,mime_type,content,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?)')
       };
@@ -1732,7 +1763,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       try {
         for (const row of bundle.conversations || []) inserts.conversation.run(row.id,userId,row.title,row.created_at,row.updated_at);
         for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
-        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,assertMemorySafe(row.content),row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at,row.proactive_allowed===0?0:1);
+        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,assertMemorySafe(row.content),row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at,row.last_mentioned_at||null,row.relevance_score??1,row.superseded_by||null,row.embedding||null,row.proactive_allowed===0?0:1);
         for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,assertMemorySafe(row.content),row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
         for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',normalizePriority(row.priority),row.source_message_id||null,row.created_at,row.completed_at||null);
         for (const row of bundle.goals || []) inserts.goal.run(row.id,userId,row.title,row.description||null,row.status||'active',normalizePriority(row.priority),Math.max(0,Math.min(Number(row.progress)||0,100)),row.target_date||null,row.next_step||null,row.created_at,row.updated_at,row.completed_at||null);
@@ -1743,10 +1774,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         for (const row of bundle.approvals || []) inserts.approval.run(row.id,userId,row.kind,row.title,row.summary,row.payload_json||'{}',['pending','executed','rejected','failed'].includes(row.status)?row.status:'pending',row.source_message_id||null,row.result_json||null,row.last_error||null,row.created_at,row.updated_at,row.reviewed_at||null);
         for (const row of bundle.conversationSummaries || []) inserts.summary.run(row.conversation_id,userId,row.summary,row.message_count,row.updated_at);
         for (const row of bundle.calendarFeeds || []) inserts.calendar.run(row.id,userId,row.label,protectSecret(row.url),row.created_at,row.updated_at);
-        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);
+        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,
+          row.delivery_channel==='whatsapp'?'whatsapp':'push',row.result,row.created_at,row.updated_at,row.attempt_count||0,null,row.last_error||null);
         for (const row of bundle.events || []) inserts.event.run(row.id,userId,row.type,row.message,row.detail,row.created_at);
         for (const row of bundle.artifacts || []) inserts.artifact.run(row.id,userId,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at);
-        if(bundle.preferences){const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,p.briefingTone,p.briefingLength,created,timestamp());}
+        if(bundle.version===6){
+          for(const entry of PORTABLE_USER_TABLES){
+            const insert=db.prepare(portableInsertSql(entry));
+            for(const row of bundle[entry.key]||[])insert.run(...portableRowValues(entry,row,userId));
+          }
+        }
+        if(bundle.preferences){
+          const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();
+          s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,p.briefingTone,p.briefingLength,created,timestamp());
+          if(bundle.version===6){
+            const old=bundle.preferences;
+            db.prepare(`UPDATE user_preferences SET buddy_name=?,writing_voice_opt_in=?,writing_voice_profile=?,writing_voice_updated_at=?,
+              writing_voice_offered=?,intro_dismissed=? WHERE user_id=?`).run(old.buddy_name||null,old.writing_voice_opt_in===1?1:0,
+              old.writing_voice_profile||null,old.writing_voice_updated_at||null,old.writing_voice_offered===1?1:0,
+              old.intro_dismissed===1?1:0,userId);
+          }
+        }
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     }
