@@ -40,6 +40,60 @@ test('a recovered task rejects completion and lease renewal from the previous at
   assert.equal(db.getTask(user.id,task.id).result,'current');
 });
 
+test('claim returns its own attempt even if another worker reclaims before the caller continues',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-claim-race-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  let modelCalls=0;
+  model.respond=async()=>{modelCalls++;return{text:'stale result',toolCalls:[]};};
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'claim@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  const claim=app.db.claimTask.bind(app.db);
+  let newerAttempt;
+  app.db.claimTask=(userId,id)=>{
+    const oldAttempt=claim(userId,id,-1000);
+    assert.equal(app.db.recoverStaleTasks(),1);
+    newerAttempt=claim(userId,id);
+    assert.ok(newerAttempt>oldAttempt);
+    return oldAttempt;
+  };
+  let notifications=0;app.push.notify=async()=>{notifications++;};
+  await app.runDueTasks();
+  assert.equal(modelCalls,0,'the old caller cannot adopt the newer claim before starting model work');
+  assert.equal(notifications,0);
+  assert.equal(app.db.getTask(user.id,task.id).attempt_count,newerAttempt);
+  assert.equal(app.db.getTask(user.id,task.id).status,'running');
+});
+
+test('editing a running task invalidates its prompt and schedule snapshot',t=>{
+  const {db,user}=fixture(t);
+  const task=db.addTask(user.id,{title:'Original',prompt:'Original prompt'});
+  const first=db.claimTask(user.id,task.id);
+  const edited=db.updateTask(user.id,task.id,{prompt:'Revised prompt',scheduleAt:new Date(Date.now()-1000).toISOString()});
+  assert.equal(edited.status,'queued');
+  assert.equal(db.activeTaskClaim(user.id,task.id,first),false);
+  const second=db.claimTask(user.id,task.id);
+  assert.ok(second>first);
+  assert.equal(db.completeClaimedTask(user.id,task.id,first,'stale result'),false);
+  assert.equal(db.completeClaimedTask(user.id,task.id,second,'revised result'),true);
+  assert.equal(db.getTask(user.id,task.id).result,'revised result');
+});
+
+test('disabled accounts cannot claim, renew, complete, or receive a task result',t=>{
+  const {db,user}=fixture(t);
+  const task=db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  const attempt=db.claimTask(user.id,task.id);
+  assert.equal(db.setUserDisabled(user.id,true),true);
+  assert.equal(db.activeTaskClaim(user.id,task.id,attempt),false);
+  assert.equal(db.renewTaskLease(user.id,task.id,attempt),false);
+  assert.equal(db.completeClaimedTask(user.id,task.id,attempt,'stale'),false);
+  assert.equal(db.deliverableTask(user.id,task.id,attempt),false);
+  assert.equal(db.recoverStaleTasks(),0);
+  db.setTaskStatus(user.id,task.id,'queued');
+  assert.equal(db.claimTask(user.id,task.id),null);
+});
+
 test('cancelling while model work is in flight discards its result and notifications',async t=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-interleave-'));
   const model=createModelClient({NODE_ENV:'test'});
@@ -67,4 +121,47 @@ test('cancelling while model work is in flight discards its result and notificat
   assert.equal(app.db.listArtifacts(user.id).length,0);
   assert.equal(app.db.listEvents(user.id).filter(event=>event.type==='task_completed').length,0);
   assert.equal(notifications,0);
+});
+
+test('account disable during model work blocks another model attempt and delivery',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-disabled-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  let release,entered;
+  const started=new Promise(resolve=>{entered=resolve;});
+  model.respond=async({assertActive})=>{
+    assert.equal(typeof assertActive,'function');
+    assertActive();
+    await new Promise(resolve=>{release=resolve;entered();});
+    assert.throws(()=>assertActive(),/no longer active/,'a fallback request must fail its active-claim check');
+    return{text:'disabled result',toolCalls:[]};
+  };
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'disabled@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  let notifications=0;app.push.notify=async()=>{notifications++;};
+  const run=app.runDueTasks();
+  await started;
+  app.db.setUserDisabled(user.id,true);
+  release();await run;
+  assert.equal(app.db.getTask(user.id,task.id).result,null);
+  assert.equal(app.db.listArtifacts(user.id).length,0);
+  assert.equal(notifications,0);
+});
+
+test('cancellation after completion blocks the next external notification',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-delivery-race-'));
+  const model=createModelClient({NODE_ENV:'test'});
+  model.respond=async()=>({text:'Synthetic result',toolCalls:[]});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  const user=app.db.createUser({email:'delivery@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  let webSends=0,nativeSends=0;
+  app.push.notify=async()=>{webSends++;app.db.setTaskStatus(user.id,task.id,'cancelled');return{sent:1,failed:0};};
+  app.apns.notify=async()=>{nativeSends++;return{sent:1,failed:0};};
+  await app.runDueTasks();
+  assert.equal(webSends,1,'the first already-started provider send cannot be retracted');
+  assert.equal(nativeSends,0,'the next provider send sees cancellation');
+  assert.equal(app.db.getTask(user.id,task.id).status,'cancelled');
 });
