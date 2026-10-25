@@ -22,6 +22,19 @@ const READY_OFFSET = 12;    // worker readiness flag (set once at startup)
 const DEFAULT_READY_TIMEOUT_MS = 30000;
 const QUERY_TIMEOUT_MS = 30000;
 
+// A notification is only a wake-up hint. A previous completed call can
+// notify after the main thread has reused this buffer for the next call.
+// Read the completion flag again after every wake and retain one deadline.
+export function waitForPgResponse(array, timeoutMs) {
+  const deadline=Date.now()+timeoutMs;
+  while(Atomics.load(array,FLAG_OFFSET/4)!==1){
+    const remaining=deadline-Date.now();
+    if(remaining<=0)return false;
+    Atomics.wait(array,FLAG_OFFSET/4,0,remaining);
+  }
+  return true;
+}
+
 export function createSyncPgAdapter(connectionString, { encryptionKey = null, readyTimeoutMs = null, queryTimeoutMs = QUERY_TIMEOUT_MS } = {}) {
   // Allow fast-fail for tests: ?readyTimeoutMs=2000 in connection string
   // or readyTimeoutMs option. Defaults to 30s for production.
@@ -146,8 +159,7 @@ export function createSyncPgAdapter(connectionString, { encryptionKey = null, re
         const callArray=responseArray;
         Atomics.store(callArray, FLAG_OFFSET / 4, 0);
         worker.postMessage({ id, method, args, sharedBuffer:callBuffer });
-        const result = Atomics.wait(callArray, FLAG_OFFSET / 4, 0, queryTimeoutMs);
-        if (result === 'timed-out') {
+        if (!waitForPgResponse(callArray,queryTimeoutMs)) {
           // The worker may still finish this query. Never let its late result
           // wake or overwrite a later synchronous call's response buffer.
           rotateResponseBuffer();
