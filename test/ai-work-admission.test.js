@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, generateKeyPairSync } from 'node:crypto';
+import pg from 'pg';
 import { openDatabase } from '../src/database.js';
 import { openPostgres } from '../src/db/postgres-adapter.js';
 import { hashToken } from '../src/security.js';
@@ -187,6 +188,77 @@ test('PostgreSQL timeline admission serializes replicas and fences stale results
   }finally{
     if(user)await first.run('DELETE FROM users WHERE id=?',user.id);
     await second.close();await first.close();
+  }
+});
+
+test('PostgreSQL pause insertion fences in-flight AI commits with no existing settings row',async()=>{
+  const databaseUrl=process.env.TEST_DATABASE_URL;
+  assert.ok(databaseUrl,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const name=`orbit_ai_pause_${randomUUID().replaceAll('-','').slice(0,16)}`;
+  const url=new URL(databaseUrl);
+  const ssl=url.searchParams.get('sslmode')==='disable'?false:true;
+  const admin=new pg.Pool({connectionString:databaseUrl,ssl});
+  let db=null,blocker=null,created=false;
+  const pending=[];
+  const waitForSettingsLock=async()=>{
+    const deadline=Date.now()+4000;
+    do{
+      const waiting=await admin.query(`SELECT 1 FROM pg_stat_activity WHERE datname=$1
+        AND query LIKE 'LOCK TABLE settings IN SHARE MODE%' AND wait_event_type='Lock' LIMIT 1`,[name]);
+      if(waiting.rowCount)return;
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }while(Date.now()<deadline);
+    throw new Error('AI commit did not wait for the pending pause write');
+  };
+  try{
+    await admin.query(`CREATE DATABASE ${name}`);created=true;
+    url.pathname=`/${name}`;
+    const setup=new pg.Pool({connectionString:url.toString(),ssl});
+    try{
+      const schema=fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8');
+      for(const statement of schema.split(';').map(part=>part.trim()).filter(Boolean))await setup.query(statement);
+    }finally{await setup.end();}
+    db=await openPostgres(url.toString());
+    blocker=new pg.Client({connectionString:url.toString(),ssl});await blocker.connect();
+    const user=await db.createUser({email:`pause-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'});
+    const month=new Date().toISOString().slice(0,7);
+    assert.equal(await db.getSetting('system_paused',null),null);
+    const token=await db.claimTimelineNarrative(user.id,month);assert.ok(token);
+    await blocker.query('BEGIN');await blocker.query('LOCK TABLE settings IN ROW EXCLUSIVE MODE');
+    const completion=db.completeTimelineNarrative(user.id,month,token,'must not persist');pending.push(completion);
+    await waitForSettingsLock();
+    await blocker.query("INSERT INTO settings(key,value,updated_at) VALUES('system_paused','true',now()::text)");
+    await blocker.query('COMMIT');
+    assert.equal(await completion,false);
+    assert.equal(await db.getTimelineNarrativeRecord(user.id,month),null);
+
+    await db.run("DELETE FROM settings WHERE key='system_paused'");
+    assert.equal(await db.getSetting('system_paused',null),null);
+    const job=await db.createImportJob(user.id,'synthetic.json');assert.ok(job);
+    await blocker.query('BEGIN');await blocker.query('LOCK TABLE settings IN ROW EXCLUSIVE MODE');
+    const suggestion=db.addImportSuggestionIfCurrent(user.id,job.id,'I read synthetic books every morning.');pending.push(suggestion);
+    await waitForSettingsLock();
+    await blocker.query("INSERT INTO settings(key,value,updated_at) VALUES('system_paused','true',now()::text)");
+    await blocker.query('COMMIT');
+    assert.equal(await suggestion,null);
+    assert.equal((await db.listMemorySuggestions(user.id)).length,0);
+  }finally{
+    if(blocker){await blocker.query('ROLLBACK').catch(()=>{});await blocker.end();}
+    await Promise.allSettled(pending);
+    if(db)await db.close();
+    try{
+      if(created){
+        const deadline=Date.now()+2000;
+        let active;
+        do{
+          active=await admin.query('SELECT pid FROM pg_stat_activity WHERE datname=$1',[name]);
+          if(!active.rowCount)break;
+          if(Date.now()>=deadline)throw new Error('Temporary PostgreSQL database still has active sessions');
+          await new Promise(resolve=>setTimeout(resolve,25));
+        }while(true);
+        await admin.query(`DROP DATABASE ${name}`);
+      }
+    }finally{await admin.end();}
   }
 });
 
