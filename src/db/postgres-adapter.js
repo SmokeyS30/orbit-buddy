@@ -192,6 +192,14 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS sentiment TEXT',
       'ALTER TABLE people_mentions ADD COLUMN IF NOT EXISTS last_context_update TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS outreach_count INTEGER NOT NULL DEFAULT 0',
+      `CREATE TABLE IF NOT EXISTS proactive_slot_days (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        local_date TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(user_id,local_date))`,
+      `CREATE TABLE IF NOT EXISTS proactive_slot_reservations (
+        token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        local_date TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','committed','released')),
+        created_at TEXT NOT NULL)`,
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_tone TEXT NOT NULL DEFAULT \'motivational\'',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS briefing_length TEXT NOT NULL DEFAULT \'quick\'',
       'ALTER TABLE user_preferences ADD COLUMN IF NOT EXISTS buddy_name TEXT',
@@ -444,6 +452,12 @@ const indexMigrations = [
     await client.query('SELECT endpoint,session_hash FROM push_session_bindings LIMIT 0');
     await client.query('SELECT device_token,session_hash FROM apns_session_bindings LIMIT 0');
     await client.query('SELECT state,lease_token,lease_expires_at,attempts FROM whatsapp_inbound_messages LIMIT 0');
+    await client.query('SELECT user_id,local_date,used_count FROM proactive_slot_days LIMIT 0');
+    await client.query('SELECT token,state FROM proactive_slot_reservations LIMIT 0');
+    await client.query(`INSERT INTO proactive_slot_days(user_id,local_date,used_count)
+      SELECT p.user_id,p.outreach_date,p.outreach_count FROM proactive_state p
+      JOIN users u ON u.id=p.user_id WHERE p.outreach_date IS NOT NULL
+      ON CONFLICT(user_id,local_date) DO NOTHING`);
     const ordering=await client.query(`SELECT column_default FROM information_schema.columns
       WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
     if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
@@ -1477,16 +1491,27 @@ const indexMigrations = [
     setLastQuietNudgeAt: async (userId, iso) => { await run(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`, userId, iso); },
     getLastOutreachAt: async (userId) => (await get('SELECT * FROM proactive_state WHERE user_id=?', userId))?.last_outreach_at || null,
-    async claimProactiveSlot(userId, localDate, limit=3) {
-      const claimed=await run(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
-        ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
-        outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
-        WHERE proactive_state.outreach_date IS DISTINCT FROM excluded.outreach_date OR proactive_state.outreach_count<?`,userId,localDate,limit);
-      return claimed.changes>0;
-    },
+    async reserveProactiveSlot(userId,localDate,limit=3) { return withTransaction(async ({get:tGet,query:tQuery,run:tRun})=>{
+      // The account lock serializes claims and refunds across all workers.
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
+      const claim=await tQuery(`INSERT INTO proactive_slot_days(user_id,local_date,used_count) VALUES(?,?,1)
+        ON CONFLICT(user_id,local_date) DO UPDATE SET used_count=proactive_slot_days.used_count+1
+        WHERE proactive_slot_days.used_count<? RETURNING used_count`,[userId,localDate,limit]);
+      if(!claim.rows.length)return false;
+      const token=randomUUID();
+      await tRun("INSERT INTO proactive_slot_reservations(token,user_id,local_date,state,created_at) VALUES(?,?,?,'reserved',?)",token,userId,localDate,timestamp());
+      return token;
+    }); },
+    async claimProactiveSlot(userId,localDate,limit=3){const token=await this.reserveProactiveSlot(userId,localDate,limit);
+      if(!token)return false;await this.commitProactiveSlot(userId,localDate,token);return true;},
+    commitProactiveSlot:async(userId,localDate,token)=>Boolean(token)&&(await run("UPDATE proactive_slot_reservations SET state='committed' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'",token,userId,localDate)).changes>0,
     markOutreach: async (userId) => (await run('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?', timestamp(), userId)).changes > 0,
-    releaseProactiveSlot: async (userId, localDate) => (await run(`UPDATE proactive_state SET outreach_count=GREATEST(0,outreach_count-1)
-      WHERE user_id=? AND outreach_date=? AND outreach_count>0`, userId, localDate)).changes > 0,
+    releaseProactiveSlot: async (userId,localDate,token)=>Boolean(token)&&withTransaction(async({get:tGet,run:tRun})=>{
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
+      if(!(await tRun("UPDATE proactive_slot_reservations SET state='released' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'",token,userId,localDate)).changes)return false;
+      await tRun('UPDATE proactive_slot_days SET used_count=GREATEST(0,used_count-1) WHERE user_id=? AND local_date=?',userId,localDate);
+      return true;
+    }),
 
     // --- Preferences ---
     async getPreferences(userId) {

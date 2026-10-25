@@ -347,7 +347,8 @@ export async function runProactiveMemoryPush({ db, model, user, timeZone, nowMs,
     return 0;
   }
   try {
-    await deliver(text, `Proactively surfaced a timely memory (${top.reason}).`);
+    const outcome=await deliver(text, `Proactively surfaced a timely memory (${top.reason}).`);
+    if(outcome===false||outcome?.recorded===false){try{releaseSlot();}catch{}return 0;}
     db.recordMemorySurfacing(user.id, {
       memoryId: top.memory.id,
       occurrenceKey: top.occurrenceKey,

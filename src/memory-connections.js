@@ -570,7 +570,8 @@ export async function runMemoryConnectionPush({ db, model, user, timeZone, nowMs
     return 0;
   }
   try {
-    await deliver(text, `Shared a memory-connection insight proactively (${candidate.reason}).`);
+    const outcome=await deliver(text, `Shared a memory-connection insight proactively (${candidate.reason}).`);
+    if(outcome===false||outcome?.recorded===false){try{releaseSlot();}catch{}return 0;}
     recordConnectionSurfacing(db, user.id, candidate);
     db.addEvent(user.id, 'memory_connection_proactive', `Shared a pattern insight proactively (${candidate.reason}).`);
     return 1;

@@ -310,6 +310,16 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS proactive_state (
       user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS proactive_slot_days (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      local_date TEXT NOT NULL, used_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(user_id,local_date)
+    );
+    CREATE TABLE IF NOT EXISTS proactive_slot_reservations (
+      token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      local_date TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('reserved','committed','released')),
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS user_preferences (
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       time_zone TEXT NOT NULL DEFAULT 'America/New_York', quiet_start TEXT NOT NULL DEFAULT '22:00',
@@ -552,6 +562,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'people_mentions', 'sentiment', 'TEXT');
   ensureColumn(db, 'people_mentions', 'last_context_update', 'TEXT');
   ensureColumn(db, 'proactive_state', 'outreach_count', 'INTEGER NOT NULL DEFAULT 0');
+  // Copy the old cap once. Reopening the database must never reset a new day's count.
+  db.exec(`INSERT OR IGNORE INTO proactive_slot_days(user_id,local_date,used_count)
+    SELECT p.user_id,p.outreach_date,p.outreach_count FROM proactive_state p
+    JOIN users u ON u.id=p.user_id WHERE p.outreach_date IS NOT NULL`);
   ensureColumn(db, 'proactive_state', 'last_app_open_at', 'TEXT');
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
@@ -758,6 +772,12 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setQuietNudge: db.prepare(`INSERT INTO proactive_state(user_id,last_quiet_nudge_at) VALUES(?,?)
       ON CONFLICT(user_id) DO UPDATE SET last_quiet_nudge_at=excluded.last_quiet_nudge_at`),
     getProactiveState: db.prepare('SELECT * FROM proactive_state WHERE user_id=?'),
+    claimProactiveDay: db.prepare(`INSERT INTO proactive_slot_days(user_id,local_date,used_count) VALUES(?,?,1)
+      ON CONFLICT(user_id,local_date) DO UPDATE SET used_count=used_count+1 WHERE used_count<?`),
+    insertProactiveReservation: db.prepare("INSERT INTO proactive_slot_reservations(token,user_id,local_date,state,created_at) VALUES(?,?,?,'reserved',?)"),
+    commitProactiveReservation: db.prepare("UPDATE proactive_slot_reservations SET state='committed' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'"),
+    releaseProactiveReservation: db.prepare("UPDATE proactive_slot_reservations SET state='released' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'"),
+    releaseProactiveDay: db.prepare('UPDATE proactive_slot_days SET used_count=used_count-1 WHERE user_id=? AND local_date=? AND used_count>0'),
     upsertProactiveSlot: db.prepare(`INSERT INTO proactive_state(user_id,outreach_date,outreach_count) VALUES(?,?,1)
       ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
       outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
@@ -1684,9 +1704,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
     getLastOutreachAt: (userId) => s.getProactiveState.get(userId)?.last_outreach_at || null,
-    claimProactiveSlot(userId,localDate,limit=3){return s.upsertProactiveSlot.run(userId,localDate,limit).changes>0;},
+    reserveProactiveSlot(userId,localDate,limit=3){return withImmediate(()=>{
+      if(s.claimProactiveDay.run(userId,localDate,limit).changes===0)return false;
+      const token=randomUUID();s.insertProactiveReservation.run(token,userId,localDate,timestamp());return token;
+    });},
+    claimProactiveSlot(userId,localDate,limit=3){const token=this.reserveProactiveSlot(userId,localDate,limit);
+      if(!token)return false;this.commitProactiveSlot(userId,localDate,token);return true;},
+    commitProactiveSlot:(userId,localDate,token)=>Boolean(token)&&s.commitProactiveReservation.run(token,userId,localDate).changes>0,
     markOutreach:(userId)=>s.markOutreach.run(timestamp(),userId).changes>0,
-    releaseProactiveSlot:(userId,localDate)=>s.releaseProactiveSlot.run(userId,localDate).changes>0,
+    releaseProactiveSlot:(userId,localDate,token)=>Boolean(token)&&withImmediate(()=>{
+      if(s.releaseProactiveReservation.run(token,userId,localDate).changes===0)return false;
+      s.releaseProactiveDay.run(userId,localDate);return true;
+    }),
     getPreferences(userId){const row=s.getPreferences.get(userId);if(row)return row;const now=timestamp();s.upsertPreferences.run(userId,'America/New_York','22:00','08:00',1,'motivational','quick',now,now);return s.getPreferences.get(userId);},
     setPreferences(userId,value){const current=this.getPreferences(userId);const next=normalizePreferences(value,current);const now=timestamp();s.upsertPreferences.run(userId,next.timeZone,next.quietStart,next.quietEnd,next.proactiveEnabled?1:0,next.briefingTone,next.briefingLength,current.created_at||now,now);return s.getPreferences.get(userId);},
     setBuddyName(userId,name){this.getPreferences(userId);const clean=String(name||'').trim().slice(0,40);if(!clean)throw new Error('Provide a name for your buddy (1-40 characters).');s.setBuddyName.run(clean,timestamp(),userId);return clean;},

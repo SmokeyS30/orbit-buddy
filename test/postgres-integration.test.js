@@ -732,6 +732,6 @@ test('PostgreSQL concurrent proactive claims respect the shared daily cap',async
     user=await db.createUser({email:`proactive-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
     const claimed=await Promise.all(Array.from({length:16},()=>db.claimProactiveSlot(user.id,'2026-10-25',3)));
     assert.equal(claimed.filter(Boolean).length,3);
-    assert.equal(Number((await db.get('SELECT outreach_count FROM proactive_state WHERE user_id=?',user.id)).outreach_count),3);
+    assert.equal(Number((await db.get('SELECT used_count FROM proactive_slot_days WHERE user_id=? AND local_date=?',user.id,'2026-10-25')).used_count),3);
   }finally{if(user)await db.deleteUserAccount(user.id);await db.close();}
 });
