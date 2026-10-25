@@ -116,18 +116,17 @@ export function createConnectorService(env, db, encryptionKey) {
       console.error(`${providerId} token refresh failed:`, googleError);
       // invalid_grant = refresh token revoked/expired — clear the dead connection so the UI shows Connect, not a broken Preview
       if (tokens.error === 'invalid_grant') {
-        try { db.deleteConnector(userId, providerId); } catch (_) {}
+        try { db.deleteConnectorIfCurrent(userId, providerId, row); } catch (_) {}
         throw Object.assign(new Error(`${provider.label} session expired. Please reconnect.`), { status: 401 });
       }
       throw Object.assign(new Error(`${provider.label} token refresh failed (${googleError}). Please reconnect.`), { status: 502 });
     }
-    db.saveConnector(userId, providerId, {
+    const refreshed = db.refreshConnector(userId, providerId, row, {
       accessEncrypted: encryptSecret(tokens.access_token, encryptionKey),
       refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : row.refresh_encrypted,
-      scopes: row.scopes,
-      expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null,
-      profile: row.profile_json ? JSON.parse(row.profile_json) : {}
+      expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null
     });
+    if (!refreshed) throw Object.assign(new Error(`${provider.label} connection changed during refresh. Please retry.`), { status: 409 });
     return tokens.access_token;
   }
 

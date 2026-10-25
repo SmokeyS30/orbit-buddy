@@ -211,27 +211,27 @@ function markdownToPdfBuffer(md){
   }
   if(cur.length)pages.push(cur);
   if(!pages.length)pages.push([]);
+  // Catalog, page tree, and fonts occupy 1–4; page/stream pairs start at 5.
   const objs=[];
-  const contentRefs=pages.map((_,i)=>`${6+i*2} 0 R`).join(' ');
   objs[1]='<< /Type /Catalog /Pages 2 0 R >>';
-  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${3+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
+  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${5+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
   pages.forEach((pg,i)=>{
-    const p=3+i*2,c=6+i*2;
-    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents ${c} 0 R >>`;
+    const p=5+i*2,c=6+i*2;
+    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${c} 0 R >>`;
     let stream='';
     for(const t of pg){stream+=`BT /${t.font} ${t.size} Tf ${t.x.toFixed(1)} ${t.y.toFixed(1)} Td (${pdfEscape(t.text)}) Tj ET\n`;}
-    objs[c]=`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
+    objs[c]=`<< /Length ${Buffer.byteLength(stream,'latin1')} >>\nstream\n${stream}\nendstream`;
   });
-  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
-  objs[5]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+  objs[3]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
   let pdf='%PDF-1.4\n';const offsets=[];
   const maxObj=Math.max(...Object.keys(objs).map(Number));
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
-    offsets[i]=Buffer.byteLength(pdf);
+    offsets[i]=Buffer.byteLength(pdf,'latin1');
     pdf+=`${i} 0 obj\n${objs[i]}\nendobj\n`;
   }
-  const xrefPos=Buffer.byteLength(pdf);
+  const xrefPos=Buffer.byteLength(pdf,'latin1');
   pdf+=`xref\n0 ${maxObj+1}\n0000000000 65535 f \n`;
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
@@ -1111,13 +1111,22 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||paused())return;workerBusy=true;
+    if(workerBusy||closing||paused())return;workerBusy=true;
     try{
       db.recoverStaleTasks();
       for(const task of db.dueTasks()){
-        if(!db.startTask(task.user_id,task.id))continue;
-        db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
+        if(closing)break;
+        const attempt=db.startTask(task.user_id,task.id);
+        if(!attempt)continue;
+        let leaseAlive=true;
+        const heartbeat=setInterval(()=>{
+          try{if(closing||!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
+          catch{leaseAlive=false;}
+          if(!leaseAlive)clearInterval(heartbeat);
+        },30_000);
+        heartbeat.unref();
         try{
+          db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
           // Strip stale "check the calendar first / suppress if absent" clauses from old reminder prompts.
@@ -1128,7 +1137,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           }
           const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
           const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);
-          db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
+          if(!leaseAlive||closing||!db.completeTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
           // Delivery channel: WhatsApp replaces push when the 24h window is open;
@@ -1137,7 +1146,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
           await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        }catch(error){if(!leaseAlive||closing||!db.failTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}
   }
@@ -2537,7 +2547,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
-    const url=new URL(req.url,'http://localhost');
+    let url;
+    try{url=new URL(req.url,'http://localhost');}
+    catch{return json(res,400,{error:'Invalid request URL.'});}
     // ===== CORS FOR THE NATIVE APP (capacitor://localhost) =====
     // Answered before the maintenance block so preflights always get a clean
     // answer. Web requests (no matching Origin) are completely unaffected.
