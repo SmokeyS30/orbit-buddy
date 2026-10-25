@@ -613,8 +613,8 @@ export function createOrbitServer(options={}) {
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
   function currentDeleteApprovalTarget(userId,approval){
-    const {id,title,objectType}=approval.payload||{};
-    if(approval.kind!==`delete_${objectType}`||!id||!title||!approval.source_message_id)return null;
+    const {id,title,objectType,targetFingerprint}=approval.payload||{};
+    if(approval.kind!==`delete_${objectType}`||!id||!title||!targetFingerprint||!approval.source_message_id)return null;
     const source=db.getMessage(userId,approval.source_message_id);
     if(!source||source.role!=='user'||!source.conversation_id)return null;
     const recent=db.listMessages(userId,200);
@@ -624,7 +624,7 @@ export function createOrbitServer(options={}) {
     // request. Require a new card instead of guessing its meaning.
     if(recent.slice(sourceIndex+1).some(row=>row.role==='user'))return null;
     const target=objectType==='goal'?db.getGoal(userId,id):objectType==='task'?db.getTask(userId,id):objectType==='routine'?db.getRoutine(userId,id):null;
-    return target?.title===title?target:null;
+    return target?.title===title&&hashToken(JSON.stringify(target))===targetFingerprint?target:null;
   }
   function createSession(user,req,res,{passwordProof=false,identitySubject=null}={}){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();const record={tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)};const created=passwordProof?db.createPasswordSessionIfCurrent({...record,expectedPasswordHash:user.password_hash,expectedPasswordSalt:user.password_salt}):identitySubject?db.createAppleSessionIfCurrent({...record,identitySubject}):db.createSession(record);if(created===false)return null;res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}

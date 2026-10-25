@@ -5,6 +5,7 @@ import { normalizeRadarRepo, parseRepoListEnv, RADAR_DEFAULT_OWNER, RADAR_OWNER_
 import { startQuizSession, answerQuizQuestion, stopQuizSession, getStudyWeakSpots, getStudyStreak, normalizeStudyExam, STUDY_EXAMS } from './study-coach.js';
 import { buildCatchupDigest } from './catchup.js';
 import { assertMemorySafe } from './relational-intelligence.js';
+import { hashToken } from './security.js';
 
 // Re-exported so existing callers keep working; new code imports from net.js.
 export { assertPublicUrl };
@@ -837,13 +838,14 @@ export function toolUpdateRoutine(args = {}, ctx = null) {
 // server-owned target and requires a separate authenticated button press.
 const DELETE_APPROVAL_KINDS = ['delete_goal', 'delete_task', 'delete_routine'];
 
-function stageDeleteApproval(ctx, kind, objectType, id, title, preview) {
+function stageDeleteApproval(ctx, kind, objectType, target, preview) {
   const { db, userId } = writeContext(ctx, kind);
+  const { id, title } = target;
   const approval = db.addApproval(userId, {
     kind,
     title: `Delete ${objectType} “${title}”`,
     summary: preview,
-    payload: { id, title, objectType },
+    payload: { id, title, objectType, targetFingerprint: hashToken(JSON.stringify(target)) },
     sourceMessageId: ctx?.messageId || null
   });
   db.addEvent(userId, 'delete_requested', `Delete requested for ${objectType} “${title}” — waiting for approval in Approvals.`);
@@ -859,7 +861,7 @@ export function toolDeleteGoal(args = {}, ctx = null) {
   if (candidates.length) return ambiguousTarget('goal', candidates, (g) => `${g.progress}% complete, ${g.status}${g.target_date ? `, target ${g.target_date}` : ''}`);
   if (!goal) throw new Error('No goal found matching that. Ask the user which goal they mean.');
   const preview = `Goal “${goal.title}” — ${goal.status}, ${goal.progress}% complete${goal.target_date ? `, target ${goal.target_date}` : ''}${goal.next_step ? `, next: ${goal.next_step}` : ''}. Deleting also removes its progress history.`;
-  return stageDeleteApproval(ctx, 'delete_goal', 'goal', goal.id, goal.title, preview);
+  return stageDeleteApproval(ctx, 'delete_goal', 'goal', goal, preview);
 }
 
 export function toolDeleteTask(args = {}, ctx = null) {
@@ -870,7 +872,7 @@ export function toolDeleteTask(args = {}, ctx = null) {
   if (candidates.length) return ambiguousTarget('task', candidates, (t) => `${String(t.status).replaceAll('_', ' ')}${t.schedule_at ? `, runs ${t.schedule_at}` : ''}`);
   if (!task) throw new Error(`No task found matching “${query}”. Ask the user which task they mean.`);
   const preview = `Task “${task.title}” — ${String(task.status).replaceAll('_', ' ')}${task.schedule_at ? `, scheduled ${task.schedule_at}` : ''}${task.recurrence && task.recurrence !== 'none' ? `, repeats ${task.recurrence}` : ''}.`;
-  return stageDeleteApproval(ctx, 'delete_task', 'task', task.id, task.title, preview);
+  return stageDeleteApproval(ctx, 'delete_task', 'task', task, preview);
 }
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -884,7 +886,7 @@ export function toolDeleteRoutine(args = {}, ctx = null) {
   if (!routine) throw new Error(`No routine found matching “${query}”. Ask the user which routine they mean.`);
   const day = routine.cadence === 'weekly' && routine.day_of_week != null ? ` on ${WEEKDAY_NAMES[routine.day_of_week]}` : '';
   const preview = `Routine “${routine.title}” — ${routine.cadence}${day} at ${routine.time_local}${routine.enabled ? '' : ' (currently paused)'}.`;
-  return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine.id, routine.title, preview);
+  return stageDeleteApproval(ctx, 'delete_routine', 'routine', routine, preview);
 }
 
 export function toolConfirmDeleteApproval(args = {}, ctx = null) {
