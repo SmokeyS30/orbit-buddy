@@ -32,6 +32,11 @@ import {
 
 const TOKEN = 'test-auth-token-123';
 const WEBHOOK_URL = 'https://orbitbuddy.app/api/whatsapp/webhook';
+const MEDIA_ACCOUNT_SID = `AC${'a'.repeat(32)}`;
+const mediaMessageSid = (digit) => `SM${digit.repeat(32)}`;
+const mediaUrl = (messageSid, digit = 'f') =>
+  `https://api.twilio.com/2010-04-01/Accounts/${MEDIA_ACCOUNT_SID}/Messages/${messageSid}/Media/ME${digit.repeat(32)}`;
+const UNIT_MEDIA_URL = mediaUrl(mediaMessageSid('1'));
 
 function sign(url, params, token = TOKEN) {
   const data = Object.keys(params).sort().reduce((acc, k) => acc + k + params[k], String(url));
@@ -119,7 +124,7 @@ test('whatsapp link/unlink round-trips', () => {
 // --- Server: webhook + linking flow ---
 
 const TWILIO_ENV = {
-  TWILIO_ACCOUNT_SID: 'ACtest123',
+  TWILIO_ACCOUNT_SID: MEDIA_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN: 'test-auth-token-xyz',
   TWILIO_WHATSAPP_NUMBER: '+14155238886',
 };
@@ -422,18 +427,18 @@ test('downloadTwilioMedia sends Basic auth and returns bytes', async () => {
   const { bytes, contentType } = await withFetchStub(async (url, opts) => {
     calls.push({ url: String(url), auth: opts.headers.Authorization });
     return mediaResponse([1, 2, 3, 4]);
-  }, () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' }));
+  }, () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL }));
   assert.equal(bytes.length, 4);
   assert.equal(contentType, 'audio/ogg');
-  assert.equal(calls[0].url, 'https://api.twilio.com/x');
-  assert.equal(calls[0].auth, `Basic ${Buffer.from('ACx:tok', 'utf8').toString('base64')}`);
+  assert.equal(calls[0].url, UNIT_MEDIA_URL);
+  assert.equal(calls[0].auth, `Basic ${Buffer.from(`${MEDIA_ACCOUNT_SID}:tok`, 'utf8').toString('base64')}`);
 });
 
 test('downloadTwilioMedia rejects oversized media via Content-Length and streaming', async () => {
   // Declared size over the cap: rejected without reading the body
   await assert.rejects(
     withFetchStub(async () => mediaResponse([1], { contentLength: String(MAX_TWILIO_MEDIA_BYTES + 1) }),
-      () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+      () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL })),
     (e) => e.code === 'MEDIA_TOO_LARGE'
   );
   // No declared size but the stream exceeds the cap: rejected mid-read
@@ -441,14 +446,14 @@ test('downloadTwilioMedia rejects oversized media via Content-Length and streami
     withFetchStub(async () => ({
       ...mediaResponse([1], { contentLength: null }),
       body: (async function* () { yield Buffer.alloc(MAX_TWILIO_MEDIA_BYTES + 1); })(),
-    }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x', maxBytes: 100 })),
+    }), () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL, maxBytes: 100 })),
     (e) => e.code === 'MEDIA_TOO_LARGE'
   );
 });
 
 test('downloadTwilioMedia throws on HTTP errors and missing URL', async () => {
   await assert.rejects(
-    withFetchStub(async () => mediaResponse([], { status: 401 }), () => downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: 'https://api.twilio.com/x' })),
+    withFetchStub(async () => mediaResponse([], { status: 401 }), () => downloadTwilioMedia({ accountSid: MEDIA_ACCOUNT_SID, authToken: 'tok', url: UNIT_MEDIA_URL })),
     /401/
   );
   await assert.rejects(downloadTwilioMedia({ accountSid: 'ACx', authToken: 'tok', url: '' }), /No media URL/);
@@ -566,8 +571,8 @@ test('webhook: voice note is downloaded, transcribed, and fed to the pipeline', 
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'audio/ogg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv/Media/MEv',
-      Body: '', MessageSid: 'SMvoice',
+      MediaUrl0: mediaUrl(mediaMessageSid('2'),'a'),
+      Body: '', MessageSid: mediaMessageSid('2'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, voiceNote: true });
@@ -601,8 +606,8 @@ test('webhook: oversized voice note gets the "bit long" reply and is not transcr
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'audio/ogg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv2/Media/MEv2',
-      Body: '', MessageSid: 'SMvoice2',
+      MediaUrl0: mediaUrl(mediaMessageSid('3'),'b'),
+      Body: '', MessageSid: mediaMessageSid('3'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, voiceNote: false });
@@ -629,8 +634,8 @@ test('webhook: inbound image is downloaded and fed through the vision pipeline',
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'image/jpeg',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi/Media/MEi',
-      Body: 'look at this', MessageSid: 'SMimg',
+      MediaUrl0: mediaUrl(mediaMessageSid('4'),'c'),
+      Body: 'look at this', MessageSid: mediaMessageSid('4'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, image: true });
@@ -661,8 +666,8 @@ test('webhook: failed image download gets the retry reply and no pipeline run', 
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'image/png',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMi2/Media/MEi2',
-      Body: '', MessageSid: 'SMimg2',
+      MediaUrl0: mediaUrl(mediaMessageSid('5'),'d'),
+      Body: '', MessageSid: mediaMessageSid('5'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true, image: false });
@@ -687,8 +692,8 @@ test('webhook: non-image media gets the unsupported-type reply', async (t) => {
     const hook = await webhookPost(base, {
       From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
       NumMedia: '1', MediaContentType0: 'video/mp4',
-      MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMv3/Media/MEv3',
-      Body: '', MessageSid: 'SMvid',
+      MediaUrl0: mediaUrl(mediaMessageSid('6'),'e'),
+      Body: '', MessageSid: mediaMessageSid('6'),
     });
     assert.equal(hook.status, 200);
     assert.deepEqual(await hook.json(), { ok: true });
