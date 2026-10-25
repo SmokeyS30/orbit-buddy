@@ -245,3 +245,66 @@ test('cancellation after completion blocks the next external notification',async
   assert.equal(nativeSends,0,'the next provider send sees cancellation');
   assert.equal(app.db.getTask(user.id,task.id).status,'cancelled');
 });
+
+test('shutdown waits for task work and requeues its in-flight result without delivery',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-shutdown-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const model=createModelClient({NODE_ENV:'test'});
+  let entered,release;
+  const started=new Promise(resolve=>{entered=resolve;});
+  const gate=new Promise(resolve=>{release=resolve;});
+  model.respond=async({assertActive})=>{
+    entered();await gate;
+    assert.throws(()=>assertActive(),/no longer active/);
+    return{text:'stale shutdown result',toolCalls:[]};
+  };
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const user=app.db.createUser({email:'shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  let notifications=0;app.push.notify=async()=>{notifications++;};
+  const run=app.runDueTasks();
+  await started;
+  let closed=false;
+  const close=app.close().then(()=>{closed=true;});
+  await new Promise(resolve=>setImmediate(resolve));
+  const closedBeforeWorker=closed;
+  release();
+  const outcomes=await Promise.allSettled([run,close]);
+  assert.equal(closedBeforeWorker,false,'shutdown must join the in-flight task worker');
+  assert.deepEqual(outcomes.map(outcome=>outcome.status),['fulfilled','fulfilled']);
+  const reopened=openDatabase(path.join(dir,'orbit.sqlite'));
+  try{
+    assert.equal(reopened.getTask(user.id,task.id).status,'queued');
+    assert.equal(reopened.listArtifacts(user.id).length,0);
+  }finally{await reopened.close();}
+  assert.equal(notifications,0);
+});
+
+test('shutdown during device delivery prevents the next unstarted task send',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-send-shutdown-'));
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const model=createModelClient({NODE_ENV:'test'});
+  model.respond=async()=>({text:'Synthetic result',toolCalls:[]});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const user=app.db.createUser({email:'send-shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+  let entered,release;
+  const started=new Promise(resolve=>{entered=resolve;});
+  const gate=new Promise(resolve=>{release=resolve;});
+  let first=0,second=0,native=0;
+  app.push.notify=async(_userId,_title,_body,_data,canDeliver)=>{
+    if(canDeliver()){entered();await gate;first++;}
+    if(canDeliver())second++;
+    return{sent:first+second,failed:0};
+  };
+  app.apns.notify=async()=>{native++;return{sent:1,failed:0};};
+  const run=app.runDueTasks();
+  await started;
+  const close=app.close();
+  release();
+  const outcomes=await Promise.allSettled([run,close]);
+  assert.deepEqual(outcomes.map(outcome=>outcome.status),['fulfilled','fulfilled']);
+  assert.equal(first,1,'an already-started send cannot be recalled');
+  assert.equal(second,0,'a new device send must see shutdown');
+  assert.equal(native,0,'a new channel send must see shutdown');
+});

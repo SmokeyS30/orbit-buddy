@@ -628,7 +628,7 @@ export function createOrbitServer(options={}) {
   function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
-  let workerBusy=false;
+  let workerBusy=false,taskWorkerDone=null;
   const activeReplyJobs=new Map();
   const ephemeralReplyPayloads=new EphemeralReplyPayloads();
   const EPHEMERAL_REPLY_TTL_MS=30*60_000;
@@ -1123,17 +1123,19 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||paused())return;workerBusy=true;
+    if(workerBusy||closing||paused())return;workerBusy=true;
+    let finishTaskWorker;
+    taskWorkerDone=new Promise(resolve=>{finishTaskWorker=resolve;});
     try{
       db.recoverStaleTasks();
       for(const candidate of db.dueTasks()){
-        if(paused())break;
+        if(closing||paused())break;
         const task=db.claimDueTask(candidate.user_id,candidate.id);
         if(!task)continue;
         const attempt=task.attempt_count;
         let leaseAlive=true;
         const assertTaskActive=()=>{
-          if(paused()){
+          if(closing||paused()){
             try{db.releaseClaimedTask(task.user_id,task.id,attempt);}finally{leaseAlive=false;}
           }
           if(!leaseAlive||!db.activeTaskClaim(task.user_id,task.id,attempt)){
@@ -1141,9 +1143,9 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
             throw Object.assign(new Error('Task claim is no longer active.'),{code:'REPLY_LEASE_LOST'});
           }
         };
-        const canDeliver=()=>!paused()&&db.deliverableTask(task.user_id,task.id,attempt);
+        const canDeliver=()=>!closing&&!paused()&&db.deliverableTask(task.user_id,task.id,attempt);
         const heartbeat=setInterval(()=>{
-          try{if(!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
+          try{if(closing||!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
           catch{leaseAlive=false;}
         },30_000);
         heartbeat.unref();
@@ -1161,7 +1163,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           }
           assertTaskActive();
           const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
-          if(paused()){
+          if(closing||paused()){
             db.releaseClaimedTask(task.user_id,task.id,attempt);
             continue;
           }
@@ -1176,10 +1178,10 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
           if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
           if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
-        }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
+        }catch(error){if(closing){db.releaseClaimedTask(task.user_id,task.id,attempt);continue;}if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
         finally{clearInterval(heartbeat);}
       }
-    }finally{workerBusy=false;}
+    }finally{workerBusy=false;finishTaskWorker();taskWorkerDone=null;}
   }
 
   // A proactive message lands in the default conversation AND as a push notification,
@@ -3841,7 +3843,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       if(backupTimer)clearInterval(backupTimer);
       if(metricsTimer)clearInterval(metricsTimer);
       const serverClosed=server.listening?new Promise((resolve)=>server.close(resolve)):Promise.resolve();
-      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...activeReplyJobs.values(),
+      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...(taskWorkerDone?[taskWorkerDone]:[]),...activeReplyJobs.values(),
         ...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
       let timeout;
       const settled=await Promise.race([

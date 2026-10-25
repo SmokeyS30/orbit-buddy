@@ -1967,14 +1967,21 @@ const indexMigrations = [
       return await tGet('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?',hash);
     }),
     finishOauthConnection: async(stateHash,userId,provider,data)=>withTransaction(async ({get:tGet,run:tRun})=>{
-      const now=timestamp();
       const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
       if(!user||user.disabled||user.moderation_blocked||(provider==='gmail'&&user.role!=='owner'))return false;
       const state=await tGet(`SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
-        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,now);
+        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,timestamp());
       if(!state?.session_hash)return false;
-      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,now);
+      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,timestamp());
       if(!session)return false;
+      // Either row lock may have waited beyond expiry. Recheck both proofs only
+      // after the user and session locks are held, before writing credentials.
+      const now=timestamp();
+      const currentProof=await tGet(`SELECT 1 FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+        JOIN sessions s ON s.token_hash=b.session_hash AND s.user_id=o.user_id
+        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL
+          AND o.expires_at>? AND s.expires_at>?`,stateHash,userId,provider,now,now);
+      if(!currentProof)return false;
       await tRun('DELETE FROM oauth_states WHERE state_hash=?',stateHash);
       await tRun(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,

@@ -5,10 +5,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import pg from 'pg';
 import { openDatabase } from '../src/database.js';
+import { openPostgres } from '../src/db/postgres-adapter.js';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 import { createConnectorService } from '../src/connectors.js';
-import { encryptSecret, decryptSecret } from '../src/security.js';
+import { encryptSecret, decryptSecret, hashToken } from '../src/security.js';
 
 function fixture(t,driver){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-connector-link-'));
@@ -174,3 +176,41 @@ for(const driver of ['SQLite','PostgreSQL']){
     await assert.rejects(service.complete('gmail','code',state),{status:400});
   });
 }
+
+for(const lockedRow of ['user','session'])test(`PostgreSQL: OAuth cannot finish after proof expires behind a ${lockedRow}-row lock`,async t=>{
+  const {db,user,sessionHash,service}=fixture(t,'PostgreSQL');
+  const stateHash=hashToken(stateOf(service.begin(user.id,'gmail','https://test.example',sessionHash)));
+  assert.ok(db.consumeOauthState(stateHash));
+  const url=new URL(process.env.TEST_DATABASE_URL);
+  const applicationName=`orbit-oauth-expiry-${randomUUID()}`;
+  url.searchParams.set('application_name',applicationName);
+  const adapter=await openPostgres(url.toString());
+  const locker=new pg.Client({connectionString:process.env.TEST_DATABASE_URL});
+  const observer=new pg.Client({connectionString:process.env.TEST_DATABASE_URL});
+  await Promise.all([locker.connect(),observer.connect()]);
+  t.after(async()=>{await Promise.all([adapter.close(),locker.end(),observer.end()]);});
+  const expiresAt=new Date(Date.now()+3000).toISOString();
+  await observer.query('UPDATE oauth_states SET expires_at=$1 WHERE state_hash=$2',[expiresAt,stateHash]);
+  await observer.query('UPDATE sessions SET expires_at=$1 WHERE token_hash=$2',[expiresAt,sessionHash]);
+  await locker.query('BEGIN');
+  let finish;
+  try{
+    if(lockedRow==='user')await locker.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[user.id]);
+    else await locker.query('SELECT token_hash FROM sessions WHERE token_hash=$1 FOR UPDATE',[sessionHash]);
+    finish=adapter.finishOauthConnection(stateHash,user.id,'gmail',{
+      accessEncrypted:encryptSecret('synthetic-access',Buffer.alloc(32,9)),scopes:'gmail',profile:{email:'owner@example.test'}
+    });
+    const deadline=Date.now()+1500;
+    let waiting=false;
+    while(Date.now()<deadline){
+      const result=await observer.query(`SELECT 1 FROM pg_stat_activity WHERE application_name=$1
+        AND state='active' AND wait_event_type='Lock' LIMIT 1`,[applicationName]);
+      if(result.rowCount){waiting=true;break;}
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    assert.ok(waiting,`finish must be blocked on the held ${lockedRow} row`);
+    await new Promise(resolve=>setTimeout(resolve,Math.max(0,new Date(expiresAt).getTime()+100-Date.now())));
+  }finally{await locker.query('ROLLBACK');}
+  assert.equal(await finish,false,'expired proof cannot be accepted after the lock wait');
+  assert.ok(!db.getConnector(user.id,'gmail'));
+});
