@@ -30,6 +30,20 @@ function deferredModel(){
   }};
 }
 
+function twoDeviceSendBarrier(t,service){
+  let releaseFirst,enteredFirst,sends=0;
+  const firstSent=new Promise(resolve=>{enteredFirst=resolve;});
+  service.notify=async (...args)=>{
+    const canDeliver=args[4]||(()=>true);
+    sends++;
+    await new Promise(resolve=>{releaseFirst=resolve;enteredFirst();});
+    if(canDeliver())sends++;
+    return{sent:sends,failed:0};
+  };
+  t.after(()=>releaseFirst?.());
+  return{firstSent,release:()=>releaseFirst?.(),sent:()=>sends};
+}
+
 test('moderation blocked account cannot persist a proactive check-in',async t=>{
   const {app,user}=fixture(t);
   assert.equal(app.db.setModerationBlocked(user.id,true),true);
@@ -49,6 +63,37 @@ test('pause while push is in flight prevents a new APNs send',async t=>{
   finally{releasePush?.();}
   await delivering;
   assert.equal(apnsCalls,0);
+});
+
+test('pausing during the first proactive web push stops the second device',async t=>{
+  const {app,user}=fixture(t);
+  const delivery=twoDeviceSendBarrier(t,app.push);
+  let apnsCalls=0;
+  app.apns.notify=async()=>{apnsCalls++;return{sent:1};};
+  const running=app.deliverProactive(user,'Synthetic check-in','test','Synthetic test');
+  try{await delivery.firstSent;app.db.setSetting('system_paused','true');}
+  finally{delivery.release();}
+  const result=await running;
+  assert.equal(result.recorded,true);
+  assert.equal(delivery.sent(),1,'the paused worker must not start the second web device');
+  assert.equal(apnsCalls,0,'the paused worker must not start another channel');
+});
+
+test('reclaimed proactive lease during the first APNs push stops the second device',async t=>{
+  const {app,user,dbPath}=fixture(t,async()=>({text:'Synthetic check-in',toolCalls:[]}));
+  app.db.addFollowUp(user.id,{description:'synthetic appointment',dueDate:'2026-10-28'});
+  app.push.notify=async()=>({sent:0,failed:0});
+  const delivery=twoDeviceSendBarrier(t,app.apns);
+  const running=app.runProactiveChecks(nowMs);
+  try{
+    await delivery.firstSent;
+    const raw=new DatabaseSync(dbPath);
+    try{raw.prepare("UPDATE worker_leases SET expires_at='2020-01-01T00:00:00.000Z' WHERE name='proactive'").run();}
+    finally{raw.close();}
+    assert.equal(app.db.claimWorkerLease('proactive','replacement'),true);
+  }finally{delivery.release();}
+  await running;
+  assert.equal(delivery.sent(),1,'the old worker must not start the second APNs device');
 });
 
 test('moderation change while push is in flight prevents a new APNs send',async t=>{
