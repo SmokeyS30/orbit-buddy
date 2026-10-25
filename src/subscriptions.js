@@ -229,12 +229,15 @@ export function createSubscriptionService(env, db, dependencies = {}) {
       if (!userId) { db.completeNotification(notificationId); return { ignored: true, reason: 'unknown account token' }; }
       const current = db.getSubscription(userId);
       const eventSignedAt = isoFromMillis(outer.signedDate);
+      if (!eventSignedAt) throw new Error('Notification missing signed date.');
       if (current?.last_event_signed_at && eventSignedAt && new Date(eventSignedAt) < new Date(current.last_event_signed_at)) {
         db.completeNotification(notificationId); return { ignored: true, reason: 'stale notification' };
       }
       const entitlement = await resolveEntitlement(txn.originalTransactionId || txn.transactionId, target);
       if (!entitlement || entitlement.appAccountToken !== txn.appAccountToken) throw new Error('Apple status did not match the notification account token.');
-      db.saveSubscription(userId, { ...entitlement, lastEventSignedAt: eventSignedAt || entitlement.signedAt });
+      if (!db.applySubscriptionNotification(userId, { ...entitlement, lastEventSignedAt: eventSignedAt })) {
+        db.completeNotification(notificationId); return { ignored: true, reason: 'stale notification' };
+      }
       try { db.addEvent(userId, 'subscription_updated', `Subscription ${entitlement.status}.`); } catch (_) {}
       db.completeNotification(notificationId);
       return { ok: true, status: entitlement.status };

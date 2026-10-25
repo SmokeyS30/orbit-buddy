@@ -1651,6 +1651,19 @@ const indexMigrations = [
         randomUUID(), userId, productId, status, expiresAt || null, appAccountToken || null,
         environment || 'production', originalTransactionId || null, lastEventSignedAt, now, now);
     },
+    applySubscriptionNotification: async (userId, { productId, status, expiresAt, appAccountToken, environment, originalTransactionId, lastEventSignedAt }) => {
+      if (!appAccountToken || !lastEventSignedAt) throw new Error('Signed notification binding and date are required.');
+      const now = timestamp();
+      const applied=await run(`INSERT INTO subscriptions(id,user_id,product_id,status,expires_at,app_account_token,environment,original_transaction_id,last_event_signed_at,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET product_id=excluded.product_id,status=excluded.status,
+        expires_at=excluded.expires_at,app_account_token=excluded.app_account_token,environment=excluded.environment,
+        original_transaction_id=excluded.original_transaction_id,last_event_signed_at=excluded.last_event_signed_at,updated_at=excluded.updated_at
+        WHERE (subscriptions.app_account_token IS NULL OR subscriptions.app_account_token=excluded.app_account_token)
+          AND (subscriptions.last_event_signed_at IS NULL OR subscriptions.last_event_signed_at<excluded.last_event_signed_at)`,
+        randomUUID(), userId, productId, status, expiresAt || null, appAccountToken,
+        environment || 'production', originalTransactionId || null, lastEventSignedAt, now, now);
+      return applied.changes>0;
+    },
     getSubscription: async (userId) => (await get('SELECT * FROM subscriptions WHERE user_id=?', userId)) || null,
     getDailyUsageCount: async (userId, dayNy) => {
       const row = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
