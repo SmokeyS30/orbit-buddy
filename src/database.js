@@ -8,6 +8,7 @@ import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalize
 import { assertMemorySafe } from './relational-intelligence.js';
 import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from './portable-recovery.js';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './reply-jobs.js';
+import { currentDeleteApproval, decodeApprovalRow } from './delete-approval.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -1564,6 +1565,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimApproval(userId,id){const at=timestamp();const staleBefore=new Date(Date.now()-10*60_000).toISOString();if(!s.claimApproval.run(at,at,id,userId,staleBefore).changes)return null;return this.getApproval(userId,id);},
     resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     finishApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','failed'].includes(status))return null;const at=timestamp();if(!s.finishApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
+    executeDeleteApprovalIfCurrent(userId,approvalId){return withImmediate(()=>{
+      const raw=s.getApproval.get(approvalId,userId);
+      if(!raw||raw.status!=='pending'||raw.execution_started_at)return{status:'already'};
+      const approval=decodeApprovalRow(raw),{id,objectType}=approval.payload||{};
+      const target=objectType==='goal'?s.getGoal.get(id,userId):objectType==='task'?s.getTask.get(id,userId):objectType==='routine'?s.getRoutine.get(id,userId):null;
+      const recent=s.listMessages.all(userId,200);
+      const selected=currentDeleteApproval(approval,recent,target);
+      const now=timestamp();
+      if(!selected){
+        db.prepare("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run('Deletion request or target changed.',now,now,approvalId,userId);
+        return{status:'stale',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId))};
+      }
+      const deleted=selected.objectType==='goal'?s.deleteGoal.run(id,userId).changes:selected.objectType==='task'?s.deleteTask.run(id,userId).changes:s.deleteRoutine.run(id,userId).changes;
+      if(!deleted)throw new Error('Deletion target changed during transaction.');
+      const result={deleted:approval.kind,id:selected.id,title:selected.title};
+      db.prepare("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run(JSON.stringify(result),now,now,approvalId,userId);
+      return{status:'executed',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId)),result};
+    });},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),

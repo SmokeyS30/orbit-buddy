@@ -613,20 +613,6 @@ export function createOrbitServer(options={}) {
   function authenticate(req){const session=sessionUser(req);if(session&&!session.disabled&&!session.moderation_blocked)return session;return null;}
   function requireCsrf(req,user){if(!['GET','HEAD','OPTIONS'].includes(req.method)&&req.headers['x-orbit-csrf']!==user.csrf_token)throw Object.assign(new Error('Security token is missing or expired.'),{status:403});}
   function requireOwner(user){if(user.role!=='owner')throw Object.assign(new Error('Owner access is required.'),{status:403});}
-  function currentDeleteApprovalTarget(userId,approval){
-    const {id,title,objectType,targetFingerprint}=approval.payload||{};
-    if(approval.kind!==`delete_${objectType}`||!id||!title||!targetFingerprint||!approval.source_message_id)return null;
-    const source=db.getMessage(userId,approval.source_message_id);
-    if(!source||source.role!=='user'||!source.conversation_id)return null;
-    const recent=db.listMessages(userId,200);
-    const sourceIndex=recent.findIndex(row=>row.id===source.id);
-    if(sourceIndex<0)return null;
-    // A later chat turn in any conversation changes the context of this
-    // request. Require a new card instead of guessing its meaning.
-    if(recent.slice(sourceIndex+1).some(row=>row.role==='user'))return null;
-    const target=objectType==='goal'?db.getGoal(userId,id):objectType==='task'?db.getTask(userId,id):objectType==='routine'?db.getRoutine(userId,id):null;
-    return target?.title===title&&hashToken(JSON.stringify(target))===targetFingerprint?target:null;
-  }
   function createSession(user,req,res,{passwordProof=false,identitySubject=null}={}){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();const record={tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)};const created=passwordProof?db.createPasswordSessionIfCurrent({...record,expectedPasswordHash:user.password_hash,expectedPasswordSalt:user.password_salt}):identitySubject?db.createAppleSessionIfCurrent({...record,identitySubject}):db.createSession(record);if(created===false)return null;res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
@@ -3689,9 +3675,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           }
           if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
           if(approval.kind==='gmail_send'||approval.kind==='gmail_delete'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});}
-          if(['delete_goal','delete_task','delete_routine'].includes(approval.kind)&&!currentDeleteApprovalTarget(userId,approval)){
-            db.resolveApproval(userId,approval.id,'rejected');
-            throw Object.assign(new Error('This deletion request is stale or its target changed. Ask Orbit to stage it again.'),{status:409});
+          if(['delete_goal','delete_task','delete_routine'].includes(approval.kind)){
+            const outcome=db.executeDeleteApprovalIfCurrent(userId,approval.id);
+            if(outcome.status!=='executed')throw Object.assign(new Error('This deletion request is stale or was already reviewed. Ask Orbit to stage it again.'),{status:409});
+            try{db.addEvent(userId,'approval_executed',`Deleted ${approval.payload.objectType} “${approval.payload.title}” after approval.`);}catch(error){console.error('Deletion completed; audit event write failed:',error);}
+            return json(res,200,{approval:outcome.approval});
           }
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
@@ -3706,19 +3694,6 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               const result=await sendEmail(()=>connectors.getValidToken(userId,'gmail'),approval.payload);
               const executed=db.finishApproval(userId,approval.id,'executed',{result});
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
-              return json(res,200,{approval:executed});
-            }
-            if(approval.kind==='delete_goal'||approval.kind==='delete_task'||approval.kind==='delete_routine'){
-              if(!currentDeleteApprovalTarget(userId,approval))throw Object.assign(new Error('This deletion request became stale. Nothing was deleted.'),{status:409});
-              const {id,title,objectType}=approval.payload||{};
-              const ok=approval.kind==='delete_goal'?db.deleteGoal(userId,id):approval.kind==='delete_task'?db.deleteTask(userId,id):db.deleteRoutine(userId,id);
-              if(!ok){
-                db.finishApproval(userId,approval.id,'failed',{error:'The item was already gone.'});
-                db.addEvent(userId,'approval_failed',`Could not delete “${title||'item'}” — it no longer exists.`);
-                return json(res,200,{approval:db.getApproval(userId,approval.id)});
-              }
-              const executed=db.finishApproval(userId,approval.id,'executed',{result:{deleted:approval.kind,id,title}});
-              db.addEvent(userId,'approval_executed',`Deleted ${objectType||'item'} “${title}” after approval.`);
               return json(res,200,{approval:executed});
             }
             const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id,expectedPreview:approval.payload.preview});
