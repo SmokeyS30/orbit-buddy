@@ -54,3 +54,19 @@ test('an email-listed comped benefit requires verified mailbox ownership',()=>{
   assert.equal(service.isComped('unverified',{email,email_verified_at:null,role:'member'}),false);
   assert.equal(service.isComped('verified',{email,email_verified_at:'2026-10-25T00:00:00.000Z',role:'member'}),true);
 });
+
+test('an existing unverified member can restore email-listed access by mailbox reset',async t=>{
+  const fx=await fixture(t);
+  const claimed='legacy-comped@example.test';
+  const member=fx.app.db.createUser({email:claimed,displayName:'Legacy member',passwordHash:'synthetic-old-hash',passwordSalt:'synthetic-old-salt',role:'member'});
+  const service=createSubscriptionService({COMPED_USER_EMAILS:claimed},{getSetting:()=>null});
+  assert.equal(service.isComped(member.id,fx.app.db.getUserById(member.id)),false);
+  const forgot=await fetch(`${fx.base}/api/auth/forgot-password`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:claimed})});
+  assert.equal(forgot.status,200);
+  const resetUrl=new URL(fx.sent.at(-1).text.match(/https?:\/\/\S+/)[0]);
+  const reset=await fetch(`${fx.base}/api/auth/reset-password`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:resetUrl.searchParams.get('token'),newPassword:'new mailbox owner password 123'})});
+  assert.equal(reset.status,200);
+  const verified=fx.app.db.getUserById(member.id);
+  assert.ok(verified.email_verified_at);
+  assert.equal(service.isComped(member.id,verified),true);
+});
