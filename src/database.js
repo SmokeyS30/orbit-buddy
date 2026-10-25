@@ -616,6 +616,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
       (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listMessagesByInsertion: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY rowid DESC LIMIT ?'),
     getReportSubmission: db.prepare('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?'),
     countRecentReports: db.prepare('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?'),
     addReport: db.prepare(`INSERT INTO reports(id,reporter_user_id,submission_id,kind,reason,description,message_id,message_excerpt,status,created_at,updated_at,reviewed_at)
@@ -1465,7 +1466,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       if(!raw||raw.status!=='pending'||raw.execution_started_at)return{status:'already'};
       const approval=decodeApprovalRow(raw),{id,objectType}=approval.payload||{};
       const target=objectType==='goal'?s.getGoal.get(id,userId):objectType==='task'?s.getTask.get(id,userId):objectType==='routine'?s.getRoutine.get(id,userId):null;
-      const recent=s.listMessages.all(userId,200);
+      const recent=s.listMessagesByInsertion.all(userId,200);
       const selected=currentDeleteApproval(approval,recent,target);
       const now=timestamp();
       if(!selected){
