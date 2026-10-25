@@ -1771,7 +1771,7 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
-            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');},
+            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw Object.assign(new Error('Import job is no longer authorized.'),{code:'REPLY_LEASE_LOST'});},
             message:`Extract durable facts about this user from these past AI conversations.
 
 Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
@@ -3174,7 +3174,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
               try{
                 const prefs=db.getPreferences(userId);
-                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw new Error('Timeline generation is no longer authorized.');};
+                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw Object.assign(new Error('Timeline generation is no longer authorized.'),{code:'REPLY_LEASE_LOST'});};
                 const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
                 const generated=text.trim().slice(0,1200);
                 if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;

@@ -118,9 +118,14 @@ test('timeline reuses a fresh current-month narrative and does no model work whi
 test('timeline does not save or return an in-flight model result after pause or account removal',async t=>{
   for(const revoke of ['pause','disable','delete']){
     let started,release;
+    let abortedCode=null;
     const entered=new Promise(resolve=>{started=resolve;});
     const gate=new Promise(resolve=>{release=resolve;});
-    const fx=await fixture({}, {respond:async()=>{started();await gate;return{text:'Private generated narrative',toolCalls:[]};}});
+    const fx=await fixture({}, {respond:async({assertActive})=>{
+      started();await gate;
+      try{await assertActive();}catch(error){abortedCode=error.code;throw error;}
+      return{text:'Private generated narrative',toolCalls:[]};
+    }});
     t.after(async()=>{release();await fx.close();});
     const owner=await auth(fx.base,'/api/auth/register',{email:'owner@example.test',displayName:'Owner',password:'correct horse battery staple'});
     fx.app.db.addMemory(owner.user.id,'A synthetic private memory.',{source:'user'});
@@ -133,6 +138,7 @@ test('timeline does not save or return an in-flight model result after pause or 
     const response=await pending;
     const body=await response.text();
     assert.doesNotMatch(body,/Private generated narrative/,`${revoke} must suppress the in-flight result`);
+    assert.equal(abortedCode,'REPLY_LEASE_LOST',`${revoke} must stop model retries and fallbacks`);
     assert.equal(fx.app.db.getTimelineNarrativeRecord(owner.user.id,new Date().toISOString().slice(0,7)),null);
   }
 });
@@ -185,11 +191,12 @@ test('PostgreSQL timeline admission serializes replicas and fences stale results
 });
 
 test('pausing during an import stops later model chunks',async t=>{
-  let beginFirst,releaseFirst,calls=0;
+  let beginFirst,releaseFirst,calls=0,abortedCode=null;
   const firstStarted=new Promise(resolve=>{beginFirst=resolve;});
   const firstGate=new Promise(resolve=>{releaseFirst=resolve;});
-  const fx=await fixture({}, {respond:async()=>{
+  const fx=await fixture({}, {respond:async({assertActive})=>{
     calls++;if(calls===1){beginFirst();await firstGate;}
+    try{await assertActive();}catch(error){abortedCode=error.code;throw error;}
     return{text:'[{"content":"I enjoy a synthetic morning reading habit every day.","kind":"preference","confidence":0.9}]',toolCalls:[]};
   }});
   t.after(async()=>{releaseFirst();await fx.close();});
@@ -211,6 +218,7 @@ test('pausing during an import stops later model chunks',async t=>{
   }
   assert.equal(status,'failed');
   assert.equal(calls,1,'a pause prevents the second chunk from starting');
+  assert.equal(abortedCode,'REPLY_LEASE_LOST','a pause must stop model retries and fallbacks');
   assert.equal(fx.app.db.listMemorySuggestions(owner.user.id).length,0,'the in-flight result is not persisted after pause');
 });
 
