@@ -34,6 +34,13 @@ function mockDb() {
         last_event_signed_at: value.lastEventSignedAt || old?.last_event_signed_at || null,
       });
     },
+    applySubscriptionNotification(userId, value) {
+      const current=subs.get(userId);
+      if(current?.app_account_token && current.app_account_token!==value.appAccountToken)return false;
+      if(current?.last_event_signed_at && current.last_event_signed_at>=value.lastEventSignedAt)return false;
+      this.saveSubscription(userId,value);
+      return true;
+    },
     getDailyUsageCount: (userId, day) => usage.get(`${userId}:${day}`) || 0,
     incrementDailyUsage(userId, day) { usage.set(`${userId}:${day}`, (usage.get(`${userId}:${day}`) || 0) + 1); },
     consumeDailyUsage(userId, day, limit) {
