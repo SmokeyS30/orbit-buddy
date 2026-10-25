@@ -782,7 +782,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       ON CONFLICT(user_id) DO UPDATE SET outreach_date=excluded.outreach_date,
       outreach_count=CASE WHEN proactive_state.outreach_date=excluded.outreach_date THEN proactive_state.outreach_count+1 ELSE 1 END
       WHERE proactive_state.outreach_date IS DISTINCT FROM excluded.outreach_date OR proactive_state.outreach_count<?`),
-    markOutreach: db.prepare('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?'),
+    markOutreach: db.prepare(`INSERT INTO proactive_state(user_id,last_outreach_at)
+      SELECT id,? FROM users WHERE id=?
+      ON CONFLICT(user_id) DO UPDATE SET last_outreach_at=excluded.last_outreach_at`),
     releaseProactiveSlot: db.prepare(`UPDATE proactive_state SET outreach_count=MAX(0,outreach_count-1)
       WHERE user_id=? AND outreach_date=? AND outreach_count>0`),
     getPreferences: db.prepare('SELECT * FROM user_preferences WHERE user_id=?'),

@@ -8,6 +8,45 @@ import { DatabaseSync } from 'node:sqlite';
 import pg from 'pg';
 import { openDatabase } from '../src/database.js';
 import { openPostgres } from '../src/db/postgres-adapter.js';
+import { createOrbitServer } from '../server.js';
+
+async function checkFreshAccountOutreach(app,email){
+  const user=app.db.createUser({email,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+  const date='2026-10-28';
+  assert.equal(app.db.getLastOutreachAt(user.id),null,'fresh account has no proactive state');
+  const token=app.db.reserveProactiveSlot(user.id,date);
+  assert.ok(token,'fresh account can reserve a daily slot');
+  const outcome=await app.deliverProactive(user,'Synthetic check-in','test','Synthetic delivery',{date,token});
+  assert.equal(outcome.recorded,true);
+  assert.ok(Number.isFinite(Date.parse(app.db.getLastOutreachAt(user.id))),
+    'delivery must create last_outreach_at for cross-feature cooldowns');
+  const quiet='2026-10-27T15:00:00.000Z';
+  app.db.setLastQuietNudgeAt(user.id,quiet);
+  assert.equal(app.db.markOutreach(user.id),true);
+  assert.equal(app.db.getLastQuietNudgeAt(user.id),quiet,'upsert preserves unrelated proactive fields');
+  return user;
+}
+
+test('SQLite fresh-account proactive delivery records the outreach cooldown',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-fresh-outreach-sqlite-'));
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'}});
+  t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
+  await checkFreshAccountOutreach(app,`fresh-${randomUUID()}@example.test`);
+});
+
+test('PostgreSQL fresh-account proactive delivery records the outreach cooldown',async t=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const setup=new pg.Client({connectionString:url,ssl:url.includes('sslmode=disable')?false:true});
+  await setup.connect();
+  try{await setup.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));}
+  finally{await setup.end();}
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-fresh-outreach-pg-'));
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',DATABASE_URL:url}});
+  let user;
+  try{user=await checkFreshAccountOutreach(app,`fresh-${randomUUID()}@example.test`);}
+  finally{if(user)app.db.deleteUserAccount(user.id);await app.close();fs.rmSync(dir,{recursive:true,force:true});}
+});
 
 async function checkDateAndRelease(db,userId){
   const newDate='2026-10-26',oldDate='2026-10-25';

@@ -1504,7 +1504,12 @@ const indexMigrations = [
     async claimProactiveSlot(userId,localDate,limit=3){const token=await this.reserveProactiveSlot(userId,localDate,limit);
       if(!token)return false;await this.commitProactiveSlot(userId,localDate,token);return true;},
     commitProactiveSlot:async(userId,localDate,token)=>Boolean(token)&&(await run("UPDATE proactive_slot_reservations SET state='committed' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'",token,userId,localDate)).changes>0,
-    markOutreach: async (userId) => (await run('UPDATE proactive_state SET last_outreach_at=? WHERE user_id=?', timestamp(), userId)).changes > 0,
+    markOutreach: async (userId) => withTransaction(async ({get:tGet,run:tRun})=>{
+      // Account deletion takes this same lock before removing user-scoped rows.
+      if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
+      return (await tRun(`INSERT INTO proactive_state(user_id,last_outreach_at) VALUES(?,?)
+        ON CONFLICT(user_id) DO UPDATE SET last_outreach_at=excluded.last_outreach_at`,userId,timestamp())).changes>0;
+    }),
     releaseProactiveSlot: async (userId,localDate,token)=>Boolean(token)&&withTransaction(async({get:tGet,run:tRun})=>{
       if(!await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId))return false;
       if(!(await tRun("UPDATE proactive_slot_reservations SET state='released' WHERE token=? AND user_id=? AND local_date=? AND state='reserved'",token,userId,localDate)).changes)return false;
