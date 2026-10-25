@@ -7,7 +7,8 @@
 // after 10 minutes. Bytes never touch the DB or disk, and are never logged.
 
 import { randomUUID } from 'node:crypto';
-import { processImageInput, MAX_IMAGE_BYTES } from './model.js';
+import { validateImageInput, MAX_IMAGE_BYTES } from './model.js';
+import { reserveRetainedMediaBuffer } from './media-memory.js';
 
 /** Staged attachments expire this long after upload. */
 export const ATTACHMENT_TTL_MS = 10 * 60_000;
@@ -15,13 +16,37 @@ export const ATTACHMENT_TTL_MS = 10 * 60_000;
 export const MAX_ATTACHMENTS_PER_USER = 5;
 // Slightly over the 10MB image cap to absorb multipart framing overhead.
 export const MAX_UPLOAD_BYTES = MAX_IMAGE_BYTES + 256 * 1024;
+export const MAX_CONCURRENT_ATTACHMENT_UPLOADS=4;
+export const MAX_CONCURRENT_UPLOADS_PER_USER=2;
 
 const staged = new Map(); // id -> { userId, bytes, mimeType, createdAt }
+let activeUploads=0;
+const activeByUser=new Map();
+
+export function acquireAttachmentUpload(userId){
+  const owned=activeByUser.get(userId)||0;
+  if(activeUploads>=MAX_CONCURRENT_ATTACHMENT_UPLOADS||owned>=MAX_CONCURRENT_UPLOADS_PER_USER){
+    throw Object.assign(new Error('Attachment upload capacity is temporarily full. Retry shortly.'),{status:429});
+  }
+  activeUploads++;activeByUser.set(userId,owned+1);
+  let released=false;
+  return()=>{
+    if(released)return;released=true;activeUploads--;
+    const remaining=(activeByUser.get(userId)||1)-1;
+    if(remaining>0)activeByUser.set(userId,remaining);else activeByUser.delete(userId);
+  };
+}
+
+function discard(id,entry){staged.delete(id);entry.releaseBudget();}
 
 export function pruneAttachments(nowMs = Date.now()) {
   for (const [id, entry] of staged) {
-    if (nowMs - entry.createdAt > ATTACHMENT_TTL_MS) staged.delete(id);
+    if (nowMs - entry.createdAt > ATTACHMENT_TTL_MS) discard(id,entry);
   }
+}
+
+export function clearAttachmentsForUser(userId){
+  for(const [id,entry] of staged)if(entry.userId===userId)discard(id,entry);
 }
 
 function mimeFromPartHeaders(headers) {
@@ -80,15 +105,19 @@ export function stageAttachment(userId, { bytes, mimeType }) {
   if (owned >= MAX_ATTACHMENTS_PER_USER) {
     throw Object.assign(new Error('Too many pending attachments. Send or remove one first.'), { status: 429 });
   }
-  processImageInput({ bytes, mimeType }); // type/size validation; throws 415/413/400
-  const id = randomUUID();
-  staged.set(id, {
-    userId,
-    bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes || []),
-    mimeType: String(mimeType || ''),
-    createdAt: Date.now(),
-  });
-  return id;
+  const {buffer,mime}=validateImageInput({bytes,mimeType}); // no throwaway base64 copy
+  const {bytes:retained,releaseBudget}=reserveRetainedMediaBuffer(buffer);
+  try{
+    const id = randomUUID();
+    staged.set(id, {
+      userId,
+      bytes:retained,
+      mimeType:mime,
+      createdAt: Date.now(),
+      releaseBudget,
+    });
+    return id;
+  }catch(error){releaseBudget();throw error;}
 }
 
 /**
@@ -98,7 +127,7 @@ export function stageAttachment(userId, { bytes, mimeType }) {
 export function takeAttachment(userId, id) {
   const entry = peekAttachment(userId, id);
   if (!entry) return null;
-  staged.delete(String(id));
+  discard(String(id),entry);
   return { bytes: entry.bytes, mimeType: entry.mimeType };
 }
 
