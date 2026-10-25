@@ -3577,7 +3577,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
               return json(res,200,{approval:executed});
             }
-            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
+            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id,expectedPreview:approval.payload.preview});
             const executed=db.finishApproval(userId,approval.id,'executed',{result});
             db.addEvent(userId,'approval_executed','Moved an approved Gmail message to trash.');
             return json(res,200,{approval:executed});
