@@ -2831,18 +2831,22 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           if(inboundSid&&db.getWhatsAppInboundState(inboundSid))return json(res,200,{ok:true,deduped:true});
           if(!from)return json(res,200,{ok:true,ignored:true});
           if(!db.allowWhatsAppLinkAttempt(from))return json(res,429,{ok:false,linkRateLimited:true});
-          if(inboundSid&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
+          let linkUserId=null;
           try{
-            const linkUserId=db.consumeAndLinkWhatsApp(body,from);
-            if(linkUserId){
-                db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');
-                try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
-              return json(res,200,{ok:true});
-            }
+            linkUserId=db.consumeAndLinkWhatsApp(body,from,inboundSid);
           }catch(e){
+            const phoneConflict=(e.code==='23505'&&String(e.constraint||'').includes('phone_e164'))||
+              /UNIQUE constraint failed: whatsapp_links\.phone_e164/.test(String(e.message||''));
+            if(!phoneConflict)throw e;
             try{await twilioSend(from,'That phone number is already linked to another Orbit account.');}catch(e2){console.error('whatsapp link conflict reply failed',e2.message);}
             return json(res,200,{ok:true});
           }
+          if(linkUserId){
+            try{db.addEvent(linkUserId,'whatsapp_linked','Connected WhatsApp to Orbit.');}catch(e){console.error('whatsapp link event failed',e.message);}
+            try{await twilioSend(from,'Connected! This number is now linked to your Orbit account — just text me like normal.');}catch(e){console.error('whatsapp link confirm failed',e.message);}
+            return json(res,200,{ok:true});
+          }
+          if(inboundSid&&!db.claimWhatsAppInboundSid(inboundSid))return json(res,200,{ok:true,deduped:true});
           // Code didn't match: fall through to normal message handling below.
         }
         const link=from?db.getUserByWhatsApp(from):null;

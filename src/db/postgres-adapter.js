@@ -2008,14 +2008,16 @@ const indexMigrations = [
       const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
       return taken&&sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
     }),
-    consumeAndLinkWhatsApp: async (code,phoneE164) => withTransaction(async ({get:tGet}) => {
+    consumeAndLinkWhatsApp: async (code,phoneE164,inboundSid=null) => withTransaction(async ({get:tGet}) => {
       const key=`whatsapp_link_code_${code}`;
       const record=(await tGet('SELECT value FROM settings WHERE key=?',key))?.value;
       if(!record)return null;
       const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
       if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
       const owner=await tGet("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0 FOR UPDATE",userId);
-      if(!owner)return null;
+      if(!owner||Date.now()>=new Date(expiresAt).valueOf())return null;
+      if(inboundSid&&!await tGet(`INSERT INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)
+        ON CONFLICT(sid) DO NOTHING RETURNING sid`,inboundSid,timestamp()))return null;
       const taken=await tGet('DELETE FROM settings WHERE key=? AND value=? RETURNING value',key,record);
       if(!taken)return null;
       const now=timestamp();

@@ -1910,13 +1910,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
       return sep>0&&userId&&Date.now()<new Date(expiresAt).valueOf()?userId:null;
     });},
-    consumeAndLinkWhatsApp(code,phoneE164) { return withImmediate(()=>{
+    consumeAndLinkWhatsApp(code,phoneE164,inboundSid=null) { return withImmediate(()=>{
       const key=`whatsapp_link_code_${code}`,record=s.setting.get(key)?.value;
       if(!record)return null;
       const sep=record.indexOf(':'),userId=record.slice(0,sep),expiresAt=record.slice(sep+1);
       if(sep<1||!userId||Date.now()>=new Date(expiresAt).valueOf())return null;
       const owner=db.prepare("SELECT id FROM users WHERE id=? AND role='owner' AND disabled=0 AND moderation_blocked=0").get(userId);
       if(!owner)return null;
+      if(inboundSid&&!db.prepare('INSERT OR IGNORE INTO whatsapp_inbound_messages(sid,created_at) VALUES(?,?)')
+        .run(inboundSid,timestamp()).changes)return null;
       db.prepare('DELETE FROM settings WHERE key=? AND value=?').run(key,record);
       const now=timestamp();
       s.linkWhatsApp.run(userId,phoneE164,now,now,now);
