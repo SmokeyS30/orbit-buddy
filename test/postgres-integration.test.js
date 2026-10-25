@@ -6,6 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 
@@ -259,6 +260,32 @@ test('PostgreSQL task attempts fence stale and cancelled worker completions',asy
     assert.equal((await db.getTask(user.id,task.id)).status,'cancelled');
   }finally{
     if(user)await db.deleteUserAccount(user.id);
+    await db.close();
+  }
+});
+
+test('PostgreSQL due selection skips ten earlier blocked tasks',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  const users=[];
+  try{
+    const oldDue=new Date(Date.now()-120_000).toISOString();
+    const laterDue=new Date(Date.now()-60_000).toISOString();
+    for(let i=0;i<10;i++){
+      const user=await db.createUser({email:`task-blocked-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+      users.push(user);
+      await db.addTask(user.id,{title:`Blocked ${i}`,prompt:'Do not run',scheduleAt:oldDue});
+      assert.equal(i%2?await db.setModerationBlocked(user.id,true):await db.setUserDisabled(user.id,true),true);
+    }
+    const eligible=await db.createUser({email:`task-eligible-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    users.push(eligible);
+    const task=await db.addTask(eligible.id,{title:'Eligible',prompt:'Run',scheduleAt:laterDue});
+    assert.ok((await db.dueTasks()).some(row=>row.id===task.id));
+    assert.equal((await db.claimDueTask(eligible.id,task.id))?.id,task.id);
+  }finally{
+    for(const user of users)await db.deleteUserAccount(user.id);
     await db.close();
   }
 });

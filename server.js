@@ -1162,9 +1162,9 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           // outside the window (or on send failure) fall back to push — a reminder
           // is never silently dropped.
           const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
-          if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-          if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+          if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+          if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+        }catch(error){if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
         finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}

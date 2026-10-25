@@ -1599,7 +1599,9 @@ const indexMigrations = [
     failClaimedTask: async (userId,id,attempt,message,error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)",message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp())).changes>0,
     releaseClaimedTask: async (userId,id,attempt) => {const current=timestamp();return (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=?",current,current,id,userId,attempt)).changes>0;},
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
-      AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
+      AND (schedule_at IS NULL OR schedule_at<=?)
+      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)
+      ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
 
     // --- Calendar feeds ---
     async addCalendarFeed(userId, { label, url }) {
