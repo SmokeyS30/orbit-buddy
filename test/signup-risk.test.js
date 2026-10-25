@@ -144,6 +144,26 @@ test('ambiguous enforcement fails safely when transactional email is unavailable
   assert.equal(app.db.countUsers(), 1, 'unverified applicant must not be created');
 });
 
+test('Apple-only verified signup stays discoverable when email delivery is unavailable', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-apple-only-signup-'));
+  const app = createOrbitServer({ dataDir: directory, env: {
+    NODE_ENV: 'test', SIGNUP_RISK_MODE: 'enforce', SIGNUP_AUDIT_KEY: 'synthetic-signup-key',
+    APPLE_CLIENT_ID: 'com.test.orbit', APPLE_TEAM_ID: 'TEAM', APPLE_KEY_ID: 'KEY', APPLE_PRIVATE_KEY: 'synthetic-key'
+  }});
+  await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await app.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  const owner = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'OrbitBuddy/1.1' }, body: JSON.stringify({ email: 'owner@example.test', displayName: 'Owner', password: 'correct horse battery staple' }) });
+  assert.equal(owner.status, 201);
+  const setup = await (await fetch(`${base}/api/auth/setup-status`)).json();
+  assert.equal(setup.emailVerificationReady, false);
+  assert.equal(setup.appleSignupReady, true);
+  assert.equal(setup.automaticSignup, true, 'the shipped client uses this flag to show Apple signup');
+  const unproved = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'OrbitBuddy/1.1' }, body: JSON.stringify({ email: 'unproved@example.test', displayName: 'Unproved', password: 'correct horse battery staple' }) });
+  assert.equal(unproved.status, 503, 'ordinary unverified signup must remain closed without email delivery');
+  assert.equal(app.db.countUsers(), 1);
+});
+
 test('failed email delivery releases the pending slot for a safe retry', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-signup-email-failure-'));
   let attempts = 0;

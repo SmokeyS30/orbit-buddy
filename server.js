@@ -2638,8 +2638,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     try {
       if(req.method==='GET'&&url.pathname==='/api/auth/setup-status'){
         const needsOwner=db.countUsers()===0;
-        const emailVerificationReady=transactionalEmailConfigured&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
-        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'&&emailVerificationReady,emailVerificationReady,appleSignInReady:appleAuthReady(env),appleSignupReady:appleAuthReady(env)&&!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY),appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
+        const hasSignupBindingKey=!!(env.SIGNUP_AUDIT_KEY||env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
+        const emailVerificationReady=transactionalEmailConfigured&&hasSignupBindingKey;
+        const appleSignupReady=appleAuthReady(env)&&hasSignupBindingKey;
+        return json(res,200,{needsOwner,registrationOpen:registrationOpen(),automaticSignup:!needsOwner&&signupRiskMode(env)==='enforce'&&(emailVerificationReady||appleSignupReady),emailVerificationReady,appleSignInReady:appleAuthReady(env),appleSignupReady,appAttestReady:appAttestReady(env),signupsPaused:signupPause()});
       }
       if(req.method==='POST'&&url.pathname==='/api/demo/start'){
         if(rateLimited(req,10,'demo_start'))throw Object.assign(new Error('Too many demo requests. Try again later.'),{status:429});
