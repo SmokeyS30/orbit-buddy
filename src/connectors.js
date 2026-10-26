@@ -20,7 +20,10 @@ const providers = {
 
 const challenge = (value) => createHash('sha256').update(value).digest('base64url');
 
-export function createConnectorService(env, db, encryptionKey) {
+export function createConnectorService(env, db, encryptionKey, { cutoverHold = false } = {}) {
+  function requireCutoverOpen() {
+    if (cutoverHold) throw Object.assign(new Error('Account connections are temporarily paused. Try again shortly.'), { status: 503 });
+  }
   function requireProviderAccess(userId, providerId) {
     if (providerId !== 'gmail') return;
     const user = db.getUserById(userId);
@@ -39,6 +42,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   function begin(userId, providerId, origin) {
+    requireCutoverOpen();
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
     requireProviderAccess(userId, providerId);
@@ -56,6 +60,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function complete(providerId, code, state) {
+    requireCutoverOpen();
     const provider = providers[providerId];
     const oauthState = db.consumeOauthState(hashToken(state));
     if (!provider || !oauthState || oauthState.provider !== providerId) throw Object.assign(new Error('OAuth state is invalid or expired.'), { status: 400 });
@@ -93,6 +98,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function getValidToken(userId, providerId) {
+    requireCutoverOpen();
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
     requireProviderAccess(userId, providerId);
