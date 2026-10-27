@@ -138,6 +138,7 @@ test('allowed voice upload reaches only the stubbed server transcription path',a
       assert.equal(options.redirect,'error');
       return {ok:true,json:async()=>({text:'synthetic transcript'})};
     }
+    if(!String(url).startsWith(f.base+'/'))throw new Error('Unexpected external request in synthetic voice test.');
     return original(url,options);
   };
   try{
