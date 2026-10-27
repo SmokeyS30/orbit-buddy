@@ -79,7 +79,7 @@ jobs:
           grep -n "const CACHE" public/sw.js
 
       - name: Build and push image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
