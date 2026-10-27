@@ -127,6 +127,7 @@ export async function learnWritingVoice({ db, userId, getToken, model, maxSample
     throw new Error(`Only found ${samples.length} usable sent email(s). Write and send a few more emails first, then try again.`);
   }
   const { text } = await model.respond({
+    aiConsentUserId: userId,
     message: buildVoiceDistillPrompt(samples),
     tools: false,
     taskMode: true

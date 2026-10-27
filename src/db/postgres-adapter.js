@@ -147,6 +147,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_signup_verification_email ON signup_verification_tokens(email_hash)',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TEXT',
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_sharing_consent_at TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_job_id TEXT',
@@ -501,7 +502,7 @@ const indexMigrations = [
 
     // --- Users ---
     countUsers: async () => Number((await get('SELECT COUNT(*) AS count FROM users')).count),
-    listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
+    listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,ai_sharing_consent_at,created_at,updated_at FROM users ORDER BY created_at'),
     async createUser({ email, displayName, passwordHash, passwordSalt, role }) {
       const now = timestamp(); const id = randomUUID();
       await run('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)', id, email, displayName, passwordHash, passwordSalt, role, now, now);
@@ -525,6 +526,7 @@ const indexMigrations = [
     // email column is CITEXT: plain = is already case-insensitive
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
+    setAiSharingConsent: async (id, accepted) => (await run('UPDATE users SET ai_sharing_consent_at=?, updated_at=? WHERE id=?',accepted?timestamp():null,timestamp(),id)).changes>0,
     setSignupPause: async (paused) => withTransaction(async ({query:tQuery,run:tRun}) => {
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
@@ -1713,6 +1715,7 @@ const indexMigrations = [
     completeTask: async (userId, id, attempt, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", status, result, scheduleAt, timestamp(), id, userId, attempt, timestamp())).changes > 0,
     failTask: async (userId, id, attempt, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", message, String(error||'').slice(0, 1000), timestamp(), id, userId, attempt, timestamp())).changes > 0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
+      AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
 
     // --- Calendar feeds ---

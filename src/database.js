@@ -86,7 +86,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, display_name TEXT NOT NULL,
       password_hash TEXT NOT NULL, password_salt TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','member')),
-      disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0, email_verified_at TEXT, ai_sharing_consent_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
       token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -488,6 +488,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'users', 'moderation_blocked', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'users', 'is_demo', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'users', 'email_verified_at', 'TEXT');
+  ensureColumn(db, 'users', 'ai_sharing_consent_at', 'TEXT');
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
   ensureColumn(db, 'messages', 'reply_job_id', 'TEXT');
@@ -577,7 +578,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
 
   const s = {
     countUsers: db.prepare('SELECT COUNT(*) AS count FROM users'),
-    listUsers: db.prepare('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
+    listUsers: db.prepare('SELECT id,email,display_name,role,disabled,moderation_blocked,ai_sharing_consent_at,created_at,updated_at FROM users ORDER BY created_at'),
     createUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)'),
     createDemoUser: db.prepare('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,is_demo,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)'),
     listExpiredDemoUsers: db.prepare("SELECT id FROM users WHERE is_demo=1 AND created_at<=?"),
@@ -815,6 +816,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
+      AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
     listEvents: db.prepare('SELECT * FROM events WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
@@ -980,6 +982,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     },
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
+    setAiSharingConsent: (id, accepted) => db.prepare('UPDATE users SET ai_sharing_consent_at=?, updated_at=? WHERE id=?').run(accepted ? timestamp() : null,timestamp(),id).changes>0,
     setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
     createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');

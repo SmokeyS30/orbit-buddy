@@ -13,7 +13,7 @@ li{margin-bottom:.4em}
 </head>
 <body>
 <h1>Privacy Policy — Orbit Buddy</h1>
-<p class="muted">Last updated: October 22, 2026</p>
+<p class="muted">Last updated: October 27, 2026</p>
 
 <p>Orbit Buddy ("the app," "we") is a personal AI companion application. Your privacy matters to us. This policy describes in detail what information we collect, why we collect it, how we use and protect it, and the choices you have.</p>
 
@@ -36,9 +36,9 @@ li{margin-bottom:.4em}
 <li><strong>Gmail (OAuth, optional):</strong> If you connect your Google account, the app receives an OAuth access token and refresh token. With your permission, the app can:
   <ul>
     <li>Send email on your behalf (<code>gmail.send</code> scope) — only after you review the exact recipient, subject, and body and explicitly confirm.</li>
-    <li>Search and read your inbox (<code>gmail.readonly</code> scope) — only when you ask a question about your email.</li>
+    <li>Search and read your inbox (<code>gmail.readonly</code> scope) when you ask about email, or read a limited set of sent messages if you choose writing-voice learning.</li>
   </ul>
-  The app does not download, index, or analyze your entire mailbox. It accesses only the specific messages needed to fulfill your immediate request.
+  The app does not download or index your entire mailbox. Email questions read relevant messages; optional writing-voice learning reads a limited set of sent messages and may share selected excerpts as described below.
 </li>
 <li><strong>Push notifications:</strong> If you enable push notifications, we store a push subscription endpoint linked to your device so the server can deliver notifications you have opted into (e.g., reminders, check-ins).</li>
 <li><strong>App Store subscriptions:</strong> If you purchase a subscription, Apple processes the payment. We receive and store the product identifier, subscription status, transaction identifiers, and expiration date needed to verify and provide your entitlement. We do not receive or store your full payment-card information.</li>
@@ -76,14 +76,14 @@ li{margin-bottom:.4em}
 <li>The app requests the <code>gmail.send</code> and <code>gmail.readonly</code> scopes. These are the minimum scopes necessary for the email features described above.</li>
 <li>Data received from Google APIs is used only to provide or improve the user-facing features you request.</li>
 <li>Google user data is not used for serving advertisements.</li>
-<li>Google user data is not transferred to third parties except as necessary to provide the requested feature (e.g., sending an email through Google's own Gmail API at your direction), to comply with applicable law, or as part of a merger or acquisition with user notice.</li>
+<li>Google user data is transferred only as needed for a feature you request, such as using Gmail's API to send a confirmed email. If you opt into writing-voice learning and separately allow AI data sharing, selected sent-email excerpts are sent to the configured AI provider to build your writing profile.</li>
 <li>The app does not allow humans to read Google user data except: (a) with your affirmative agreement, (b) as necessary for security purposes such as investigating abuse, (c) to comply with applicable law, or (d) for the app's internal operations where the data has been aggregated and anonymized.</li>
 </ul>
 
 <h2>4. Third-Party Services We Use</h2>
 <ul>
 <li><strong>Hosting:</strong> The app and its PostgreSQL database are hosted on Microsoft Azure.</li>
-<li><strong>AI model provider:</strong> Your conversation messages are sent to our AI model provider (OpenAI) to generate replies. We do not send your stored memories or emails to the model provider except as needed for the immediate conversation context.</li>
+<li><strong>AI model providers:</strong> After you explicitly allow AI data sharing, Orbit may send your messages, attached images, relevant saved memories, goals, projects, conversation history, summaries, and task, reminder, routine, or briefing context to OpenAI or Microsoft Azure OpenAI to generate replies and run AI features. Relevant context can be sent during scheduled background work, even when you are not actively chatting. Voice recordings sent for server transcription go to OpenAI. Browser speech recognition, where available, may use your browser's speech service. If you choose writing-voice learning, selected sent-email excerpts may be sent to the AI provider. The provider used for text depends on server configuration. Declining keeps new AI requests off; you can withdraw permission in Safety. Requests already sent cannot be recalled.</li>
 <li><strong>Apple:</strong> Apple processes App Store subscription purchases and sends signed transaction and subscription-status information to our server so we can verify access.</li>
 <li><strong>Google:</strong> When you use Gmail features, requests are sent to Google's Gmail API using your OAuth token.</li>
 <li><strong>WhatsApp (via Twilio):</strong> If you connect WhatsApp, your WhatsApp messages are processed by Twilio and Meta in addition to our AI model provider. WhatsApp Business messages are not end-to-end encrypted from Meta by design.</li>
@@ -114,6 +114,7 @@ li{margin-bottom:.4em}
 <li><strong>Correction:</strong> You can edit or update your profile, memories, goals, and tasks at any time.</li>
 <li><strong>Deletion:</strong> You can delete individual items at any time. To permanently delete your account and associated data, open <strong>Safety → Delete account</strong> in the app. Apple subscription billing must be cancelled separately in your Apple subscription settings.</li>
 <li><strong>Withdraw consent:</strong> Disconnecting Gmail or removing a calendar feed immediately stops all access to that service and deletes stored credentials.</li>
+<li><strong>AI data sharing:</strong> Choose Allow or Not now when first prompted. In Safety, you can review the disclosure, allow sharing, or withdraw it. Withdrawal blocks new AI model and server voice-transcription requests; it cannot recall data already sent.</li>
 <li><strong>Opt out of proactive messages:</strong> You can disable smart check-ins and notifications in your preferences or quiet-hour settings.</li>
 </ul>
 

@@ -11,6 +11,7 @@ import { openPostgres } from '../src/db/postgres-adapter.js';
 import { hashToken } from '../src/security.js';
 import { nyDayKey } from '../src/subscriptions.js';
 import { createOrbitServer } from '../server.js';
+import { allowAiSharing } from './ai-sharing-fixture.js';
 
 async function fixture(extraEnv={},modelClient=null){
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-ai-admission-'));
@@ -27,7 +28,9 @@ async function auth(base,endpoint,payload){
   const response=await fetch(`${base}${endpoint}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   assert.ok([200,201].includes(response.status));
   const body=await response.json();
-  return{cookie:response.headers.get('set-cookie').split(';')[0],csrf:body.csrf,user:body.user};
+  const credentials={cookie:response.headers.get('set-cookie').split(';')[0],csrf:body.csrf,user:body.user};
+  await allowAiSharing(base,credentials);
+  return credentials;
 }
 const importRequest=(base,credentials)=>fetch(`${base}/api/import/conversations`,{
   method:'POST',headers:headers(credentials),body:JSON.stringify(upload)});
@@ -385,6 +388,7 @@ test('regeneration consumes the same enforced daily AI allowance as chat',async 
   const fx=await fixture({SUBSCRIPTIONS_ENABLED:'true',APPSTORE_SANDBOX:'true',APPSTORE_ISSUER_ID:'synthetic',APPSTORE_KEY_ID:'synthetic',APPSTORE_PRIVATE_KEY_P8:key});
   t.after(()=>fx.close());
   const member=fx.app.db.createUser({email:'member@example.test',displayName:'Member',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'});
+  fx.app.db.setAiSharingConsent(member.id,true);
   const token='synthetic-member-session',csrf='synthetic-csrf';
   fx.app.db.createSession({tokenHash:hashToken(token),userId:member.id,csrfToken:csrf,expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic'});
   const conversation=fx.app.db.ensureDefaultConversation(member.id);

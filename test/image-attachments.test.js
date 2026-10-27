@@ -19,6 +19,7 @@ import {
   MAX_UPLOAD_BYTES,
 } from '../src/attachments.js';
 import { createOrbitServer } from '../server.js';
+import { allowAiSharing } from './ai-sharing-fixture.js';
 
 const PNG_1PX = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -245,7 +246,9 @@ async function register(base, { email = 'img-owner@example.com', displayName = '
   });
   assert.equal(response.status, 201);
   const body = await response.json();
-  return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf };
+  const auth={ cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf };
+  await allowAiSharing(base,auth);
+  return auth;
 }
 
 function uploadRequest(base, auth, body, contentType) {

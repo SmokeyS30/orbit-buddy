@@ -8,13 +8,13 @@ const part=source.slice(source.indexOf('let refreshInFlight=null;'),source.index
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r;});return{promise,resolve};}
 function harness(snapshotFor){
   const commits=[];
-  const state={user:{id:'member',role:'member'},status:null,snapshot:null};
+  const state={user:{id:'member',role:'member'},status:null,snapshot:null,aiSharing:null};
   const element={textContent:'',classList:{toggle(){},contains(){return false;}}};
   const context=vm.createContext({
     state,activeConversationId:'a',renderedConversationId:'a',conversationLoadingId:null,
     modelCheckInFlight:false,reportingUI:{onNavigation(){}},localStorage:{setItem(){}},
     $:()=>element,api:(url)=>url.startsWith('/api/snapshot')?snapshotFor(url):Promise.resolve(url==='/api/status'?{buddyName:'Orbit',paused:false,modelConfigured:false}:{}),
-    render:()=>commits.push(state.snapshot?.activeConversation?.id),renderModelPill(){},
+    render:()=>commits.push(state.snapshot?.activeConversation?.id),renderModelPill(){},renderAiSharingChoice(){},
     isComposing:()=>false,loadBriefing(){},loadCatchupCard(){},renderThreads(){},renderMessages(){},syncTypingBubble(){},syncStreamPoller(){}
   });
   vm.runInContext(part,context);

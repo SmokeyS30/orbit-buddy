@@ -555,6 +555,7 @@ export async function runMemoryConnectionPush({ db, model, user, timeZone, nowMs
   let text;
   try {
     ({ text } = await model.respond({
+      aiConsentUserId: user.id,
       buddyName, userName: user.display_name, message: prompt,
       memories: candidate.memory ? [candidate.memory] : [], goals: [], history: [],
       userTimeZone: timeZone, taskMode: true,

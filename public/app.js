@@ -29,7 +29,7 @@ import { createConnectionRecovery, canAttemptNetwork, isTransportError } from '.
 import { loadChatQueue as loadStoredChatQueue, enqueueChatMessage, createChatQueueEntry, flushChatQueueEntries } from './chat-queue.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
-const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
+const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null,aiSharing:null};
 const SUPPORT_RETURN_KEY='orbit-support-return-view';
 function dismissSplashForSupportReturn(){
   const splash=document.getElementById('orbit-splash');
@@ -101,6 +101,35 @@ function empty(root,text,tryText){const p=document.createElement('p');p.classNam
 function suggestPrompt(text){activateView('today');const input=$('#chat-input');if(input){input.value=text;input.focus();}}
 function button(label,className,handler){const value=document.createElement('button');value.type='button';value.className=className;value.textContent=label;value.addEventListener('click',handler);return value;}
 function showCodes(codes){$('#codes-output').textContent=codes.join('\n');$('#codes-dialog').showModal();}
+function renderAiSharingChoice(){
+  const accepted=!!state.aiSharing?.accepted;
+  const status=$('#ai-sharing-status');
+  if(status)status.textContent=accepted?'Allowed. AI features can use the providers described above.':'Not allowed. New AI requests are blocked.';
+  $('#ai-consent-allow')?.classList.toggle('hidden',accepted);
+  $('#ai-consent-withdraw')?.classList.toggle('hidden',!accepted);
+}
+function openAiConsentDialog(){
+  renderAiSharingChoice();
+  $('#ai-consent-error').textContent='';
+  const dialog=$('#ai-consent-dialog');
+  if(dialog&&!dialog.open)dialog.showModal();
+}
+async function changeAiSharingChoice(accepted){
+  const allow=$('#ai-consent-allow'),withdraw=$('#ai-consent-withdraw');
+  allow.disabled=true;withdraw.disabled=true;
+  try{
+    state.aiSharing=await api('/api/ai-sharing-consent',{method:'POST',body:JSON.stringify({accepted})});
+    renderAiSharingChoice();
+    $('#ai-consent-dialog').close();
+    toast(accepted?'AI sharing allowed.':'AI sharing withdrawn. New AI requests are blocked.');
+    if(accepted)refresh().catch((error)=>toast(error.message));
+  }catch(error){$('#ai-consent-error').textContent=error.message;}
+  finally{allow.disabled=false;withdraw.disabled=false;}
+}
+$('#ai-consent-allow')?.addEventListener('click',()=>changeAiSharingChoice(true));
+$('#ai-consent-withdraw')?.addEventListener('click',()=>changeAiSharingChoice(false));
+$('#ai-consent-decline')?.addEventListener('click',()=>$('#ai-consent-dialog').close());
+$('#ai-sharing-change')?.addEventListener('click',openAiConsentDialog);
 
 let typingActive=false;
 function appendTypingBubble(){const root=$('#messages');if(!root||root.querySelector('.typing-bubble'))return;const el=document.createElement('div');el.className='message assistant typing-bubble';el.setAttribute('role','status');const label=document.createElement('span');label.className='typing-label';label.textContent=`${state.status?.buddyName||'Orbit'} is typing`;const dots=document.createElement('span');dots.className='typing-dots';dots.setAttribute('aria-hidden','true');for(let i=0;i<3;i++)dots.append(document.createElement('span'));const stream=document.createElement('span');stream.className='stream-text';el.append(label,dots,stream);root.append(el);}
@@ -905,19 +934,22 @@ async function refreshOnce(){
     ]):Promise.resolve(null);
   // These reads do not depend on one another. Keep the required snapshot and
   // status failures visible, while optional panels fall back independently.
-  const [status,setup,snapshot,writingVoice,ownReports,ownerReadsResult]=await Promise.all([
+  const [status,setup,snapshot,writingVoice,ownReports,ownerReadsResult,aiSharing]=await Promise.all([
     api('/api/status'),
     api('/api/auth/setup-status').catch(()=>null),
     api('/api/snapshot'+qs),
     api('/api/writing-voice').catch(()=>null),
     api('/api/reports/mine').catch(()=>({reports:[]})),
-    ownerReads
+    ownerReads,
+    api('/api/ai-sharing-consent').catch(()=>null)
   ]);
   if(state.user!==userAtStart)return;
   if(activeConversationId!==selectedConversationId){refreshQueued=true;return;}
   state.status=status;
   if(setup)state.setup=setup;
   state.snapshot=snapshot;
+  state.aiSharing=aiSharing;
+  renderAiSharingChoice();
   // Keep the first app-open timestamp; subsequent snapshots stamp a new one.
   if(state.catchupSince===undefined)state.catchupSince=snapshot.lastAppOpenAt||null;
   state.writingVoice=writingVoice;
@@ -950,7 +982,7 @@ async function refreshOnce(){
     syncTypingBubble();
     syncStreamPoller();
   }else syncTypingBubble();
-  if(state.user&&$('#today').classList.contains('active')){loadBriefing();loadCatchupCard();}
+  if(state.user&&state.aiSharing?.accepted&&$('#today').classList.contains('active')){loadBriefing();loadCatchupCard();}
 }
 async function refresh(){
   if(refreshInFlight){refreshQueued=true;return refreshInFlight;}
@@ -982,11 +1014,14 @@ async function connect(){
     if(me.user.isDemo){state.isDemo=true;showDemoBanner();}
     $('#account-button').textContent=state.user.displayName;
     $('#account-button').classList.remove('hidden');
+    $('#plans-button').classList.remove('hidden');
     $('#delete-account-panel')?.classList.toggle('hidden',!!me.user.isDemo);
     $('#owner-delete-warning')?.classList.toggle('hidden',me.user.role!=='owner');
     await refresh();
     connectionEstablished=true;connectionIssueShown=false;
-    maybeAskName();$('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();
+    if(state.aiSharing?.accepted)maybeAskName();
+    $('#hero-signin')?.classList.add('hidden');$('#auth-dialog').close();
+    if(!state.aiSharing?.accepted)openAiConsentDialog();
     if(isNativeRuntime(window))setupNativePush();else setupWebPush();
     if(loadChatQueue().length)flushChatQueue().catch(()=>{});
     return 'connected';
@@ -1018,7 +1053,7 @@ async function connect(){
     return 'retry';
   }
 }
-function setAuthMode(mode){if(mode!=='register')state.appleSignupProof=null;renderAppleAuthControls(document,{nativeReady:IS_NATIVE&&!!signupPlugin(),loginReady:!!state.setup?.appleSignInReady,signupReady:!!state.setup?.appleSignupReady,mode,registrationAvailable:!!state.setup?.needsOwner||(!state.setup?.signupsPaused&&(!!state.setup?.registrationOpen||!!state.setup?.automaticSignup))});$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';const forgot=mode==='forgot';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':forgot?'Reset password':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':forgot?'Enter your email and we\'ll send you a password reset link.':register&&state.signupVerificationToken?'Finish email verification by re-entering the account details you just chose.':'Private by design — your conversations stay on your server and never train AI models.';$('#name-label').classList.toggle('hidden',!register);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover||forgot);$('#forgot-row').classList.toggle('hidden',mode!=='login');$('#auth-password').required=!recover&&!forgot;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').disabled=false;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':forgot?'Send reset link':'Sign in';const doorClosed=register&&state.setup&&!state.setup.needsOwner&&!state.setup.registrationOpen&&!state.setup.automaticSignup;$('#auth-closed').classList.toggle('hidden',!doorClosed);for(const id of['#name-label','#email-label','#password-label','#auth-submit']){const field=$(id);if(field)field.classList.toggle('hidden',!!doorClosed);}if(doorClosed){$('#auth-title').textContent='Registration is closed';$('#auth-copy').textContent='Ask the owner to open registration, then try again.';}$('#auth-error').textContent='';$('#request-form').classList.add('hidden');$('#request-status').textContent='';}
+function setAuthMode(mode){if(mode!=='register')state.appleSignupProof=null;renderAppleAuthControls(document,{nativeReady:IS_NATIVE&&!!signupPlugin(),loginReady:!!state.setup?.appleSignInReady,signupReady:!!state.setup?.appleSignupReady,mode,registrationAvailable:!!state.setup?.needsOwner||(!state.setup?.signupsPaused&&(!!state.setup?.registrationOpen||!!state.setup?.automaticSignup))});$('#auth-form').dataset.mode=mode;const register=mode==='register';const recover=mode==='recover';const forgot=mode==='forgot';$('#auth-title').textContent=register?(state.setup?.needsOwner?'Create the owner account':'Create an account'):recover?'Recover your account':forgot?'Reset password':'Sign in';$('#auth-copy').textContent=recover?'Use one of your offline recovery codes.':forgot?'Enter your email and we\'ll send you a password reset link.':register&&state.signupVerificationToken?'Finish email verification by re-entering the account details you just chose.':'AI features require your permission to share relevant data with an AI provider. You can review the details after sign-in.';$('#name-label').classList.toggle('hidden',!register);$('#recovery-label').classList.toggle('hidden',!recover);$('#new-password-label').classList.toggle('hidden',!recover);$('#password-label').classList.toggle('hidden',recover||forgot);$('#forgot-row').classList.toggle('hidden',mode!=='login');$('#auth-password').required=!recover&&!forgot;$('#auth-name').required=register;$('#auth-recovery').required=recover;$('#auth-new-password').required=recover;$('#auth-submit').disabled=false;$('#auth-submit').textContent=register?'Create account':recover?'Recover account':forgot?'Send reset link':'Sign in';const doorClosed=register&&state.setup&&!state.setup.needsOwner&&!state.setup.registrationOpen&&!state.setup.automaticSignup;$('#auth-closed').classList.toggle('hidden',!doorClosed);for(const id of['#name-label','#email-label','#password-label','#auth-submit']){const field=$(id);if(field)field.classList.toggle('hidden',!!doorClosed);}if(doorClosed){$('#auth-title').textContent='Registration is closed';$('#auth-copy').textContent='Ask the owner to open registration, then try again.';}$('#auth-error').textContent='';$('#request-form').classList.add('hidden');$('#request-status').textContent='';}
 function renderAccessRequests(){const list=$('#access-list');if(!list)return;list.replaceChildren();const pending=(state.accessRequests||[]).filter((r)=>!r.handled_at);if(!pending.length)return empty(list,'Nobody is waiting for access right now.');for(const r of pending){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=r.name;const p=document.createElement('p');p.textContent=`${r.email} · asked ${formatDate(r.created_at)}`;wrap.append(h,p);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Approve','primary',()=>approveRequest(r.id)),button('Deny','danger',()=>denyRequest(r.id)),button('Dismiss','ghost',()=>dismissRequest(r.id)));head.append(wrap);card.append(head,actions);list.append(card);}}
 async function resetUserPassword(email,displayName){if(!window.confirm(`Send a password reset email to ${displayName||email}?`))return;try{const res=await api('/api/admin/reset-password',{method:'POST',body:JSON.stringify({email})});toast(res.emailed?`Reset email sent to ${displayName||email}.`:`Reset link created for ${displayName||email} (email not sent).`);}catch(e){toast('Reset failed: '+e.message);}}
 function renderUserList(){const list=$('#user-list');if(!list)return;list.replaceChildren();const users=state.users||[];if(!users.length)return empty(list,'No other people have accounts yet.');for(const u of users){const card=document.createElement('article');card.className='item-card';const head=document.createElement('header');const wrap=document.createElement('div');const h=document.createElement('h3');h.textContent=u.displayName||u.email;const p=document.createElement('p');p.textContent=u.email;wrap.append(h,p);const badges=document.createElement('div');badges.className='meta';const role=document.createElement('span');role.className='badge';role.textContent=u.role;const status=document.createElement('span');status.className='badge '+(u.disabled?'blocked':'completed');status.textContent=u.disabled?'disabled':'active';badges.append(role,status);wrap.append(badges);const actions=document.createElement('div');actions.className='mini-actions';actions.append(button('Reset password','ghost',()=>resetUserPassword(u.email,u.displayName)));if(u.role==='member'&&(!u.disabled||u.moderationBlocked))actions.append(button(u.moderationBlocked?'Restore account':'Block account',u.moderationBlocked?'ghost':'danger',()=>setModerationBlock(u,!u.moderationBlocked)));head.append(wrap,actions);card.append(head);list.append(card);}}
@@ -1084,7 +1119,7 @@ async function beginConnector(provider){try{const result=await api(`/api/connect
 async function disconnectConnector(provider){try{await api(`/api/connectors/${provider}`,{method:'DELETE'});await refresh();toast('Connector disconnected.');}catch(error){toast(error.message);}}
 async function previewConnector(provider){try{const result=await api(`/api/connectors/${provider}/preview`);const items=(result.items||[]).slice(0,5);const summary=items.map((item)=>{const label=item.name||item.start||'Item';return item.from?`${label} — ${item.from.replace(/<.*>/,'').trim().slice(0,40)}`:label;}).join(' · ');toast(summary||'Connected, with no recent items.');}catch(error){toast(error.message);}}
 
-function activateView(name,{updateHash=true}={}){if(name==='more')return true;reportingUI.onNavigation();const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));if(name==='today'&&state.user){loadBriefing();loadCatchupCard();}return true;}
+function activateView(name,{updateHash=true}={}){if(name==='more')return true;reportingUI.onNavigation();const tab=document.querySelector(`.tab[data-view="${CSS.escape(name)}"]`);if(!tab)return false;$$('.tab').forEach((item)=>item.classList.toggle('active',item===tab));$$('.view').forEach((view)=>view.classList.toggle('active',view.id===name));if(updateHash&&location.hash!==`#${name}`)history.replaceState(null,'',`#${name}`);if(name==='today')requestAnimationFrame(()=>settleAtBottom($('#messages')));if(name==='today'&&state.user&&state.aiSharing?.accepted){loadBriefing();loadCatchupCard();}return true;}
 $$('.tab').forEach((tab)=>{if(tab.dataset.view==='more')return;tab.addEventListener('click',()=>activateView(tab.dataset.view));});
 
 // --- In-chat search UI (Q3) ---
@@ -1533,6 +1568,7 @@ async function transcribeAudio(blob){
 }
 let voiceMode=null;
 async function openVoiceMode(){
+  if(!state.aiSharing?.accepted){openAiConsentDialog();return;}
   // W7: the voice chunk loads when voice mode is first entered. The memoized
   // loader means a double-tap shares one fetch; the !voiceMode guard below
   // runs synchronously after the await, so the controller is built exactly once.
@@ -1821,6 +1857,7 @@ $('#chat-form').addEventListener('submit',(event)=>{
   event.preventDefault();
   const input=$('#chat-input');
   const text=input.value;
+  if(state.user&&!state.aiSharing?.accepted){openAiConsentDialog();return;}
   // Keep a second draft and an unauthenticated draft in the composer.
   if(sendInFlight)return;
   if(!state.user||(!text.trim()&&!pendingAttachments.length)){sendChatMessage(text);return;}
@@ -1866,6 +1903,7 @@ function appendOptimisticMessage(text){const root=$('#messages');if(!root)return
   let recognition=null;
   voiceBtn.addEventListener('click',()=>{
     if(longPressFired){longPressFired=false;return;} // long-press already opened voice mode
+    if(!state.aiSharing?.accepted){openAiConsentDialog();return;}
     if(!shouldUseWebSpeech(window)){openVoiceMode();return;} // native/iOS: MediaRecorder + server transcription
     if(recognizing&&recognition){recognition.stop();return;}
     recognition=new SR();
@@ -2099,7 +2137,7 @@ const SUB_PRODUCT_FALLBACK=[
 ];
 const MEMBERSHIP_PLANS=[
   {id:'basic',name:'Basic',kicker:'More room for everyday conversations',summary:'A low-cost step up when 25 included messages are not enough.',productIds:['com.smokeys30.orbitbuddy.basic.monthly'],benefits:['100 messages every day','Memory across conversations','Voice conversations','Goals, reminders, and routines','Secure sync across devices']},
-  {id:'plus',name:'Plus',kicker:'Your everyday Orbit, without limits',summary:'Unlimited conversations and the complete everyday Orbit experience.',badge:'Most popular',productIds:['com.smokeys30.orbitbuddy.standard.monthly','com.smokeys30.orbitbuddy.standard.yearly'],benefits:['Unlimited conversations','Persistent memory and history','Goals, reminders, and routines','Voice conversations','Secure sync across devices']},
+  {id:'plus',name:'Plus',kicker:'Your everyday Orbit, without limits',summary:'Unlimited conversations with monthly or yearly billing.',badge:'Most popular',productIds:['com.smokeys30.orbitbuddy.standard.monthly','com.smokeys30.orbitbuddy.standard.yearly'],benefits:['Unlimited conversations','Persistent memory and history','Goals, reminders, and routines','Voice conversations','Secure sync across devices']},
   {id:'unlimited',name:'Unlimited',kicker:'Orbit at its most capable',summary:'The strongest model and longest live context for demanding work.',productIds:['com.smokeys30.orbitbuddy.pro.monthly'],benefits:['Everything in Plus','Strongest AI model for every message','Longer live conversation context','Expanded response capacity','Built for complex projects']},
 ];
 function formatStoreKitPrice(p){
@@ -2234,6 +2272,7 @@ function openMembershipExperience(planId='chooser'){
   }
   renderMembershipExperience(planId);
 }
+$('#plans-button')?.addEventListener('click',()=>openMembershipExperience());
 let subProductsCache=null,subProductsPromise=null;
 const STOREKIT_PENDING_KEY='orbit_storekit_pending_v1';
 function setPendingStoreKitPurchase(value){try{if(value)localStorage.setItem(STOREKIT_PENDING_KEY,JSON.stringify(value));else localStorage.removeItem(STOREKIT_PENDING_KEY);}catch(_){}}

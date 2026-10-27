@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseResponsesStream, createModelClient, stripCitationMarkers } from '../src/model.js';
 import { createOrbitServer } from '../server.js';
+import { allowAiSharing } from './ai-sharing-fixture.js';
 
 function sseBody(chunks) {
   const encoder = new TextEncoder();
@@ -195,7 +196,9 @@ async function register(base, { email = 'owner@example.com', displayName = 'Owne
   const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName, password: 'correct horse battery staple' }) });
   assert.equal(response.status, 201);
   const body = await response.json();
-  return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, body };
+  const auth={ cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, body };
+  await allowAiSharing(base,auth);
+  return auth;
 }
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
