@@ -525,6 +525,7 @@ export function createModelClient(env = process.env) {
           ...(extra.stream ? { Accept: 'text/event-stream' } : {})
         },
         body: JSON.stringify(requestPayload(modelInput, modelName, extra)),
+        redirect: 'error',
         signal: controller.signal
       });
       clearTimeout(firstResponseTimer);
@@ -657,6 +658,7 @@ export function createModelClient(env = process.env) {
   const probeEndpointModels = async (endpoint) => {
     const response = await fetch(`${endpoint.baseUrl}/models`, {
       headers: endpoint.authHeaders,
+      redirect: 'error',
       signal: AbortSignal.timeout(5_000)
     });
     const payload = await response.json().catch(() => ({}));

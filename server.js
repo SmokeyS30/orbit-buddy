@@ -1114,7 +1114,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||closing||paused())return;workerBusy=true;
+    if(workerBusy||closing||paused()||!disclosedRecipientReady)return;workerBusy=true;
     try{
       db.recoverStaleTasks();
       for(const task of db.dueTasks()){

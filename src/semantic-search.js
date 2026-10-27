@@ -49,6 +49,7 @@ export async function getEmbedding(text, apiKey) {
             'Content-Type': 'application/json',
           },
       body: JSON.stringify({ model: usingAzure ? azureDeployment : EMBEDDING_MODEL, input }),
+      redirect: 'error',
       signal: AbortSignal.timeout(15_000),
     }
   );

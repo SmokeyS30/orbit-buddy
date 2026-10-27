@@ -202,6 +202,10 @@ test('an undisclosed configured model host cannot receive an AI sharing grant',a
   assert.equal(choice.status,503);
   assert.equal(f.app.db.getUserById(f.userId).ai_sharing_consent_at,null);
   assert.equal(f.calls(),0);
+  f.app.db.setAiSharingConsent(f.userId,true); // simulate consent saved under an earlier, supported configuration
+  const task=f.app.db.addTask(f.userId,{title:'Synthetic reminder',prompt:'Synthetic'});
+  await f.app.runDueTasks();
+  assert.equal(f.app.db.getTask(f.userId,task.id).attempt_count,0);
   assert.equal((await fetch(f.base+'/healthz')).status,200,'non-AI health remains available');
 });
 

@@ -246,6 +246,7 @@ export async function transcribeVoiceNote({ apiKey, audioBytes, filename = 'voic
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey.trim()}` },
     body: form,
+    redirect: 'error',
   });
   if (!response.ok) {
     const text = await response.text().catch(() => '');
