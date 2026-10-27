@@ -127,6 +127,27 @@ test('chat and voice transcription refuse unconsented input before provider acce
   assert.equal(f.calls(),1);
 });
 
+test('allowed voice upload reaches only the stubbed server transcription path',async t=>{
+  const f=await fixture(t);
+  assert.equal((await fetch(f.base+'/api/ai-sharing-consent',{method:'POST',headers:f.headers,body:'{"accepted":true}'})).status,200);
+  const original=globalThis.fetch;
+  let providerCalls=0;
+  globalThis.fetch=async(url,options)=>{
+    if(String(url).endsWith('/v1/audio/transcriptions')){
+      providerCalls++;
+      assert.equal(options.redirect,'error');
+      return {ok:true,json:async()=>({text:'synthetic transcript'})};
+    }
+    return original(url,options);
+  };
+  try{
+    const response=await original(f.base+'/api/voice/transcribe',{method:'POST',headers:f.headers,body:JSON.stringify({audio:Buffer.from('synthetic audio').toString('base64'),mimeType:'audio/webm'})});
+    assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{text:'synthetic transcript'});
+    assert.equal(providerCalls,1);
+  }finally{globalThis.fetch=original;}
+});
+
 test('unconsented imports and writing-voice learning are refused; due tasks remain queued',async t=>{
   const f=await fixture(t);
   const imported=await fetch(f.base+'/api/import/conversations',{method:'POST',headers:f.headers,body:JSON.stringify({messages:[{role:'user',content:'synthetic'}]})});

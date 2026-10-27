@@ -164,3 +164,40 @@ test('desktop controller never constructs a browser speech service', () => {
     env.restore();
   }
 });
+
+test('microphone tap records audio and uses the consent-gated transcription dependency', async () => {
+  const win=runtime();
+  const env=installVoiceDom(win);
+  const oldNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const oldRecorder=Object.getOwnPropertyDescriptor(globalThis,'MediaRecorder');
+  const stopped=[];
+  let transcriptions=0;
+  const sent=[];
+  const stream={getTracks:()=>[{stop:()=>stopped.push(true)}]};
+  class FakeRecorder {
+    static isTypeSupported(){return true;}
+    constructor(){this.state='inactive';this.mimeType='audio/webm';}
+    start(){this.state='recording';}
+    stop(){this.state='inactive';this.ondataavailable({data:new Blob(['synthetic audio'])});queueMicrotask(()=>this.onstop());}
+  }
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>stream}}});
+  Object.defineProperty(globalThis,'MediaRecorder',{configurable:true,value:FakeRecorder});
+  globalThis.document.createElement=()=>fakeElement();
+  try {
+    const controller=createVoiceMode({buddyName:()=> 'Orbit',transcribeAudio:async blob=>{transcriptions++;assert.ok(blob.size>0);return 'synthetic transcript';},sendTurn:async text=>{sent.push(text);return '';}});
+    controller.open();
+    controller.interrupt();
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(env.ids.get('voice-status').textContent,'Recording… tap the mic to send.');
+    controller.interrupt();
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(transcriptions,1);
+    assert.deepEqual(sent,['synthetic transcript']);
+    assert.equal(stopped.length,1);
+    controller.close();
+  } finally {
+    if(oldNavigator)Object.defineProperty(globalThis,'navigator',oldNavigator);else delete globalThis.navigator;
+    if(oldRecorder)Object.defineProperty(globalThis,'MediaRecorder',oldRecorder);else delete globalThis.MediaRecorder;
+    env.restore();
+  }
+});
