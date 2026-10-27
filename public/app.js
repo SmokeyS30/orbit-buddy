@@ -30,6 +30,7 @@ import { loadChatQueue as loadStoredChatQueue, enqueueChatMessage, createChatQue
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null,aiSharing:null};
+let aiChoiceVersion=0;
 const SUPPORT_RETURN_KEY='orbit-support-return-view';
 function dismissSplashForSupportReturn(){
   const splash=document.getElementById('orbit-splash');
@@ -104,8 +105,8 @@ function showCodes(codes){$('#codes-output').textContent=codes.join('\n');$('#co
 function renderAiSharingChoice(){
   const accepted=!!state.aiSharing?.accepted;
   const status=$('#ai-sharing-status');
-  if(status)status.textContent=accepted?'Allowed. AI features can use the providers described above.':'Not allowed. New AI requests are blocked.';
-  $('#ai-consent-allow')?.classList.toggle('hidden',accepted);
+  if(status)status.textContent=state.aiSharing?.recipientAvailable===false?'The configured AI recipient is not covered by this disclosure. AI features are unavailable.':accepted?'Allowed. AI features can use the providers described above.':'Not allowed. New AI requests are blocked.';
+  $('#ai-consent-allow')?.classList.toggle('hidden',accepted||state.aiSharing?.recipientAvailable===false);
   $('#ai-consent-withdraw')?.classList.toggle('hidden',!accepted);
 }
 function openAiConsentDialog(){
@@ -118,7 +119,9 @@ async function changeAiSharingChoice(accepted){
   const allow=$('#ai-consent-allow'),withdraw=$('#ai-consent-withdraw');
   allow.disabled=true;withdraw.disabled=true;
   try{
-    state.aiSharing=await api('/api/ai-sharing-consent',{method:'POST',body:JSON.stringify({accepted})});
+    const choice=await api('/api/ai-sharing-consent',{method:'POST',body:JSON.stringify({accepted})});
+    aiChoiceVersion++;
+    state.aiSharing=choice;
     renderAiSharingChoice();
     $('#ai-consent-dialog').close();
     toast(accepted?'AI sharing allowed.':'AI sharing withdrawn. New AI requests are blocked.');
@@ -923,6 +926,7 @@ let refreshQueued=false;
 async function refreshOnce(){
   const selectedConversationId=activeConversationId;
   const userAtStart=state.user;
+  const aiChoiceAtStart=aiChoiceVersion;
   const qs=selectedConversationId?`?conversation=${encodeURIComponent(selectedConversationId)}`:'';
   const ownerReads=userAtStart?.role==='owner'
     ?Promise.all([
@@ -948,7 +952,7 @@ async function refreshOnce(){
   state.status=status;
   if(setup)state.setup=setup;
   state.snapshot=snapshot;
-  state.aiSharing=aiSharing;
+  if(aiChoiceVersion===aiChoiceAtStart)state.aiSharing=aiSharing;
   renderAiSharingChoice();
   // Keep the first app-open timestamp; subsequent snapshots stamp a new one.
   if(state.catchupSince===undefined)state.catchupSince=snapshot.lastAppOpenAt||null;
@@ -1009,6 +1013,7 @@ function reportConnectionIssue(error){
 }
 async function connect(){
   try{
+    aiChoiceVersion++;state.aiSharing=null;
     const me=await api('/api/auth/me');
     state.user=me.user;state.csrf=me.csrf;
     if(me.user.isDemo){state.isDemo=true;showDemoBanner();}
@@ -1869,70 +1874,14 @@ $('#chat-form').addEventListener('submit',(event)=>{
 });
 function appendOptimisticMessage(text){const root=$('#messages');if(!root)return null;const el=document.createElement('div');el.className='message user';el.dataset.optimistic='1';const body=document.createElement('span');body.textContent=text;el.append(body);root.append(el);scrollToBottom(root);return el;}
 
-// Voice input via Web Speech API, plus R1 voice conversation mode ("call Orbit").
-// Tap the mic: dictate into the composer (needs Web Speech API).
-// Long-press the mic — or type "call Orbit" — for a full spoken conversation.
-// Where Web Speech API is missing entirely, the mic opens voice mode directly
-// (it falls back to server-side Whisper transcription).
+// The mic always opens consent-gated voice mode. Browser SpeechRecognition can
+// use an unnamed external service, so it is not part of this disclosure.
 (function(){
   const voiceBtn=$('#voice-button');
-  const input=$('#chat-input');
-  if(!voiceBtn||!input)return;
-  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
-  // Resolve the runtime again at tap time. The classifier also recognizes the
-  // capacitor: scheme and iOS itself, so a missing/late bridge can never route
-  // a native iPhone into its blocked Web Speech implementation.
-  let longPressTimer=null,longPressFired=false;
-  voiceBtn.addEventListener('pointerdown',()=>{
-    longPressFired=false;
-    clearTimeout(longPressTimer);
-    longPressTimer=setTimeout(()=>{longPressFired=true;openVoiceMode();},650);
-  });
-  const cancelLongPress=()=>{clearTimeout(longPressTimer);longPressTimer=null;};
-  voiceBtn.addEventListener('pointerup',cancelLongPress);
-  voiceBtn.addEventListener('pointerleave',cancelLongPress);
-  voiceBtn.addEventListener('pointercancel',cancelLongPress);
-  voiceBtn.addEventListener('contextmenu',(event)=>event.preventDefault());
-  if(!SR){
-    voiceBtn.title='Voice conversation';
-    voiceBtn.setAttribute('aria-label','Voice conversation');
-    voiceBtn.addEventListener('click',()=>{if(longPressFired){longPressFired=false;return;}openVoiceMode();});
-    return;
-  }
-  let recognizing=false;
-  let recognition=null;
-  voiceBtn.addEventListener('click',()=>{
-    if(longPressFired){longPressFired=false;return;} // long-press already opened voice mode
-    if(!state.aiSharing?.accepted){openAiConsentDialog();return;}
-    if(!shouldUseWebSpeech(window)){openVoiceMode();return;} // native/iOS: MediaRecorder + server transcription
-    if(recognizing&&recognition){recognition.stop();return;}
-    recognition=new SR();
-    recognition.lang='en-US';
-    recognition.interimResults=true;
-    recognition.maxAlternatives=1;
-    let finalTranscript='';
-    recognition.onresult=(event)=>{
-      let interim='';
-      for(let i=event.resultIndex;i<event.results.length;i++){
-        const transcript=event.results[i][0].transcript;
-        if(event.results[i].isFinal)finalTranscript+=transcript+' ';
-        else interim+=transcript;
-      }
-      input.value=(finalTranscript+interim).trim();
-    };
-    recognition.onend=()=>{recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');};
-    recognition.onerror=(event)=>{
-      recognizing=false;voiceBtn.textContent='🎤';voiceBtn.classList.remove('listening');
-      // Blocked speech service (iOS WKWebView): fall through to voice mode,
-      // which falls back to tap-to-record + Whisper on its own.
-      if(event.error==='service-not-allowed'||event.error==='not-allowed'){openVoiceMode();return;}
-      if(event.error!=='aborted'&&event.error!=='no-speech')toast('Voice input: '+event.error);
-    };
-    recognition.start();
-    recognizing=true;
-    voiceBtn.textContent='🔴';
-    voiceBtn.classList.add('listening');
-  });
+  if(!voiceBtn)return;
+  voiceBtn.title='Voice conversation';
+  voiceBtn.setAttribute('aria-label','Voice conversation');
+  voiceBtn.addEventListener('click',openVoiceMode);
 })();
 $('#new-task-button').addEventListener('click',()=>$('#task-form').classList.remove('hidden'));$('#cancel-task').addEventListener('click',()=>$('#task-form').classList.add('hidden'));$('#task-form').addEventListener('submit',async(event)=>{event.preventDefault();try{const date=$('#task-date').value;await api('/api/tasks',{method:'POST',body:JSON.stringify({title:$('#task-title').value,prompt:$('#task-prompt').value,recurrence:$('#task-recurrence').value,risk:$('#task-risk').value,scheduleAt:date?new Date(date).toISOString():null})});event.target.reset();event.target.classList.add('hidden');await refresh();toast('Task created.');}catch(error){toast(error.message);}});
 $('#new-goal-button').addEventListener('click',()=>$('#goal-form').classList.remove('hidden'));$('#cancel-goal').addEventListener('click',()=>$('#goal-form').classList.add('hidden'));$('#goal-form').addEventListener('submit',async(event)=>{event.preventDefault();try{await api('/api/goals',{method:'POST',body:JSON.stringify({title:$('#goal-title').value,description:$('#goal-description').value,targetDate:$('#goal-target').value||null,priority:Number($('#goal-priority').value),nextStep:$('#goal-next-step').value})});event.target.reset();$('#goal-priority').value='2';event.target.classList.add('hidden');await refresh();toast('Goal created.');}catch(error){toast(error.message);}});

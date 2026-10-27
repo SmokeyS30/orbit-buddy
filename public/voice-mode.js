@@ -1,12 +1,10 @@
 // Orbit Buddy voice conversation mode ("call Orbit").
-import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 //
 // A real spoken conversation: the user talks, Orbit talks back. The transcript
 // is an ordinary chat conversation (every turn goes through the normal chat
 // pipeline), so history, search, and memories all work unchanged.
 //
-// Speech recognition: Web Speech API when available (free, on-device, low
-// latency); otherwise the server-side Whisper fallback via deps.transcribeAudio.
+// Speech recognition uses consent-gated server transcription via deps.transcribeAudio.
 // Speech synthesis: speechSynthesis with a picked natural voice.
 // Barge-in: true acoustic barge-in — while Orbit is speaking, a mic analyser
 // watches for sustained user speech over the speaker output and cancels the
@@ -190,13 +188,11 @@ export function createBargeInDetector(opts = {}) {
  *   buddyName()            -> display name for the overlay
  *   sendTurn(text)         -> Promise<string>: post a chat turn and resolve
  *                              with the assistant's reply text when done
- *   transcribeAudio(blob)  -> Promise<string>: Whisper fallback for browsers
- *                              without Web Speech API
+ *   transcribeAudio(blob)  -> Promise<string>: consent-gated server transcription
  */
 export function createVoiceMode(deps) {
   const els = {};
-  let state = 'closed'; // closed|opening|idle-tap|listening|thinking|speaking|recording
-  let recognition = null;
+  let state = 'closed'; // closed|opening|idle-tap|thinking|speaking|recording
   let recorder = null;
   let recordChunks = [];
   let synth = null;
@@ -232,13 +228,6 @@ export function createVoiceMode(deps) {
     if (live) live.remove();
   }
 
-  function stopRecognition() {
-    if (recognition) {
-      try { recognition.onresult = null; recognition.onend = null; recognition.onerror = null; recognition.abort(); } catch (_) {}
-      recognition = null;
-    }
-  }
-
   function stopRecording() {
     if (recorder && recorder.state !== 'inactive') {
       try { recorder.stop(); } catch (_) {}
@@ -254,7 +243,6 @@ export function createVoiceMode(deps) {
   }
 
   function stopAll() {
-    stopRecognition();
     stopRecording();
     stopSpeaking();
     stopBargeSampling();
@@ -379,114 +367,12 @@ export function createVoiceMode(deps) {
     })().catch(() => { stopBargeSampling(); });
   }
 
-  const SR = () => window.SpeechRecognition || window.webkitSpeechRecognition;
-
   function startListen() {
     if (state === 'closed') return;
     stopAll();
-    // Web Speech API is broken in iOS WKWebView (service-not-allowed) —
-    // use tap-to-record + Whisper on native instead. Check live because the
-    // Capacitor bridge may not be ready when the app module first loads.
-    let nativeFromDependency = false;
-    try {
-      nativeFromDependency = typeof deps.isNative === 'function'
-        ? deps.isNative() === true
-        : deps.isNative === true;
-    } catch (_) {}
-    const isNativeNow = nativeFromDependency || isNativeRuntime(window);
-    const useWebSpeech = Boolean(SR()) && !isNativeNow && shouldUseWebSpeech(window);
-    if (useWebSpeech) {
-      state = 'listening';
-      setOrb('listening');
-      setStatus('Listening…');
-      const Rec = SR();
-      recognition = new Rec();
-      recognition.lang = 'en-US';
-      recognition.interimResults = true;
-      recognition.maxAlternatives = 1;
-      let finalTranscript = '';
-      // If the speech service is blocked or hangs without firing (iOS WKWebView
-      // exposes the constructor but the service is unavailable), fall back to
-      // tap-to-record + Whisper instead of stranding the user on "Listening…".
-      let webSpeechFinished = false;
-      let webSpeechHangTimer = null;
-      const clearWebSpeechTimer = () => {
-        if (webSpeechHangTimer) clearTimeout(webSpeechHangTimer);
-        webSpeechHangTimer = null;
-      };
-      const fallbackToTap = () => {
-        if (webSpeechFinished || state !== 'listening') return;
-        webSpeechFinished = true;
-        clearWebSpeechTimer();
-        const activeRecognition = recognition;
-        recognition = null;
-        try {
-          if (activeRecognition) {
-            activeRecognition.onresult = null;
-            activeRecognition.onend = null;
-            activeRecognition.onerror = null;
-            activeRecognition.abort();
-          }
-        } catch (_) {}
-        state = 'idle-tap';
-        setOrb('idle');
-        setStatus('Tap the mic, say your piece, tap again to send.');
-      };
-      const armWebSpeechTimer = () => {
-        clearWebSpeechTimer();
-        webSpeechHangTimer = setTimeout(() => {
-          if (state === 'listening') fallbackToTap();
-        }, 4000);
-      };
-      armWebSpeechTimer();
-      const finishWebSpeech = () => {
-        webSpeechFinished = true;
-        clearWebSpeechTimer();
-      };
-      recognition.onresult = (event) => {
-        if (state !== 'listening') return;
-        armWebSpeechTimer();
-        let interim = '';
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const tr = event.results[i][0].transcript;
-          if (event.results[i].isFinal) finalTranscript += tr + ' ';
-          else interim += tr;
-        }
-        const show = (finalTranscript + interim).trim();
-        if (show) addLine('user', show, true);
-      };
-      recognition.onend = () => {
-        recognition = null;
-        if (state !== 'listening') return;
-        const text = finalTranscript.trim();
-        clearLiveLine();
-        finishWebSpeech();
-        if (text) submitTurn(text);
-        else startListen(); // ordinary desktop web: keep listening hands-free
-      };
-      recognition.onerror = (event) => {
-        if (state !== 'listening') return;
-        const err = event && event.error;
-        if (err === 'not-allowed' || err === 'service-not-allowed') {
-          fallbackToTap();
-          return;
-        }
-        finishWebSpeech();
-        recognition = null;
-        // 'no-speech', 'aborted', 'network': just listen again
-        if (err !== 'aborted') startListen();
-      };
-      try {
-        recognition.start();
-      } catch (_) {
-        fallbackToTap();
-      }
-    } else {
-      // No Web Speech API (e.g. Firefox, iOS native): tap-to-record via Whisper fallback.
-      state = 'idle-tap';
-      setOrb('idle');
-      setStatus('Tap the mic, say your piece, tap again to send.');
-    }
+    state = 'idle-tap';
+    setOrb('idle');
+    setStatus('Tap the mic, say your piece, tap again to send.');
   }
 
   async function startRecording() {
@@ -590,10 +476,6 @@ export function createVoiceMode(deps) {
     }
     if (state === 'idle-tap' || state === 'idle-blocked') {
       startRecording();
-      return;
-    }
-    if (state === 'listening') {
-      // Already listening with Web Speech — nothing to do.
       return;
     }
   }

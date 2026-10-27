@@ -527,6 +527,14 @@ const indexMigrations = [
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
     setAiSharingConsent: async (id, accepted) => (await run('UPDATE users SET ai_sharing_consent_at=?, updated_at=? WHERE id=?',accepted?timestamp():null,timestamp(),id)).changes>0,
+    setAiSharingConsentIfSessionCurrent: async (id,tokenHash,csrfToken,accepted) => withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT id,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',id);
+      if(!user||user.disabled||user.moderation_blocked)return false;
+      const session=await tGet('SELECT user_id,csrf_token,expires_at FROM sessions WHERE token_hash=? AND user_id=? FOR UPDATE',tokenHash,id);
+      if(!session||session.csrf_token!==csrfToken||session.expires_at<=timestamp())return false;
+      await tRun('UPDATE users SET ai_sharing_consent_at=?,updated_at=? WHERE id=?',accepted?timestamp():null,timestamp(),id);
+      return true;
+    }),
     setSignupPause: async (paused) => withTransaction(async ({query:tQuery,run:tRun}) => {
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
@@ -1714,6 +1722,7 @@ const indexMigrations = [
     completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes > 0,
     completeTask: async (userId, id, attempt, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", status, result, scheduleAt, timestamp(), id, userId, attempt, timestamp())).changes > 0,
     failTask: async (userId, id, attempt, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", message, String(error||'').slice(0, 1000), timestamp(), id, userId, attempt, timestamp())).changes > 0,
+    deferTaskForAiConsent: async (userId,id,attempt) => (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",timestamp(),id,userId,attempt,timestamp())).changes>0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),

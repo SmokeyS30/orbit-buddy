@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { consentGatedModel, requireAiSharingConsent } from './src/ai-sharing.js';
+import { consentGatedModel, requireAiSharingConsent, disclosedAiRecipientConfigured } from './src/ai-sharing.js';
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
@@ -523,7 +523,8 @@ export function createOrbitServer(options={}) {
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
-  const model=consentGatedModel(options.modelClient||createModelClient(env),db);
+  const disclosedRecipientReady=disclosedAiRecipientConfigured(env);
+  const model=consentGatedModel(options.modelClient||createModelClient(env),db,disclosedRecipientReady);
   const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
@@ -1149,7 +1150,16 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
           await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){if(!leaseAlive||closing||!db.failTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        }catch(error){
+          if(error?.code==='AI_SHARING_CONSENT_REQUIRED'||error?.code==='AI_SHARING_RECIPIENT_UNDISCLOSED'){
+            if(leaseAlive&&!closing)db.deferTaskForAiConsent(task.user_id,task.id,attempt);
+            continue;
+          }
+          if(!leaseAlive||closing||!db.failTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;
+          db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);
+          await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});
+          await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});
+        }
         finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}
@@ -2828,7 +2838,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             let transcript=null;
             try{
               const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
-              await requireAiSharingConsent(db,waUserId);
+              await requireAiSharingConsent(db,waUserId,disclosedRecipientReady);
               transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
             }catch(e){
               console.error('whatsapp voice note failed',e.code||e.message);
@@ -3063,14 +3073,17 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(url.pathname.startsWith('/api/')){
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
         if(req.method==='GET'&&url.pathname==='/api/auth/me')return json(res,200,{user:publicUser(user),csrf:user.csrf_token||null});
-        if(req.method==='GET'&&url.pathname==='/api/ai-sharing-consent')return json(res,200,{accepted:!!(await db.getUserById(user.user_id||user.id))?.ai_sharing_consent_at});
+        if(req.method==='GET'&&url.pathname==='/api/ai-sharing-consent')return json(res,200,{accepted:!!(await db.getUserById(user.user_id||user.id))?.ai_sharing_consent_at,recipientAvailable:disclosedRecipientReady});
         if(req.method==='POST'&&url.pathname==='/api/ai-sharing-consent'){
           const body=await readJson(req);
           if(typeof body.accepted!=='boolean')throw Object.assign(new Error('accepted must be true or false.'),{status:400});
+          if(body.accepted&&!disclosedRecipientReady)throw Object.assign(new Error('The configured AI recipient is not covered by the current disclosure.'),{status:503,code:'AI_SHARING_RECIPIENT_UNDISCLOSED'});
           const consentUserId=user.user_id||user.id;
-          if(!await db.setAiSharingConsent(consentUserId,body.accepted))throw Object.assign(new Error('Account is unavailable.'),{status:404});
+          const sessionToken=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);
+          if(!sessionToken||!await db.setAiSharingConsentIfSessionCurrent(consentUserId,hashToken(sessionToken),req.headers['x-orbit-csrf'],body.accepted))
+            throw Object.assign(new Error('Sign in again before changing AI sharing.'),{status:401});
           db.addEvent(consentUserId,body.accepted?'ai_sharing_allowed':'ai_sharing_withdrawn',body.accepted?'Allowed AI provider sharing.':'Withdrew AI provider sharing.');
-          return json(res,200,{accepted:body.accepted});
+          return json(res,200,{accepted:body.accepted,recipientAvailable:disclosedRecipientReady});
         }
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status'){const me=user.user_id||user.id;return json(res,200,{buddyName:buddyNameFor(me),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(me),role:user.role,appleLinked:await db.hasAuthIdentityForUser('apple',me)});}
@@ -3308,7 +3321,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
-          await requireAiSharingConsent(db,userId);
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
           // Demo users are capped on messages
           if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
@@ -3351,7 +3364,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const regenMatch=url.pathname.match(/^\/api\/chat\/messages\/([0-9a-f-]{36})\/regenerate$/);
         if(req.method==='POST'&&regenMatch){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
-          await requireAiSharingConsent(db,userId);
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
           if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
           const target=db.getMessage(userId,regenMatch[1]);
@@ -3397,7 +3410,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         // R1 voice mode: Whisper transcription fallback for browsers without
         // Web Speech API. Audio is processed in memory and never persisted.
         if(req.method==='POST'&&url.pathname==='/api/voice/transcribe'){
-          await requireAiSharingConsent(db,userId);
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'voice-transcribe',20,60*60_000))throw Object.assign(new Error('Too many transcription requests. Try again shortly.'),{status:429});
           const body=await readJson(req,6*1024*1024);
           const audioBytes=Buffer.from(String(body.audio||''),'base64');
@@ -3406,6 +3419,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(audioBytes.length>4*1024*1024)throw Object.assign(new Error('Audio is too large (4MB max).'),{status:413});
           if(!/^audio\//.test(mimeType))throw Object.assign(new Error('Unsupported audio type.'),{status:400});
           if(!env.OPENAI_API_KEY)throw Object.assign(new Error('Voice transcription is not configured on this server.'),{status:503});
+          if(!authenticate(req))throw Object.assign(new Error('Sign in again before using voice transcription.'),{status:401});
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           const text=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes,filename:'voice-turn.'+(mimeType.includes('mp4')?'m4a':'webm'),mimeType});
           db.addEvent(userId,'voice_transcribed','Transcribed a voice-mode turn with Whisper.');
           return json(res,200,{text});
@@ -3537,7 +3552,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
           if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
-          await requireAiSharingConsent(db,userId);
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3589,7 +3604,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         // The distilled profile text itself never leaves the server.
         if(req.method==='GET'&&url.pathname==='/api/writing-voice'){requireOwner(user);return json(res,200,writingVoiceStatus(db,userId));}
         if(req.method==='POST'&&url.pathname==='/api/writing-voice/opt-in'){requireOwner(user);const body=await readJson(req);if(typeof body.optIn!=='boolean')throw Object.assign(new Error('optIn must be true or false.'),{status:400});db.setWritingVoiceOptIn(userId,body.optIn);db.addEvent(userId,body.optIn?'writing_voice_enabled':'writing_voice_disabled',body.optIn?'Turned the writing voice on for drafts.':'Turned the writing voice off (profile kept).');return json(res,200,writingVoiceStatus(db,userId));}
-        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});await requireAiSharingConsent(db,userId);if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
+        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});await requireAiSharingConsent(db,userId,disclosedRecipientReady);if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
         if(req.method==='DELETE'&&url.pathname==='/api/writing-voice'){requireOwner(user);db.clearWritingVoice(userId);db.addEvent(userId,'writing_voice_forgotten','Deleted the learned writing voice and opt-in.');return json(res,200,{forgotten:true});}
         if(req.method==='POST'&&url.pathname==='/api/goals'){const body=await readJson(req);const targetDate=body.targetDate?validDateString(body.targetDate):null;if(body.targetDate&&!targetDate)throw Object.assign(new Error('targetDate must be YYYY-MM-DD.'),{status:400});const goal=db.addGoal(userId,{title:cleanText(body.title,120,'title'),description:optionalText(body.description,1000),priority:normalizePriority(body.priority),targetDate,nextStep:optionalText(body.nextStep,500)});db.addEvent(userId,'goal_created',`Started tracking goal “${goal.title}”.`);return json(res,201,goal);}
         const goalMatch=url.pathname.match(/^\/api\/goals\/([0-9a-f-]+)$/);if(goalMatch&&req.method==='PATCH'){const body=await readJson(req);if(body.progress!==undefined&&(!Number.isFinite(Number(body.progress))||Number(body.progress)<0||Number(body.progress)>100))throw Object.assign(new Error('progress must be from 0 to 100.'),{status:400});if(body.status!==undefined&&!['active','paused','completed'].includes(body.status))throw Object.assign(new Error('status is not valid.'),{status:400});const goal=db.updateGoal(userId,goalMatch[1],{progress:body.progress,status:body.status,nextStep:body.nextStep===undefined?undefined:optionalText(body.nextStep,500),note:optionalText(body.note,1000)});if(!goal)throw Object.assign(new Error('Goal not found.'),{status:404});db.addEvent(userId,'goal_updated',`Updated “${goal.title}” to ${goal.progress}% (${goal.status}).`);return json(res,200,goal);}

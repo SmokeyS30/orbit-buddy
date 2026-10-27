@@ -815,6 +815,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
     completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
+    deferTaskForAiConsent: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
@@ -983,6 +984,18 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getUserByEmail: (email) => s.userByEmail.get(email),
     getUserById: (id) => s.userById.get(id),
     setAiSharingConsent: (id, accepted) => db.prepare('UPDATE users SET ai_sharing_consent_at=?, updated_at=? WHERE id=?').run(accepted ? timestamp() : null,timestamp(),id).changes>0,
+    setAiSharingConsentIfSessionCurrent(id, tokenHash, csrfToken, accepted) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const session=db.prepare(`SELECT 1 FROM sessions JOIN users ON users.id=sessions.user_id
+          WHERE sessions.user_id=? AND sessions.token_hash=? AND sessions.csrf_token=?
+          AND sessions.expires_at>? AND users.disabled=0 AND users.moderation_blocked=0`).get(id,tokenHash,csrfToken,timestamp());
+        if(!session){db.exec('ROLLBACK');return false;}
+        db.prepare('UPDATE users SET ai_sharing_consent_at=?,updated_at=? WHERE id=?')
+          .run(accepted?timestamp():null,timestamp(),id);
+        db.exec('COMMIT');return true;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
     setSignupPause(paused) {s.setSetting.run('signups_paused',String(paused),timestamp());},
     createSignupAccount({email,displayName,passwordHash,passwordSalt,verificationHash=null,emailHash=null,automatic=false,environmentPaused=false,appleProofHash=null,appleEmailHash=null}) {
       db.exec('BEGIN IMMEDIATE');
@@ -1683,6 +1696,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     completeTaskByUser:(userId,id,result)=>db.prepare("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')").run(result,timestamp(),id,userId).changes>0,
     completeTask: (userId,id,attempt,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
     failTask:(userId,id,attempt,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
+    deferTaskForAiConsent:(userId,id,attempt)=>s.deferTaskForAiConsent.run(timestamp(),id,userId,attempt,timestamp()).changes>0,
     dueTasks: () => s.dueTasks.all(timestamp()),
     addEvent(userId,type,message,detail=null) { const row={id:randomUUID(),user_id:userId,type,message,detail,created_at:timestamp()}; s.addEvent.run(row.id,row.user_id,row.type,row.message,row.detail,row.created_at); return row; },
     listEvents: (userId,limit=80) => s.listEvents.all(userId,Math.min(Math.max(limit,1),200)),
