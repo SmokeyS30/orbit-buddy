@@ -26,6 +26,7 @@ import { parseConversationDeepLink } from './deep-link.js';
 import { geoAttemptPlan, markGeoAsked, clearGeoAsked } from './geo-prompt.js';
 import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 import { createConnectionRecovery, canAttemptNetwork, isTransportError } from './connection-recovery.js';
+import { loadChatQueue as loadStoredChatQueue, enqueueChatMessage, removeChatQueueEntry, createChatQueueEntry, nextSendableEntry } from './chat-queue.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
@@ -1275,29 +1276,36 @@ $('#delete-account-button')?.addEventListener('click',async()=>{
 // --- Offline message queue (Q5) ---
 // Typed messages queue locally when the network drops and send automatically
 // when connectivity returns — no error, no lost message, no extra UI.
-const CHAT_QUEUE_KEY='orbit-chat-queue';
-function loadChatQueue(){try{const q=JSON.parse(localStorage.getItem(CHAT_QUEUE_KEY));return Array.isArray(q)?q:[];}catch(_){return[];}}
-function saveChatQueue(queue){try{localStorage.setItem(CHAT_QUEUE_KEY,JSON.stringify(queue));}catch(_){}}
+function loadChatQueue(){return loadStoredChatQueue(localStorage);}
 function isNetworkError(error){return isTransportError(error,IS_NATIVE,navigator.onLine);}
 function markQueued(el){if(!el||el.classList.contains('queued'))return;el.classList.add('queued');const note=document.createElement('span');note.className='queued-note';note.textContent='queued — will send when online';el.append(note);}
-function queueOfflineMessage(text,element){const queue=loadChatQueue();const entry={id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,queuedAt:new Date().toISOString()};queue.push(entry);saveChatQueue(queue);markQueued(element||appendOptimisticMessage(text));}
+function queueOfflineMessage(text,element){const entry=createChatQueueEntry({id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,ownerId:state.user?state.user.id:null,queuedAt:new Date().toISOString()});enqueueChatMessage(localStorage,entry);markQueued(element||appendOptimisticMessage(text));}
 let flushingQueue=false;
 async function flushChatQueue(){
-  if(flushingQueue)return;flushingQueue=true;
+  if(flushingQueue)return;
+  // Never flush without a signed-in account: entries are bound to the
+  // account that queued them and may only be sent under that account.
+  const ownerId=state.user?state.user.id:null;
+  if(!ownerId)return;
+  flushingQueue=true;
   try{
-    let queue=loadChatQueue();
-    while(queue.length){
+    for(;;){
       if(!canAttemptNetwork(IS_NATIVE,navigator.onLine))break; // web is still offline
-      const entry=queue[0];
+      if(!state.user||state.user.id!==ownerId)break; // account changed mid-flush — stop, the rest is not ours to send
+      // Fresh read every round: messages queued while a send was in
+      // flight must survive this flush's bookkeeping.
+      const entry=nextSendableEntry(loadChatQueue(),ownerId);
+      if(!entry)break;
       try{
         const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:entry.text,conversationId:entry.conversationId||activeConversationId})});
         pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now());
+        removeChatQueueEntry(localStorage,entry.id);
       }catch(error){
         if(error.auth||isNetworkError(error))break; // keep the message until the session or connection recovers
+        removeChatQueueEntry(localStorage,entry.id); // non-network error — drop this one
         if(isPaywallError(error))showInlinePaywall(); // daily limit: inline nudge, never a generic toast
-        else toast(`A queued message failed: ${error.message}`); // non-network error — drop this one
+        else toast(`A queued message failed: ${error.message}`);
       }
-      queue=queue.slice(1);saveChatQueue(queue);
     }
     await refresh().catch(()=>{});
   }finally{flushingQueue=false;}
