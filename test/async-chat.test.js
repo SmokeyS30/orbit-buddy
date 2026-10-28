@@ -13,8 +13,8 @@ async function fixture(extraEnv = {}, extraOptions = {}) {
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
 
-async function register(base) {
-  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'owner@example.com', displayName: 'Owner', password: 'correct horse battery staple' }) });
+async function register(base,email='owner@example.com') {
+  const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, displayName: 'Owner', password: 'correct horse battery staple' }) });
   assert.equal(response.status, 201);
   const body = await response.json();
   return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, userId: body.user.id };
@@ -104,6 +104,100 @@ test('rapid sends are queued and answered in order', async (t) => {
   assert.deepEqual(messages.map((m) => m.role), ['user', 'assistant', 'user', 'assistant']);
   assert.ok(messages[1].content.includes('first question'), 'first reply matches first message');
   assert.ok(messages[3].content.includes('second question'), 'second reply matches second message');
+});
+
+test('slow summary does not block the next reply or hide uncovered history',async(t)=>{
+  const model=createModelClient({NODE_ENV:'test'});
+  model.configured=true;
+  let releaseSummary,summaryStarted=false;
+  let secondHistory=[];
+  model.respond=async({message,history=[],taskMode})=>{
+    if(taskMode){summaryStarted=true;await new Promise((resolve)=>{releaseSummary=resolve;});return{text:'Synthetic summary',toolCalls:[]};}
+    if(message.includes('second question'))secondHistory=history;
+    return{text:`Answered ${message}`,toolCalls:[]};
+  };
+  const {app,base}=await fixture({}, {modelClient:model});
+  t.after(async()=>{releaseSummary?.();await app.close();});
+  const auth=await register(base);
+  const conversation=app.db.ensureDefaultConversation(auth.userId);
+  for(let i=0;i<30;i++)app.db.addMessage(auth.userId,conversation.id,i%2?'assistant':'user',i===0?'Early context marker':'Synthetic earlier turn');
+  const first=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please answer the first question in detail.'})});
+  assert.equal(first.status,202);
+  assert.ok(await waitFor(()=>summaryStarted),'background summary started');
+  const second=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please answer the second question in detail.'})});
+  assert.equal(second.status,202);
+  assert.ok(await waitFor(()=>app.db.listConversationMessages(auth.userId,conversation.id,5)
+    .some((m)=>m.role==='assistant'&&m.content.includes('second question'))),
+    'second reply completed while summary model call remained pending');
+  assert.ok(secondHistory.some((m)=>m.content==='Early context marker'),'uncovered early history reached the second reply');
+  releaseSummary();
+  assert.ok(await waitFor(()=>app.db.getConversationSummary(auth.userId,conversation.id)?.summary==='Synthetic summary'));
+  app.db.setConversationSummary(auth.userId,conversation.id,'newer',100);
+  app.db.setConversationSummary(auth.userId,conversation.id,'stale',50);
+  assert.equal(app.db.getConversationSummary(auth.userId,conversation.id).summary,'newer');
+});
+
+test('queued turn history excludes later accepted user messages',async(t)=>{
+  const model=createModelClient({NODE_ENV:'test'});
+  let releaseFirst,started=false;
+  let secondHistory=[];
+  model.respond=async({message,history=[]})=>{
+    if(message==='First queued question'){started=true;await new Promise((resolve)=>{releaseFirst=resolve;});}
+    if(message==='Second queued question')secondHistory=history;
+    return{text:`Answered ${message}`,toolCalls:[]};
+  };
+  const {app,base}=await fixture({}, {modelClient:model});
+  t.after(async()=>{releaseFirst?.();await app.close();});
+  const auth=await register(base);
+  const send=(message)=>fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message})});
+  assert.equal((await send('First queued question')).status,202);
+  assert.ok(await waitFor(()=>started));
+  assert.equal((await send('Second queued question')).status,202);
+  assert.equal((await send('Third queued question')).status,202);
+  releaseFirst();
+  const conversation=app.db.ensureDefaultConversation(auth.userId);
+  assert.ok(await waitFor(()=>app.db.listConversationMessages(auth.userId,conversation.id,10)
+    .some((m)=>m.role==='assistant'&&m.content==='Answered Third queued question')));
+  assert.ok(secondHistory.some((m)=>m.content==='First queued question'));
+  assert.ok(secondHistory.every((m)=>m.content!=='Third queued question'));
+});
+
+test('owner latency diagnostics aggregate queued turns without exposing conversation data', async (t) => {
+  const model=createModelClient({NODE_ENV:'test'});
+  let releaseFirst,firstStarted=false,calls=0;
+  model.respond=async({onTurn,onToken})=>{
+    calls++;
+    onTurn?.(0);
+    if(calls===1){firstStarted=true;await new Promise((resolve)=>{releaseFirst=resolve;});}
+    onToken?.('A safe reply.');
+    return {text:'A safe reply.',toolCalls:[]};
+  };
+  const {app,base}=await fixture({}, {modelClient:model});t.after(()=>app.close());
+  const auth=await register(base);
+  assert.equal((await fetch(`${base}/api/admin/chat-latency`)).status,401);
+  const opened=await fetch(`${base}/api/admin/registration`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({open:true})});
+  assert.equal(opened.status,200);
+  const member=await register(base,'member@example.com');
+  assert.equal((await fetch(`${base}/api/admin/chat-latency`,{headers:{Cookie:member.cookie}})).status,403);
+  const first=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please explain the first turn in detail.'})});
+  assert.equal(first.status,202);
+  assert.ok(await waitFor(()=>firstStarted));
+  const second=await fetch(`${base}/api/chat`,{method:'POST',headers:authHeaders(auth),body:JSON.stringify({message:'Please explain the second turn in detail.'})});
+  assert.equal(second.status,202);
+  await new Promise((resolve)=>setTimeout(resolve,50));
+  releaseFirst();
+  assert.ok(await waitFor(()=>app.chatMetrics.snapshot().count===2));
+  const response=await fetch(`${base}/api/admin/chat-latency`,{headers:{Cookie:auth.cookie}});
+  assert.equal(response.status,200);
+  assert.equal(response.headers.get('cache-control'),'no-store');
+  const diagnostics=await response.json();
+  assert.equal(diagnostics.count,2);
+  assert.ok(diagnostics.timings.queueMs.p95>=40);
+  assert.equal(diagnostics.timings.modelFirstTokenMs.count,2);
+  assert.equal(diagnostics.timings.databaseMs.count,2);
+  assert.ok(!JSON.stringify(diagnostics).includes('Please explain'));
+  const health=await(await fetch(`${base}/healthz`)).json();
+  assert.deepEqual(health.chatPerformance,{state:'insufficient',windowMinutes:60});
 });
 
 test('a failing model call saves a graceful reply instead of a 500', async (t) => {

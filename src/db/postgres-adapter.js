@@ -22,8 +22,11 @@ import { signupSecuritySchema } from '../signup-security-schema.js';
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { decryptSecret, encryptSecret } from '../security.js';
+import { currentDeleteApproval, decodeApprovalRow, DELETE_APPROVAL_TABLES } from '../delete-approval.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from '../intelligence.js';
 import { assertMemorySafe } from '../relational-intelligence.js';
+import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from '../portable-recovery.js';
+import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from '../reply-jobs.js';
 
 const { Pool } = pg;
 const timestamp = () => new Date().toISOString();
@@ -95,8 +98,14 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
 
   // Test connection
   const client = await pool.connect();
+  let migrationLockHeld=false;
   try {
     await client.query('SELECT 1');
+    // Multiple replicas may start together during a deployment. Serialize
+    // additive DDL so each checks the finished schema, not a rival's partial
+    // migration. PostgreSQL releases this session lock if the worker exits.
+    await client.query('SELECT pg_advisory_lock($1::bigint)',[6108403817]);
+    migrationLockHeld=true;
     // Self-migration: ensure new columns exist (mirrors SQLite ensureColumn)
     const migrations = [
       ...signupSecuritySchema,
@@ -140,6 +149,10 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_job_id TEXT',
+      'CREATE SEQUENCE IF NOT EXISTS message_insert_order_seq',
+      'ALTER TABLE messages ADD COLUMN IF NOT EXISTS insert_order BIGINT',
+      "ALTER TABLE messages ALTER COLUMN insert_order SET DEFAULT nextval('message_insert_order_seq')",
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT \'fact\'',
       'ALTER TABLE memories ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT \'legacy\'',
@@ -326,6 +339,12 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (user_id, day_ny)
       )`,
+      `CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        month_key TEXT NOT NULL,
+        token TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      )`,
       `CREATE TABLE IF NOT EXISTS processed_notifications (
         notification_id TEXT PRIMARY KEY,
         received_at TEXT NOT NULL,
@@ -336,8 +355,39 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       "ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'processed'",
       'ALTER TABLE processed_notifications ADD COLUMN IF NOT EXISTS completed_at TEXT',
       'ALTER TABLE proactive_state ADD COLUMN IF NOT EXISTS last_app_open_at TEXT',
+      `CREATE TABLE IF NOT EXISTS reply_jobs (
+        seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        id TEXT NOT NULL UNIQUE,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        user_message_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('chat','regenerate')),
+        channel TEXT NOT NULL CHECK(channel IN ('web','whatsapp')),
+        status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','interrupted','cancelled')),
+        origin_instance TEXT,
+        requires_ephemeral INTEGER NOT NULL DEFAULT 0,
+        queued_at TEXT NOT NULL,
+        claimed_at TEXT,
+        lease_expires_at TEXT,
+        lease_token TEXT,
+        completed_at TEXT,
+        reply_message_id TEXT,
+        insert_created_at TEXT,
+        delivery_attempted_at TEXT,
+        delivery_to_phone TEXT,
+        delivery_link_verified_at TEXT
+      )`,
+      'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_to_phone TEXT',
+      'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_link_verified_at TEXT',
     ];
 const indexMigrations = [
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id)',
+      'CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(user_id,conversation_id,created_at DESC,insert_order DESC,id DESC)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq)',
+      'CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_created ON radar_findings(created_at DESC)',
       'CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)',
@@ -365,8 +415,20 @@ const indexMigrations = [
     // Reports are required by the reporting routes. Surface a failed table
     // migration at startup instead of leaving those routes to fail later.
     await client.query('SELECT 1 FROM reports LIMIT 0');
+    await client.query('SELECT 1 FROM reply_jobs LIMIT 0');
+    await client.query('SELECT delivery_to_phone,delivery_link_verified_at FROM reply_jobs LIMIT 0');
+    const ordering=await client.query(`SELECT column_default FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='messages' AND column_name='insert_order'`);
+    if(!String(ordering.rows[0]?.column_default||'').includes('message_insert_order_seq')){
+      throw new Error('PostgreSQL message insertion ordering migration is incomplete.');
+    }
+    const uniqueness=await client.query(`SELECT pg_get_indexdef(to_regclass('public.idx_messages_reply_job')) AS definition`);
+    if(!/^CREATE UNIQUE INDEX /i.test(String(uniqueness.rows[0]?.definition||''))){
+      throw new Error('PostgreSQL reply job uniqueness migration is incomplete.');
+    }
   } finally {
-    client.release();
+    try{if(migrationLockHeld)await client.query('SELECT pg_advisory_unlock($1::bigint)',[6108403817]);}
+    finally{client.release();}
   }
 
   // Helper to run queries
@@ -393,14 +455,14 @@ const indexMigrations = [
 
   // Transaction helper: runs fn with transaction-scoped get/all/run.
   // Commits on success, rolls back on error.
-  const withTransaction = async (fn) => {
+  const withTransaction = async (fn, readOnlySnapshot = false) => {
     const txClient = await pool.connect();
     const tQuery = async (sql, params = []) => txClient.query(toPgPlaceholders(sql), params);
     const tGet = async (sql, ...params) => (await tQuery(sql, params)).rows[0] || null;
     const tAll = async (sql, ...params) => (await tQuery(sql, params)).rows;
     const tRun = async (sql, ...params) => ({ changes: (await tQuery(sql, params)).rowCount || 0 });
     try {
-      await txClient.query('BEGIN');
+      await txClient.query(readOnlySnapshot?'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY':'BEGIN');
       const result = await fn({ query: tQuery, get: tGet, all: tAll, run: tRun });
       await txClient.query('COMMIT');
       return result;
@@ -575,7 +637,7 @@ const indexMigrations = [
 
     // --- Sessions ---
     createSession: async ({ tokenHash, userId, csrfToken, expiresAt, userAgent }) => { await run('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)', tokenHash, userId, csrfToken, expiresAt, timestamp(), userAgent || null); },
-    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    getSession: async (tokenHash) => get(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`, tokenHash, timestamp()),
     deleteSession: async (tokenHash) => { await run('DELETE FROM sessions WHERE token_hash=?', tokenHash); },
     deleteUserSessions: async (userId) => { await run('DELETE FROM sessions WHERE user_id=?', userId); },
@@ -633,11 +695,155 @@ const indexMigrations = [
       await run('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES (?, ?, ?, ?, ?, ?)', row.id, row.user_id, row.conversation_id, row.role, row.content, row.created_at);
       return row;
     },
+    acceptReplyJob: async (userId,conversationId,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
+      if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
+      // Serialize accepts for one conversation before allocating the global
+      // sequence. Otherwise a later seq can commit and run before an earlier
+      // uncommitted job becomes visible to claimers.
+      if(!await tGet('SELECT id FROM conversations WHERE id=? AND user_id=? FOR UPDATE',conversationId,userId))
+        throw new Error('Conversation not found.');
+      const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
+      await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)',
+        userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
+      const jobId=randomUUID(),queuedAt=timestamp();
+      const job=await tGet(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,origin_instance,requires_ephemeral,queued_at,lease_expires_at,delivery_to_phone,delivery_link_verified_at)
+        VALUES(?,?,?,?,'chat',?,?,?,?,?,?,?) RETURNING *`,jobId,userId,conversationId,userMessage.id,channel,originInstance,requiresEphemeral?1:0,queuedAt,
+        requiresEphemeral?new Date(Date.now()+REPLY_LEASE_MS).toISOString():null,deliveryToPhone,deliveryLinkVerifiedAt);
+      await tRun('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?',timestamp(),conversationId,userId);
+      return{userMessage,job};
+    }),
+    acceptRegenerateReplyJob: async (userId,conversationId,userMessageId,targetMessageId,insertCreatedAt,quotaPolicy=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      if(!await tGet('SELECT id FROM conversations WHERE id=? AND user_id=? FOR UPDATE',conversationId,userId))return null;
+      const userMessage=await tGet('SELECT * FROM messages WHERE id=? AND user_id=? AND conversation_id=? AND role=\'user\'',userMessageId,userId,conversationId);
+      const target=await tGet('SELECT * FROM messages WHERE id=? AND user_id=? AND conversation_id=? AND role=\'assistant\' FOR UPDATE',targetMessageId,userId,conversationId);
+      if(!userMessage||!target)return null;
+      if(quotaPolicy?.enforced){
+        const usage=await tGet(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+          ON CONFLICT(user_id,day_ny) DO UPDATE SET count=daily_usage.count+1,updated_at=excluded.updated_at
+          WHERE daily_usage.count<? RETURNING count`,userId,quotaPolicy.day,timestamp(),quotaPolicy.limit);
+        if(!usage){
+          const prior=await tGet('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?',userId,quotaPolicy.day);
+          return{quotaDenied:{...quotaPolicy,allowed:false,used:Number(prior?.count||quotaPolicy.limit)}};
+        }
+      }
+      await tRun('DELETE FROM messages WHERE id=? AND user_id=?',targetMessageId,userId);
+      const job=await tGet(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,queued_at,insert_created_at)
+        VALUES(?,?,?,?,'regenerate','web',?,?) RETURNING *`,randomUUID(),userId,conversationId,userMessageId,timestamp(),insertCreatedAt);
+      await tRun('UPDATE conversations SET updated_at=? WHERE id=? AND user_id=?',timestamp(),conversationId,userId);
+      return{userMessage,job};
+    }),
+    getReplyJob: async (id)=>get('SELECT * FROM reply_jobs WHERE id=?',id),
+    getConversationReplyJobState: async (userId,conversationId)=>get('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1',userId,conversationId),
+    cancelDisallowedReplyJobs: async ()=>(await run(`UPDATE reply_jobs j SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      FROM users u WHERE j.user_id=u.id AND j.status IN ('queued','running')
+      AND (u.disabled=1 OR u.moderation_blocked=1)`,timestamp())).changes,
+    cancelReplyJob: async (id,token)=>(await run(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE id=? AND status='running' AND lease_token=?`,timestamp(),id,token)).changes>0,
+    renewQueuedEphemeralReplyJobs: async (instanceId)=>(await run(`UPDATE reply_jobs SET lease_expires_at=? WHERE origin_instance=?
+      AND requires_ephemeral=1 AND status='queued'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),instanceId)).changes,
+    claimNextReplyJob: async (instanceId,leaseMs=REPLY_LEASE_MS)=>withTransaction(async ({get:tGet})=>{
+      const job=await tGet(`SELECT j.* FROM reply_jobs j JOIN conversations c ON c.id=j.conversation_id WHERE j.status='queued'
+        AND (j.requires_ephemeral=0 OR j.origin_instance=?)
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs active WHERE active.conversation_id=j.conversation_id AND active.status='running')
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs prior WHERE prior.conversation_id=j.conversation_id
+          AND prior.seq<j.seq AND prior.status IN ('queued','running'))
+        ORDER BY j.seq LIMIT 1 FOR UPDATE OF j,c SKIP LOCKED`,instanceId);
+      if(!job)return null;
+      const token=randomUUID(),claimedAt=timestamp(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      return tGet(`UPDATE reply_jobs SET status='running',claimed_at=?,lease_expires_at=?,lease_token=?
+        WHERE id=? AND status='queued' RETURNING *`,claimedAt,expiresAt,token,job.id);
+    }),
+    renewReplyJobLease: async (id,token,leaseMs=REPLY_LEASE_MS)=>(await run(`UPDATE reply_jobs SET lease_expires_at=?
+      WHERE id=? AND lease_token=? AND status='running' AND lease_expires_at>?`,new Date(Date.now()+leaseMs).toISOString(),id,token,timestamp())).changes>0,
+    releaseReplyJob: async (id,token)=>(await run(`UPDATE reply_jobs SET status='queued',claimed_at=NULL,
+      lease_expires_at=CASE WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
+      WHERE id=? AND lease_token=? AND status='running'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token)).changes>0,
+    completeReplyJob: async (id,token,content,insertCreatedAt=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const job=await tGet('SELECT * FROM reply_jobs WHERE id=? FOR UPDATE',id);
+      if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
+      const account=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',job.user_id);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        await tRun("UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL WHERE id=?",timestamp(),id);
+        return null;
+      }
+      const message={id:randomUUID(),user_id:job.user_id,conversation_id:job.conversation_id,role:'assistant',content,
+        created_at:insertCreatedAt||timestamp(),reply_job_id:id};
+      await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id) VALUES(?,?,?,?,?,?,?)',
+        message.id,message.user_id,message.conversation_id,message.role,message.content,message.created_at,id);
+      await tRun(`UPDATE reply_jobs SET status='completed',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=? AND lease_token=?`,
+        timestamp(),message.id,id,token);
+      return message;
+    }),
+    recoverExpiredReplyJobs: async (nowMs=Date.now())=>withTransaction(async ({all:tAll,get:tGet,run:tRun})=>{
+      const current=new Date(nowMs).toISOString();
+      const jobs=await tAll(`SELECT * FROM reply_jobs WHERE
+        (status='running' AND lease_expires_at<=?) OR
+        (status='queued' AND requires_ephemeral=1 AND lease_expires_at<=?)
+        ORDER BY seq FOR UPDATE SKIP LOCKED`,current,current);
+      for(const job of jobs){
+        await tRun(`INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id)
+          VALUES(?,?,?,'assistant',?,?,?) ON CONFLICT(reply_job_id) DO NOTHING`,randomUUID(),job.user_id,job.conversation_id,
+          REPLY_INTERRUPTED_TEXT,job.insert_created_at||current,job.id);
+        const reply=await tGet('SELECT id FROM messages WHERE reply_job_id=?',job.id);
+        await tRun(`UPDATE reply_jobs SET status='interrupted',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=?`,
+          current,reply?.id||null,job.id);
+      }
+      return jobs.length;
+    }),
+    markReplyDeliveryAttempted: async (id)=>(await run(`UPDATE reply_jobs SET delivery_attempted_at=? WHERE id=? AND channel='whatsapp'
+      AND status IN ('completed','interrupted') AND delivery_attempted_at IS NULL`,timestamp(),id)).changes>0,
+    listPendingReplyDeliveries: async (limit=10)=>all(`SELECT * FROM reply_jobs WHERE channel='whatsapp'
+      AND status IN ('completed','interrupted') AND delivery_attempted_at IS NULL AND reply_message_id IS NOT NULL
+      ORDER BY seq LIMIT ?`,Math.min(Math.max(limit,1),50)),
     async listConversationMessages(userId, conversationId, limit=60) {
-      return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
+      return (await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, conversationId, Math.min(Math.max(limit, 1), 200))).reverse();
+    },
+    async listConversationMessagesThrough(userId, conversationId, messageId, limit=60) {
+      return (await all(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND (created_at,COALESCE(insert_order,0),id)<=
+        (SELECT created_at,COALESCE(insert_order,0),id FROM messages WHERE id=? AND user_id=? AND conversation_id=?)
+        ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?`,userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200))).reverse();
+    },
+    // Chat hot path: one worker crossing, with independent PostgreSQL reads in
+    // flight together. The synchronous wrapper otherwise serializes every
+    // method call and blocks the Node event loop for each database round trip.
+    async getChatReplyContext(userId, conversationId, historyLimit=24) {
+      const limit = Math.min(Math.max(historyLimit, 1), 200);
+      const keys = [`buddy_name_asked_${userId}`, `ambient_context_${userId}`, `ambient_asked_${userId}`];
+      let [conversation, history, preferences, summary, settingRows, countRow] = await Promise.all([
+        get('SELECT * FROM conversations WHERE id=? AND user_id=?', conversationId, userId),
+        historyLimit > 0
+          ? all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, conversationId, limit)
+          : Promise.resolve([]),
+        get('SELECT * FROM user_preferences WHERE user_id=?', userId),
+        get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId),
+        all(`SELECT key,value FROM settings WHERE key IN (${keys.map(() => '?').join(',')})`, ...keys),
+        get('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?', conversationId, userId),
+      ]);
+      if (!preferences) {
+        const createdAt = timestamp();
+        await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', createdAt, createdAt);
+        preferences = await get('SELECT * FROM user_preferences WHERE user_id=?', userId);
+      }
+      const settings = Object.fromEntries(keys.map((key) => [key, null]));
+      for (const row of settingRows) settings[row.key] = row.value;
+      return {
+        conversation: conversation || null,
+        messageCount: Number(countRow?.count || 0),
+        history: history.reverse(),
+        preferences,
+        summary: summary || null,
+        settings,
+        writingVoice: {
+          optIn: Number(preferences?.writing_voice_opt_in) === 1,
+          profile: preferences?.writing_voice_profile || null,
+          updatedAt: preferences?.writing_voice_updated_at || null,
+          offered: Number(preferences?.writing_voice_offered) === 1,
+        },
+      };
     },
     async listMessages(userId, limit=60) {
-      return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
+      return (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,insert_order DESC NULLS LAST,id DESC LIMIT ?', userId, Math.min(Math.max(limit, 1), 200))).reverse();
     },
     getReportSubmission: async (userId, submissionId) => get('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?', userId, submissionId),
     countRecentReports: async (userId, since) => Number((await get('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?', userId, since)).count),
@@ -666,7 +872,7 @@ const indexMigrations = [
     async deleteMessageTurn(userId, messageId) {
       const target = await get('SELECT * FROM messages WHERE id=? AND user_id=?', messageId, userId);
       if (!target) return null;
-      const ordered = await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at ASC, id ASC LIMIT 200', userId, target.conversation_id);
+      const ordered = await all('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at ASC, insert_order ASC NULLS FIRST, id ASC LIMIT 200', userId, target.conversation_id);
       const idx = ordered.findIndex((m) => m.id === messageId);
       const ids = [messageId];
       const prev = idx > 0 ? ordered[idx - 1] : null;
@@ -674,7 +880,11 @@ const indexMigrations = [
       if (target.role === 'assistant' && prev && prev.role === 'user') ids.push(prev.id);
       if (target.role === 'user' && next && next.role === 'assistant') ids.push(next.id);
       await withTransaction(async ({ run: tRun }) => {
-        for (const id of ids) await tRun('DELETE FROM messages WHERE id=? AND user_id=?', id, userId);
+        for (const id of ids){
+          await tRun(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+            WHERE user_id=? AND user_message_id=? AND status IN ('queued','running')`,timestamp(),userId,id);
+          await tRun('DELETE FROM messages WHERE id=? AND user_id=?', id, userId);
+        }
       });
       return ids;
     },
@@ -732,6 +942,48 @@ const indexMigrations = [
       }
       return ranked;
     },
+    // Batch the independent context selects inside the PostgreSQL worker. This
+    // preserves ranking, episodic last-mentioned stamps, goal ordering, and
+    // project steps while removing serial main-thread worker waits.
+    async getChatModelContext(userId, queryText, { includePlanning=false, memoryLimit=8 }={}) {
+      const planningReads = includePlanning
+        ? [
+            all("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY priority DESC,due_date,created_at", userId),
+            all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+            all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+            all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
+          ]
+        : [Promise.resolve([]), Promise.resolve([]), Promise.resolve([]), Promise.resolve([])];
+      const [allMemories, followUps, goalRows, projectRows, projectSteps] = await Promise.all([
+        all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
+        ...planningReads,
+      ]);
+      const memories = rankMemories(allMemories, queryText, memoryLimit);
+      if (memories.length) {
+        const ids = memories.map((memory) => memory.id);
+        await run(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(() => '?').join(',')})`, timestamp(), userId, ...ids);
+      }
+      const grouped = new Map();
+      for (const step of projectSteps) {
+        const steps = grouped.get(step.project_id) || [];
+        steps.push(step);
+        grouped.set(step.project_id, steps);
+      }
+      return {
+        memories,
+        allMemories,
+        followUps: followUps.slice(0, 8),
+        goals: rankGoals(goalRows, 10),
+        projects: projectRows.filter((project) => project.status !== 'completed').map((row) => ({ ...row, steps: grouped.get(row.id) || [] })),
+      };
+    },
+    async getChatProactiveContext(userId) {
+      const [surfacedRows, personalDates] = await Promise.all([
+        all('SELECT * FROM memory_surfacing WHERE user_id=? ORDER BY surfaced_at DESC LIMIT ?', userId, 200),
+        all('SELECT * FROM personal_dates WHERE user_id=? ORDER BY month,day,label', userId),
+      ]);
+      return { surfacedRows, personalDates };
+    },
     // Memory decay: recalculate relevance scores based on inactivity.
     // Run during the daily learning cycle.
     async applyMemoryDecay(userId) {
@@ -784,12 +1036,17 @@ const indexMigrations = [
     },
 
     // --- Import jobs ---
-    async createImportJob(userId, filename) {
+    async createImportJob(userId, filename) { return withTransaction(async ({query:tQuery,get:tGet,run:tRun})=>{
+      await tQuery('SELECT pg_advisory_xact_lock(hashtext(?))',[userId]);
       const now = timestamp();
+      await tRun("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?",
+        now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(await tGet("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1",userId))return null;
+      if(Number((await tGet('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?',userId,new Date(Date.now()-24*60*60_000).toISOString())).count)>=3)return null;
       const row = { id: randomUUID(), user_id: userId, filename: String(filename||'').slice(0, 200), status: 'processing', total_chunks: 0, done_chunks: 0, suggestions_added: 0, error: null, created_at: now, updated_at: now };
-      await run('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.user_id, row.filename, row.status, row.total_chunks, row.done_chunks, row.suggestions_added, row.error, row.created_at, row.updated_at);
+      await tRun('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', row.id, row.user_id, row.filename, row.status, row.total_chunks, row.done_chunks, row.suggestions_added, row.error, row.created_at, row.updated_at);
       return row;
-    },
+    }); },
     getImportJob: async (userId, id) => (await get('SELECT * FROM import_jobs WHERE id=? AND user_id=?', id, userId)) || null,
     listImportJobs: async (userId) => all('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 5', userId),
     async updateImportJob(userId, id, patch={}) {
@@ -799,6 +1056,42 @@ const indexMigrations = [
       await run('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?', next.status, next.total_chunks, next.done_chunks, next.suggestions_added, next.error, next.updated_at, id, userId);
       return { ...cur, ...next };
     },
+    async isImportJobActive(userId,id){
+      const row=await get(`SELECT 1 FROM import_jobs j JOIN users u ON u.id=j.user_id
+        WHERE j.id=? AND j.user_id=? AND j.status='processing' AND u.disabled=0 AND u.moderation_blocked=0 AND u.is_demo=0`,id,userId);
+      return !!row&&(await get("SELECT value FROM settings WHERE key='system_paused'"))?.value!=='true';
+    },
+    updateImportJobIfCurrent: async (userId,id,patch={},allowInactive=false)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      if(!allowInactive){
+        // Pausing uses an UPSERT; a row lock alone cannot fence it when the
+        // setting has never been stored. The short table lock also covers that case.
+        await tQuery('LOCK TABLE settings IN SHARE MODE');
+        const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
+        if(!user||user.disabled||user.moderation_blocked||user.is_demo
+          ||(await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
+      }
+      const cur=await tGet('SELECT * FROM import_jobs WHERE id=? AND user_id=? FOR UPDATE',id,userId);
+      if(cur?.status!=='processing')return null;
+      const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,
+        done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,
+        error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};
+      await tRun('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?',
+        next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);
+      return{...cur,...next};
+    }),
+    addImportSuggestionIfCurrent: async (userId,id,content,options={})=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
+      const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo)return null;
+      if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
+      const job=await tGet('SELECT status FROM import_jobs WHERE id=? AND user_id=? FOR UPDATE',id,userId);
+      if(job?.status!=='processing')return null;
+      const row={id:randomUUID(),user_id:userId,content:assertMemorySafe(content),created_at:timestamp(),
+        kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};
+      await tRun('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)',
+        row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);
+      return row;
+    }),
 
     // --- Follow-ups ---
     async addFollowUp(userId, { description, dueDate, priority=2, sourceMessageId=null }) {
@@ -1041,6 +1334,36 @@ const indexMigrations = [
       const at = timestamp();
       if (!(await run("UPDATE approvals SET status=?,result_json=?,last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending' AND execution_started_at IS NOT NULL", status, result ? JSON.stringify(result) : null, error ? String(error).slice(0, 1000) : null, at, at, id, userId)).changes) return null;
       return this.getApproval(userId, id);
+    },
+    async executeDeleteApprovalIfCurrent(userId, approvalId) {
+      return withTransaction(async ({ query: tQuery, get: tGet, all: tAll, run: tRun }) => {
+        // A concurrent editor, chat turn or reviewer must commit either before
+        // this decision is read or after the deletion is committed. Avoid a
+        // late destructive write if an overloaded database cannot get locks.
+        await tQuery("SET LOCAL lock_timeout = '5000ms'");
+        const raw = await tGet('SELECT * FROM approvals WHERE id=? AND user_id=? FOR UPDATE', approvalId, userId);
+        if (!raw || raw.status !== 'pending' || raw.execution_started_at) return { status: 'already' };
+        const approval = decodeApprovalRow(raw);
+        const { id, objectType } = approval.payload || {};
+        const table = DELETE_APPROVAL_TABLES[objectType];
+        const target = table ? await tGet(`SELECT * FROM ${table} WHERE id=? AND user_id=? FOR UPDATE`, id, userId) : null;
+        // messages has no user FK or common write lock. SHARE blocks message
+        // writes until this short transaction commits, including newer chat
+        // turns on separate application replicas.
+        await tQuery('LOCK TABLE messages IN SHARE MODE');
+        const recent = await tAll('SELECT * FROM messages WHERE user_id=? ORDER BY insert_order DESC NULLS LAST, created_at DESC, id DESC LIMIT 200', userId);
+        const selected = currentDeleteApproval(approval, recent, target);
+        const now = timestamp();
+        if (!selected) {
+          await tRun("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'", 'Deletion request or target changed.', now, now, approvalId, userId);
+          return { status: 'stale', approval: decodeApprovalRow(await tGet('SELECT * FROM approvals WHERE id=? AND user_id=?', approvalId, userId)) };
+        }
+        const deleted = await tRun(`DELETE FROM ${table} WHERE id=? AND user_id=?`, id, userId);
+        if (!deleted.changes) throw new Error('Deletion target changed during transaction.');
+        const result = { deleted: approval.kind, id: selected.id, title: selected.title };
+        await tRun("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'", JSON.stringify(result), now, now, approvalId, userId);
+        return { status: 'executed', approval: decodeApprovalRow(await tGet('SELECT * FROM approvals WHERE id=? AND user_id=?', approvalId, userId)), result };
+      });
     },
 
     // --- Proactive / nudges ---
@@ -1294,10 +1617,44 @@ const indexMigrations = [
       const row = await get('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?', userId, monthKey);
       return row ? row.narrative : null;
     },
+    getTimelineNarrativeRecord: async (userId, monthKey) => get('SELECT narrative, generated_at FROM timeline_cache WHERE user_id=? AND month_key=?',userId,monthKey),
     setTimelineNarrative: async (userId, monthKey, narrative) => {
       await run(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
         ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`, userId, monthKey, narrative, timestamp());
     },
+    claimTimelineNarrative: async (userId,monthKey,freshAfter=null)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
+      const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo)return null;
+      if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return null;
+      const cached=await tGet('SELECT generated_at FROM timeline_cache WHERE user_id=? AND month_key=?',userId,monthKey);
+      if(cached&&(!freshAfter||cached.generated_at>freshAfter))return null;
+      const now=timestamp(),token=randomUUID();
+      const claimed=await tRun(`INSERT INTO timeline_generation_leases(user_id,month_key,token,expires_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET month_key=excluded.month_key,token=excluded.token,expires_at=excluded.expires_at
+        WHERE timeline_generation_leases.expires_at<=?`,userId,monthKey,token,new Date(Date.now()+5*60_000).toISOString(),now);
+      return claimed.changes?token:null;
+    }),
+    isTimelineNarrativeLeaseActive: async (userId,monthKey,token)=>{
+      const user=await get('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=?',userId);
+      const lease=await get('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?',userId);
+      return !!(user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo
+        &&(await get("SELECT value FROM settings WHERE key='system_paused'"))?.value!=='true'
+        &&lease?.token===token&&lease.month_key===monthKey&&lease.expires_at>timestamp());
+    },
+    completeTimelineNarrative: async (userId,monthKey,token,narrative)=>withTransaction(async ({get:tGet,run:tRun,query:tQuery})=>{
+      await tQuery('LOCK TABLE settings IN SHARE MODE');
+      const user=await tGet('SELECT disabled,moderation_blocked,is_demo FROM users WHERE id=? FOR UPDATE',userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo)return false;
+      if((await tGet("SELECT value FROM settings WHERE key='system_paused' FOR SHARE"))?.value==='true')return false;
+      const lease=await tGet('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=? FOR UPDATE',userId);
+      if(lease?.token!==token||lease.month_key!==monthKey||lease.expires_at<=timestamp())return false;
+      await tRun(`INSERT INTO timeline_cache(user_id,month_key,narrative,generated_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id,month_key) DO UPDATE SET narrative=excluded.narrative, generated_at=excluded.generated_at`,userId,monthKey,narrative,timestamp());
+      await tRun('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?',userId,token);
+      return true;
+    }),
+    releaseTimelineNarrative: async (userId,token)=>{await run('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?',userId,token);},
     async timelineMonthData(userId, monthKey) {
       return {
         memories: await all("SELECT content, kind FROM memories WHERE user_id=? AND status='approved' AND source!='registration' AND substr(created_at,1,7)=? ORDER BY created_at DESC LIMIT 8", userId, monthKey),
@@ -1312,7 +1669,8 @@ const indexMigrations = [
     getConversationSummary: async (userId, conversationId) => (await get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId)) || null,
     async setConversationSummary(userId, conversationId, summary, messageCount) {
       await run(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
-        VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`,
+        VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at
+        WHERE excluded.message_count>conversation_summaries.message_count`,
         conversationId, userId, summary, messageCount, timestamp());
       return get('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?', conversationId, userId);
     },
@@ -1343,13 +1701,17 @@ const indexMigrations = [
       return get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
     },
     deleteTask: async (userId, id) => (await run('DELETE FROM tasks WHERE id=? AND user_id=?', id, userId)).changes > 0,
-    startTask: async (userId, id, leaseMs=2*60_000) => (await run("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId)).changes > 0,
+    // RETURNING binds the generation to this claim in the same atomic update.
+    startTask: async (userId, id, leaseMs=2*60_000) => (await get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId, timestamp()))?.attempt_count || null,
+    renewTaskLease: async (userId,id,attempt,leaseMs=2*60_000) => (await run("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp())).changes > 0,
     recoverStaleTasks: async () => {
       const current = timestamp();
       return (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)", current, current, current)).changes;
     },
-    completeTask: async (userId, id, result, status='completed', scheduleAt=null) => (await run('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?', status, result, scheduleAt, timestamp(), id, userId)).changes > 0,
-    failTask: async (userId, id, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?", message, String(error||'').slice(0, 1000), timestamp(), id, userId)).changes > 0,
+    // Explicit user completion revokes any active worker lease.
+    completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes > 0,
+    completeTask: async (userId, id, attempt, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", status, result, scheduleAt, timestamp(), id, userId, attempt, timestamp())).changes > 0,
+    failTask: async (userId, id, attempt, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", message, String(error||'').slice(0, 1000), timestamp(), id, userId, attempt, timestamp())).changes > 0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
 
@@ -1467,6 +1829,9 @@ const indexMigrations = [
         data.id || randomUUID(), userId, provider, data.accessEncrypted, data.refreshEncrypted || null, data.scopes || '', data.expiresAt || null, JSON.stringify(data.profile || {}), now, now);
     },
     listConnectors: async (userId) => all('SELECT id,provider,scopes,expires_at,profile_json,created_at,updated_at FROM connectors WHERE user_id=?', userId),
+    // Match the original credential revision; a refresh must never upsert.
+    refreshConnector: async (userId,provider,previous,data) => (await run('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted)).changes > 0,
+    deleteConnectorIfCurrent: async (userId,provider,previous) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',userId,provider,previous.id,previous.access_encrypted)).changes > 0,
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
     deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
 
@@ -1614,38 +1979,71 @@ const indexMigrations = [
 
     // --- Export / restore ---
     async exportUser(userId) {
-      const artifactIds = await all('SELECT id FROM artifacts WHERE user_id=? ORDER BY created_at DESC LIMIT 200', userId);
-      const artifacts = [];
-      for (const a of artifactIds) artifacts.push(await get('SELECT * FROM artifacts WHERE id=? AND user_id=?', a.id, userId));
-      return {
-        version: 5, exportedAt: timestamp(),
-        user: await get('SELECT * FROM users WHERE id = ?', userId),
-        conversations: await all('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,id DESC', userId),
-        messages: (await all('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, 20000)).reverse(),
-        memories: await all("SELECT * FROM memories WHERE user_id=? AND status='approved' ORDER BY updated_at DESC,id DESC LIMIT 100", userId),
-        memorySuggestions: await all('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 50', userId),
-        followUps: await all("SELECT * FROM follow_ups WHERE user_id=? AND status='scheduled' ORDER BY priority DESC,due_date,created_at", userId),
-        goals: await all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
-        goalCheckins: await all('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at', userId),
-        routines: await all('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,LOWER(title)', userId),
-        projects: await all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
-        projectSteps: await all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
-        approvals: await all("SELECT * FROM approvals WHERE user_id=? ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END,created_at DESC,id DESC LIMIT 200", userId),
-        preferences: await this.getPreferences(userId),
-        conversationSummaries: await all('SELECT * FROM conversation_summaries WHERE user_id=?', userId),
-        calendarFeeds: await this.listCalendarFeeds(userId),
-        tasks: await all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),
-        events: await all('SELECT * FROM events WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT ?', userId, 20000),
-        artifacts,
-      };
+      await this.getPreferences(userId); // Create defaults before the read-only snapshot.
+      return withTransaction(async ({get,all})=>{
+        const user=await get('SELECT id,email,display_name FROM users WHERE id=?',userId);
+        if(!user)throw new Error('Backup user not found.');
+        const hasInsertOrder=(await get(`SELECT EXISTS(SELECT 1 FROM information_schema.columns
+          WHERE table_schema=current_schema() AND table_name='messages' AND column_name='insert_order') AS present`))?.present;
+        const messageOrder=hasInsertOrder?'created_at,insert_order NULLS FIRST,id':'created_at,id';
+        const bundle={
+          version: 6, exportedAt: timestamp(), user,
+          conversations: await all('SELECT * FROM conversations WHERE user_id=? ORDER BY updated_at DESC,id DESC', userId),
+          messages: await all(`SELECT * FROM messages WHERE user_id=? ORDER BY ${messageOrder}`, userId),
+          memories: await all('SELECT * FROM memories WHERE user_id=? ORDER BY created_at,id', userId),
+          memorySuggestions: await all('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at,id', userId),
+          followUps: await all('SELECT * FROM follow_ups WHERE user_id=? ORDER BY created_at,id', userId),
+          goals: await all("SELECT * FROM goals WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+          goalCheckins: await all('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at', userId),
+          routines: await all('SELECT * FROM routines WHERE user_id=? ORDER BY enabled DESC,time_local,LOWER(title)', userId),
+          projects: await all("SELECT * FROM projects WHERE user_id=? ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 ELSE 2 END,priority DESC,COALESCE(target_date,'9999-12-31'),updated_at DESC", userId),
+          projectSteps: await all('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at', userId),
+          approvals: await all('SELECT * FROM approvals WHERE user_id=? ORDER BY created_at,id', userId),
+          preferences: await get('SELECT * FROM user_preferences WHERE user_id=?',userId),
+          conversationSummaries: await all('SELECT * FROM conversation_summaries WHERE user_id=?', userId),
+          calendarFeeds: (await all('SELECT * FROM calendar_feeds WHERE user_id=? ORDER BY LOWER(label)',userId))
+            .map((row)=>({...row,url:revealSecret(row.url)})),
+          tasks: await all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at,id', userId),
+          events: await all('SELECT * FROM events WHERE user_id=? ORDER BY created_at,id', userId),
+          artifacts: await all('SELECT * FROM artifacts WHERE user_id=? ORDER BY created_at,id', userId),
+        };
+        for(const entry of PORTABLE_USER_TABLES){
+          bundle[entry.key]=await all(`SELECT ${entry.columns.join(',')} FROM ${entry.table} WHERE user_id=?`,userId);
+        }
+        return bundle;
+      },true);
     },
     async restoreUser(userId, bundle) {
-      if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4,5,6].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       await withTransaction(async ({ run: tRun, get: tGet }) => {
+        // The worker waits for this transaction's definitive result. Bound a
+        // blocked SQL statement so a stalled remote database rolls back.
+        await tRun("SET LOCAL statement_timeout = '60s'");
+        await tRun("SET LOCAL lock_timeout = '10s'");
         for (const row of bundle.conversations || []) await tRun('INSERT INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.created_at, row.updated_at);
-        for (const row of bundle.messages || []) await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.conversation_id || null, row.role, row.content, row.created_at);
-        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at, normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null, row.last_confirmed_at || row.updated_at, row.proactive_allowed === 0 ? 0 : 1);
+        // Batching cuts 20,000 remote round trips to about 200. Keep each
+        // parameter batch small even when an exported message is very large.
+        let messageRows=[],messageBytes=0;
+        const flushMessages=async()=>{
+          if(!messageRows.length)return;
+          const placeholders=messageRows.map(()=>'(?,?,?,?,?,?)').join(',');
+          await tRun(`INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES ${placeholders}
+            ON CONFLICT DO NOTHING`,...messageRows.flat());
+          messageRows=[];messageBytes=0;
+        };
+        for(const row of bundle.messages||[]){
+          const values=[row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at];
+          const rowBytes=Buffer.byteLength(String(row.content||''),'utf8')+256;
+          if(messageRows.length>=100||messageBytes+rowBytes>1024*1024)await flushMessages();
+          messageRows.push(values);messageBytes+=rowBytes;
+        }
+        await flushMessages();
+        for (const row of bundle.memories || []) await tRun(`INSERT INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,
+          last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, assertMemorySafe(row.content), row.created_at, row.updated_at,
+          normalizeMemoryKind(row.kind), row.source || 'backup', row.status || 'approved', row.confidence ?? 1, row.expires_at || null,
+          row.last_confirmed_at || row.updated_at, row.last_mentioned_at || null, row.relevance_score ?? 1,
+          row.superseded_by || null, row.embedding || null, row.proactive_allowed === 0 ? 0 : 1);
         for (const row of bundle.memorySuggestions || []) await tRun('INSERT INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, assertMemorySafe(row.content), row.created_at, normalizeMemoryKind(row.kind), row.confidence ?? 0.7);
         for (const row of bundle.followUps || []) await tRun('INSERT INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.description, row.due_date, row.status || 'scheduled', normalizePriority(row.priority), row.source_message_id || null, row.created_at, row.completed_at || null);
         for (const row of bundle.goals || []) await tRun('INSERT INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.title, row.description || null, row.status || 'active', normalizePriority(row.priority), Math.max(0, Math.min(Number(row.progress) || 0, 100)), row.target_date || null, row.next_step || null, row.created_at, row.updated_at, row.completed_at || null);
@@ -1656,15 +2054,31 @@ const indexMigrations = [
         for (const row of bundle.approvals || []) await tRun('INSERT INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.kind, row.title, row.summary, row.payload_json || '{}', ['pending','executed','rejected','failed'].includes(row.status) ? row.status : 'pending', row.source_message_id || null, row.result_json || null, row.last_error || null, row.created_at, row.updated_at, row.reviewed_at || null);
         for (const row of bundle.conversationSummaries || []) await tRun('INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING', row.conversation_id, userId, row.summary, row.message_count, row.updated_at);
         for (const row of bundle.calendarFeeds || []) await tRun('INSERT INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.label, protectSecret(row.url), row.created_at, row.updated_at);
-        for (const row of bundle.tasks || []) await tRun(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, row.title, row.prompt, row.status, row.risk, row.schedule_at, row.recurrence, row.result, row.created_at, row.updated_at, row.attempt_count || 0, row.lease_expires_at || null, row.last_error || null);
+        for (const row of bundle.tasks || []) await tRun(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,
+          created_at,updated_at,attempt_count,lease_expires_at,last_error)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, row.id, userId, row.title, row.prompt, row.status, row.risk,
+          row.schedule_at, row.recurrence, row.delivery_channel==='whatsapp'?'whatsapp':'push', row.result, row.created_at,
+          row.updated_at, row.attempt_count || 0, null, row.last_error || null);
         for (const row of bundle.events || []) await tRun('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.type, row.message, row.detail, row.created_at);
         for (const row of bundle.artifacts || []) await tRun('INSERT INTO artifacts(id,user_id,task_id,name,mime_type,content,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING', row.id, userId, row.task_id, row.name, row.mime_type, row.content, row.size_bytes, row.created_at);
+        if(bundle.version===6){
+          for(const entry of PORTABLE_USER_TABLES){
+            const sql=portableInsertSql(entry,true);
+            for(const row of bundle[entry.key]||[])await tRun(sql,...portableRowValues(entry,row,userId));
+          }
+        }
         if (bundle.preferences) {
           const p = normalizePreferences(bundle.preferences);
           const current = await tGet('SELECT * FROM user_preferences WHERE user_id=?', userId);
           const created = current?.created_at || timestamp();
           await tRun(upsertPreferencesSql, userId, p.timeZone, p.quietStart, p.quietEnd, p.proactiveEnabled ? 1 : 0, p.briefingTone, p.briefingLength, created, timestamp());
+          if(bundle.version===6){
+            const old=bundle.preferences;
+            await tRun(`UPDATE user_preferences SET buddy_name=?,writing_voice_opt_in=?,writing_voice_profile=?,writing_voice_updated_at=?,
+              writing_voice_offered=?,intro_dismissed=? WHERE user_id=?`,old.buddy_name||null,old.writing_voice_opt_in===1?1:0,
+              old.writing_voice_profile||null,old.writing_voice_updated_at||null,old.writing_voice_offered===1?1:0,
+              old.intro_dismissed===1?1:0,userId);
+          }
         }
       });
     },

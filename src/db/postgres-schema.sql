@@ -55,14 +55,22 @@ CREATE TABLE IF NOT EXISTS settings (
   updated_at TEXT NOT NULL
 );
 
+CREATE SEQUENCE IF NOT EXISTS message_insert_order_seq;
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
   user_id TEXT,
   conversation_id TEXT,
   role TEXT NOT NULL CHECK(role IN ('user','assistant')),
   content TEXT NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  reply_job_id TEXT,
+  insert_order BIGINT DEFAULT nextval('message_insert_order_seq')
 );
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_job_id TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS insert_order BIGINT;
+ALTER TABLE messages ALTER COLUMN insert_order SET DEFAULT nextval('message_insert_order_seq');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_order ON messages(user_id,conversation_id,created_at DESC,insert_order DESC,id DESC);
 
 CREATE TABLE IF NOT EXISTS reports (
   id TEXT PRIMARY KEY,
@@ -372,6 +380,13 @@ CREATE TABLE IF NOT EXISTS timeline_cache (
   PRIMARY KEY (user_id, month_key)
 );
 
+CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  month_key TEXT NOT NULL,
+  token TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
 DROP TABLE IF EXISTS automation_tokens;
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -381,6 +396,34 @@ CREATE TABLE IF NOT EXISTS conversations (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reply_jobs (
+  seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  id TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  user_message_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('chat','regenerate')),
+  channel TEXT NOT NULL CHECK(channel IN ('web','whatsapp')),
+  status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','interrupted','cancelled')),
+  origin_instance TEXT,
+  requires_ephemeral INTEGER NOT NULL DEFAULT 0,
+  queued_at TEXT NOT NULL,
+  claimed_at TEXT,
+  lease_expires_at TEXT,
+  lease_token TEXT,
+  completed_at TEXT,
+  reply_message_id TEXT,
+  insert_created_at TEXT,
+  delivery_attempted_at TEXT,
+  delivery_to_phone TEXT,
+  delivery_link_verified_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq);
+CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq);
+CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq);
+CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral);
 
 CREATE TABLE IF NOT EXISTS proactive_state (
   user_id TEXT PRIMARY KEY,

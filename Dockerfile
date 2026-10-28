@@ -11,6 +11,8 @@ RUN --mount=type=secret,id=proxy_ca \
       npm ci --omit=dev --ignore-scripts; \
     fi \
     && npm cache clean --force
+ARG RELEASE_SHA=unknown
+ENV ORBIT_RELEASE_SHA=$RELEASE_SHA
 COPY server.js ./
 COPY src ./src
 COPY public ./public

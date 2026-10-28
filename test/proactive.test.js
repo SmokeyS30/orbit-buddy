@@ -158,7 +158,7 @@ test('weekly review runs once per Sunday with real activity', async (t) => {
   const auth = await register(base);
   app.db.setPreferences(auth.userId, { quietStart: '00:00', quietEnd: '00:00' });
   const task = app.db.addTask(auth.userId, { title: 'Finish report', prompt: 'Write it' });
-  app.db.completeTask(auth.userId, task.id, 'done');
+  app.db.completeTask(auth.userId, task.id, app.db.startTask(auth.userId, task.id), 'done');
   app.db.addMemory(auth.userId, 'Learned something new this week');
   const sunday = Date.parse('2026-10-04T15:00:00Z'); // Sunday, 11:00 AM EDT
   await app.runProactiveChecks(sunday);

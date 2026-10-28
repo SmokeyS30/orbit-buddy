@@ -56,5 +56,8 @@ jobs:
           if (health.backup?.configured !== true || health.backup?.state !== 'ready') {
             throw new Error(`/healthz backup state is ${health.backup?.state || 'missing'}`);
           }
+          if (health.chatPerformance?.state === 'degraded') {
+            throw new Error('Chat latency or error rate exceeded the aggregate alert threshold.');
+          }
           console.log('Orbit production health and durable backup status are ready.');
           NODE

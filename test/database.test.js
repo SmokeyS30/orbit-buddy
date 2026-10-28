@@ -145,6 +145,42 @@ test('stores typed memory and ranks relevant details ahead of unrelated ones', (
   db.close();
 });
 
+test('batched chat context preserves history, preferences, memory and planning data', () => {
+  const { db, user } = fixture();
+  const convo = db.ensureDefaultConversation(user.id);
+  db.addMessage(user.id, convo.id, 'user', 'Help plan my flight');
+  db.setSetting(`buddy_name_asked_${user.id}`, '123');
+  db.setWritingVoiceProfile(user.id, 'Short, friendly sentences.');
+  const memory = db.addMemory(user.id, 'Prefers aisle seats on flights.', { kind: 'preference' });
+  db.addMemory(user.id, 'The shed is blue.', { kind: 'fact' });
+  db.addFollowUp(user.id, { description: 'Book the flight', dueDate: '2026-12-01' });
+  db.addGoal(user.id, { title: 'Take the trip', priority: 3 });
+  db.addProject(user.id, { title: 'Travel plan', steps: [{ title: 'Compare fares' }] });
+  db.addPersonalDate(user.id, { label: 'Trip anniversary', month: 6, day: 15, type: 'anniversary' });
+
+  const reply = db.getChatReplyContext(user.id, convo.id, 24);
+  assert.equal(reply.conversation.id, convo.id);
+  assert.equal(reply.history.at(-1).content, 'Help plan my flight');
+  assert.equal(reply.preferences.time_zone, 'America/New_York');
+  assert.equal(reply.settings[`buddy_name_asked_${user.id}`], '123');
+  assert.equal(reply.writingVoice.optIn, true);
+  assert.equal(reply.writingVoice.profile, 'Short, friendly sentences.');
+  assert.deepEqual(db.getChatReplyContext(user.id, convo.id, 0).history, [], 'regenerate can skip the redundant history read');
+
+  const model = db.getChatModelContext(user.id, 'Help plan my flight', { includePlanning: true });
+  assert.equal(model.memories[0].id, memory.id);
+  assert.ok(model.allMemories.some((entry) => entry.id === memory.id));
+  assert.equal(model.followUps[0].description, 'Book the flight');
+  assert.equal(model.goals[0].title, 'Take the trip');
+  assert.equal(model.projects[0].steps[0].title, 'Compare fares');
+  assert.ok(db.getMemory(user.id, memory.id).last_mentioned_at, 'episodic recall stamp preserved');
+
+  const proactive = db.getChatProactiveContext(user.id);
+  assert.equal(proactive.personalDates[0].label, 'Trip anniversary');
+  assert.deepEqual(proactive.surfacedRows, []);
+  db.close();
+});
+
 test('encrypts calendar feed URLs at rest and decrypts them through the database API', () => {
   const key = Buffer.alloc(32, 7);
   const { db, user, filePath } = fixture({ encryptionKey: key });
@@ -162,7 +198,7 @@ test('encrypts calendar feed URLs at rest and decrypts them through the database
 test('recovers a task whose worker lease expired', () => {
   const { db, user } = fixture();
   const task = db.addTask(user.id, { title: 'Recover me', prompt: 'Continue safely' });
-  assert.equal(db.startTask(user.id, task.id, -1000), true);
+  assert.equal(db.startTask(user.id, task.id, -1000), 1);
   assert.equal(db.getTask(user.id, task.id).status, 'running');
   assert.equal(db.recoverStaleTasks(), 1);
   assert.equal(db.getTask(user.id, task.id).status, 'queued');
@@ -188,14 +224,14 @@ test('tracks goal progress and recurring routine leases', () => {
   db.close();
 });
 
-test('backup version 5 preserves goals, routines, projects, and approvals', () => {
+test('backup version 6 preserves goals, routines, projects, and approvals', () => {
   const source = fixture();
   source.db.addGoal(source.user.id, { title: 'Run a 10K', priority: 2 });
   source.db.addRoutine(source.user.id, { title: 'Evening reflection', prompt: 'Reflect', kind: 'reflection', cadence: 'daily', timeLocal: '20:00' });
   source.db.addProject(source.user.id, { title: 'Move house', steps: [{ title: 'Book movers', dueDate: '2026-11-01' }] });
   source.db.addApproval(source.user.id, { kind: 'calendar_event', title: 'Add moving day', summary: 'Calendar proposal', payload: { title: 'Moving day', startAt: '2026-11-10T14:00:00.000Z', endAt: '2026-11-10T16:00:00.000Z' } });
   const bundle = source.db.exportUser(source.user.id);
-  assert.equal(bundle.version, 5);
+  assert.equal(bundle.version, 6);
   source.db.close();
   const target = fixture();
   target.db.restoreUser(target.user.id, bundle);
@@ -305,7 +341,7 @@ test('finds memories from the same date in prior years', () => {
 test('lists recent completions for the weekly review', () => {
   const { db, user } = fixture();
   const task = db.addTask(user.id, { title: 'Finish report', prompt: 'Write it' });
-  db.completeTask(user.id, task.id, 'done');
+  db.completeTask(user.id, task.id, db.startTask(user.id, task.id), 'done');
   const pending = db.addTask(user.id, { title: 'Later thing', prompt: 'Later' });
   const weekAgo = new Date(Date.now() - 8 * 86400_000).toISOString();
   const done = db.listTasksCompletedSince(user.id, weekAgo);

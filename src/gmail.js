@@ -116,9 +116,49 @@ export async function listSentEmails(getToken, { max = 30 } = {}) {
   return { count: emails.length, emails };
 }
 
-// Move an email to trash (recoverable for 30 days) by message ID
-export async function trashEmail(getToken, { id }) {
-  if (!id) throw new Error('A message ID is required.');
-  await apiFetch(getToken, `/messages/${encodeURIComponent(id)}/trash`, { method: 'POST' });
-  return { trashed: true, id };
+const TRASH_PREVIEW_FIELDS=['id','mailbox','threadId','historyId','from','subject','date','snippet'];
+const cleanPreviewText=(value,limit)=>String(value||'').replace(/\s+/g,' ').trim().slice(0,limit);
+
+async function trashPreviewForToken(token,id){
+  if(!/^[A-Za-z0-9_-]{1,100}$/.test(String(id||'')))throw Object.assign(new Error('A valid Gmail message ID is required.'),{status:400});
+  let profile,message;
+  try{
+    const getToken=async()=>token;
+    profile=await apiFetch(getToken,'/profile');
+    message=await apiFetch(getToken,`/messages/${encodeURIComponent(id)}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`);
+  }catch(error){throw Object.assign(new Error('Could not verify this Gmail message. Try again after checking the connection.'),{status:502,cause:error});}
+  const mailbox=cleanPreviewText(profile.emailAddress,254).toLowerCase();
+  if(!mailbox.includes('@')||message.id!==id||!message.threadId||!message.historyId||message.labelIds?.includes('TRASH')){
+    throw Object.assign(new Error('Gmail returned incomplete or changed metadata for the selected message.'),{status:409});
+  }
+  const headers=Object.fromEntries((message.payload?.headers||[]).map(header=>[String(header.name||'').toLowerCase(),header.value]));
+  const from=cleanPreviewText(headers.from,300);
+  if(!from)throw Object.assign(new Error('Gmail did not provide a sender for this message.'),{status:409});
+  return{
+    id:String(id),mailbox,threadId:cleanPreviewText(message.threadId,100),historyId:cleanPreviewText(message.historyId,100),
+    from,subject:cleanPreviewText(headers.subject,300)||'(no subject)',date:cleanPreviewText(headers.date,100),
+    snippet:cleanPreviewText(message.snippet,200)
+  };
+}
+
+// Build the review card from Gmail's exact message ID and mailbox, never from
+// model-supplied sender/subject text. Reuse one access token for both reads.
+export async function getTrashPreview(getToken,{id}){
+  return trashPreviewForToken(await getToken(),id);
+}
+
+// Move the exact reviewed message to trash. The metadata and connected Gmail
+// mailbox must still match immediately before the write. Legacy approvals
+// without an authoritative preview cannot be executed.
+export async function trashEmail(getToken,{id,expectedPreview}){
+  if(!expectedPreview||TRASH_PREVIEW_FIELDS.some(field=>typeof expectedPreview[field]!=='string')){
+    throw Object.assign(new Error('This Gmail deletion lacks a verified preview. Stage it again.'),{status:409});
+  }
+  const token=await getToken();
+  const current=await trashPreviewForToken(token,id);
+  if(TRASH_PREVIEW_FIELDS.some(field=>current[field]!==expectedPreview[field])){
+    throw Object.assign(new Error('This Gmail message or connected mailbox changed. Stage it again.'),{status:409});
+  }
+  await apiFetch(async()=>token,`/messages/${encodeURIComponent(id)}/trash`,{method:'POST'});
+  return{trashed:true,id};
 }

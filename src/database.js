@@ -6,6 +6,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { decryptSecret, encryptSecret } from './security.js';
 import { calculateRelevance, detectContradiction, normalizeMemoryKind, normalizePreferences, normalizePriority, rankGoals, rankMemories, validDateString, validTimeString } from './intelligence.js';
 import { assertMemorySafe } from './relational-intelligence.js';
+import { PORTABLE_USER_TABLES, portableInsertSql, portableRowValues } from './portable-recovery.js';
+import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './reply-jobs.js';
+import { currentDeleteApproval, decodeApprovalRow } from './delete-approval.js';
 
 const timestamp = () => new Date().toISOString();
 
@@ -58,6 +61,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     db.exec('PRAGMA journal_mode = DELETE;');
   }
   db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+  const withImmediate=(fn)=>{db.exec('BEGIN IMMEDIATE');try{const value=fn();db.exec('COMMIT');return value;}catch(error){db.exec('ROLLBACK');throw error;}};
+  const insertReplyJob=({userId,conversationId,userMessageId,kind='chat',channel='web',originInstance=null,requiresEphemeral=false,insertCreatedAt=null,deliveryToPhone=null,deliveryLinkVerifiedAt=null})=>{
+    if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
+    const id=randomUUID(),queuedAt=timestamp();
+    db.prepare(`INSERT INTO reply_jobs(id,user_id,conversation_id,user_message_id,kind,channel,origin_instance,requires_ephemeral,queued_at,lease_expires_at,insert_created_at,delivery_to_phone,delivery_link_verified_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id,userId,conversationId,userMessageId,kind,channel,originInstance,requiresEphemeral?1:0,queuedAt,
+      requiresEphemeral?new Date(Date.now()+REPLY_LEASE_MS).toISOString():null,insertCreatedAt,deliveryToPhone,deliveryLinkVerifiedAt);
+    return db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id);
+  };
   for (const sql of signupSecuritySchema) db.exec(sql);
   const protectSecret = (value) => {
     const text = String(value || '');
@@ -241,11 +253,44 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       generated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, month_key)
     );
+    CREATE TABLE IF NOT EXISTS timeline_generation_leases (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      month_key TEXT NOT NULL,
+      token TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
     DROP TABLE IF EXISTS automation_tokens;
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       title TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reply_jobs (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      user_message_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('chat','regenerate')),
+      channel TEXT NOT NULL CHECK(channel IN ('web','whatsapp')),
+      status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','interrupted','cancelled')),
+      origin_instance TEXT,
+      requires_ephemeral INTEGER NOT NULL DEFAULT 0,
+      queued_at TEXT NOT NULL,
+      claimed_at TEXT,
+      lease_expires_at TEXT,
+      lease_token TEXT,
+      completed_at TEXT,
+      reply_message_id TEXT,
+      insert_created_at TEXT,
+      delivery_attempted_at TEXT,
+      delivery_to_phone TEXT,
+      delivery_link_verified_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq);
+    CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq);
+    CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at);
+    CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq);
+    CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral);
     CREATE TABLE IF NOT EXISTS proactive_state (
       user_id TEXT PRIMARY KEY, last_quiet_nudge_at TEXT
     );
@@ -445,6 +490,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'users', 'email_verified_at', 'TEXT');
   ensureColumn(db, 'messages', 'user_id', 'TEXT');
   ensureColumn(db, 'messages', 'conversation_id', 'TEXT');
+  ensureColumn(db, 'messages', 'reply_job_id', 'TEXT');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(user_id, conversation_id, created_at DESC)');
   for (const row of db.prepare('SELECT DISTINCT user_id FROM messages WHERE conversation_id IS NULL AND user_id IS NOT NULL').all()) adoptOrphanMessages(db, row.user_id);
   ensureColumn(db, 'memories', 'user_id', 'TEXT');
@@ -485,6 +532,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'user_preferences', 'briefing_tone', "TEXT NOT NULL DEFAULT 'motivational'");
   ensureColumn(db, 'user_preferences', 'briefing_length', "TEXT NOT NULL DEFAULT 'quick'");
   ensureColumn(db, 'user_preferences', 'buddy_name', 'TEXT');
+  ensureColumn(db, 'reply_jobs', 'delivery_to_phone', 'TEXT');
+  ensureColumn(db, 'reply_jobs', 'delivery_link_verified_at', 'TEXT');
   // X5 "Writes like you": opt-in flag + distilled style profile (additive only).
   ensureColumn(db, 'user_preferences', 'writing_voice_opt_in', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'user_preferences', 'writing_voice_profile', 'TEXT');
@@ -547,7 +596,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimTasks: db.prepare('UPDATE tasks SET user_id=? WHERE user_id IS NULL'),
     claimEvents: db.prepare('UPDATE events SET user_id=? WHERE user_id IS NULL'),
     createSession: db.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?)'),
-    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked
+    session: db.prepare(`SELECT sessions.*, users.email, users.display_name, users.role, users.disabled, users.moderation_blocked, users.is_demo
       FROM sessions JOIN users ON users.id=sessions.user_id WHERE sessions.token_hash=? AND sessions.expires_at>?`),
     deleteSession: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
     deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id=?'),
@@ -570,7 +619,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation: db.prepare('DELETE FROM conversations WHERE id=? AND user_id=?'),
     deleteConversationMessages: db.prepare('DELETE FROM messages WHERE conversation_id=? AND user_id=?'),
     listConversationMessages: db.prepare('SELECT * FROM messages WHERE user_id=? AND conversation_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listConversationMessagesThrough: db.prepare(`SELECT * FROM messages WHERE user_id=? AND conversation_id=? AND rowid<=
+      (SELECT rowid FROM messages WHERE id=? AND user_id=? AND conversation_id=?) ORDER BY created_at DESC,rowid DESC LIMIT ?`),
     listMessages: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
+    listMessagesByInsertion: db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY rowid DESC LIMIT ?'),
     getReportSubmission: db.prepare('SELECT * FROM reports WHERE reporter_user_id=? AND submission_id=?'),
     countRecentReports: db.prepare('SELECT COUNT(*) AS count FROM reports WHERE reporter_user_id=? AND created_at>=?'),
     addReport: db.prepare(`INSERT INTO reports(id,reporter_user_id,submission_id,kind,reason,description,message_id,message_excerpt,status,created_at,updated_at,reviewed_at)
@@ -602,6 +654,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemorySuggestions: db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 50'),
     deleteMemorySuggestion: db.prepare('DELETE FROM memory_suggestions WHERE id=? AND user_id=?'),
     addImportJob: db.prepare('INSERT INTO import_jobs(id,user_id,filename,status,total_chunks,done_chunks,suggestions_added,error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'),
+    expireStaleImportJobs: db.prepare("UPDATE import_jobs SET status='failed',error='Import stopped before completion. Please try again.',updated_at=? WHERE user_id=? AND status='processing' AND updated_at<?"),
+    activeImportJob: db.prepare("SELECT 1 FROM import_jobs WHERE user_id=? AND status='processing' LIMIT 1"),
+    countRecentImportJobs: db.prepare('SELECT COUNT(*) AS count FROM import_jobs WHERE user_id=? AND created_at>=?'),
     getImportJob: db.prepare('SELECT * FROM import_jobs WHERE id=? AND user_id=?'),
     listImportJobs: db.prepare('SELECT * FROM import_jobs WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT 5'),
     updateImportJob: db.prepare('UPDATE import_jobs SET status=?,total_chunks=?,done_chunks=?,suggestions_added=?,error=?,updated_at=? WHERE id=? AND user_id=?'),
@@ -740,7 +795,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setBuddyName: db.prepare('UPDATE user_preferences SET buddy_name=?, updated_at=? WHERE user_id=?'),
     getConversationSummary: db.prepare('SELECT * FROM conversation_summaries WHERE conversation_id=? AND user_id=?'),
     upsertConversationSummary: db.prepare(`INSERT INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at)
-      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at`),
+      VALUES(?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET summary=excluded.summary,message_count=excluded.message_count,updated_at=excluded.updated_at
+      WHERE excluded.message_count>conversation_summaries.message_count`),
     countConversationMessages: db.prepare('SELECT COUNT(*) AS count FROM messages WHERE conversation_id=? AND user_id=?'),
     countUserMessages: db.prepare("SELECT COUNT(*) AS count FROM messages WHERE user_id=? AND role='user'"),
     addTask: db.prepare(`INSERT INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,created_at,updated_at)
@@ -754,10 +810,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
     updateTaskFields: db.prepare('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?'),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id=? AND user_id=?'),
-    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled')"),
+    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count"),
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
-    completeTask: db.prepare('UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=?'),
-    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=?"),
+    completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
+    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -1068,7 +1124,114 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     touchConversation:(userId,id)=>s.touchConversation.run(timestamp(),id,userId).changes>0,
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
+    acceptReplyJob(userId,conversationId,content,options={}){return withImmediate(()=>{
+      const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
+      s.addMessage.run(userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
+      const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...options});
+      s.touchConversation.run(timestamp(),conversationId,userId);
+      return{userMessage,job};
+    });},
+    acceptRegenerateReplyJob(userId,conversationId,userMessageId,targetMessageId,insertCreatedAt,quotaPolicy=null){return withImmediate(()=>{
+      const userMessage=s.getMessage.get(userMessageId,userId);
+      if(!userMessage||userMessage.conversation_id!==conversationId||userMessage.role!=='user')return null;
+      const target=s.getMessage.get(targetMessageId,userId);
+      if(!target||target.conversation_id!==conversationId||target.role!=='assistant')return null;
+      if(quotaPolicy?.enforced){
+        const prior=s.getDailyUsage.get(userId,quotaPolicy.day)?.count||0;
+        if(prior>=quotaPolicy.limit)return{quotaDenied:{...quotaPolicy,allowed:false,used:prior}};
+        s.incrementDailyUsage.run(userId,quotaPolicy.day,timestamp());
+      }
+      s.deleteMessageRow.run(targetMessageId,userId);
+      const job=insertReplyJob({userId,conversationId,userMessageId,kind:'regenerate',insertCreatedAt});
+      s.touchConversation.run(timestamp(),conversationId,userId);
+      return{userMessage,job};
+    });},
+    getReplyJob:(id)=>db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id)||null,
+    getConversationReplyJobState:(userId,conversationId)=>db.prepare('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1').get(userId,conversationId)||null,
+    cancelDisallowedReplyJobs(){return db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE status IN ('queued','running') AND EXISTS(SELECT 1 FROM users u WHERE u.id=reply_jobs.user_id
+        AND (u.disabled=1 OR u.moderation_blocked=1))`).run(timestamp()).changes;},
+    cancelReplyJob(id,token){return db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+      WHERE id=? AND status='running' AND lease_token=?`).run(timestamp(),id,token).changes>0;},
+    renewQueuedEphemeralReplyJobs(instanceId){return db.prepare(`UPDATE reply_jobs SET lease_expires_at=? WHERE origin_instance=? AND requires_ephemeral=1 AND status='queued'`)
+      .run(new Date(Date.now()+REPLY_LEASE_MS).toISOString(),instanceId).changes;},
+    claimNextReplyJob(instanceId,leaseMs=REPLY_LEASE_MS){return withImmediate(()=>{
+      const job=db.prepare(`SELECT j.* FROM reply_jobs j WHERE j.status='queued'
+        AND (j.requires_ephemeral=0 OR j.origin_instance=?)
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs active WHERE active.conversation_id=j.conversation_id AND active.status='running')
+        AND NOT EXISTS(SELECT 1 FROM reply_jobs prior WHERE prior.conversation_id=j.conversation_id
+          AND prior.seq<j.seq AND prior.status IN ('queued','running'))
+        ORDER BY j.seq LIMIT 1`).get(instanceId);
+      if(!job)return null;
+      const token=randomUUID(),claimedAt=timestamp(),expiresAt=new Date(Date.now()+leaseMs).toISOString();
+      db.prepare(`UPDATE reply_jobs SET status='running',claimed_at=?,lease_expires_at=?,lease_token=? WHERE id=? AND status='queued'`)
+        .run(claimedAt,expiresAt,token,job.id);
+      return{...job,status:'running',claimed_at:claimedAt,lease_expires_at:expiresAt,lease_token:token};
+    });},
+    renewReplyJobLease(id,token,leaseMs=REPLY_LEASE_MS){return db.prepare(`UPDATE reply_jobs SET lease_expires_at=? WHERE id=? AND lease_token=? AND status='running' AND lease_expires_at>?`)
+      .run(new Date(Date.now()+leaseMs).toISOString(),id,token,timestamp()).changes>0;},
+    releaseReplyJob(id,token){return db.prepare(`UPDATE reply_jobs SET status='queued',claimed_at=NULL,lease_expires_at=CASE
+      WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
+      WHERE id=? AND lease_token=? AND status='running'`).run(new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token).changes>0;},
+    completeReplyJob(id,token,content,insertCreatedAt=null){return withImmediate(()=>{
+      const job=db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id);
+      if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
+      const account=db.prepare('SELECT disabled,moderation_blocked FROM users WHERE id=?').get(job.user_id);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        db.prepare("UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL WHERE id=?").run(timestamp(),id);
+        return null;
+      }
+      const message={id:randomUUID(),user_id:job.user_id,conversation_id:job.conversation_id,role:'assistant',content,
+        created_at:insertCreatedAt||timestamp(),reply_job_id:id};
+      db.prepare('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id) VALUES(?,?,?,?,?,?,?)')
+        .run(message.id,message.user_id,message.conversation_id,message.role,message.content,message.created_at,id);
+      db.prepare(`UPDATE reply_jobs SET status='completed',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=? AND lease_token=?`)
+        .run(timestamp(),message.id,id,token);
+      return message;
+    });},
+    recoverExpiredReplyJobs(nowMs=Date.now()){return withImmediate(()=>{
+      const current=new Date(nowMs).toISOString();
+      const jobs=db.prepare(`SELECT * FROM reply_jobs WHERE
+        (status='running' AND lease_expires_at<=?) OR
+        (status='queued' AND requires_ephemeral=1 AND lease_expires_at<=?) ORDER BY seq`).all(current,current);
+      for(const job of jobs){
+        const messageId=randomUUID();
+        db.prepare(`INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at,reply_job_id)
+          VALUES(?, ?, ?, 'assistant', ?, ?, ?)`).run(messageId,job.user_id,job.conversation_id,REPLY_INTERRUPTED_TEXT,job.insert_created_at||current,job.id);
+        const reply=db.prepare('SELECT id FROM messages WHERE reply_job_id=?').get(job.id);
+        db.prepare(`UPDATE reply_jobs SET status='interrupted',completed_at=?,lease_expires_at=NULL,reply_message_id=? WHERE id=?`)
+          .run(current,reply?.id||null,job.id);
+      }
+      return jobs.length;
+    });},
+    markReplyDeliveryAttempted(id){return db.prepare(`UPDATE reply_jobs SET delivery_attempted_at=? WHERE id=? AND channel='whatsapp'
+      AND status IN ('completed','interrupted') AND delivery_attempted_at IS NULL`).run(timestamp(),id).changes>0;},
+    listPendingReplyDeliveries(limit=10){return db.prepare(`SELECT * FROM reply_jobs WHERE channel='whatsapp' AND status IN ('completed','interrupted')
+      AND delivery_attempted_at IS NULL AND reply_message_id IS NOT NULL ORDER BY seq LIMIT ?`).all(Math.min(Math.max(limit,1),50));},
     listConversationMessages(userId, conversationId, limit=60) { return s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(limit,1),200)).reverse(); },
+    listConversationMessagesThrough(userId,conversationId,messageId,limit=60){return s.listConversationMessagesThrough.all(userId,conversationId,messageId,userId,conversationId,Math.min(Math.max(limit,1),200)).reverse();},
+    // Chat hot path: keep the SQLite and PostgreSQL adapters on one contract.
+    // PostgreSQL resolves these independent reads concurrently inside its
+    // worker, collapsing several blocking worker/database round trips into one.
+    getChatReplyContext(userId,conversationId,historyLimit=24){
+      const preferences=this.getPreferences(userId);
+      const keys=[`buddy_name_asked_${userId}`,`ambient_context_${userId}`,`ambient_asked_${userId}`];
+      const settings=Object.fromEntries(keys.map((key)=>[key,s.setting.get(key)?.value??null]));
+      return{
+        conversation:s.getConversation.get(conversationId,userId)||null,
+        messageCount:s.countConversationMessages.get(conversationId,userId).count,
+        history:historyLimit>0?s.listConversationMessages.all(userId,conversationId,Math.min(Math.max(historyLimit,1),200)).reverse():[],
+        preferences,
+        summary:s.getConversationSummary.get(conversationId,userId)||null,
+        settings,
+        writingVoice:{
+          optIn:preferences?.writing_voice_opt_in===1,
+          profile:preferences?.writing_voice_profile||null,
+          updatedAt:preferences?.writing_voice_updated_at||null,
+          offered:preferences?.writing_voice_offered===1,
+        },
+      };
+    },
     listMessages(userId, limit=60) { return s.listMessages.all(userId,Math.min(Math.max(limit,1),200)).reverse(); },
     getReportSubmission:(userId,submissionId)=>s.getReportSubmission.get(userId,submissionId),
     countRecentReports:(userId,since)=>s.countRecentReports.get(userId,since).count,
@@ -1105,7 +1268,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       if(target.role==='assistant'&&prev&&prev.role==='user')ids.push(prev.id);
       if(target.role==='user'&&next&&next.role==='assistant')ids.push(next.id);
       db.exec('BEGIN IMMEDIATE');
-      try{for(const id of ids)s.deleteMessageRow.run(id,userId);db.exec('COMMIT');}
+      try{
+        for(const id of ids){
+          db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
+            WHERE user_id=? AND user_message_id=? AND status IN ('queued','running')`).run(timestamp(),userId,id);
+          s.deleteMessageRow.run(id,userId);
+        }
+        db.exec('COMMIT');
+      }
       catch(error){db.exec('ROLLBACK');throw error;}
       return ids;
     },
@@ -1149,6 +1319,33 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
       return ranked;
     },
+    // Load the independent model-context reads as one logical operation. On
+    // SQLite this is just a compact local read; on PostgreSQL it is one sync
+    // worker crossing and the underlying selects run concurrently.
+    getChatModelContext(userId,query,{includePlanning=false,memoryLimit=8}={}){
+      const allMemories=s.listMemories.all(userId);
+      const memories=rankMemories(allMemories,query,memoryLimit);
+      if(memories.length){
+        const ids=memories.map((memory)=>memory.id);
+        db.prepare(`UPDATE memories SET last_mentioned_at=? WHERE user_id=? AND id IN (${ids.map(()=>'?').join(',')})`).run(timestamp(),userId,...ids);
+      }
+      if(!includePlanning)return{memories,allMemories,followUps:[],goals:[],projects:[]};
+      const rows=s.listProjects.all(userId);const grouped=new Map();
+      for(const step of s.listUserProjectSteps.all(userId)){const steps=grouped.get(step.project_id)||[];steps.push(step);grouped.set(step.project_id,steps);}
+      return{
+        memories,
+        allMemories,
+        followUps:s.listFollowUps.all(userId).slice(0,8),
+        goals:rankGoals(s.listGoals.all(userId),10),
+        projects:rows.filter((project)=>project.status!=='completed').map((row)=>({...row,steps:grouped.get(row.id)||[]})),
+      };
+    },
+    getChatProactiveContext(userId){
+      return{
+        surfacedRows:s.listMemorySurfacings.all(userId,200),
+        personalDates:s.listPersonalDates.all(userId),
+      };
+    },
     // Memory decay: recalculate relevance scores based on inactivity.
     // Run during the daily learning cycle.
     applyMemoryDecay(userId){
@@ -1186,10 +1383,39 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       }
       return saved;
     },
-    createImportJob(userId,filename){const now=timestamp();const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;},
+    createImportJob(userId,filename){return withImmediate(()=>{
+      const now=timestamp();
+      s.expireStaleImportJobs.run(now,userId,new Date(Date.now()-15*60_000).toISOString());
+      if(s.activeImportJob.get(userId)||s.countRecentImportJobs.get(userId,new Date(Date.now()-24*60*60_000).toISOString()).count>=3)return null;
+      const row={id:randomUUID(),user_id:userId,filename:String(filename||'').slice(0,200),status:'processing',total_chunks:0,done_chunks:0,suggestions_added:0,error:null,created_at:now,updated_at:now};
+      s.addImportJob.run(row.id,row.user_id,row.filename,row.status,row.total_chunks,row.done_chunks,row.suggestions_added,row.error,row.created_at,row.updated_at);return row;
+    });},
     getImportJob:(userId,id)=>s.getImportJob.get(id,userId)||null,
     listImportJobs:(userId)=>s.listImportJobs.all(userId),
     updateImportJob(userId,id,patch={}){const cur=s.getImportJob.get(id,userId);if(!cur)return null;const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);return {...cur,...next};},
+    isImportJobActive(userId,id){
+      const row=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      return !!(row?.status==='processing'&&user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true');
+    },
+    updateImportJobIfCurrent(userId,id,patch={},allowInactive=false){return withImmediate(()=>{
+      const cur=s.getImportJob.get(id,userId);
+      if(cur?.status!=='processing')return null;
+      const user=s.userById.get(userId);
+      if(!allowInactive&&(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'))return null;
+      const next={status:patch.status||cur.status,total_chunks:patch.total_chunks??cur.total_chunks,
+        done_chunks:patch.done_chunks??cur.done_chunks,suggestions_added:patch.suggestions_added??cur.suggestions_added,
+        error:patch.error!==undefined?patch.error:cur.error,updated_at:timestamp()};
+      s.updateImportJob.run(next.status,next.total_chunks,next.done_chunks,next.suggestions_added,next.error,next.updated_at,id,userId);
+      return{...cur,...next};
+    });},
+    addImportSuggestionIfCurrent(userId,id,content,options={}){return withImmediate(()=>{
+      const job=s.getImportJob.get(id,userId),user=s.userById.get(userId);
+      if(job?.status!=='processing'||!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const now=timestamp(),row={id:randomUUID(),user_id:userId,content:assertMemorySafe(content),created_at:now,
+        kind:normalizeMemoryKind(options.kind),confidence:Math.max(0,Math.min(Number(options.confidence??0.7),1))};
+      s.addMemorySuggestion.run(row.id,row.user_id,row.content,row.created_at,row.kind,row.confidence);
+      return row;
+    });},
     addFollowUp(userId,{description,dueDate,priority=2,sourceMessageId=null}){const row={id:randomUUID(),user_id:userId,description,due_date:validDateString(dueDate)||dueDate,status:'scheduled',priority:normalizePriority(priority),source_message_id:sourceMessageId,created_at:timestamp(),completed_at:null};const result=s.addFollowUp.run(row.id,row.user_id,row.description,row.due_date,row.priority,row.source_message_id,row.created_at);return result.changes?row:s.listFollowUps.all(userId).find((item)=>item.description===description&&item.due_date===row.due_date);},
     listFollowUps:(userId)=>s.listFollowUps.all(userId),
     dueFollowUps:(userId,today,at=timestamp())=>s.dueFollowUps.all(userId,today,at),
@@ -1278,6 +1504,24 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     claimApproval(userId,id){const at=timestamp();const staleBefore=new Date(Date.now()-10*60_000).toISOString();if(!s.claimApproval.run(at,at,id,userId,staleBefore).changes)return null;return this.getApproval(userId,id);},
     resolveApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','rejected','failed'].includes(status))return null;const at=timestamp();if(!s.resolveApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
     finishApproval(userId,id,status,{result=null,error=null}={}){if(!['executed','failed'].includes(status))return null;const at=timestamp();if(!s.finishApproval.run(status,result?JSON.stringify(result):null,error?String(error).slice(0,1000):null,at,at,id,userId).changes)return null;return this.getApproval(userId,id);},
+    executeDeleteApprovalIfCurrent(userId,approvalId){return withImmediate(()=>{
+      const raw=s.getApproval.get(approvalId,userId);
+      if(!raw||raw.status!=='pending'||raw.execution_started_at)return{status:'already'};
+      const approval=decodeApprovalRow(raw),{id,objectType}=approval.payload||{};
+      const target=objectType==='goal'?s.getGoal.get(id,userId):objectType==='task'?s.getTask.get(id,userId):objectType==='routine'?s.getRoutine.get(id,userId):null;
+      const recent=s.listMessagesByInsertion.all(userId,200);
+      const selected=currentDeleteApproval(approval,recent,target);
+      const now=timestamp();
+      if(!selected){
+        db.prepare("UPDATE approvals SET status='rejected',last_error=?,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run('Deletion request or target changed.',now,now,approvalId,userId);
+        return{status:'stale',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId))};
+      }
+      const deleted=selected.objectType==='goal'?s.deleteGoal.run(id,userId).changes:selected.objectType==='task'?s.deleteTask.run(id,userId).changes:s.deleteRoutine.run(id,userId).changes;
+      if(!deleted)throw new Error('Deletion target changed during transaction.');
+      const result={deleted:approval.kind,id:selected.id,title:selected.title};
+      db.prepare("UPDATE approvals SET status='executed',result_json=?,last_error=NULL,execution_started_at=NULL,reviewed_at=?,updated_at=? WHERE id=? AND user_id=? AND status='pending'").run(JSON.stringify(result),now,now,approvalId,userId);
+      return{status:'executed',approval:decodeApprovalRow(s.getApproval.get(approvalId,userId)),result};
+    });},
     lastUserMessageAt: (userId) => s.lastUserMessage.get(userId)?.last_at || null,
     getLastQuietNudgeAt: (userId) => s.getQuietNudge.get(userId)?.last_quiet_nudge_at || null,
     setLastQuietNudgeAt: (userId,iso) => s.setQuietNudge.run(userId,iso),
@@ -1368,7 +1612,35 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listMemoriesSince:(userId,sinceISO)=>s.listMemoriesSince.all(userId,sinceISO),
     listGoalCheckinsSince:(userId,sinceISO)=>s.listGoalCheckinsSince.all(userId,sinceISO),
     getTimelineNarrative:(userId,monthKey)=>{const row=s.getTimelineNarrative.get(userId,monthKey);return row?row.narrative:null;},
+    getTimelineNarrativeRecord:(userId,monthKey)=>s.getTimelineNarrative.get(userId,monthKey)||null,
     setTimelineNarrative:(userId,monthKey,narrative)=>{s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());},
+    claimTimelineNarrative(userId,monthKey,freshAfter=null){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true')return null;
+      const cached=s.getTimelineNarrative.get(userId,monthKey);
+      if(cached&&(!freshAfter||cached.generated_at>freshAfter))return null;
+      const now=timestamp(),token=randomUUID();
+      const claimed=db.prepare(`INSERT INTO timeline_generation_leases(user_id,month_key,token,expires_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET month_key=excluded.month_key,token=excluded.token,expires_at=excluded.expires_at
+        WHERE timeline_generation_leases.expires_at<=?`).run(userId,monthKey,token,new Date(Date.now()+5*60_000).toISOString(),now);
+      return claimed.changes?token:null;
+    });},
+    isTimelineNarrativeLeaseActive(userId,monthKey,token){
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      return !!(user&&!user.disabled&&!user.moderation_blocked&&!user.is_demo&&s.setting.get('system_paused')?.value!=='true'
+        &&lease?.token===token&&lease.month_key===monthKey&&lease.expires_at>timestamp());
+    },
+    completeTimelineNarrative(userId,monthKey,token,narrative){return withImmediate(()=>{
+      const user=s.userById.get(userId);
+      const lease=db.prepare('SELECT token,month_key,expires_at FROM timeline_generation_leases WHERE user_id=?').get(userId);
+      if(!user||user.disabled||user.moderation_blocked||user.is_demo||s.setting.get('system_paused')?.value==='true'
+        ||lease?.token!==token||lease.month_key!==monthKey||lease.expires_at<=timestamp())return false;
+      s.setTimelineNarrative.run(userId,monthKey,narrative,timestamp());
+      db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);
+      return true;
+    });},
+    releaseTimelineNarrative(userId,token){db.prepare('DELETE FROM timeline_generation_leases WHERE user_id=? AND token=?').run(userId,token);},
     timelineMonthData(userId,monthKey){
       return {
         memories:s.timelineMemories.all(userId,monthKey),
@@ -1400,10 +1672,14 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
     updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,now,id,userId);return s.getTask.get(id,userId);},
     deleteTask: (userId,id) => s.deleteTask.run(id,userId).changes>0,
-    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.run(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId).changes>0,
+    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId,timestamp())?.attempt_count||null,
+    // The monotonically increasing attempt fences workers after recovery/restart.
+    renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?").run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
     recoverStaleTasks(){const current=timestamp();return s.recoverTasks.run(current,current,current).changes;},
-    completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
-    failTask:(userId,id,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId).changes>0,
+    // Explicit user completion is independent of a worker's lease and revokes it.
+    completeTaskByUser:(userId,id,result)=>db.prepare("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')").run(result,timestamp(),id,userId).changes>0,
+    completeTask: (userId,id,attempt,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
+    failTask:(userId,id,attempt,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
     dueTasks: () => s.dueTasks.all(timestamp()),
     addEvent(userId,type,message,detail=null) { const row={id:randomUUID(),user_id:userId,type,message,detail,created_at:timestamp()}; s.addEvent.run(row.id,row.user_id,row.type,row.message,row.detail,row.created_at); return row; },
     listEvents: (userId,limit=80) => s.listEvents.all(userId,Math.min(Math.max(limit,1),200)),
@@ -1448,6 +1724,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     prunePurchaseIntents() { s.prunePurchaseIntents.run(timestamp()); },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
+    // Encrypted access tokens use fresh random IVs, so they also identify the
+    // credential revision. Refreshes must never insert or mutate a replacement.
+    refreshConnector:(userId,provider,previous,data)=>db.prepare('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted).changes>0,
+    deleteConnectorIfCurrent:(userId,provider,previous)=>db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(userId,provider,previous.id,previous.access_encrypted).changes>0,
     getConnector: (userId,provider) => s.connector.get(userId,provider),
     deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
@@ -1525,14 +1805,44 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteSignupVerificationToken(tokenHash) { return s.deleteSignupVerificationToken.run(tokenHash).changes>0; },
     cleanSignupVerificationTokens() { s.cleanSignupVerificationTokens.run(timestamp()); },
     pruneDoorTokens: () => s.pruneDoorTokens.run(timestamp()),
-    exportUser(userId) { return {version:5,exportedAt:timestamp(),user:s.userById.get(userId),conversations:s.listConversations.all(userId),messages:s.listMessages.all(userId,20000).reverse(),memories:s.listMemories.all(userId),memorySuggestions:s.listMemorySuggestions.all(userId),followUps:s.listFollowUps.all(userId),goals:s.listGoals.all(userId),goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),approvals:s.listApprovals.all(userId),preferences:this.getPreferences(userId),conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),calendarFeeds:this.listCalendarFeeds(userId),tasks:s.listTasks.all(userId),events:s.listEvents.all(userId,20000),artifacts:s.listArtifacts.all(userId).map((a)=>s.getArtifact.get(a.id,userId))}; },
+    exportUser(userId) {
+      const user=s.userById.get(userId);
+      if(!user)throw new Error('Backup user not found.');
+      this.getPreferences(userId); // Create defaults before opening a read snapshot.
+      db.exec('BEGIN');
+      try{
+        const bundle={version:6,exportedAt:timestamp(),user:{id:user.id,email:user.email,display_name:user.display_name},
+          conversations:s.listConversations.all(userId),
+          messages:db.prepare('SELECT * FROM messages WHERE user_id=? ORDER BY created_at,rowid').all(userId),
+          memories:db.prepare('SELECT * FROM memories WHERE user_id=? ORDER BY created_at,id').all(userId),
+          memorySuggestions:db.prepare('SELECT * FROM memory_suggestions WHERE user_id=? ORDER BY created_at,id').all(userId),
+          followUps:db.prepare('SELECT * FROM follow_ups WHERE user_id=? ORDER BY created_at,id').all(userId),
+          goals:s.listGoals.all(userId),
+          goalCheckins:db.prepare('SELECT * FROM goal_checkins WHERE user_id=? ORDER BY created_at').all(userId),
+          routines:s.listRoutines.all(userId),projects:s.listProjects.all(userId),
+          projectSteps:db.prepare('SELECT * FROM project_steps WHERE user_id=? ORDER BY project_id,position,created_at').all(userId),
+          approvals:db.prepare('SELECT * FROM approvals WHERE user_id=? ORDER BY created_at,id').all(userId),
+          preferences:this.getPreferences(userId),
+          conversationSummaries:db.prepare('SELECT * FROM conversation_summaries WHERE user_id=?').all(userId),
+          calendarFeeds:this.listCalendarFeeds(userId),
+          tasks:db.prepare('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at,id').all(userId),
+          events:db.prepare('SELECT * FROM events WHERE user_id=? ORDER BY created_at,id').all(userId),
+          artifacts:db.prepare('SELECT * FROM artifacts WHERE user_id=? ORDER BY created_at,id').all(userId)};
+        for(const entry of PORTABLE_USER_TABLES){
+          bundle[entry.key]=db.prepare(`SELECT ${entry.columns.join(',')} FROM ${entry.table} WHERE user_id=?`).all(userId);
+        }
+        db.exec('COMMIT');
+        return bundle;
+      }catch(error){db.exec('ROLLBACK');throw error;}
+    },
     restoreUser(userId, bundle) {
-      if (!bundle || ![2,3,4,5].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
+      if (!bundle || ![2,3,4,5,6].includes(bundle.version)) throw Object.assign(new Error('Backup version is not supported.'), { status: 400 });
       const inserts = {
         conversation: db.prepare('INSERT OR IGNORE INTO conversations(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)'),
         message: db.prepare('INSERT OR IGNORE INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)'),
-        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,last_confirmed_at,proactive_allowed)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`),
+        memory: db.prepare(`INSERT OR IGNORE INTO memories(id,user_id,content,created_at,updated_at,kind,source,status,confidence,expires_at,
+          last_confirmed_at,last_mentioned_at,relevance_score,superseded_by,embedding,proactive_allowed)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
         suggestion: db.prepare('INSERT OR IGNORE INTO memory_suggestions(id,user_id,content,created_at,kind,confidence) VALUES(?,?,?,?,?,?)'),
         followUp: db.prepare('INSERT OR IGNORE INTO follow_ups(id,user_id,description,due_date,status,priority,source_message_id,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)'),
         goal: db.prepare('INSERT OR IGNORE INTO goals(id,user_id,title,description,status,priority,progress,target_date,next_step,created_at,updated_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)'),
@@ -1543,8 +1853,8 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         approval: db.prepare('INSERT OR IGNORE INTO approvals(id,user_id,kind,title,summary,payload_json,status,source_message_id,result_json,last_error,created_at,updated_at,reviewed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)'),
         summary: db.prepare('INSERT OR IGNORE INTO conversation_summaries(conversation_id,user_id,summary,message_count,updated_at) VALUES(?,?,?,?,?)'),
         calendar: db.prepare('INSERT OR IGNORE INTO calendar_feeds(id,user_id,label,url,created_at,updated_at) VALUES(?,?,?,?,?,?)'),
-        task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,result,created_at,updated_at,attempt_count,lease_expires_at,last_error)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
+        task: db.prepare(`INSERT OR IGNORE INTO tasks(id,user_id,title,prompt,status,risk,schedule_at,recurrence,delivery_channel,result,
+          created_at,updated_at,attempt_count,lease_expires_at,last_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
         event: db.prepare('INSERT OR IGNORE INTO events(id,user_id,type,message,detail,created_at) VALUES(?,?,?,?,?,?)'),
         artifact: db.prepare('INSERT OR IGNORE INTO artifacts(id,user_id,task_id,name,mime_type,content,size_bytes,created_at) VALUES(?,?,?,?,?,?,?,?)')
       };
@@ -1552,7 +1862,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       try {
         for (const row of bundle.conversations || []) inserts.conversation.run(row.id,userId,row.title,row.created_at,row.updated_at);
         for (const row of bundle.messages || []) inserts.message.run(row.id,userId,row.conversation_id||null,row.role,row.content,row.created_at);
-        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,assertMemorySafe(row.content),row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at,row.proactive_allowed===0?0:1);
+        for (const row of bundle.memories || []) inserts.memory.run(row.id,userId,assertMemorySafe(row.content),row.created_at,row.updated_at,normalizeMemoryKind(row.kind),row.source||'backup',row.status||'approved',row.confidence??1,row.expires_at||null,row.last_confirmed_at||row.updated_at,row.last_mentioned_at||null,row.relevance_score??1,row.superseded_by||null,row.embedding||null,row.proactive_allowed===0?0:1);
         for (const row of bundle.memorySuggestions || []) inserts.suggestion.run(row.id,userId,assertMemorySafe(row.content),row.created_at,normalizeMemoryKind(row.kind),row.confidence??0.7);
         for (const row of bundle.followUps || []) inserts.followUp.run(row.id,userId,row.description,row.due_date,row.status||'scheduled',normalizePriority(row.priority),row.source_message_id||null,row.created_at,row.completed_at||null);
         for (const row of bundle.goals || []) inserts.goal.run(row.id,userId,row.title,row.description||null,row.status||'active',normalizePriority(row.priority),Math.max(0,Math.min(Number(row.progress)||0,100)),row.target_date||null,row.next_step||null,row.created_at,row.updated_at,row.completed_at||null);
@@ -1563,10 +1873,27 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         for (const row of bundle.approvals || []) inserts.approval.run(row.id,userId,row.kind,row.title,row.summary,row.payload_json||'{}',['pending','executed','rejected','failed'].includes(row.status)?row.status:'pending',row.source_message_id||null,row.result_json||null,row.last_error||null,row.created_at,row.updated_at,row.reviewed_at||null);
         for (const row of bundle.conversationSummaries || []) inserts.summary.run(row.conversation_id,userId,row.summary,row.message_count,row.updated_at);
         for (const row of bundle.calendarFeeds || []) inserts.calendar.run(row.id,userId,row.label,protectSecret(row.url),row.created_at,row.updated_at);
-        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,row.result,row.created_at,row.updated_at,row.attempt_count||0,row.lease_expires_at||null,row.last_error||null);
+        for (const row of bundle.tasks || []) inserts.task.run(row.id,userId,row.title,row.prompt,row.status,row.risk,row.schedule_at,row.recurrence,
+          row.delivery_channel==='whatsapp'?'whatsapp':'push',row.result,row.created_at,row.updated_at,row.attempt_count||0,null,row.last_error||null);
         for (const row of bundle.events || []) inserts.event.run(row.id,userId,row.type,row.message,row.detail,row.created_at);
         for (const row of bundle.artifacts || []) inserts.artifact.run(row.id,userId,row.task_id,row.name,row.mime_type,row.content,row.size_bytes,row.created_at);
-        if(bundle.preferences){const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,p.briefingTone,p.briefingLength,created,timestamp());}
+        if(bundle.version===6){
+          for(const entry of PORTABLE_USER_TABLES){
+            const insert=db.prepare(portableInsertSql(entry));
+            for(const row of bundle[entry.key]||[])insert.run(...portableRowValues(entry,row,userId));
+          }
+        }
+        if(bundle.preferences){
+          const p=normalizePreferences(bundle.preferences);const current=s.getPreferences.get(userId);const created=current?.created_at||timestamp();
+          s.upsertPreferences.run(userId,p.timeZone,p.quietStart,p.quietEnd,p.proactiveEnabled?1:0,p.briefingTone,p.briefingLength,created,timestamp());
+          if(bundle.version===6){
+            const old=bundle.preferences;
+            db.prepare(`UPDATE user_preferences SET buddy_name=?,writing_voice_opt_in=?,writing_voice_profile=?,writing_voice_updated_at=?,
+              writing_voice_offered=?,intro_dismissed=? WHERE user_id=?`).run(old.buddy_name||null,old.writing_voice_opt_in===1?1:0,
+              old.writing_voice_profile||null,old.writing_voice_updated_at||null,old.writing_voice_offered===1?1:0,
+              old.intro_dismissed===1?1:0,userId);
+          }
+        }
         db.exec('COMMIT');
       } catch (error) { db.exec('ROLLBACK'); throw error; }
     }

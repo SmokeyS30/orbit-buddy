@@ -5,10 +5,12 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
+import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
 import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
@@ -18,6 +20,7 @@ import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
 import { writeAutomatedBackup } from './src/backups.js';
+import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
 import { buildRoutinePrompt, dueRoutines } from './src/proactive.js';
 import { searchMessages, formatSearchResults, formatSearchItems, parseSearchFilterParams } from './src/conversation-search.js';
@@ -208,27 +211,27 @@ function markdownToPdfBuffer(md){
   }
   if(cur.length)pages.push(cur);
   if(!pages.length)pages.push([]);
+  // Catalog, page tree, and fonts occupy 1–4; page/stream pairs start at 5.
   const objs=[];
-  const contentRefs=pages.map((_,i)=>`${6+i*2} 0 R`).join(' ');
   objs[1]='<< /Type /Catalog /Pages 2 0 R >>';
-  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${3+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
+  objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${5+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
   pages.forEach((pg,i)=>{
-    const p=3+i*2,c=6+i*2;
-    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents ${c} 0 R >>`;
+    const p=5+i*2,c=6+i*2;
+    objs[p]=`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${c} 0 R >>`;
     let stream='';
     for(const t of pg){stream+=`BT /${t.font} ${t.size} Tf ${t.x.toFixed(1)} ${t.y.toFixed(1)} Td (${pdfEscape(t.text)}) Tj ET\n`;}
-    objs[c]=`<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`;
+    objs[c]=`<< /Length ${Buffer.byteLength(stream,'latin1')} >>\nstream\n${stream}\nendstream`;
   });
-  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
-  objs[5]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
+  objs[3]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+  objs[4]='<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>';
   let pdf='%PDF-1.4\n';const offsets=[];
   const maxObj=Math.max(...Object.keys(objs).map(Number));
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
-    offsets[i]=Buffer.byteLength(pdf);
+    offsets[i]=Buffer.byteLength(pdf,'latin1');
     pdf+=`${i} 0 obj\n${objs[i]}\nendobj\n`;
   }
-  const xrefPos=Buffer.byteLength(pdf);
+  const xrefPos=Buffer.byteLength(pdf,'latin1');
   pdf+=`xref\n0 ${maxObj+1}\n0000000000 65535 f \n`;
   for(let i=1;i<=maxObj;i++){
     if(!objs[i])continue;
@@ -515,10 +518,12 @@ export function createOrbitServer(options={}) {
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
   const encryptionKey=readEncryptionKey(env.DATA_ENCRYPTION_KEY||env.CONNECTOR_ENCRYPTION_KEY);
   const db=createDatabase({dbPath:options.dbPath||path.join(dataDir,'orbit.sqlite'),encryptionKey,databaseUrl:env.DATABASE_URL});
+  const replyInstanceId=randomUUID();
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
   const model=options.modelClient||createModelClient(env);
+  const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
@@ -622,9 +627,122 @@ export function createOrbitServer(options={}) {
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
   let workerBusy=false;
-  const chatQueues=new Map();
+  const activeReplyJobs=new Map();
+  const ephemeralReplyPayloads=new Map();
+  let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
+  const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
-  function enqueueChatReply(conversationId,job){const prev=chatQueues.get(conversationId)||Promise.resolve();const next=prev.then(async()=>{try{await job();}catch(error){console.error('chat job failed',conversationId,error&&error.message);}});chatQueues.set(conversationId,next);next.finally(()=>{if(chatQueues.get(conversationId)===next)chatQueues.delete(conversationId);});return next;}
+  const replyDb=async(method,...args)=>db.async?db.async[method](...args):db[method](...args);
+  function scheduleReplyPump(){
+    if(closing||replyPumpScheduled)return;
+    replyPumpScheduled=true;
+    setImmediate(()=>{replyPumpScheduled=false;pumpReplyJobs();});
+  }
+  function pumpReplyJobs(){
+    if(closing)return Promise.resolve();
+    if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
+    replyPumpRunning=true;
+    replyPumpTask=(async()=>{
+      try{
+        await replyDb('renewQueuedEphemeralReplyJobs',replyInstanceId);
+        if(closing)return;
+        await replyDb('cancelDisallowedReplyJobs');
+        if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
+        await replyDb('recoverExpiredReplyJobs');
+        if(closing)return;
+        scheduleWhatsAppDeliveries();
+        while(!closing&&activeReplyJobs.size<4){
+          const job=await replyDb('claimNextReplyJob',replyInstanceId,REPLY_LEASE_MS);
+          if(!job)break;
+          // close() can begin while the claim is awaiting PostgreSQL. Do not
+          // start work after its active-job snapshot; return the lease so a
+          // surviving replica or restarted worker can take the queued turn.
+          if(closing){await replyDb('releaseReplyJob',job.id,job.lease_token);break;}
+          const task=executeReplyJob(job).catch((error)=>{
+            chatMetrics.record({queueMs:Math.max(0,Date.now()-Date.parse(job.queued_at)),error:true});
+            console.error('chat job failed',job.id,error&&error.message);
+          }).finally(()=>{
+            activeReplyJobs.delete(job.id);
+            ephemeralReplyPayloads.delete(job.id);
+            scheduleReplyPump();
+          });
+          activeReplyJobs.set(job.id,task);
+        }
+      }catch(error){if(!closing)console.error('reply pump failed',error&&error.message);}
+      finally{
+        replyPumpRunning=false;
+        replyPumpTask=null;
+        if(replyPumpAgain){replyPumpAgain=false;scheduleReplyPump();}
+      }
+    })();
+    return replyPumpTask;
+  }
+  function scheduleWhatsAppDeliveries(){
+    if(closing)return Promise.resolve();
+    if(deliveryTask)return deliveryTask;
+    deliveryTask=deliverPendingWhatsAppReplies()
+      .catch((error)=>console.error('WhatsApp reply delivery failed',error&&error.message))
+      .finally(()=>{deliveryTask=null;});
+    return deliveryTask;
+  }
+  async function deliverPendingWhatsAppReplies(){
+    for(const job of await replyDb('listPendingReplyDeliveries',10)){
+      if(closing)break;
+      if(!await replyDb('markReplyDeliveryAttempted',job.id))continue;
+      try{
+        const [link,user]=await Promise.all([replyDb('getWhatsAppLink',job.user_id),replyDb('getUserById',job.user_id)]);
+        const reply=job.reply_message_id?await replyDb('getMessage',job.user_id,job.reply_message_id):null;
+        // A queued reply belongs only to the verified link that accepted its
+        // inbound turn. Old jobs without this binding fail closed.
+        if(!user||user.disabled===1||user.moderation_blocked===1||
+          !job.delivery_to_phone||!job.delivery_link_verified_at||
+          link?.phone_e164!==job.delivery_to_phone||link?.verified_at!==job.delivery_link_verified_at||
+          !isWindowOpen(link.last_inbound_at)||!reply)continue;
+        await sendWhatsAppText({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,
+          fromNumber:env.TWILIO_WHATSAPP_NUMBER,toPhone:job.delivery_to_phone,body:reply.content});
+      }catch(error){
+        console.error('whatsapp send failed',error&&error.message);
+        try{db.addEvent(job.user_id,'whatsapp_send_failed','Could not send WhatsApp reply.',String(error?.message||error).slice(0,200));}catch{}
+      }
+    }
+  }
+  async function executeReplyJob(job){
+    let leaseAlive=true;
+    let renewing=false;
+    const heartbeat=setInterval(()=>{
+      if(renewing)return;
+      renewing=true;
+      replyDb('renewReplyJobLease',job.id,job.lease_token,REPLY_LEASE_MS)
+        .then((renewed)=>{if(!renewed)leaseAlive=false;})
+        .catch(()=>{leaseAlive=false;})
+        .finally(()=>{renewing=false;});
+    },30_000);
+    heartbeat.unref();
+    try{
+      const [user,conversation,userMsg]=await Promise.all([
+        replyDb('getUserById',job.user_id),replyDb('getConversation',job.user_id,job.conversation_id),replyDb('getMessage',job.user_id,job.user_message_id)]);
+      if(!user||user.disabled===1||user.moderation_blocked===1||!conversation||!userMsg){
+        await replyDb('cancelReplyJob',job.id,job.lease_token);
+        return;
+      }
+      const fresh=await replyDb('getReplyJob',job.id);
+      if(!fresh||fresh.status!=='running'||fresh.lease_token!==job.lease_token)return;
+      const ephemeral=ephemeralReplyPayloads.get(job.id);
+      if(job.requires_ephemeral&&!ephemeral){
+        await replyDb('completeReplyJob',job.id,job.lease_token,REPLY_INTERRUPTED_TEXT,job.insert_created_at);
+        return;
+      }
+      const message=job.requires_ephemeral?ephemeral?.message:userMsg.content;
+      const images=ephemeral?.images||[];
+      const historyOverride=job.kind==='regenerate'
+        ?(await replyDb('listConversationMessagesThrough',job.user_id,job.conversation_id,userMsg.id,24)).filter((m)=>m.id!==userMsg.id)
+        :null;
+      const answer=await runChatReplyJob({userId:job.user_id,user,conversation,message:message||REPLY_INTERRUPTED_TEXT,
+        userMsg,images,historyOverride,insertCreatedAt:job.insert_created_at,
+        queueMs:Math.max(0,Date.now()-Date.parse(job.queued_at)),replyJob:job,leaseAlive:()=>leaseAlive});
+      if(answer&&job.channel==='whatsapp')await scheduleWhatsAppDeliveries();
+    }finally{clearInterval(heartbeat);}
+  }
   // R3 ambient context ("Orbit remembers the room"). With the user's explicit
   // permission, note the setting of a conversation: weekday, time of day, and
   // a self-declared place label. One memory per day max; repeats of the same
@@ -651,14 +769,32 @@ export function createOrbitServer(options={}) {
   // `insertCreatedAt` re-inserts the new assistant message at an explicit
   // position in conversation order (regenerate replaces the old answer
   // in place instead of appending it at the end).
-  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null}){
-    if(!db.getConversation(userId,conversation.id))return null;
+  async function runChatReplyJob({userId,user,conversation,message,userMsg,images=[],historyOverride=null,insertCreatedAt=null,queueMs=0,replyJob=null,leaseAlive=()=>true}){
+    const startedAt=performance.now();
+    let databaseMs=0,contextMs=null,modelFirstTokenMs=null,modelCompletionMs=0,modelStartedAt=null;
+    let replyFailed=false,modelFallback=false;
+    const timedDb=(read)=>{const at=performance.now();try{return read();}finally{databaseMs+=performance.now()-at;}};
+    const timedDbAsync=async(read)=>{const at=performance.now();try{return await read();}finally{databaseMs+=performance.now()-at;}};
+    const timedModel=async(call)=>{
+      const at=performance.now();
+      if(modelStartedAt===null){modelStartedAt=at;contextMs=at-startedAt;}
+      try{return await call();}finally{modelCompletionMs+=performance.now()-at;}
+    };
+    // Capture the turn's ordered history before yielding to other requests.
+    // The later independent context reads can use the asynchronous PG worker
+    // without letting a subsequent send enter this turn's conversation history.
+    const replyContext=timedDb(()=>db.getChatReplyContext(userId,conversation.id,historyOverride?0:24));
+    if(!replyContext.conversation){chatMetrics.record({queueMs,databaseMs,contextMs:performance.now()-startedAt,completionMs:queueMs+performance.now()-startedAt,error:true});return null;}
     // Membership is resolved from the server-side, Apple-verified entitlement.
     // The client cannot opt itself into stronger model routing.
-    const membershipTier=subscriptions.tier(userId,user);
+    const membershipTier=timedDb(()=>subscriptions.tier(userId,user));
     const streamState={turn:-1,text:'',rawText:'',filtered:false,done:false};pendingStreams.set(conversation.id,streamState);
+    const finishStream=()=>{streamState.done=true;const cleanup=setTimeout(()=>{
+      if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);
+    },60_000);cleanup.unref();};
     const onStreamTurn=(turn)=>{streamState.turn=turn;streamState.text='';streamState.rawText='';streamState.filtered=false;};
     const onStreamToken=(delta)=>{
+      if(modelFirstTokenMs===null&&modelStartedAt!==null)modelFirstTokenMs=performance.now()-modelStartedAt;
       if(streamState.filtered)return;
       streamState.rawText+=delta;
       // Every rule is shorter than this window. Scan the tail on small token
@@ -667,24 +803,57 @@ export function createOrbitServer(options={}) {
       if(checked.filtered){streamState.filtered=true;streamState.rawText='';streamState.text=checked.text;}
       else streamState.text=streamState.rawText;
     };
-    let answer=null;
-    const storeAssistantMessage=(content)=>{const checked=filterAssistantContent(content);if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}const stored=db.addMessage(userId,conversation.id,'assistant',checked.text);if(insertCreatedAt)db.retimeMessage(userId,stored.id,insertCreatedAt);captureCanvasRevision(db,userId,conversation.id,stored);return stored;};
+    const leaseLost=()=>Object.assign(new Error('Reply lease lost.'),{code:'REPLY_LEASE_LOST'});
+    const assertReplyLease=async()=>{
+      if(!leaseAlive())throw leaseLost();
+      if(!replyJob)return;
+      const [current,account]=await Promise.all([replyDb('getReplyJob',replyJob.id),replyDb('getUserById',userId)]);
+      if(!account||account.disabled===1||account.moderation_blocked===1){
+        await replyDb('cancelReplyJob',replyJob.id,replyJob.lease_token);
+        throw leaseLost();
+      }
+      if(!current||current.status!=='running'||current.lease_token!==replyJob.lease_token||
+        !current.lease_expires_at||Date.parse(current.lease_expires_at)<=Date.now())throw leaseLost();
+    };
+    let answer=null,replyStored=false;
+    const storeAssistantMessage=(content)=>{
+      const checked=filterAssistantContent(content);
+      if(checked.filtered){answer=checked.text;db.addEvent(userId,'content_filtered','An AI response was hidden by the local safety filter.');}
+      if(!leaseAlive())throw leaseLost();
+      const stored=replyJob
+        ?db.completeReplyJob(replyJob.id,replyJob.lease_token,checked.text,insertCreatedAt)
+        :db.addMessage(userId,conversation.id,'assistant',checked.text);
+      if(!stored)throw leaseLost();
+      replyStored=true;
+      if(insertCreatedAt&&!replyJob)db.retimeMessage(userId,stored.id,insertCreatedAt);
+      captureCanvasRevision(db,userId,conversation.id,stored);
+      return stored;
+    };
     try{
-      const baseHistory=historyOverride||db.listConversationMessages(userId,conversation.id,24);
-      const history=sanitizeAssistantMessages(baseHistory.slice(-24)).filter((m)=>m.id!==userMsg.id);
-      const preferences=db.getPreferences(userId);const summary=db.getConversationSummary(userId,conversation.id);
+      await assertReplyLease();
+      // A summary covers messages before its final 12. Until a newer summary
+      // lands, include the uncovered interval so a queued reply cannot lose
+      // older context. Cap the temporary expansion at 48 messages to keep
+      // model input and token spending bounded while the summary is pending.
+      const covered=replyContext.summary?Math.max(0,Number(replyContext.summary.message_count)-12):0;
+      const historyLimit=Math.min(48,Math.max(24,replyContext.messageCount-covered));
+      const baseHistory=historyOverride||(historyLimit>24||replyContext.history.at(-1)?.id!==userMsg.id
+        ?timedDb(()=>db.listConversationMessagesThrough(userId,conversation.id,userMsg.id,historyLimit))
+        :replyContext.history);
+      const history=sanitizeAssistantMessages(baseHistory.filter((m)=>m.id!==userMsg.id));
+      const preferences=replyContext.preferences;const summary=historyOverride?null:replyContext.summary;
       const customBuddyName=String(preferences?.buddy_name||'').trim().slice(0,40);
       let needsBuddyName=false;
       if(!customBuddyName){
-        const askedAt=Number(db.getSetting(`buddy_name_asked_${userId}`)||0);
+        const askedAt=Number(replyContext.settings[`buddy_name_asked_${userId}`]||0);
         if(!askedAt||Date.now()-askedAt>7*24*3600_000){needsBuddyName=true;db.setSetting(`buddy_name_asked_${userId}`,String(Date.now()));}
       }
       // R3 ambient context: one gentle permission ask in chat, never a toggle.
       // Declined = never ask again; dodged = re-ask after 90 days at most.
       // Only asked once the user has actually chatted a little (>=4 turns).
       let needsAmbientAsk=false;
-      if(!db.getSetting(`ambient_context_${userId}`)){
-        const ambientAskedAt=Number(db.getSetting(`ambient_asked_${userId}`)||0);
+      if(!replyContext.settings[`ambient_context_${userId}`]){
+        const ambientAskedAt=Number(replyContext.settings[`ambient_asked_${userId}`]||0);
         if(!ambientAskedAt||Date.now()-ambientAskedAt>90*24*3600_000){
           // baseHistory (24 msgs, already loaded above) usually settles the
           // >=4 user-turn gate on its own — the extra 50-message read only
@@ -693,7 +862,7 @@ export function createOrbitServer(options={}) {
           // so it keeps the original full-conversation read.
           let userTurns=baseHistory.filter((m)=>m.role==='user').length;
           if(historyOverride||needsFullAmbientHistoryRead(baseHistory)){
-            userTurns=db.listConversationMessages(userId,conversation.id,50).filter((m)=>m.role==='user').length;
+            userTurns=timedDb(()=>db.listConversationMessages(userId,conversation.id,50)).filter((m)=>m.role==='user').length;
           }
           if(userTurns>=4){needsAmbientAsk=true;db.setSetting(`ambient_asked_${userId}`,String(Date.now()));}
         }
@@ -702,7 +871,7 @@ export function createOrbitServer(options={}) {
       // instruction when opted in. Never in normal chat, never without opt-in.
       // One-time offer: if the user hasn't opted in and hasn't been offered yet,
       // let the model offer it on this writing task, then mark offered so we ask once.
-      const voiceState=db.getWritingVoice(userId);
+      const voiceState=replyContext.writingVoice;
       const writingVoice=(voiceState?.optIn&&voiceState?.profile)?buildVoiceStyleDirective(voiceState.profile,user?.display_name):null;
       let offerWritingVoice=false;
       if(!voiceState?.optIn&&!voiceState?.offered){
@@ -746,7 +915,7 @@ export function createOrbitServer(options={}) {
       let chitchatAnswered=false;
       if(membershipTier!=='unlimited'&&images.length===0&&isChitchatMessage(message)){
         try{
-          const { text: chitchatText }=await model.respondChitchat({
+          const { text: chitchatText }=await timedModel(()=>model.respondChitchat({
             buddyName:customBuddyName||defaultBuddyName,
             userName:user?.display_name,
             message,
@@ -755,12 +924,16 @@ export function createOrbitServer(options={}) {
             soulDirective:null,
             userTimeZone:preferences.time_zone,
             onTurn:onStreamTurn,
-            onToken:onStreamToken
-          });
+            onToken:onStreamToken,
+            assertActive:assertReplyLease
+          }));
+          await assertReplyLease();
           answer=chitchatText;
           storeAssistantMessage(answer);db.addEvent(userId,'chat','Orbit replied to a message.');
           chitchatAnswered=true;
         }catch(chitchatError){
+          if(chitchatError?.code==='REPLY_LEASE_LOST')throw chitchatError;
+          modelFallback=true;
           console.error('chitchat fast-path failed, falling back to full path',chitchatError&&chitchatError.message);
         }
       }
@@ -786,12 +959,16 @@ export function createOrbitServer(options={}) {
           emotionContext=buildEmotionalContext({userName:user?.display_name,tone:emotionTone,emotionPhrase:emotionPattern&&emotionPattern.phrase});
         }catch(error){console.error('emotional context failed',error&&error.message);emotionContext=null;}
       }
-      const recalledMemories=db.listRelevantMemories(userId,message);
-      // Planning context is comparatively expensive: projects also load their
-      // steps. Only fetch it for turns where it can affect the answer.
-      const openCommitments=loadPlanningContext?db.listFollowUps(userId).slice(0,8):[];
-      const activeGoals=loadPlanningContext?db.listActiveGoals(userId):[];
-      const activeProjects=loadPlanningContext?db.listProjects(userId).filter((project)=>project.status!=='completed'):[];
+      // Memory + optional planning reads are independent. PostgreSQL executes
+      // them concurrently behind one worker crossing; SQLite keeps identical
+      // results locally. Episodic last-mentioned stamps remain intact.
+      const modelContext=await timedDbAsync(()=>db.async
+        ?db.async.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8})
+        :db.getChatModelContext(userId,message,{includePlanning:loadPlanningContext,memoryLimit:8}));
+      const recalledMemories=modelContext.memories;
+      const openCommitments=modelContext.followUps;
+      const activeGoals=modelContext.goals;
+      const activeProjects=modelContext.projects;
       const relationalContext=buildRelationalDirective({message,memories:recalledMemories,commitments:openCommitments,plan:relationalPlan});
       // Proactive memory (2026-10-16): volunteer at most ONE timely memory
       // (a due date from memories, or an open loop the topic calls for) as a
@@ -805,14 +982,16 @@ export function createOrbitServer(options={}) {
       // receives the same data shape when the reads do run.
       if(!isDemoUser(user)&&!shouldDeferProactiveSurfacing({recalledMemories,message})){
         try{
-          const surfacedRows=db.listMemorySurfacings(userId,200);
+          const proactiveContext=await timedDbAsync(()=>db.async
+            ?db.async.getChatProactiveContext(userId):db.getChatProactiveContext(userId));
+          const surfacedRows=proactiveContext.surfacedRows;
           // Memory connections (2026-10-16): unified chooser — date triggers
           // first (time-sensitive), then memory patterns / emotional
           // patterns, then open loops. At most one aside per turn.
           proactiveSurfacing=chooseChatSurfacingWithPatterns({
-            allMemories:db.listMemories(userId),
+            allMemories:modelContext.allMemories,
             recalledMemories,
-            personalDates:db.listPersonalDates(userId),
+            personalDates:proactiveContext.personalDates,
             historyMessages:history,
             userMessage:message,
             surfacedKeys:new Set(surfacedRows.map((r)=>r.occurrence_key)),
@@ -823,12 +1002,14 @@ export function createOrbitServer(options={}) {
           });
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
-      const { text: rawAnswer, toolCalls }=await model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
+      await assertReplyLease();
+      const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
-        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,model,
+        tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,regenerated:replyJob?.kind==='regenerate',model,
           gmail:user.role==='owner'?{ getToken: () => connectors.getValidToken(userId,'gmail') }:null},
-        onTurn:onStreamTurn,onToken:onStreamToken});
+        onTurn:onStreamTurn,onToken:onStreamToken,assertActive:assertReplyLease}));
+      await assertReplyLease();
       // Legacy follow-up and memory markers can persist their text outside the
       // chat message. Filter before reading them as well as before delivery.
       const checkedRaw=filterAssistantContent(rawAnswer);
@@ -884,9 +1065,22 @@ export function createOrbitServer(options={}) {
         // R3: note the setting of this conversation. Non-blocking; in-memory only.
         setImmediate(()=>{try{captureAmbientContext(db,userId,message,preferences.time_zone||'America/New_York');}catch(error){console.error('ambient capture failed',error&&error.message);}});
       }
-    }catch(error){console.error('chat reply failed',conversation.id,error&&error.message);db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';storeAssistantMessage(answer);}
-    streamState.done=true;const cleanup=setTimeout(()=>{if(pendingStreams.get(conversation.id)===streamState)pendingStreams.delete(conversation.id);},60_000);cleanup.unref();
-    await maybeRefreshConversationSummary(user,conversation);
+    }catch(error){
+      if(error?.code==='REPLY_LEASE_LOST'){finishStream();return null;}
+      replyFailed=true;console.error('chat reply failed',conversation.id,error&&error.message);
+      try{db.addEvent(userId,'chat_failed','Orbit could not finish a reply.',error&&error.message);}catch{}
+      if(!replyStored){
+        try{await assertReplyLease();}catch(leaseError){if(leaseError?.code==='REPLY_LEASE_LOST'){finishStream();return null;}throw leaseError;}
+        const connectionIssue=['authentication','quota','rate_limit','model_access','network','service'].includes(error?.classification);
+        answer=connectionIssue?'My model connection needs attention. Check the AI model connection card in Safety for the exact next step.':'I ran into trouble with that one — mind trying again?';
+        storeAssistantMessage(answer);
+      }
+    }
+    finishStream();
+    chatMetrics.record({queueMs,databaseMs,contextMs:contextMs??performance.now()-startedAt,modelFirstTokenMs,
+      modelCompletionMs:modelStartedAt===null?null:modelCompletionMs,completionMs:queueMs+performance.now()-startedAt,
+      error:replyFailed,modelFallback});
+    queueSummaryRefresh(user,conversation);
     if(isCorrectionMessage(message)){
       // Learn from the correction without blocking: figure out what was wrong and save the fix
       setImmediate(async()=>{
@@ -917,13 +1111,22 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||paused())return;workerBusy=true;
+    if(workerBusy||closing||paused())return;workerBusy=true;
     try{
       db.recoverStaleTasks();
       for(const task of db.dueTasks()){
-        if(!db.startTask(task.user_id,task.id))continue;
-        db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
+        if(closing)break;
+        const attempt=db.startTask(task.user_id,task.id);
+        if(!attempt)continue;
+        let leaseAlive=true;
+        const heartbeat=setInterval(()=>{
+          try{if(closing||!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
+          catch{leaseAlive=false;}
+          if(!leaseAlive)clearInterval(heartbeat);
+        },30_000);
+        heartbeat.unref();
         try{
+          db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
           // Strip stale "check the calendar first / suppress if absent" clauses from old reminder prompts.
@@ -934,7 +1137,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           }
           const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
           const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);
-          db.completeTask(task.user_id,task.id,result,following?'scheduled':'completed',following);
+          if(!leaseAlive||closing||!db.completeTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
           // Delivery channel: WhatsApp replaces push when the 24h window is open;
@@ -943,7 +1146,8 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
           await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
           await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){db.failTask(task.user_id,task.id,'Task failed safely.',error.message);db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        }catch(error){if(!leaseAlive||closing||!db.failTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});}
+        finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;}
   }
@@ -1018,6 +1222,13 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     const transcript=older.map((entry)=>`${entry.role==='user'?'User':'Orbit'}: ${entry.content}`).join('\n').slice(-24000);
     const prompt=`Summarize the earlier part of this conversation for future continuity. Preserve decisions, open questions, goals, preferences, names, dates, and commitments. Do not add facts or advice. Use concise plain text.\n\n${existing?.summary?`Previous summary:\n${existing.summary}\n\n`:''}Conversation:\n${transcript}`;
     try{const preferences=db.getPreferences(userId);const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:prompt,memories:[],history:[],userTimeZone:preferences.time_zone,taskMode:true});db.setConversationSummary(userId,conversation.id,text,messageCount);db.addEvent(userId,'conversation_summarized',`Refreshed context for “${conversation.title}”.`);}catch(error){db.addEvent(userId,'conversation_summary_failed',`Could not refresh context for “${conversation.title}”.`,error.message);}
+  }
+  function queueSummaryRefresh(user,conversation){
+    if(!model.configured||summaryJobs.has(conversation.id))return;
+    const job=Promise.resolve().then(()=>maybeRefreshConversationSummary(user,conversation))
+      .catch((error)=>console.error('conversation summary failed',error&&error.message))
+      .finally(()=>{if(summaryJobs.get(conversation.id)===job)summaryJobs.delete(conversation.id);});
+    summaryJobs.set(conversation.id,job);
   }
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
@@ -1550,21 +1761,27 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
     const row=db.getImportJob(userId,id);
     if(!row||row.status!=='processing')return;
     try{
+      if(!db.isImportJobActive(userId,id))throw new Error('Import stopped before starting.');
       const extracted=extractMessages(parsed);
       if(!extracted||!extracted.messages.length)throw new Error('No conversation messages found in the upload.');
       const chunks=chunkMessages(extracted.messages,20);
       if(!chunks.length)throw new Error('Nothing substantial to learn from in this export.');
-      // Cap chunks to bound cost on huge exports
-      const work=chunks.slice(0,60);
-      db.updateImportJob(userId,id,{total_chunks:work.length});
+      // Each user can start at most three imports a day; bound one import's
+      // model work too, even when the uploaded export is very large.
+      const work=chunks.slice(0,20);
+      if(!db.updateImportJobIfCurrent(userId,id,{total_chunks:work.length}))throw new Error('Import stopped before starting model work.');
       const prefs=db.getPreferences(userId);
       const timeZone=prefs.time_zone||'America/New_York';
       const user=db.getUserById(userId);
       let added=0;
       for(let i=0;i<work.length;i++){
+        const currentUser=db.getUserById(userId);
+        if(paused()||!currentUser||currentUser.disabled||isDemoUser(currentUser))throw new Error('Import stopped because AI work is paused or this account is unavailable.');
+        if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
           const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+            assertActive:()=>{if(!db.isImportJobActive(userId,id))throw Object.assign(new Error('Import job is no longer authorized.'),{code:'REPLY_LEASE_LOST'});},
             message:`Extract durable facts about this user from these past AI conversations.
 
 Focus on: personal facts (name, location, work, school, family), preferences (likes/dislikes, how they like answers), opinions, habits, goals, relationships.
@@ -1574,6 +1791,8 @@ ${convoText}
 
 Respond with a JSON array of insights, max 6: [{"content":"brief clear fact","kind":"fact"|"preference"|"goal"|"relationship"|"decision","confidence":0.0-1.0}]
 Only include what's clearly supported — skip one-off questions, transient topics, and anything uncertain. If nothing durable, respond with [].`});
+          const activeUser=db.getUserById(userId);
+          if(paused()||!activeUser||activeUser.disabled||isDemoUser(activeUser)||db.getImportJob(userId,id)?.status!=='processing')throw new Error('Import stopped before applying this model result.');
           const jm=text.match(/\[[\s\S]*\]/);
           if(jm){
             const insights=JSON.parse(jm[0]);
@@ -1586,19 +1805,23 @@ Only include what's clearly supported — skip one-off questions, transient topi
                 if(existing.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
                 const sug=db.listMemorySuggestions(userId);
                 if(sug.some((m)=>m.content.toLowerCase().includes(content.toLowerCase().slice(0,30))))continue;
-                db.addMemorySuggestion(userId,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))});
+                if(!db.addImportSuggestionIfCurrent(userId,id,content,{kind:normalizeMemoryKind(ins.kind),confidence:Math.max(0.4,Math.min(Number(ins.confidence)||0.6,0.85))}))throw new Error('Import stopped before saving a suggestion.');
                 added++;
               }
             }
           }
-        }catch(e){/* one bad chunk shouldn't kill the job */}
-        db.updateImportJob(userId,id,{done_chunks:i+1,suggestions_added:added});
+        }catch(e){
+          const latestUser=db.getUserById(userId);
+          if(paused()||!latestUser||latestUser.disabled||isDemoUser(latestUser))throw e;
+          // One malformed or failed chunk should not discard the whole import.
+        }
+        if(!db.updateImportJobIfCurrent(userId,id,{done_chunks:i+1,suggestions_added:added}))throw new Error('Import stopped before recording progress.');
       }
-      db.updateImportJob(userId,id,{status:'done',suggestions_added:added});
+      if(!db.updateImportJobIfCurrent(userId,id,{status:'done',suggestions_added:added}))throw new Error('Import stopped before completion.');
       db.addEvent(userId,'import_completed',`Conversation import finished: ${added} suggestion${added===1?'':'s'} ready for review in Memory.`);
     }catch(error){
-      db.updateImportJob(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)});
-      db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
+      if(db.updateImportJobIfCurrent(userId,id,{status:'failed',error:String(error?.message||error).slice(0,300)},true)&&db.getUserById(userId))
+        db.addEvent(userId,'import_failed','Conversation import failed.',String(error?.message||error).slice(0,200));
     }
   }
   async function runSmartCheckins(nowMs){
@@ -2324,7 +2547,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
     if(production)res.setHeader('Strict-Transport-Security','max-age=31536000; includeSubDomains');
     if(rateLimited(req))return json(res,429,{error:'Too many requests. Try again shortly.'});
-    const url=new URL(req.url,'http://localhost');
+    let url;
+    try{url=new URL(req.url,'http://localhost');}
+    catch{return json(res,400,{error:'Invalid request URL.'});}
     // ===== CORS FOR THE NATIVE APP (capacitor://localhost) =====
     // Answered before the maintenance block so preflights always get a clean
     // answer. Web requests (no matching Origin) are completely unaffected.
@@ -2341,13 +2566,13 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
     }
     // Shallow liveness: Node process is alive (no DB check to avoid restart loops)
-    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy'});}
+    if(url.pathname==='/livez'){return json(res,200,{ok:true,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown'});}
     // Readiness: PostgreSQL must be reachable
     if(url.pathname==='/readyz'){
       let dbState='ready';const dbDriver=db.driver||'unknown';
       try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
       const ok=dbState==='ready';
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',database:{driver:dbDriver,state:dbState}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',database:{driver:dbDriver,state:dbState}});
     }
     if(url.pathname==='/healthz'){
       const modelStatus=model.diagnostics();
@@ -2356,7 +2581,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
       const backup=backupStatus();
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
     }
     // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
     // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
@@ -2448,31 +2673,31 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(owner){await push.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});await apns.notify(owner.id,'New waitlist signup',`${email} joined the waitlist.`,{view:'safety'}).catch(()=>{});}
         return json(res,201,{ok:true});
       }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist'){
-        requireOwner(req);
-        const rows=db.listWaitlist();
-        return json(res,200,{ok:true,waitlist:rows});
-      }
-      if(req.method==='POST'&&url.pathname.startsWith('/api/admin/waitlist/')){
-        requireOwner(req);
-        const id=url.pathname.split('/').pop();
-        const body=await readJson(req);
-        const status=String(body.status||'').trim();
-        if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
-        db.updateWaitlistStatus(id,status);
-        return json(res,200,{ok:true});
-      }
-      if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
-      }
-      if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
-        requireOwner(req);
-        const body=await readJson(req);
-        const n=parseInt(body.invitesPerWeek,10);
-        if(!n||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1\u20131000.'),{status:400});
-        db.setSetting('waitlist_invites_per_week',String(n));
-        return json(res,200,{ok:true,invitesPerWeek:n});
+      if(url.pathname==='/api/admin/waitlist'||url.pathname.startsWith('/api/admin/waitlist/')){
+        const admin=authenticate(req);
+        if(!admin)return json(res,401,{error:'Sign in first.'});
+        requireOwner(admin);
+        if(req.method==='POST')requireCsrf(req,admin);
+        res.setHeader('Cache-Control','no-store');
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist')return json(res,200,{ok:true,waitlist:db.listWaitlist()});
+        if(req.method==='GET'&&url.pathname==='/api/admin/waitlist/settings')
+          return json(res,200,{ok:true,invitesPerWeek:parseInt(db.getSetting('waitlist_invites_per_week','10'),10)||10});
+        if(req.method==='POST'&&url.pathname==='/api/admin/waitlist/settings'){
+          const body=await readJson(req);
+          const n=Number(body.invitesPerWeek);
+          if(!Number.isInteger(n)||n<1||n>1000)throw Object.assign(new Error('Invites per week must be 1–1000.'),{status:400});
+          db.setSetting('waitlist_invites_per_week',String(n));
+          return json(res,200,{ok:true,invitesPerWeek:n});
+        }
+        const row=url.pathname.match(/^\/api\/admin\/waitlist\/(wl_[A-Za-z0-9_-]{1,100})$/);
+        if(req.method==='POST'&&row){
+          const body=await readJson(req);
+          const status=String(body.status||'').trim();
+          if(!['pending','invited','approved','rejected'].includes(status))throw Object.assign(new Error('Invalid status.'),{status:400});
+          if(!db.updateWaitlistStatus(row[1],status))return json(res,404,{error:'Waitlist entry not found.'});
+          return json(res,200,{ok:true});
+        }
+        return json(res,404,{error:'Waitlist route not found.'});
       }
       if(req.method==='GET'&&url.pathname==='/api/access-status'){
         const email=safeEmail(url.searchParams.get('email')||'');
@@ -2571,26 +2796,23 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         const link=from?db.getUserByWhatsApp(from):null;
         if(!link)return json(res,200,{ok:true,ignored:true}); // unknown sender (or status callback): ignore
         const waUserId=link.user_id;
+        const waUser=db.getUserById(waUserId);
+        if(!waUser||waUser.disabled===1||waUser.moderation_blocked===1)return json(res,200,{ok:true,ignored:true});
         if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
         if(paused())return json(res,200,{ok:true,paused:true});
         db.setWhatsAppLastInbound(waUserId);
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
-        const waUser=db.getUserById(waUserId);
         // Location share: Latitude/Longitude form fields, no media. Coordinates are
         // passed to the model turn only — the stored history row is redacted and
         // nothing is logged, so the location stays ephemeral.
         const sharedLocation=parseWhatsAppLocation(params);
         if(sharedLocation){
           const locationMessage=formatLocationMessage(sharedLocation,body);
-          const userMsg=db.addMessage(waUserId,conversation.id,'user',LOCATION_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-          enqueueChatReply(conversation.id,async()=>{
-            const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:locationMessage,userMsg});
-            if(answer&&from){
-              try{await twilioSend(from,answer);}
-              catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-            }
-          });
+          const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
+            {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+          ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
+          scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
         }
         if(numMedia>0){
@@ -2616,14 +2838,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,voiceNote:false});
             }
             const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
-            const userMsg=db.addMessage(waUserId,conversation.id,'user',voiceMessage);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async()=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:voiceMessage,userMsg});
-              if(answer&&from){
-                try{await twilioSend(from,answer);}
-                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-              }
-            });
+            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+            scheduleReplyPump();
             return json(res,200,{ok:true,voiceNote:true});
           }
           // Image attachments: download from Twilio, run through the SAME
@@ -2645,14 +2861,10 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,image:false});
             }
             const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            const userMsg=db.addMessage(waUserId,conversation.id,'user',WHATSAPP_IMAGE_STORED_MESSAGE);db.touchConversation(waUserId,conversation.id);
-            enqueueChatReply(conversation.id,async()=>{
-              const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:caption||'Look at this.',userMsg,images:[imageBlock]});
-              if(answer&&from){
-                try{await twilioSend(from,answer);}
-                catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-              }
-            });
+            const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
+              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+            ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
+            scheduleReplyPump();
             return json(res,200,{ok:true,image:true});
           }
           // Other media types (video, documents) are not supported yet.
@@ -2661,14 +2873,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           return json(res,200,{ok:true});
         }
         if(!body)return json(res,200,{ok:true}); // e.g. delivery status callback
-        const userMsg=db.addMessage(waUserId,conversation.id,'user',body.slice(0,6000));db.touchConversation(waUserId,conversation.id);
-        enqueueChatReply(conversation.id,async()=>{
-          const answer=await runChatReplyJob({userId:waUserId,user:waUser,conversation,message:body,userMsg});
-          if(answer&&from){
-            try{await twilioSend(from,answer);}
-            catch(e){console.error('whatsapp send failed',e.message);db.addEvent(waUserId,'whatsapp_send_failed','Could not send WhatsApp reply.',String(e.message).slice(0,200));}
-          }
-        });
+        db.acceptReplyJob(waUserId,conversation.id,body.slice(0,6000),{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+        scheduleReplyPump();
         return json(res,200,{ok:true});
       }
       if(url.pathname.startsWith('/api/auth/apple/')||url.pathname.startsWith('/api/auth/attest/')||url.pathname==='/api/auth/signup-appeal'){
@@ -2957,14 +3163,21 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const curKey=`${now.getUTCFullYear()}-${String(now.getUTCMonth()+1).padStart(2,'0')}`;
           const monthLabel=(key)=>{const[y,m]=key.split('-').map(Number);return new Date(Date.UTC(y,m-1,1)).toLocaleString('en-US',{month:'long',year:'numeric',timeZone:'UTC'});};
           const out=[];
+          let modelNarratives=0;
           for(let i=0;i<months;i++){
             const d=new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth()-i,1));
             const key=`${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}`;
             const data=db.timelineMonthData(userId,key);
             const activity=data.memories.length+data.conversations.length+data.goalsCreated.length+data.goalsCompleted.length+data.checkins;
             if(!activity)continue;
-            let narrative=db.getTimelineNarrative(userId,key);
-            if(!narrative||key===curKey){
+            const cached=db.getTimelineNarrativeRecord(userId,key);
+            let narrative=cached?.narrative||null;
+            const freshCurrent=key===curKey&&narrative&&new Date(cached.generated_at).valueOf()>Date.now()-6*60*60_000;
+            const needsNarrative=!narrative||(key===curKey&&!freshCurrent);
+            const lease=needsNarrative&&!paused()&&!isDemoUser(user)&&modelNarratives<1
+              ?db.claimTimelineNarrative(userId,key,key===curKey?new Date(Date.now()-6*60*60_000).toISOString():null):null;
+            if(lease){
+              modelNarratives++;
               const facts=[];
               if(data.memories.length)facts.push(`Saved ${data.memories.length} memories${data.memories[0]?`, including: ${data.memories.slice(0,3).map((m)=>`"${String(m.content).slice(0,80)}"`).join('; ')}`:''}`);
               if(data.goalsCompleted.length)facts.push(`Completed ${data.goalsCompleted.length} goals: ${data.goalsCompleted.map((g)=>g.title).join(', ')}`);
@@ -2973,26 +3186,46 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               if(data.checkins)facts.push(`Logged ${data.checkins} goal check-ins`);
               try{
                 const prefs=db.getPreferences(userId);
-                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true});
-                narrative=text.trim().slice(0,1200)||null;
-                if(narrative)db.setTimelineNarrative(userId,key,narrative);
-              }catch(e){narrative=null;}
-              if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
+                const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw Object.assign(new Error('Timeline generation is no longer authorized.'),{code:'REPLY_LEASE_LOST'});};
+                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
+                const generated=text.trim().slice(0,1200);
+                if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;
+              }catch(e){/* keep the last cached narrative when generation fails */}
+              finally{db.releaseTimelineNarrative(userId,lease);}
+            }else if(needsNarrative){
+              // Another replica may have populated the cache since this request read it.
+              narrative=db.getTimelineNarrativeRecord(userId,key)?.narrative||narrative;
             }
+            if(!narrative)narrative=`An active month — ${data.memories.length} memories saved, ${data.conversations.length} conversations, ${data.goalsCompleted.length} goals completed.`;
             const highlights=[];
             for(const g of data.goalsCompleted.slice(0,3))highlights.push(`Completed "${g.title}"`);
             for(const g of data.goalsCreated.slice(0,2))highlights.push(`Started "${g.title}"`);
             if(data.memories.length)highlights.push(`${data.memories.length} memories saved`);
             out.push({key,label:monthLabel(key),narrative,highlights:highlights.slice(0,6),stats:{memories:data.memories.length,conversations:data.conversations.length,goalsCompleted:data.goalsCompleted.length}});
           }
+          const activeUser=db.getUserById(userId);
+          if(!activeUser||activeUser.disabled||activeUser.moderation_blocked)throw Object.assign(new Error('Account unavailable.'),{status:403});
           return json(res,200,{months:out});
         }
-        if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});const conversationId=url.searchParams.get('conversationId');if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});const stream=conversationId?pendingStreams.get(conversationId):null;if(!stream)return json(res,200,{state:'idle'});if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});}
+        if(req.method==='GET'&&url.pathname==='/api/chat/stream-state'){
+          if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
+          const conversationId=url.searchParams.get('conversationId');
+          if(conversationId&&!db.getConversation(userId,conversationId))throw Object.assign(new Error('Conversation not found.'),{status:404});
+          const stream=conversationId?pendingStreams.get(conversationId):null;
+          const job=conversationId?await(db.async?db.async.getConversationReplyJobState(userId,conversationId):db.getConversationReplyJobState(userId,conversationId)):null;
+          if(job&&['queued','running'].includes(job.status)&&(!stream||stream.done))return json(res,200,{state:'streaming',turn:-1,text:''});
+          if(!stream){
+            const recentCompletion=job?.completed_at&&Date.now()-new Date(job.completed_at).valueOf()<60_000;
+            return json(res,200,{state:recentCompletion?'done':'idle'});
+          }
+          if(stream.done){pendingStreams.delete(conversationId);return json(res,200,{state:'done'});}
+          return json(res,200,{state:'streaming',turn:stream.turn,text:stripModelMarkers(stream.text)});
+        }
         // True SSE chat streaming: one long-lived connection per reply pushes
         // token deltas as they arrive (~100ms granularity) instead of 1s
         // polling. Same auth, ownership, and rate-limit checks as
-        // /api/chat/stream-state (that endpoint is left untouched — the
-        // WhatsApp flow and the polling fallback keep using it).
+        // /api/chat/stream-state (WhatsApp and the polling fallback still use
+        // that endpoint, including cross-replica job status).
         if(req.method==='GET'&&url.pathname==='/api/chat/stream'){
           if(userRateLimited(userId,'stream',600))throw Object.assign(new Error('Too many requests. Try again shortly.'),{status:429});
           const conversationId=url.searchParams.get('conversationId');
@@ -3000,12 +3233,23 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache, no-transform','Connection':'keep-alive','X-Accel-Buffering':'no'});
           res.write(': connected\n\n');
           let closed=false;
-          let lastTurn=-2,lastSentText='',lastBeat=Date.now();
+          let lastTurn=-2,lastSentText='',lastBeat=Date.now(),lastJobCheck=0,lastJob=null;
           const sseSend=(event,payload)=>{if(!closed)res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);};
           const tick=()=>{
             if(closed)return;
             const stream=pendingStreams.get(conversationId);
-            if(!stream){sseSend('done',{turn:-1});clearInterval(timer);res.end();return;}
+            if(!stream||stream.done){
+              if(Date.now()-lastJobCheck>=1000){
+                lastJobCheck=Date.now();
+                try{lastJob=db.getConversationReplyJobState(userId,conversationId);}catch{return;}
+              }
+              if(lastJob&&['queued','running'].includes(lastJob.status)){
+                if(lastTurn!==-1){lastTurn=-1;lastSentText='';sseSend('sync',{turn:-1,text:''});}
+                if(Date.now()-lastBeat>=15000){lastBeat=Date.now();res.write(': heartbeat\n\n');}
+                return;
+              }
+              sseSend('done',{turn:stream?.turn??-1});clearInterval(timer);res.end();return;
+            }
             const turn=stream.turn,text=stripModelMarkers(stream.text||'');
             if(turn!==lastTurn){
               lastTurn=turn;lastSentText=text;sseSend('sync',{turn,text});
@@ -3018,7 +3262,6 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               lastSentText=text;sseSend('sync',{turn,text});
             }
             if(Date.now()-lastBeat>=15000){lastBeat=Date.now();if(!closed)res.write(': heartbeat\n\n');}
-            if(stream.done){sseSend('done',{turn});clearInterval(timer);res.end();}
           };
           const timer=setInterval(tick,100);
           timer.unref();
@@ -3077,8 +3320,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // allowance, so simultaneous requests cannot send message 26.
           const quota=subscriptions.consumeQuota(userId,user);
           if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const userMsg=db.addMessage(userId,conversation.id,'user',message||IMAGE_STORED_MESSAGE);db.touchConversation(userId,conversation.id);
-          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:message||'Look at this.',userMsg,images:imageBlocks}));
+          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+          const userMsg=accepted.userMessage;
+          if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
+          scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
         }
         // W1: per-message actions.
@@ -3111,10 +3357,11 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const slotMs=(Number.isFinite(prevMs)&&Number.isFinite(nextMs)&&nextMs>prevMs)?Math.floor((prevMs+nextMs)/2):prevMs+1;
             insertCreatedAt=new Date(slotMs).toISOString();
           }
-          db.deleteMessage(userId,target.id); // replace the turn
-          db.touchConversation(userId,conversation.id);
-          const historyOverride=ordered.slice(Math.max(0,targetIdx-24),targetIdx);
-          enqueueChatReply(conversation.id,()=>runChatReplyJob({userId,user,conversation,message:userMsg.content,userMsg,images:[],historyOverride,insertCreatedAt}));
+          const quotaPolicy=subscriptions.quotaPolicy(userId,user);
+          const accepted=db.acceptRegenerateReplyJob(userId,conversation.id,userMsg.id,target.id,insertCreatedAt,quotaPolicy);
+          if(accepted?.quotaDenied)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota:accepted.quotaDenied});
+          if(!accepted)throw Object.assign(new Error('This reply changed. Refresh and try again.'),{status:409});
+          scheduleReplyPump();
           return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working',regenerated:true});
         }
         // W1: delete a message turn (own conversations only; getMessage is
@@ -3271,6 +3518,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           return json(res,200,{jobs:db.listImportJobs(userId)});
         }
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
+          if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
+          if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3292,6 +3541,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const extracted=extractMessages(parsed);
           if(!extracted||!extracted.messages.length)throw Object.assign(new Error('No conversation messages found. Upload a ChatGPT export (conversations.json) or a {messages:[...]} file.'),{status:422});
           const job=db.createImportJob(userId,filename);
+          if(!job)throw Object.assign(new Error('An import is already running or the daily import limit was reached. Try again later.'),{status:429});
           db.addEvent(userId,'import_started',`Started analyzing ${extracted.messages.length} imported messages.`);
           // Process in background — raw export lives in memory only, never persisted.
           setImmediate(()=>processImportJob(userId,job.id,parsed).catch((e)=>{console.error('import job failed',job.id,e?.message);}));
@@ -3349,6 +3599,12 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           }
           if(!['calendar_event','gmail_send','gmail_delete','delete_goal','delete_task','delete_routine'].includes(approval.kind))throw Object.assign(new Error('This approval type is not supported.'),{status:400});
           if(approval.kind==='gmail_send'||approval.kind==='gmail_delete'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});}
+          if(['delete_goal','delete_task','delete_routine'].includes(approval.kind)){
+            const outcome=db.executeDeleteApprovalIfCurrent(userId,approval.id);
+            if(outcome.status!=='executed')throw Object.assign(new Error('This deletion request is stale or was already reviewed. Ask Orbit to stage it again.'),{status:409});
+            try{db.addEvent(userId,'approval_executed',`Deleted ${approval.payload.objectType} “${approval.payload.title}” after approval.`);}catch(error){console.error('Deletion completed; audit event write failed:',error);}
+            return json(res,200,{approval:outcome.approval});
+          }
           if(!db.claimApproval(userId,approval.id))throw Object.assign(new Error('Approval item was already reviewed or is being executed.'),{status:409});
           try{
             if(approval.kind==='calendar_event'){
@@ -3364,19 +3620,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               db.addEvent(userId,'approval_executed',`Sent approved email to ${result.to}.`);
               return json(res,200,{approval:executed});
             }
-            if(approval.kind==='delete_goal'||approval.kind==='delete_task'||approval.kind==='delete_routine'){
-              const {id,title,objectType}=approval.payload||{};
-              const ok=approval.kind==='delete_goal'?db.deleteGoal(userId,id):approval.kind==='delete_task'?db.deleteTask(userId,id):db.deleteRoutine(userId,id);
-              if(!ok){
-                db.finishApproval(userId,approval.id,'failed',{error:'The item was already gone.'});
-                db.addEvent(userId,'approval_failed',`Could not delete “${title||'item'}” — it no longer exists.`);
-                return json(res,200,{approval:db.getApproval(userId,approval.id)});
-              }
-              const executed=db.finishApproval(userId,approval.id,'executed',{result:{deleted:approval.kind,id,title}});
-              db.addEvent(userId,'approval_executed',`Deleted ${objectType||'item'} “${title}” after approval.`);
-              return json(res,200,{approval:executed});
-            }
-            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id});
+            const result=await trashEmail(()=>connectors.getValidToken(userId,'gmail'),{id:approval.payload.id,expectedPreview:approval.payload.preview});
             const executed=db.finishApproval(userId,approval.id,'executed',{result});
             db.addEvent(userId,'approval_executed','Moved an approved Gmail message to trash.');
             return json(res,200,{approval:executed});
@@ -3451,11 +3695,15 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
           return json(res,200,{deleted:true});
         }
-        if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const payload=await encryptPortable(db.exportUser(userId),body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
-        if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,12*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);db.restoreUser(userId,bundle);db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
+        if(req.method==='POST'&&url.pathname==='/api/backups/export'){const body=await readJson(req);const bundle=await(db.async?db.async.exportUser(userId):db.exportUser(userId));const payload=await encryptPortable(bundle,body.passphrase);res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Disposition':'attachment; filename="orbit-backup.orbitbackup"','Cache-Control':'no-store'});return res.end(payload);}
+        if(req.method==='POST'&&url.pathname==='/api/backups/restore'){requireOwner(user);const body=await readJson(req,64*1024*1024);if(body.confirm!=='RESTORE')throw Object.assign(new Error('Type RESTORE to confirm.'),{status:400});const bundle=await decryptPortable(body.payload,body.passphrase);setPaused(true);await(db.async?db.async.restoreUser(userId,bundle):db.restoreUser(userId,bundle));db.addEvent(userId,'backup_restored','Merged an encrypted backup. Orbit remains paused for review.');return json(res,200,{ok:true,paused:true});}
         if(req.method==='GET'&&url.pathname==='/api/admin/backup-status'){
           requireOwner(user);
           return json(res,200,{ok:true,backupDir:backupDir||null,...backupStatus()});
+        }
+        if(req.method==='GET'&&url.pathname==='/api/admin/chat-latency'){
+          requireOwner(user);res.setHeader('Cache-Control','no-store');
+          return json(res,200,chatMetrics.snapshot());
         }
         if(req.method==='POST'&&url.pathname==='/api/admin/pause'){requireOwner(user);setPaused(true);for(const account of db.listUsers()){db.addEvent(account.id,'emergency_pause','Emergency pause enabled.');await push.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});await apns.notify(account.id,`${buddyNameFor(account.id)} paused`,'Background work and connectors are paused.',{view:'activity'});}return json(res,200,{paused:true});}
         if(req.method==='POST'&&url.pathname==='/api/admin/resume'){requireOwner(user);const body=await readJson(req);if(body.confirm!=='RESUME')throw Object.assign(new Error('Type RESUME to continue.'),{status:400});setPaused(false);db.addEvent(userId,'emergency_resume','Emergency pause cleared.');setImmediate(runDueTasks);return json(res,200,{paused:false});}
@@ -3525,11 +3773,34 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
     try{const stat=fs.statSync(resolved);if(!stat.isFile())throw new Error();const shellAsset=['index.html','app.js','sw.js'].includes(path.basename(resolved));const isWelcome=path.basename(resolved)==='welcome.html';if(isWelcome)res.setHeader('Content-Security-Policy',"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");res.writeHead(200,{'Content-Type':mime[path.extname(resolved)]||'application/octet-stream','Cache-Control':shellAsset||isWelcome?'no-cache':'public, max-age=3600'});if(req.method==='HEAD')return res.end();fs.createReadStream(resolved).pipe(res);}catch{return json(res,404,{error:'Not found.'});}
   });
 
-  const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;
-  return {server,db,push,pendingStreams,runDueTasks,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
-    async close(){if(workerTimer)clearInterval(workerTimer);if(backupTimer)clearInterval(backupTimer);if(server.listening)await new Promise((resolve)=>server.close(resolve));db.close();}
+  const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
+  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+    async close(){
+      closing=true;
+      if(workerTimer)clearInterval(workerTimer);
+      if(replyPollTimer)clearInterval(replyPollTimer);
+      if(backupTimer)clearInterval(backupTimer);
+      if(metricsTimer)clearInterval(metricsTimer);
+      const serverClosed=server.listening?new Promise((resolve)=>server.close(resolve)):Promise.resolve();
+      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...activeReplyJobs.values(),
+        ...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
+      let timeout;
+      const settled=await Promise.race([
+        Promise.all([serverClosed,pending]).then(()=>true),
+        new Promise((resolve)=>{timeout=setTimeout(()=>resolve(false),options.replyShutdownGraceMs??25_000);})
+      ]);
+      clearTimeout(timeout);
+      if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
+      await db.close();
+    }
   };
 }
 
-if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createOrbitServer();const port=Number(process.env.PORT)||3000;const host=process.env.HOST||'127.0.0.1';app.server.listen(port,host,()=>{app.startWorker();console.log(`Orbit Buddy is ready at http://${host}:${port}`);});}
+if(process.argv[1]===fileURLToPath(import.meta.url)){
+  const app=createOrbitServer();const port=Number(process.env.PORT)||3000;const host=process.env.HOST||'127.0.0.1';
+  app.server.listen(port,host,()=>{app.startWorker();console.log(`Orbit Buddy is ready at http://${host}:${port}`);});
+  let stopping=false;
+  const stop=()=>{if(stopping)return;stopping=true;app.close().then(()=>process.exit(0)).catch((error)=>{console.error('shutdown failed',error&&error.message);process.exit(1);});};
+  process.once('SIGTERM',stop);process.once('SIGINT',stop);
+}
