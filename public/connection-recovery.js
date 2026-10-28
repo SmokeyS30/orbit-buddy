@@ -1,0 +1,64 @@
+const RETRY_DELAYS_MS = [1000, 2000, 5000, 10000, 30000];
+
+// A failed first request must be retried even if navigator.onLine never changes.
+// The caller returns "retry" only for failures that should be attempted again.
+export function createConnectionRecovery(connect, {
+  visible = () => true,
+  schedule = setTimeout,
+  cancel = clearTimeout,
+} = {}) {
+  let timer = null;
+  let inFlight = null;
+  let failures = 0;
+  let stopped = false;
+
+  function clearPending() {
+    if (timer !== null) cancel(timer);
+    timer = null;
+  }
+
+  function retryLater() {
+    if (stopped || !visible() || timer !== null) return;
+    const delay = RETRY_DELAYS_MS[Math.min(failures++, RETRY_DELAYS_MS.length - 1)];
+    timer = schedule(() => {
+      timer = null;
+      if (!stopped && visible()) attempt();
+    }, delay);
+  }
+
+  function attempt() {
+    if (stopped) return Promise.resolve('stopped');
+    if (inFlight) return inFlight;
+    clearPending();
+    inFlight = Promise.resolve().then(connect).catch(() => 'retry').then((result) => {
+      if (result === 'retry') retryLater();
+      else failures = 0;
+      return result;
+    }).finally(() => { inFlight = null; });
+    return inFlight;
+  }
+
+  function wake() {
+    stopped = false;
+    if (visible()) return attempt();
+  }
+
+  function stop() {
+    stopped = true;
+    clearPending();
+  }
+
+  return { attempt, wake, stop };
+}
+
+// WKWebView's connectivity hint is not a prerequisite for a real HTTPS fetch.
+export function canAttemptNetwork(native, online) {
+  return native || online;
+}
+
+export function isTransportError(error, native, online) {
+  if (error?.status) return false;
+  return !canAttemptNetwork(native, online)
+    || error?.offline === true
+    || /failed to fetch|load failed|network error|networkerror|request timed out/i.test(String(error?.message || ''));
+}
