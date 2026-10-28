@@ -2230,6 +2230,7 @@ async function renderMembershipExperience(view='chooser'){
   if(plan)renderMembershipDetail(shell,plan,products);else renderMembershipChooser(shell,products);
   const focusTarget=shell.querySelector('button');if(focusTarget)focusTarget.focus();
 }
+$('#view-plans-button')?.addEventListener('click',()=>openMembershipExperience());
 function openMembershipExperience(planId='chooser'){
   let overlay=$('#membership-experience');
   if(!overlay){
