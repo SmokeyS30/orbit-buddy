@@ -28,7 +28,7 @@ test('a model redirect cannot forward private request content to another origin'
 test('voice transcription rejects provider redirects before following them',async t=>{
   const original=globalThis.fetch;
   globalThis.fetch=async(url,options)=>{
-    assert.match(String(url),/api\.openai\.com\/v1\/audio\/transcriptions/);
+    assert.equal(String(url),'https://api.openai.com/v1/audio/transcriptions');
     assert.equal(options.redirect,'error');
     return {ok:true,json:async()=>({text:'synthetic'})};
   };

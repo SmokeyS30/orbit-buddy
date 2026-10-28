@@ -30,7 +30,7 @@ function runtime(overrides = {}) {
 test('capacitor scheme is native even when the bridge global is missing', () => {
   const win = runtime({ location: { protocol: 'capacitor:' } });
   assert.equal(isNativeRuntime(win), true);
-  assert.equal(shouldUseWebSpeech(win), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('native bridge is sufficient even when Capacitor reports web', () => {
@@ -41,19 +41,19 @@ test('native bridge is sufficient even when Capacitor reports web', () => {
   const info = nativeRuntimeInfo(win);
   assert.equal(info.bridgePresent, true);
   assert.equal(info.native, true);
-  assert.equal(shouldUseWebSpeech(win), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('iPhone and iPadOS stay off Web Speech without any Capacitor signal', () => {
   const iphone = runtime({ navigator: { userAgent: 'Mozilla/5.0 (iPhone)', platform: 'iPhone' } });
   const ipadDesktopUa = runtime({ navigator: { userAgent: 'Mozilla/5.0 (Macintosh)', platform: 'MacIntel', maxTouchPoints: 5 } });
-  assert.equal(shouldUseWebSpeech(iphone), false);
-  assert.equal(shouldUseWebSpeech(ipadDesktopUa), false);
+  assert.equal(shouldUseWebSpeech(), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('desktop web also avoids unnamed browser speech services', () => {
   assert.equal(isNativeRuntime(runtime()), false);
-  assert.equal(shouldUseWebSpeech(runtime()), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('mic click opens consent-gated voice mode without browser recognition', () => {

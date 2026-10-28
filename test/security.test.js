@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { clearSessionCookie, decryptPortable, decryptSecret, encryptPortable, encryptSecret, hashPassword, sessionCookie, verifyPassword } from '../src/security.js';
+import { clearSessionCookie, decryptPortable, decryptSecret, encryptPortable, encryptSecret, hashPassword, parseCookies, sessionCookie, verifyPassword } from '../src/security.js';
 
 test('password hashes verify without storing the password', async () => {
   const password = 'correct horse battery staple';
@@ -47,4 +47,10 @@ test('clearSessionCookie mirrors the sameSite option', () => {
   assert.match(native, /SameSite=None/);
   assert.match(native, /Secure/);
   assert.match(native, /Max-Age=0/);
+});
+
+test('cookie parsing returns only the allowlisted Orbit session token', () => {
+  assert.deepEqual(parseCookies('theme=dark; orbit_session=abc%20123; __proto__=polluted'), { orbit_session: 'abc 123' });
+  assert.deepEqual(parseCookies('theme=dark'), {});
+  assert.equal({}.polluted, undefined);
 });
