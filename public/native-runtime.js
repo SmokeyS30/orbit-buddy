@@ -42,12 +42,10 @@ export function isNativeRuntime(win = globalThis.window) {
 }
 
 /**
- * Web Speech is not reliable in iOS WKWebView: recent releases expose the
- * constructor while rejecting or silently hanging the backing service.  Keep
- * all native runtimes—and all iOS WebKit contexts as a final safety net—on the
- * MediaRecorder + server transcription path.
+ * Browser speech recognition may send audio to an unnamed browser service.
+ * The AI permission choice identifies only OpenAI and Azure OpenAI, so all
+ * runtimes use the consent-gated server transcription path.
  */
-export function shouldUseWebSpeech(win = globalThis.window) {
-  const info = nativeRuntimeInfo(win);
-  return !info.native && !info.iosDevice;
+export function shouldUseWebSpeech() {
+  return false;
 }

@@ -30,13 +30,14 @@ export function makeRecoveryCodes(count = 10) {
 }
 
 export function parseCookies(header = '') {
-  const output = {};
+  let sessionToken;
   for (const piece of header.split(';')) {
     const index = piece.indexOf('=');
     if (index < 0) continue;
-    output[decodeURIComponent(piece.slice(0, index).trim())] = decodeURIComponent(piece.slice(index + 1).trim());
+    const name = decodeURIComponent(piece.slice(0, index).trim());
+    if (name === 'orbit_session') sessionToken = decodeURIComponent(piece.slice(index + 1).trim());
   }
-  return output;
+  return sessionToken === undefined ? {} : { orbit_session: sessionToken };
 }
 
 export function sessionCookie(token, { secure = true, maxAge = 60 * 60 * 24 * 30, sameSite = 'Strict' } = {}) {

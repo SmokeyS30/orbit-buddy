@@ -10,7 +10,7 @@ Most AI apps wait for you to type. Orbit is built to do the opposite — it come
 
 - **It follows up.** Mention an upcoming appointment, interview, trip, or deadline and Orbit notes the date, then checks in afterward to ask how it went — in chat and as a push notification.
 - **It checks in first.** Morning briefings, evening wind-downs, and a gentle nudge if you've been quiet for a couple of days keep the conversation alive without you having to start it.
-- **It's yours, privately.** Self-hostable and open source: your conversations live in SQLite locally or PostgreSQL in production, encrypted backups stay under your passphrase, and nothing you say trains anyone's model. Your buddy, not their product.
+- **It's yours, privately.** Self-hostable and open source: your conversations live in SQLite locally or PostgreSQL in production, and encrypted backups stay under your passphrase. Orbit asks for permission before sending relevant data to OpenAI or Microsoft Azure OpenAI for AI features.
 - **It keeps your threads.** Separate conversations per topic, a name it actually calls you, and a steady-copilot personality — warm, unhurried, and quietly competent.
 
 ## What works now

@@ -61,6 +61,6 @@ test('native bundle uses the polished asset revisions and replacement 1.1 build'
   assert.ok(version);
   for(const asset of ['styles.css', 'mobile.css', 'app.js'])
     assert.ok(index.includes(`/${asset}?v=${version}`), `${asset} must match the service worker revision`);
-  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261031;/g) || []).length, 2);
+  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261033;/g) || []).length, 2);
   assert.equal((project.match(/MARKETING_VERSION = 1\.1;/g) || []).length, 2);
 });

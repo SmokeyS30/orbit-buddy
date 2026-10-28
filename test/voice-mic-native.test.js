@@ -30,7 +30,7 @@ function runtime(overrides = {}) {
 test('capacitor scheme is native even when the bridge global is missing', () => {
   const win = runtime({ location: { protocol: 'capacitor:' } });
   assert.equal(isNativeRuntime(win), true);
-  assert.equal(shouldUseWebSpeech(win), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('native bridge is sufficient even when Capacitor reports web', () => {
@@ -41,30 +41,28 @@ test('native bridge is sufficient even when Capacitor reports web', () => {
   const info = nativeRuntimeInfo(win);
   assert.equal(info.bridgePresent, true);
   assert.equal(info.native, true);
-  assert.equal(shouldUseWebSpeech(win), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
 test('iPhone and iPadOS stay off Web Speech without any Capacitor signal', () => {
   const iphone = runtime({ navigator: { userAgent: 'Mozilla/5.0 (iPhone)', platform: 'iPhone' } });
   const ipadDesktopUa = runtime({ navigator: { userAgent: 'Mozilla/5.0 (Macintosh)', platform: 'MacIntel', maxTouchPoints: 5 } });
-  assert.equal(shouldUseWebSpeech(iphone), false);
-  assert.equal(shouldUseWebSpeech(ipadDesktopUa), false);
+  assert.equal(shouldUseWebSpeech(), false);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
-test('ordinary desktop web may use Web Speech', () => {
+test('desktop web also avoids unnamed browser speech services', () => {
   assert.equal(isNativeRuntime(runtime()), false);
-  assert.equal(shouldUseWebSpeech(runtime()), true);
+  assert.equal(shouldUseWebSpeech(), false);
 });
 
-test('mic click gates speech recognition through the shared runtime classifier', () => {
-  const start = appJs.indexOf('// Tap the mic: dictate into the composer');
+test('mic click opens consent-gated voice mode without browser recognition', () => {
+  const start = appJs.indexOf('// The mic always opens consent-gated voice mode');
   const end = appJs.indexOf('})();', start);
   assert.ok(start > -1 && end > start, 'mic button block must exist');
   const body = appJs.slice(start, end);
-  const clickIdx = body.lastIndexOf("addEventListener('click'");
-  const handler = body.slice(clickIdx);
-  assert.match(handler, /if\(!shouldUseWebSpeech\(window\)\)\{openVoiceMode\(\);return;\}/);
-  assert.ok(handler.indexOf('shouldUseWebSpeech(window)') < handler.indexOf('new SR()'));
+  assert.match(body,/addEventListener\('click',openVoiceMode\)/);
+  assert.doesNotMatch(body,/new\s+(?:SR|SpeechRecognition)\(/);
 });
 
 function fakeClassList() {
@@ -147,7 +145,7 @@ test('native controller never constructs SpeechRecognition', () => {
   }
 });
 
-test('service-not-allowed behaviorally enters tap-to-record mode', () => {
+test('desktop controller never constructs a browser speech service', () => {
   const instances = [];
   class FakeRecognition {
     constructor() { instances.push(this); }
@@ -159,13 +157,47 @@ test('service-not-allowed behaviorally enters tap-to-record mode', () => {
   try {
     const controller = createVoiceMode(voiceDeps());
     controller.open();
-    assert.equal(env.ids.get('voice-status').textContent, 'Listening…');
-    assert.equal(instances.length, 1);
-    instances[0].onerror({ error: 'service-not-allowed' });
     assert.equal(env.ids.get('voice-status').textContent, 'Tap the mic, say your piece, tap again to send.');
-    assert.equal(instances[0].aborted, true);
+    assert.equal(instances.length, 0);
     controller.close();
   } finally {
+    env.restore();
+  }
+});
+
+test('microphone tap records audio and uses the consent-gated transcription dependency', async () => {
+  const win=runtime();
+  const env=installVoiceDom(win);
+  const oldNavigator=Object.getOwnPropertyDescriptor(globalThis,'navigator');
+  const oldRecorder=Object.getOwnPropertyDescriptor(globalThis,'MediaRecorder');
+  const stopped=[];
+  let transcriptions=0;
+  const sent=[];
+  const stream={getTracks:()=>[{stop:()=>stopped.push(true)}]};
+  class FakeRecorder {
+    static isTypeSupported(){return true;}
+    constructor(){this.state='inactive';this.mimeType='audio/webm';}
+    start(){this.state='recording';}
+    stop(){this.state='inactive';this.ondataavailable({data:new Blob(['synthetic audio'])});queueMicrotask(()=>this.onstop());}
+  }
+  Object.defineProperty(globalThis,'navigator',{configurable:true,value:{mediaDevices:{getUserMedia:async()=>stream}}});
+  Object.defineProperty(globalThis,'MediaRecorder',{configurable:true,value:FakeRecorder});
+  globalThis.document.createElement=()=>fakeElement();
+  try {
+    const controller=createVoiceMode({buddyName:()=> 'Orbit',transcribeAudio:async blob=>{transcriptions++;assert.ok(blob.size>0);return 'synthetic transcript';},sendTurn:async text=>{sent.push(text);return '';}});
+    controller.open();
+    controller.interrupt();
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(env.ids.get('voice-status').textContent,'Recording… tap the mic to send.');
+    controller.interrupt();
+    await new Promise(resolve=>setTimeout(resolve,0));
+    assert.equal(transcriptions,1);
+    assert.deepEqual(sent,['synthetic transcript']);
+    assert.equal(stopped.length,1);
+    controller.close();
+  } finally {
+    if(oldNavigator)Object.defineProperty(globalThis,'navigator',oldNavigator);else delete globalThis.navigator;
+    if(oldRecorder)Object.defineProperty(globalThis,'MediaRecorder',oldRecorder);else delete globalThis.MediaRecorder;
     env.restore();
   }
 });

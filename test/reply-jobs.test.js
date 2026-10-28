@@ -14,6 +14,7 @@ import pg from 'pg';
 
 function seed(db){
   const user=db.createUser({email:`reply-${randomUUID()}@example.com`,displayName:'Job test',passwordHash:'test',passwordSalt:'test',role:'member'});
+  db.setAiSharingConsent(user.id,true);
   return{user,conversation:db.createConversation(user.id,'Job test')};
 }
 
