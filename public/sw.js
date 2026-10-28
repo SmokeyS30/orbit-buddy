@@ -11,8 +11,8 @@
 // Bump CACHE + STATIC_VERSION together whenever shipped static assets change,
 // so existing clients drop the old cache cleanly on next visit.
 
-const CACHE = 'orbit-buddy-v66';
-const STATIC_VERSION = '20261028a'; // keep in sync with the ?v= in public/index.html
+const CACHE = 'orbit-buddy-v67';
+const STATIC_VERSION = '20261028b'; // keep in sync with the ?v= in public/index.html
 
 // Every static asset the app shell needs on first paint / offline.
 // The list is generated from these entries (see buildPrecacheManifest) so it
