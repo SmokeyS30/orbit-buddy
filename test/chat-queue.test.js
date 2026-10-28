@@ -11,6 +11,7 @@ import {
   isEntrySendableUnder,
   nextSendableEntry,
   legacyEntries,
+  flushChatQueueEntries,
 } from '../public/chat-queue.js';
 
 function memoryStorage() {
@@ -19,6 +20,20 @@ function memoryStorage() {
     getItem: (k) => (map.has(k) ? map.get(k) : null),
     setItem: (k, v) => { map.set(k, String(v)); },
     removeItem: (k) => { map.delete(k); },
+  };
+}
+
+function failingWriteStorage() {
+  const storage = memoryStorage();
+  let failWrites = false;
+  return {
+    getItem: storage.getItem,
+    removeItem: storage.removeItem,
+    setItem(key, value) {
+      if (failWrites) throw new Error('quota exceeded');
+      storage.setItem(key, value);
+    },
+    failWrites() { failWrites = true; },
   };
 }
 
@@ -40,19 +55,13 @@ function entry(ownerId, text = 'hello') {
 // `send` may throw ({auth:true}) or ({network:true}) to simulate failures.
 async function flush(storage, ownerId, send) {
   const sent = [];
-  for (;;) {
-    const next = nextSendableEntry(loadChatQueue(storage), ownerId);
-    if (!next) break;
-    try {
-      await send(next);
-    } catch (error) {
-      if (error && (error.auth || error.network)) break; // kept for a later flush
-      removeChatQueueEntry(storage, next.id); // non-network failure: dropped, as in app.js
-      continue;
-    }
-    sent.push(next);
-    removeChatQueueEntry(storage, next.id);
-  }
+  await flushChatQueueEntries({
+    storage,
+    ownerId,
+    send,
+    shouldRetry: (error) => !!(error && (error.auth || error.network)),
+    onSent: (_response, queued) => { sent.push(queued); },
+  });
   return sent;
 }
 
@@ -148,6 +157,47 @@ test('removal is by id against fresh storage, exactly once', () => {
   assert.deepEqual(loadChatQueue(storage).map((e) => e.id), [b.id]);
 });
 
+test('queue writes report success and failure instead of silently claiming persistence', () => {
+  const storage = failingWriteStorage();
+  const queued = entry('account-a');
+  assert.equal(enqueueChatMessage(storage, queued), queued);
+  storage.failWrites();
+
+  assert.equal(enqueueChatMessage(storage, entry('account-a')), null, 'a failed append is surfaced');
+  assert.equal(removeChatQueueEntry(storage, queued.id), false, 'a failed removal is surfaced');
+  assert.deepEqual(loadChatQueue(storage).map((item) => item.id), [queued.id], 'failed writes do not change durable state');
+});
+
+test('an accepted message is not repeatedly sent in-session when durable removal fails', async () => {
+  const storage = failingWriteStorage();
+  const queued = entry('account-a');
+  enqueueChatMessage(storage, queued);
+  storage.failWrites();
+  const blockedIds = new Set();
+  let sends = 0;
+
+  const first = await flushChatQueueEntries({
+    storage,
+    ownerId: 'account-a',
+    blockedIds,
+    send: async () => { sends += 1; return { id: 'server-message' }; },
+  });
+  assert.equal(sends, 1);
+  assert.equal(first.persistenceFailed, true);
+  assert.equal(first.deliveryUncertain, true);
+  assert.equal(first.blockedEntryId, queued.id);
+  assert.equal(loadChatQueue(storage).length, 1, 'the failed removal remains visible in durable storage');
+
+  const second = await flushChatQueueEntries({
+    storage,
+    ownerId: 'account-a',
+    blockedIds,
+    send: async () => { sends += 1; },
+  });
+  assert.equal(sends, 1, 'a later connection wake does not resend the uncertain entry');
+  assert.equal(second.sent, 0);
+});
+
 test('enqueue appends against fresh storage, not a stale snapshot', () => {
   const storage = memoryStorage();
   const stale = loadChatQueue(storage); // a caller holding an old snapshot
@@ -190,8 +240,8 @@ test('app.js wires the queue through the binding module', () => {
   const sw = readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
   assert.match(app, /from '\.\/chat-queue\.js'/);
   assert.match(app, /ownerId:state\.user\?state\.user\.id:null/, 'queued messages record the account that wrote them');
-  assert.match(app, /nextSendableEntry\(loadChatQueue\(\),ownerId\)/, 'flush only picks entries bound to the signed-in account');
-  assert.match(app, /removeChatQueueEntry\(localStorage,entry\.id\)/, 'flush removes sent entries by id against fresh storage');
+  assert.match(app, /flushChatQueueEntries\(/, 'app uses the tested queue drain implementation');
+  assert.match(app, /ownerId,\s*blockedIds:blockedChatQueueIds/, 'the tested drain receives the signed-in owner and in-session duplicate hold');
   assert.ok(!/queue=queue\.slice\(1\);saveChatQueue/.test(app), 'the overwrite-prone snapshot save is gone');
   assert.ok(sw.includes("'/chat-queue.js'"), 'service worker precaches the queue module');
 });

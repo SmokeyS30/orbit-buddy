@@ -29,7 +29,12 @@ export function loadChatQueue(storage) {
 }
 
 export function saveChatQueue(storage, queue) {
-  try { storage.setItem(CHAT_QUEUE_KEY, JSON.stringify(queue)); } catch (_) {}
+  try {
+    storage.setItem(CHAT_QUEUE_KEY, JSON.stringify(queue));
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 export function createChatQueueEntry({ id, text, conversationId = null, ownerId = null, queuedAt }) {
@@ -41,16 +46,14 @@ export function createChatQueueEntry({ id, text, conversationId = null, ownerId 
 export function enqueueChatMessage(storage, entry) {
   const queue = loadChatQueue(storage);
   queue.push(entry);
-  saveChatQueue(storage, queue);
-  return entry;
+  return saveChatQueue(storage, queue) ? entry : null;
 }
 
 // Remove exactly one entry, by id, against a fresh read of storage.
 // Entries enqueued after the caller's snapshot was taken survive.
 export function removeChatQueueEntry(storage, id) {
   const queue = loadChatQueue(storage).filter((entry) => entry.id !== id);
-  saveChatQueue(storage, queue);
-  return queue;
+  return saveChatQueue(storage, queue);
 }
 
 export function isEntrySendableUnder(entry, ownerId) {
@@ -66,4 +69,61 @@ export function nextSendableEntry(queue, ownerId) {
 
 export function legacyEntries(queue) {
   return queue.filter((entry) => !entry || !entry.ownerId);
+}
+
+// Drain entries using the same queue rules as the app. Storage failures are
+// explicit: once an accepted message cannot be removed, its id is held in the
+// caller-owned blocked set so another wake-up in this app session cannot send
+// it again. A reload still needs server-side idempotency to close the final
+// ambiguous-delivery window; this helper deliberately does not invent that
+// protocol.
+export async function flushChatQueueEntries({
+  storage,
+  ownerId,
+  send,
+  canContinue = () => true,
+  shouldRetry = () => false,
+  blockedIds = new Set(),
+  onSent = () => {},
+  onDropped = () => {},
+  onPersistenceFailure = () => {},
+}) {
+  const result = { sent: 0, dropped: 0, persistenceFailed: false, deliveryUncertain: false, blockedEntryId: null };
+  if (!ownerId) return result;
+
+  for (;;) {
+    if (!canContinue()) break;
+    const entry = nextSendableEntry(loadChatQueue(storage), ownerId);
+    if (!entry || blockedIds.has(entry.id)) break;
+
+    let response;
+    try {
+      response = await send(entry);
+    } catch (error) {
+      if (shouldRetry(error)) break;
+      if (!removeChatQueueEntry(storage, entry.id)) {
+        blockedIds.add(entry.id);
+        result.persistenceFailed = true;
+        result.blockedEntryId = entry.id;
+        await onPersistenceFailure({ entry, error, delivered: false });
+        break;
+      }
+      result.dropped += 1;
+      await onDropped(error, entry);
+      continue;
+    }
+
+    if (!removeChatQueueEntry(storage, entry.id)) {
+      blockedIds.add(entry.id);
+      result.persistenceFailed = true;
+      result.deliveryUncertain = true;
+      result.blockedEntryId = entry.id;
+      await onPersistenceFailure({ entry, response, delivered: true });
+      break;
+    }
+    result.sent += 1;
+    await onSent(response, entry);
+  }
+
+  return result;
 }

@@ -26,7 +26,7 @@ import { parseConversationDeepLink } from './deep-link.js';
 import { geoAttemptPlan, markGeoAsked, clearGeoAsked } from './geo-prompt.js';
 import { isNativeRuntime, shouldUseWebSpeech } from './native-runtime.js';
 import { createConnectionRecovery, canAttemptNetwork, isTransportError } from './connection-recovery.js';
-import { loadChatQueue as loadStoredChatQueue, enqueueChatMessage, removeChatQueueEntry, createChatQueueEntry, nextSendableEntry } from './chat-queue.js';
+import { loadChatQueue as loadStoredChatQueue, enqueueChatMessage, createChatQueueEntry, flushChatQueueEntries } from './chat-queue.js';
 // L2 goals/projects v2: SVG progress arcs + kanban/timeline view builders.
 import { buildGoalArc, buildKanbanRegion, buildTimelineRegion } from './goals-projects.js';
 const state={csrf:null,user:null,status:null,snapshot:null,setup:null,signupVerificationToken:null};
@@ -1252,10 +1252,10 @@ async function jumpToSearchResult(item){
 })();
 window.addEventListener('hashchange',()=>activateView(location.hash.slice(1),{updateHash:false}));
 $('#model-check-button')?.addEventListener('click',checkModelConnection);
-$('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await nativeFetch(API_BASE+'/api/auth/forgot-password',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await nativeFetch(API_BASE+'/api/auth/recover',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value,...(state.signupVerificationToken?{verificationToken:state.signupVerificationToken}:{})}:{email:$('#auth-email').value,password:$('#auth-password').value};if(mode==='register'){payload.attestationProof=await signupAttestation(payload.email);if(state.appleSignupProof)payload.appleSignupProof=state.appleSignupProof;}const response=await nativeFetch(API_BASE+endpoint,{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(body.verificationRequired){state.signupVerificationToken=null;$('#auth-error').textContent='';$('#auth-copy').textContent=body.error;$('#auth-submit').disabled=body.verificationSent===true;return;}if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.signupVerificationToken=null;state.appleSignupProof=null;if(body.sessionToken)setNativeToken(body.sessionToken);if(body.recoveryCodes)showCodes(body.recoveryCodes);if(mode==='register')state.justRegistered=true;await connectionRecovery.wake();}catch(error){$('#auth-error').textContent=error.message;}});
+$('#auth-form').addEventListener('submit',async(event)=>{event.preventDefault();const mode=event.target.dataset.mode;try{if(mode==='forgot'){const response=await nativeFetch(API_BASE+'/api/auth/forgot-password',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);$('#auth-error').textContent='';$('#auth-copy').textContent='If that email has an account, a password reset link is on its way.';$('#auth-submit').disabled=true;return;}if(mode==='recover'){const response=await nativeFetch(API_BASE+'/api/auth/recover',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify({email:$('#auth-email').value,recoveryCode:$('#auth-recovery').value,newPassword:$('#auth-new-password').value})});const body=await response.json();if(!response.ok)throw new Error(body.error);showCodes(body.recoveryCodes);setAuthMode('login');return;}const endpoint=mode==='register'?'/api/auth/register':'/api/auth/login';const payload=mode==='register'?{email:$('#auth-email').value,password:$('#auth-password').value,displayName:$('#auth-name').value,...(state.signupVerificationToken?{verificationToken:state.signupVerificationToken}:{})}:{email:$('#auth-email').value,password:$('#auth-password').value};if(mode==='register'){payload.attestationProof=await signupAttestation(payload.email);if(state.appleSignupProof)payload.appleSignupProof=state.appleSignupProof;}const response=await nativeFetch(API_BASE+endpoint,{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const body=await response.json();if(body.verificationRequired){state.signupVerificationToken=null;$('#auth-error').textContent='';$('#auth-copy').textContent=body.error;$('#auth-submit').disabled=body.verificationSent===true;return;}if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.signupVerificationToken=null;state.appleSignupProof=null;if(body.sessionToken)setNativeToken(body.sessionToken);if(body.recoveryCodes)showCodes(body.recoveryCodes);if(mode==='register')state.justRegistered=true;await connectionRecovery.afterAuth();}catch(error){$('#auth-error').textContent=error.message;}});
 $('#show-login').addEventListener('click',()=>setAuthMode('login'));$('#show-register').addEventListener('click',()=>setAuthMode('register'));$('#show-recover').addEventListener('click',()=>setAuthMode('recover'));$('#show-forgot')?.addEventListener('click',()=>setAuthMode('forgot'));
 $('#hero-signin')?.addEventListener('click',()=>{const d=$('#auth-dialog');if(d&&!d.open)d.showModal();});
-$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;if(body.sessionToken)setNativeToken(body.sessionToken);await connectionRecovery.wake();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
+$('#try-demo').addEventListener('click',async()=>{try{$('#try-demo').disabled=true;$('#try-demo').textContent='Loading demo...';const response=await nativeFetch(API_BASE+'/api/demo/start',{method:'POST',credentials:NATIVE_CREDENTIALS,headers:{'Content-Type':'application/json'}});const body=await response.json();if(!response.ok)throw new Error(body.error);state.user=body.user;state.csrf=body.csrf;state.isDemo=true;state.demoCap=body.demoCap;if(body.sessionToken)setNativeToken(body.sessionToken);await connectionRecovery.afterAuth();showDemoBanner();}catch(error){toast(error.message||'Could not start demo.');$('#try-demo').disabled=false;$('#try-demo').textContent='Try the demo — no signup needed';}});
 function showDemoBanner(){if($('#demo-banner'))return;const banner=document.createElement('div');banner.id='demo-banner';banner.style.cssText='background:#fff3cd;color:#856404;text-align:center;padding:10px;font-size:.9em;border-bottom:1px solid #ffeaa7;position:sticky;top:0;z-index:1000;';banner.innerHTML='🎪 <strong>DEMO MODE</strong> — exploring with sample data. <a href="#" id="demo-signup" style="color:#856404;font-weight:bold;">Create a free account</a> to save your stuff.';document.body.prepend(banner);$('#demo-signup').addEventListener('click',(e)=>{e.preventDefault();document.querySelector('[data-view="safety"]').click();toast('Demo is read-only for account creation — sign up from the login page!');});}
 $('#close-codes').addEventListener('click',()=>$('#codes-dialog').close());$('#copy-codes').addEventListener('click',()=>navigator.clipboard.writeText($('#codes-output').textContent).then(()=>toast('Recovery codes copied.')));
 $('#account-button').addEventListener('click',()=>document.querySelector('[data-view="safety"]').click());$('#logout-button').addEventListener('click',async()=>{try{clearGeoAsked(safeStorage());}catch(_){}try{await api('/api/auth/logout',{method:'POST'});}catch(_){}setNativeToken(null);location.reload();});
@@ -1279,8 +1279,9 @@ $('#delete-account-button')?.addEventListener('click',async()=>{
 function loadChatQueue(){return loadStoredChatQueue(localStorage);}
 function isNetworkError(error){return isTransportError(error,IS_NATIVE,navigator.onLine);}
 function markQueued(el){if(!el||el.classList.contains('queued'))return;el.classList.add('queued');const note=document.createElement('span');note.className='queued-note';note.textContent='queued — will send when online';el.append(note);}
-function queueOfflineMessage(text,element){const entry=createChatQueueEntry({id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,ownerId:state.user?state.user.id:null,queuedAt:new Date().toISOString()});enqueueChatMessage(localStorage,entry);markQueued(element||appendOptimisticMessage(text));}
+function queueOfflineMessage(text,element){const entry=createChatQueueEntry({id:'q'+Date.now().toString(36)+Math.random().toString(36).slice(2,8),text,conversationId:activeConversationId,ownerId:state.user?state.user.id:null,queuedAt:new Date().toISOString()});if(!enqueueChatMessage(localStorage,entry)){toast('Orbit could not save this message offline. Your draft is still here.');return false;}markQueued(element||appendOptimisticMessage(text));return true;}
 let flushingQueue=false;
+const blockedChatQueueIds=new Set();
 async function flushChatQueue(){
   if(flushingQueue)return;
   // Never flush without a signed-in account: entries are bound to the
@@ -1289,24 +1290,17 @@ async function flushChatQueue(){
   if(!ownerId)return;
   flushingQueue=true;
   try{
-    for(;;){
-      if(!canAttemptNetwork(IS_NATIVE,navigator.onLine))break; // web is still offline
-      if(!state.user||state.user.id!==ownerId)break; // account changed mid-flush — stop, the rest is not ours to send
-      // Fresh read every round: messages queued while a send was in
-      // flight must survive this flush's bookkeeping.
-      const entry=nextSendableEntry(loadChatQueue(),ownerId);
-      if(!entry)break;
-      try{
-        const sent=await api('/api/chat',{method:'POST',body:JSON.stringify({message:entry.text,conversationId:entry.conversationId||activeConversationId})});
-        pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now());
-        removeChatQueueEntry(localStorage,entry.id);
-      }catch(error){
-        if(error.auth||isNetworkError(error))break; // keep the message until the session or connection recovers
-        removeChatQueueEntry(localStorage,entry.id); // non-network error — drop this one
-        if(isPaywallError(error))showInlinePaywall(); // daily limit: inline nudge, never a generic toast
-        else toast(`A queued message failed: ${error.message}`);
-      }
-    }
+    await flushChatQueueEntries({
+      storage:localStorage,
+      ownerId,
+      blockedIds:blockedChatQueueIds,
+      canContinue:()=>canAttemptNetwork(IS_NATIVE,navigator.onLine)&&state.user?.id===ownerId,
+      shouldRetry:(error)=>error.auth||isNetworkError(error),
+      send:(entry)=>api('/api/chat',{method:'POST',body:JSON.stringify({message:entry.text,conversationId:entry.conversationId||activeConversationId})}),
+      onSent:(sent,entry)=>pendingFor(sent.conversationId||entry.conversationId||activeConversationId).set(sent.id,Date.now()),
+      onDropped:(error)=>{if(isPaywallError(error))showInlinePaywall();else toast(`A queued message failed: ${error.message}`);},
+      onPersistenceFailure:({delivered})=>toast(delivered?'Orbit sent this message, but could not update the offline queue. Automatic resend is paused.':'Orbit could not update the offline queue. Automatic resend is paused.'),
+    });
     await refresh().catch(()=>{});
   }finally{flushingQueue=false;}
 }
@@ -1803,7 +1797,7 @@ async function sendChatMessage(text){
     // The offline text queue can't carry staged images — keep the thumbnails
     // so the user can send once they're back online.
     if(attachmentIds.length)toast('Attachments need a connection — they’ll stay ready to send.');
-    else queueOfflineMessage(message);
+    else if(!queueOfflineMessage(message))input.value=message;
     if(submit)submit.disabled=false;return;
   }
   const el=appendOptimisticMessage(message||'[Image attached]');
@@ -1813,7 +1807,7 @@ async function sendChatMessage(text){
   }catch(error){
     if(isNetworkError(error)){
       if(attachmentIds.length)toast('Connection lost — your image is staged and ready to resend.');
-      else queueOfflineMessage(message,el);
+      else if(!queueOfflineMessage(message,el)){input.value=message;if(el)el.remove();}
     }
     // Daily free limit hit: inline paywall nudge in the conversation, never
     // the generic error toast. No refresh() here — it would re-render the
@@ -2501,7 +2495,7 @@ async function appleSignIn(purpose){
     const result=await signupPost('/api/auth/apple/complete',{...credentials,nonce:challenge.nonce,purpose,password});
     if(purpose==='signup'){state.appleSignupProof=result.appleSignupProof;setAuthMode('register');$('#auth-email').value=result.email;$('#auth-password').required=false;$('#auth-copy').textContent='Apple verified your email. Enter your name to finish creating your account. A password is optional; recovery codes will be provided.';return;}
     if(purpose==='link'){if(state.user?.id===linkUserId){state.status={...state.status,appleLinked:true};renderSignupSafety();}toast('Apple linked. Your password still works.');return;}
-    state.user=result.user;state.csrf=result.csrf;if(result.sessionToken)setNativeToken(result.sessionToken);await connectionRecovery.wake();
+    state.user=result.user;state.csrf=result.csrf;if(result.sessionToken)setNativeToken(result.sessionToken);await connectionRecovery.afterAuth();
   }finally{if(purpose==='link'){state.appleLinkPending=false;$('#apple-link-password').value='';renderSignupSafety();}}
 }
 function renderSignupSafety(){

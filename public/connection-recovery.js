@@ -9,6 +9,7 @@ export function createConnectionRecovery(connect, {
 } = {}) {
   let timer = null;
   let inFlight = null;
+  let afterAuthInFlight = null;
   let failures = 0;
   let stopped = false;
 
@@ -43,12 +44,29 @@ export function createConnectionRecovery(connect, {
     if (visible()) return attempt();
   }
 
+  // Authentication changes the credentials observed by connect(). If a
+  // pre-login request is already running, a normal wake would merely reuse it.
+  // Queue exactly one new attempt after that request settles instead.
+  function afterAuth() {
+    stopped = false;
+    if (!visible()) return Promise.resolve('hidden');
+    if (!inFlight) return attempt();
+    if (!afterAuthInFlight) {
+      afterAuthInFlight = inFlight.then(() => undefined, () => undefined).then(() => {
+        if (stopped) return 'stopped';
+        if (!visible()) return 'hidden';
+        return attempt();
+      }).finally(() => { afterAuthInFlight = null; });
+    }
+    return afterAuthInFlight;
+  }
+
   function stop() {
     stopped = true;
     clearPending();
   }
 
-  return { attempt, wake, stop };
+  return { attempt, wake, afterAuth, stop };
 }
 
 // WKWebView's connectivity hint is not a prerequisite for a real HTTPS fetch.

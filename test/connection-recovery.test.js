@@ -74,6 +74,29 @@ test('network wake-ups do not start duplicate connection attempts', async () => 
   assert.equal(await first, 'connected');
 });
 
+test('an auth-state change waits for a pre-login request and then starts one fresh request', async () => {
+  let finishFirst;
+  let authenticated = false;
+  const observedAuth = [];
+  const recovery = createConnectionRecovery(() => {
+    observedAuth.push(authenticated);
+    if (observedAuth.length === 1) return new Promise((resolve) => { finishFirst = resolve; });
+    return 'connected';
+  });
+
+  const preLogin = recovery.attempt();
+  await Promise.resolve();
+  authenticated = true;
+  const firstAuthWake = recovery.afterAuth();
+  const secondAuthWake = recovery.afterAuth();
+  assert.strictEqual(firstAuthWake, secondAuthWake, 'concurrent auth wakes share one fresh attempt');
+
+  finishFirst('auth');
+  assert.equal(await preLogin, 'auth');
+  assert.equal(await firstAuthWake, 'connected');
+  assert.deepEqual(observedAuth, [false, true], 'the second request observes the authenticated state');
+});
+
 test('leaving the page cancels a pending retry and restoration can wake it', async () => {
   const clock = fakeClock();
   let calls = 0;
@@ -113,6 +136,8 @@ test('app startup, foreground, and chat paths use recovery and real native fetch
   assert.match(source, /window\.addEventListener\('online',refreshConnection\)/);
   assert.match(source, /visibilitychange',\(\)=>\{if\(!document\.hidden\)refreshConnection\(\)/);
   assert.match(source, /window\.addEventListener\('pagehide',\(\)=>connectionRecovery\.stop\(\)\)/);
-  assert.equal((source.match(/if\(!canAttemptNetwork\(IS_NATIVE,navigator\.onLine\)\)/g) || []).length, 3);
+  assert.equal((source.match(/connectionRecovery\.afterAuth\(\)/g) || []).length, 3, 'password, demo, and Apple auth request a fresh authenticated connection');
+  assert.equal((source.match(/if\(!canAttemptNetwork\(IS_NATIVE,navigator\.onLine\)\)/g) || []).length, 2);
+  assert.match(source, /canContinue:\(\)=>canAttemptNetwork\(IS_NATIVE,navigator\.onLine\)/, 'queue flushing uses the same native-aware connectivity rule');
   assert.doesNotMatch(source, /if\(!navigator\.onLine\)/);
 });
