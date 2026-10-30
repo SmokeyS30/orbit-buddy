@@ -54,3 +54,8 @@ test('cookie parsing returns only the allowlisted Orbit session token', () => {
   assert.deepEqual(parseCookies('theme=dark'), {});
   assert.equal({}.polluted, undefined);
 });
+
+test('malformed cookie encodings are ignored instead of throwing', () => {
+  assert.deepEqual(parseCookies('a=1; %E0%A4%A=2; orbit_session=abc'), { orbit_session: 'abc' });
+  assert.deepEqual(parseCookies('orbit_session=%E0%A4%A'), {});
+});

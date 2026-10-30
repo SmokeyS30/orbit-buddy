@@ -34,8 +34,10 @@ export function parseCookies(header = '') {
   for (const piece of header.split(';')) {
     const index = piece.indexOf('=');
     if (index < 0) continue;
-    const name = decodeURIComponent(piece.slice(0, index).trim());
-    if (name === 'orbit_session') sessionToken = decodeURIComponent(piece.slice(index + 1).trim());
+    try {
+      const name = decodeURIComponent(piece.slice(0, index).trim());
+      if (name === 'orbit_session') sessionToken = decodeURIComponent(piece.slice(index + 1).trim());
+    } catch { /* ignore malformed cookie */ }
   }
   return sessionToken === undefined ? {} : { orbit_session: sessionToken };
 }

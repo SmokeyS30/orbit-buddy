@@ -264,7 +264,7 @@ function expandSingle(ev, dp, defaultZone) {
 
 function expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs,remaining=RANGE_MAX_INSTANCES) {
   const dp = ev.dtstart;
-  const zone = dp.allDay ? 'UTC' : (validZone(dp.tzid) || defaultZone);
+  const zone = dp.allDay || dp.utc ? 'UTC' : (validZone(dp.tzid) || defaultZone);
   const durationMs = eventDurationMs(ev, dp, defaultZone);
   let set;
   try {
@@ -295,7 +295,7 @@ function expandRecurring(ev, defaultZone, rangeStartMs, rangeEndMs,remaining=RAN
       y: occ.getUTCFullYear(), mo: occ.getUTCMonth() + 1, d: occ.getUTCDate(),
       h: occ.getUTCHours(), mi: occ.getUTCMinutes(), s: occ.getUTCSeconds()
     };
-    const startMs = dp.allDay ? Date.UTC(wall.y, wall.mo - 1, wall.d) : zonedWallToUtcMs(wall, zone);
+    const startMs = dp.allDay ? Date.UTC(wall.y, wall.mo - 1, wall.d) : (dp.utc ? Date.UTC(wall.y, wall.mo - 1, wall.d, wall.h, wall.mi, wall.s) : zonedWallToUtcMs(wall, zone));
     out.push(toInstance(ev, startMs, !!dp.allDay, durationMs));
   }
   return out;
