@@ -19,7 +19,24 @@ function encodeMessage({ to, cc, bcc, subject, body }) {
   const lines = [`To: ${clean(to)}`];
   if (cc) lines.push(`Cc: ${clean(cc)}`);
   if (bcc) lines.push(`Bcc: ${clean(bcc)}`);
-  const encodedSubject = /^[\x20-\x7e]*$/.test(clean(subject)) ? clean(subject) : `=?UTF-8?B?${Buffer.from(clean(subject), 'utf-8').toString('base64')}?=`;
+  const cleanSubject = clean(subject);
+  let encodedSubject = cleanSubject;
+  if (!/^[\x20-\x7e]*$/.test(cleanSubject)) {
+    const words = [];
+    let chunk = '', chunkBytes = 0;
+    for (const character of cleanSubject) {
+      const characterBytes = Buffer.byteLength(character, 'utf-8');
+      if (chunkBytes + characterBytes > 42) {
+        words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf-8').toString('base64')}?=`);
+        chunk = '';
+        chunkBytes = 0;
+      }
+      chunk += character;
+      chunkBytes += characterBytes;
+    }
+    if (chunk) words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf-8').toString('base64')}?=`);
+    encodedSubject = words.join('\r\n ');
+  }
   const encodedBody = Buffer.from(String(body), 'utf-8').toString('base64').replace(/.{1,76}/g, '$&\r\n').trimEnd();
   lines.push(`Subject: ${encodedSubject}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: base64', '', encodedBody);
   return Buffer.from(lines.join('\r\n'), 'utf-8').toString('base64url');

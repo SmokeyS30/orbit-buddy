@@ -744,6 +744,7 @@ const indexMigrations = [
       return{userMessage,job};
     }),
     getReplyJob: async (id)=>get('SELECT * FROM reply_jobs WHERE id=?',id),
+    getReplyJobStates: async (ids)=>ids.length?all(`SELECT id,status FROM reply_jobs WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids):[],
     getConversationReplyJobState: async (userId,conversationId)=>get('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1',userId,conversationId),
     cancelDisallowedReplyJobs: async ()=>(await run(`UPDATE reply_jobs j SET status='cancelled',completed_at=?,lease_expires_at=NULL
       FROM users u WHERE j.user_id=u.id AND j.status IN ('queued','running')

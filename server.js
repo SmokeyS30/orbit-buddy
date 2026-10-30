@@ -101,7 +101,7 @@ function welcomeMessageText(displayName) {
 // the full URL to the client, log it, or put it in activity events.
 function maskFeedUrl(raw) { try { const url=new URL(String(raw)); const tail=String(url.pathname||'').replace(/\/$/,'').slice(-4); return `${url.protocol}//${url.host}/\u2026${tail}`; } catch { return 'invalid url'; } }
 function publicFeed(feed) { return { id:feed.id,label:feed.label,url:maskFeedUrl(feed.url),created_at:feed.created_at }; }
-async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; let parsed;try{parsed=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} if(parsed===null||typeof parsed!=='object')throw Object.assign(new Error('Request body must be a JSON object.'),{status:400}); return parsed; }
+async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; let parsed;try{parsed=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} if(parsed===null||typeof parsed!=='object'||Array.isArray(parsed))throw Object.assign(new Error('Request body must be a JSON object.'),{status:400}); return parsed; }
 const DUMMY_PASSWORD_SALT='orbit-dummy-salt';
 const DUMMY_PASSWORD_HASH='orbit-dummy-hash';
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
@@ -594,10 +594,10 @@ export function createOrbitServer(options={}) {
     return req.socket.remoteAddress||'unknown';
   }
   const MAX_LIMIT_KEYS=50_000;
-  function recordHit(log,key,windowMs){
+  function recordHit(log,key,windowMs,retentionMs=windowMs){
     const current=Date.now();
     if(log.size>=MAX_LIMIT_KEYS&&!log.has(key)){
-      for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=windowMs)log.delete(k);}
+      for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
       if(log.size>=MAX_LIMIT_KEYS)log.delete(log.keys().next().value);
     }
     const recent=(log.get(key)||[]).filter((time)=>current-time<windowMs);
@@ -608,7 +608,7 @@ export function createOrbitServer(options={}) {
   const hourLog=new Map();
   function hourlyLimited(req,limit,scope){return recordHit(hourLog,`${scope}:${getClientIp(req)}`,3_600_000)>limit;}
   const userLog=new Map();
-  function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){return recordHit(userLog,`${userId}:${scope}`,windowMs)>limit;}
+  function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){return recordHit(userLog,`${userId}:${scope}`,windowMs,3_600_000)>limit;}
   const sweepRateLogs=setInterval(()=>{const current=Date.now();for(const [log,windowMs] of [[requestLog,60_000],[hourLog,3_600_000],[userLog,3_600_000]])for(const [k,times] of log)if(!times.length||current-times[times.length-1]>=windowMs)log.delete(k);},60_000);
   sweepRateLogs.unref();
   const paused=()=>db.getSetting('system_paused','false')==='true';
@@ -664,11 +664,10 @@ export function createOrbitServer(options={}) {
         if(closing)return;
         await replyDb('cancelDisallowedReplyJobs');
         // Payloads for jobs that ended without running (cancelled, recovered) would otherwise linger.
-        for(const id of [...ephemeralReplyPayloads.keys()]){
-          if(activeReplyJobs.has(id))continue;
-          const state=await replyDb('getReplyJob',id);
-          if(!state||state.status!=='queued')ephemeralReplyPayloads.delete(id);
-        }
+        const payloadIds=[...ephemeralReplyPayloads.keys()];
+        const payloadStates=payloadIds.length?await replyDb('getReplyJobStates',payloadIds):[];
+        const stateById=new Map(payloadStates.map(({id,status})=>[id,status]));
+        for(const id of payloadIds)if(!activeReplyJobs.has(id)&&stateById.get(id)!=='queued')ephemeralReplyPayloads.delete(id);
         if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
         await replyDb('recoverExpiredReplyJobs');
         if(closing)return;
@@ -3828,6 +3827,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
     startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
+      clearInterval(sweepRateLogs);
       if(workerTimer)clearInterval(workerTimer);
       if(replyPollTimer)clearInterval(replyPollTimer);
       if(backupTimer)clearInterval(backupTimer);
