@@ -46,6 +46,31 @@ test('sendEmail encodes and sends', async () => {
   } finally { restore(); }
 });
 
+test('sendEmail folds long UTF-8 encoded subjects into compliant encoded-words', async () => {
+  const originalFetch = global.fetch;
+  let mime;
+  global.fetch = async (_url, options) => {
+    mime = Buffer.from(JSON.parse(options.body).raw, 'base64url').toString('utf-8');
+    return { ok: true, json: async () => ({ id: 'msg-long-subject' }) };
+  };
+  const subject = 'A🙂é'.repeat(25);
+  try {
+    await sendEmail(mockGetToken, { to: 'test@example.com', subject, body: 'Body' });
+    const lines = mime.split('\r\n');
+    const subjectLine = lines.findIndex((line) => line.startsWith('Subject: '));
+    const end = lines.findIndex((line, index) => index > subjectLine && !line.startsWith(' '));
+    const folded = lines.slice(subjectLine, end < 0 ? undefined : end);
+    const words = folded.join('').match(/=\?UTF-8\?B\?[^?]+\?=/g) || [];
+    assert.ok(words.length > 1);
+    assert.ok(words.every((word) => word.length <= 75));
+    assert.ok(folded.every((line) => Buffer.byteLength(line, 'utf-8') <= 78));
+    const decoded = Buffer.concat(words.map((word) => Buffer.from(word.slice(10, -2), 'base64'))).toString('utf-8');
+    assert.equal(decoded, subject);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('searchEmails returns formatted results', async () => {
   const restore = mockGmailApi([
     ['/messages?q=', { messages: [{ id: 'abc123' }] }],

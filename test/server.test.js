@@ -25,6 +25,49 @@ async function register(base, { email = 'owner@example.com', displayName = 'Owne
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
 
+test('object JSON endpoints reject array payloads without creating resources', async (t) => {
+  const { app, base } = await fixture(); t.after(() => app.close());
+  const auth = await register(base);
+  const userId = auth.body.user.id;
+  const before = app.db.listConversations(userId).length;
+  const response = await fetch(`${base}/api/conversations`, {
+    method: 'POST',
+    headers: authHeaders(auth),
+    body: '[]'
+  });
+  assert.equal(response.status, 400);
+  assert.equal(app.db.listConversations(userId).length, before);
+});
+
+test('close clears the rate-limit sweeper before the worker starts', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-server-close-'));
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const scheduled = [], cleared = [];
+  globalThis.setInterval = (callback, delay, ...args) => {
+    const timer = originalSetInterval(callback, delay, ...args);
+    scheduled.push({ timer, delay });
+    return timer;
+  };
+  globalThis.clearInterval = (timer) => {
+    cleared.push(timer);
+    return originalClearInterval(timer);
+  };
+  let app;
+  try {
+    app = createOrbitServer({ dataDir: directory, env: { NODE_ENV: 'test', OPENAI_MODEL: 'gpt-6-luna' } });
+    const sweeper = scheduled.find(({ delay }) => delay === 60_000);
+    assert.ok(sweeper);
+    await app.close();
+    assert.ok(cleared.includes(sweeper.timer));
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    if (app) await app.close().catch(() => {});
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('health and setup are public while private data requires a session', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
   // Retry the static file fetch: occasionally the server isn't fully ready

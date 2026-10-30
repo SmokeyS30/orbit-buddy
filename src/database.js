@@ -1163,6 +1163,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       return{userMessage,job};
     });},
     getReplyJob:(id)=>db.prepare('SELECT * FROM reply_jobs WHERE id=?').get(id)||null,
+    getReplyJobStates(ids){if(!ids.length)return[];return db.prepare(`SELECT id,status FROM reply_jobs WHERE id IN (${ids.map(()=>'?').join(',')})`).all(...ids);},
     getConversationReplyJobState:(userId,conversationId)=>db.prepare('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1').get(userId,conversationId)||null,
     cancelDisallowedReplyJobs(){return db.prepare(`UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL
       WHERE status IN ('queued','running') AND EXISTS(SELECT 1 FROM users u WHERE u.id=reply_jobs.user_id

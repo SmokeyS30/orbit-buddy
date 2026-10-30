@@ -63,7 +63,7 @@ export function createConnectorService(env, db, encryptionKey) {
     const params = new URLSearchParams({ code, client_id: env[provider.clientId], client_secret: env[provider.clientSecret], redirect_uri: oauthState.redirect_uri, grant_type: 'authorization_code' });
     if (oauthState.code_verifier) params.set('code_verifier', oauthState.code_verifier);
     const tokenResponse = await fetch(provider.token, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(30_000) });
-    const tokens = await tokenResponse.json();
+    const tokens = await tokenResponse.json().catch(() => ({}));
     const accessToken = providerId === 'slack' ? tokens.access_token : tokens.access_token;
     if (!tokenResponse.ok || !accessToken || tokens.ok === false) throw Object.assign(new Error('OAuth token exchange failed.'), { status: 502 });
     const profileResponse = await fetch(provider.profile, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'User-Agent': 'Orbit-Buddy' }, signal: AbortSignal.timeout(20_000) });
