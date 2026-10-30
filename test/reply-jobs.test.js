@@ -236,6 +236,22 @@ test('PostgreSQL reply survives another replica and queued work recovers on rest
   }
 });
 
+test('PostgreSQL getPreferences tolerates a user deleted mid-iteration without creating a row',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensurePostgresSchema(url);
+  const db=createSyncPgAdapter(url);
+  try{
+    const {user}=seed(db);
+    const snapshot=db.listUsers().find((u)=>u.id===user.id);
+    db.deleteUserAccount(user.id);
+    const prefs=db.getPreferences(snapshot.id);
+    assert.equal(prefs.time_zone,'America/New_York');
+    assert.equal(prefs.proactive_enabled,0);
+    assert.ok(!db.getUserById(user.id));
+  }finally{db.close();}
+});
+
 test('graceful shutdown waits for an active reply and leaves it completed',async()=>{
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-reply-drain-'));
   const model=createModelClient({NODE_ENV:'test'});

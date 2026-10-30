@@ -2364,6 +2364,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runProactiveChecks(nowMs=Date.now()){
     if(proactiveBusy||paused()||cutoverHold)return;proactiveBusy=true;
     try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
+    catch(error){console.error('proactive checks failed',error&&error.message);}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
