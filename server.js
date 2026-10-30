@@ -3363,8 +3363,14 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           const imageBlocks=attachmentIds.map((attachmentId)=>{const entry=peekAttachment(userId,attachmentId);return processImageInput({bytes:entry.bytes,mimeType:entry.mimeType});}); // revalidates type/size; bytes never logged
           const quota=subscriptions.consumeQuota(userId,user);
           if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
-            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+          let accepted;
+          try{
+            accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+              {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+          }catch(error){
+            try{subscriptions.refundQuota(userId,quota);}catch(refundError){console.error('quota refund failed',refundError.message);}
+            throw error;
+          }
           const userMsg=accepted.userMessage;
           for(const attachmentId of attachmentIds)takeAttachment(userId,attachmentId);
           if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});

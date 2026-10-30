@@ -1807,6 +1807,7 @@ const indexMigrations = [
       const current = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
       return { allowed: false, count: Number(current?.count || limit) };
     },
+    refundDailyUsage: async (userId, dayNy) => (await run('UPDATE daily_usage SET count=count-1,updated_at=? WHERE user_id=? AND day_ny=? AND count>0', timestamp(), userId, dayNy)).changes > 0,
     pruneDailyUsage: async (beforeDayNy) => { await run('DELETE FROM daily_usage WHERE day_ny<?', beforeDayNy); },
     claimNotification: async (notificationId) => {
       const now = timestamp(); const staleBefore = new Date(Date.now() - 5 * 60_000).toISOString();
