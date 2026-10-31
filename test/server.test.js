@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createOrbitServer } from '../server.js';
+import { createOrbitServer, createRateLimiter } from '../server.js';
 import { encryptSecret, readEncryptionKey } from '../src/security.js';
 import { allowAiSharing } from './ai-sharing-fixture.js';
 
@@ -24,6 +24,50 @@ async function register(base, { email = 'owner@example.com', displayName = 'Owne
 }
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
+
+test('rate-limit full sweeps are throttled independently without exceeding the key cap', () => {
+  let now = 10_000;
+  const recordHit = createRateLimiter(() => now);
+  class TrackingMap extends Map {
+    scans = 0;
+    [Symbol.iterator]() {
+      this.scans++;
+      return super[Symbol.iterator]();
+    }
+  }
+  const fullLog = (prefix) => {
+    const log = new TrackingMap();
+    for (let i = 0; i < 50_000; i++) log.set(`${prefix}:${i}`, [now]);
+    return log;
+  };
+  const firstLog = fullLog('first');
+  const secondLog = fullLog('second');
+
+  recordHit(firstLog, 'first:new-1', 60_000);
+  assert.equal(firstLog.scans, 1);
+  assert.equal(firstLog.size, 50_000);
+  assert.equal(firstLog.has('first:0'), false);
+
+  recordHit(secondLog, 'second:new-1', 60_000);
+  assert.equal(secondLog.scans, 1);
+  assert.equal(secondLog.size, 50_000);
+
+  recordHit(firstLog, 'first:new-2', 60_000);
+  assert.equal(firstLog.scans, 1);
+  assert.equal(firstLog.size, 50_000);
+  assert.equal(firstLog.has('first:1'), false);
+  assert.equal(firstLog.has('first:new-2'), true);
+
+  now += 999;
+  recordHit(firstLog, 'first:new-3', 60_000);
+  assert.equal(firstLog.scans, 1);
+  assert.equal(firstLog.size, 50_000);
+
+  now += 1;
+  recordHit(firstLog, 'first:new-4', 60_000);
+  assert.equal(firstLog.scans, 2);
+  assert.equal(firstLog.size, 50_000);
+});
 
 test('object JSON endpoints reject array payloads without creating resources', async (t) => {
   const { app, base } = await fixture(); t.after(() => app.close());
