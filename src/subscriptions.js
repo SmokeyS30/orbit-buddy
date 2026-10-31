@@ -273,6 +273,12 @@ export function createSubscriptionService(env, db, dependencies = {}) {
       : { allowed: false, enforced: true, used: result.count, limit, day, plan: product?.plan || 'included', resetAt: nextResetUtc(now).toISOString() };
   }
 
+  // Returns a slot taken by consumeQuota when the work it paid for was never accepted.
+  function refundQuota(userId, quota) {
+    if (!quota?.enforced || quota.unlimited || !quota.day) return false;
+    return db.refundDailyUsage(userId, quota.day);
+  }
+
   function runDailyReset(now = new Date()) {
     const today = nyDayKey(now);
     db.pruneDailyUsage(today);
@@ -295,6 +301,6 @@ export function createSubscriptionService(env, db, dependencies = {}) {
   return {
     enabled, configured, get ready() { return purchaseReady; }, get enforcementReady() { return enforcementReady; }, PRODUCTS, FREE_DAILY_LIMIT, BASIC_DAILY_LIMIT,
     status, verifyTransaction, fetchEntitlements, handleNotification,
-    isPaid, isComped, tier, consumeQuota, quotaPolicy, runDailyReset, nyDayKey, nextResetUtc,
+    isPaid, isComped, tier, consumeQuota, refundQuota, quotaPolicy, runDailyReset, nyDayKey, nextResetUtc,
   };
 }

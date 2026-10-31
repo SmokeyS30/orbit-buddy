@@ -309,6 +309,8 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
     assert.equal(db.completePurchaseIntent(intent.id, `txn-duplicate-${userId}`), false, 'purchase intent cannot be replayed');
     for (let i = 1; i <= 25; i++) assert.deepEqual(db.consumeDailyUsage(userId, '2026-10-19', 25), { allowed: true, count: i });
     assert.deepEqual(db.consumeDailyUsage(userId, '2026-10-19', 25), { allowed: false, count: 25 }, 'message 26 is atomically blocked');
+    assert.equal(db.refundDailyUsage(userId, '2026-10-19'), true, 'unaccepted message returns its slot');
+    assert.deepEqual(db.consumeDailyUsage(userId, '2026-10-19', 25), { allowed: true, count: 25 }, 'refunded slot is reusable');
     const notificationId = `notification-${userId}`;
     assert.equal(db.claimNotification(notificationId), true, 'notification claimed');
     assert.equal(db.claimNotification(notificationId), false, 'concurrent duplicate rejected');

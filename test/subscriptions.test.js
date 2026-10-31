@@ -41,6 +41,11 @@ function mockDb() {
       if (count >= limit) return { allowed: false, count };
       usage.set(key, count + 1); return { allowed: true, count: count + 1 };
     },
+    refundDailyUsage(userId, day) {
+      const key = `${userId}:${day}`; const count = usage.get(key) || 0;
+      if (count <= 0) return false;
+      usage.set(key, count - 1); return true;
+    },
     pruneDailyUsage(before) { for (const key of usage.keys()) if (key.split(':')[1] < before) usage.delete(key); },
     claimNotification(id) { if (notifications.has(id)) return false; notifications.set(id, 'processing'); return true; },
     completeNotification(id) { if (notifications.get(id) !== 'processing') return false; notifications.set(id, 'processed'); return true; },
@@ -122,6 +127,17 @@ test('atomic quota accepts messages 1-25 and blocks 26', () => {
   for (let i = 1; i <= 25; i++) assert.deepEqual(service.consumeQuota('u1', null, now).used, i);
   const blocked = service.consumeQuota('u1', null, now);
   assert.equal(blocked.allowed, false); assert.equal(blocked.used, 25); assert.equal(blocked.limit, FREE_DAILY_LIMIT);
+});
+
+test('refundQuota returns exactly the slot consumeQuota took and never goes below zero', () => {
+  const db = mockDb(); const { service } = enabledService(db);
+  const now = new Date('2026-10-18T12:00:00Z');
+  const q = service.consumeQuota('u1', null, now);
+  assert.equal(db.getDailyUsageCount('u1', q.day), 1);
+  assert.equal(service.refundQuota('u1', q), true);
+  assert.equal(db.getDailyUsageCount('u1', q.day), 0);
+  assert.equal(service.refundQuota('u1', q), false, 'no negative usage');
+  assert.equal(service.refundQuota('u1', { allowed: true, enforced: false }), false, 'unenforced quota is never refunded');
 });
 
 test('Basic receives exactly 100 daily messages while Plus and Unlimited are uncapped', () => {
