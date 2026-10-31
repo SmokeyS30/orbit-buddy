@@ -392,6 +392,24 @@ test('full queued-image budget refuses a chat turn without consuming its staged 
   assert.equal((await send()).status,202);
 });
 
+test('unknown conversation does not consume staged image attachments',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const auth=await register(base,{email:'missing-conversation-image@example.test'});
+  const upload=await uploadRequest(base,auth,imageUpload('missing-conversation',PNG_1PX),'multipart/form-data; boundary=missing-conversation');
+  assert.equal(upload.status,201);
+  const {id}=await upload.json();
+  const headers={Cookie:auth.cookie,'X-Orbit-CSRF':auth.csrf,'Content-Type':'application/json'};
+  const missing=await fetch(`${base}/api/chat`,{
+    method:'POST',headers,body:JSON.stringify({message:'Look',conversationId:'00000000-0000-0000-0000-000000000000',attachmentIds:[id]})
+  });
+  assert.equal(missing.status,404);
+  assert.ok(peekAttachment(app.db.getUserByEmail('missing-conversation-image@example.test').id,id));
+  const retry=await fetch(`${base}/api/chat`,{
+    method:'POST',headers,body:JSON.stringify({message:'Look',attachmentIds:[id]})
+  });
+  assert.equal(retry.status,202);
+});
+
 test('/api/chat without attachments still requires a message', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const auth = await register(base);

@@ -177,10 +177,14 @@ for(const driver of ['SQLite','PostgreSQL']){
   });
 }
 
-for(const lockedRow of ['user','session'])test(`PostgreSQL: OAuth cannot finish after proof expires behind a ${lockedRow}-row lock`,async t=>{
+for(const lockedRow of ['user','session','connector'])test(`PostgreSQL: OAuth cannot finish after proof expires behind a ${lockedRow}-row lock`,async t=>{
   const {db,user,sessionHash,service}=fixture(t,'PostgreSQL');
   const stateHash=hashToken(stateOf(service.begin(user.id,'gmail','https://test.example',sessionHash)));
   assert.ok(db.consumeOauthState(stateHash));
+  const key=Buffer.alloc(32,9);
+  if(lockedRow==='connector')db.saveConnector(user.id,'gmail',{
+    accessEncrypted:encryptSecret('existing-access',key),scopes:'existing',profile:{email:'existing@example.test'}
+  });
   const url=new URL(process.env.TEST_DATABASE_URL);
   const applicationName=`orbit-oauth-expiry-${randomUUID()}`;
   url.searchParams.set('application_name',applicationName);
@@ -196,9 +200,10 @@ for(const lockedRow of ['user','session'])test(`PostgreSQL: OAuth cannot finish 
   let finish;
   try{
     if(lockedRow==='user')await locker.query('SELECT id FROM users WHERE id=$1 FOR UPDATE',[user.id]);
-    else await locker.query('SELECT token_hash FROM sessions WHERE token_hash=$1 FOR UPDATE',[sessionHash]);
+    else if(lockedRow==='session')await locker.query('SELECT token_hash FROM sessions WHERE token_hash=$1 FOR UPDATE',[sessionHash]);
+    else await locker.query("SELECT id FROM connectors WHERE user_id=$1 AND provider='gmail' FOR UPDATE",[user.id]);
     finish=adapter.finishOauthConnection(stateHash,user.id,'gmail',{
-      accessEncrypted:encryptSecret('synthetic-access',Buffer.alloc(32,9)),scopes:'gmail',profile:{email:'owner@example.test'}
+      accessEncrypted:encryptSecret('synthetic-access',key),scopes:'gmail',profile:{email:'owner@example.test'}
     });
     const deadline=Date.now()+1500;
     let waiting=false;
@@ -212,5 +217,7 @@ for(const lockedRow of ['user','session'])test(`PostgreSQL: OAuth cannot finish 
     await new Promise(resolve=>setTimeout(resolve,Math.max(0,new Date(expiresAt).getTime()+100-Date.now())));
   }finally{await locker.query('ROLLBACK');}
   assert.equal(await finish,false,'expired proof cannot be accepted after the lock wait');
-  assert.ok(!db.getConnector(user.id,'gmail'));
+  const connector=db.getConnector(user.id,'gmail');
+  if(lockedRow==='connector')assert.equal(decryptSecret(connector.access_encrypted,key),'existing-access');
+  else assert.ok(!connector);
 });

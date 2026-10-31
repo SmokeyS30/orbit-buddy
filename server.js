@@ -2882,29 +2882,32 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Voice notes (audio/ogg): download, transcribe with Whisper, feed the
           // transcript into the normal pipeline. Audio is never stored.
           if(isAudioContentType(mediaContentType)&&mediaUrl){
+            const releaseUpload=acquireAttachmentUpload(waUserId);
             let transcript=null;
-            let releaseUpload=null;
             try{
-              releaseUpload=acquireAttachmentUpload(waUserId);
-              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
-              await requireAiSharingConsent(db,waUserId,disclosedRecipientReady);
-              transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
-            }catch(e){
-              console.error('whatsapp voice note failed',e.code||e.message);
-              const tooLong=e.code==='MEDIA_TOO_LARGE';
-              try{await twilioSend(from,tooLong
-                ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
-                :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
-              return json(res,200,{ok:true,voiceNote:false});
-            }finally{releaseUpload?.();}
-            if(!transcript){
-              try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
-              return json(res,200,{ok:true,voiceNote:false});
+              try{
+                const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+                await requireAiSharingConsent(db,waUserId,disclosedRecipientReady);
+                transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
+              }catch(e){
+                console.error('whatsapp voice note failed',e.code||e.message);
+                const tooLong=e.code==='MEDIA_TOO_LARGE';
+                try{await twilioSend(from,tooLong
+                  ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
+                  :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
+                return json(res,200,{ok:true,voiceNote:false});
+              }
+              if(!transcript){
+                try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
+                return json(res,200,{ok:true,voiceNote:false});
+              }
+              const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
+              db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+              scheduleReplyPump();
+              return json(res,200,{ok:true,voiceNote:true});
+            }finally{
+              releaseUpload();
             }
-            const voiceMessage=`[Voice note transcript]: "${transcript.slice(0,6000)}"`;
-            db.acceptReplyJob(waUserId,conversation.id,voiceMessage,{channel:'whatsapp',deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-            scheduleReplyPump();
-            return json(res,200,{ok:true,voiceNote:true});
           }
           // Image attachments: download from Twilio, run through the SAME
           // processImageInput() vision pipeline as the web composer, and feed
@@ -3401,16 +3404,18 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // Two-phase: verify every id resolves BEFORE consuming any, so one
           // stale id never silently drops the other attachments in the turn.
           let projectedImageBytes=0;
+          const stagedAttachments=[];
           for(const attachmentId of attachmentIds){
             const staged=peekAttachment(userId,attachmentId);
             if(!staged)throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            stagedAttachments.push(staged);
             projectedImageBytes+=Math.ceil(staged.bytes.length/3)*4+64;
           }
           let releaseMedia=projectedImageBytes?reserveMediaBytes(projectedImageBytes):null;
           try{
             const imageBlocks=[];
-            for(const attachmentId of attachmentIds){
-              imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
+            for(const staged of stagedAttachments){
+              imageBlocks.push(processImageInput({bytes:staged.bytes,mimeType:staged.mimeType})); // revalidates type/size; bytes never logged
             }
             const hasImages=imageBlocks.length>0;
             const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
@@ -3422,7 +3427,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
             const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
               {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
             const userMsg=accepted.userMessage;
-            if(hasImages){ephemeralReplyPayloads.set(accepted.job.id,{userId,message:message||'Look at this.',images:imageBlocks,releaseMedia,createdAt:Date.now()});releaseMedia=null;}
+            if(hasImages){
+              for(const attachmentId of attachmentIds)takeAttachment(userId,attachmentId);
+              ephemeralReplyPayloads.set(accepted.job.id,{userId,message:message||'Look at this.',images:imageBlocks,releaseMedia,createdAt:Date.now()});releaseMedia=null;
+            }
             scheduleReplyPump();
             return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
           }finally{releaseMedia?.();}

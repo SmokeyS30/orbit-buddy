@@ -7,6 +7,7 @@ import { createHmac } from 'node:crypto';
 import { openDatabase } from '../src/database.js';
 import { hashToken } from '../src/security.js';
 import { createOrbitServer } from '../server.js';
+import { acquireAttachmentUpload } from '../src/attachments.js';
 import { MAX_EPHEMERAL_MEDIA_BYTES, mediaBytesReserved, reserveMediaBytes } from '../src/media-memory.js';
 import { allowAiSharing } from './ai-sharing-fixture.js';
 import {
@@ -636,6 +637,30 @@ test('webhook: oversized voice note gets the "bit long" reply and is not transcr
     assert.ok(sent.some((s) => decodeURIComponent(s.body).replace(/\+/g, ' ').includes('a bit long')), 'expected the polite too-long reply');
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('webhook: voice upload capacity refusal skips media and provider work',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const {userId}=await linkOwnerDirectly(app,base,'owner-voice-capacity@example.com');
+  const releaseFirst=acquireAttachmentUpload(userId),releaseSecond=acquireAttachmentUpload(userId);
+  const originalFetch=globalThis.fetch;
+  let providerCalls=0;
+  globalThis.fetch=async(url,...options)=>{
+    if(new URL(String(url)).hostname==='api.twilio.com'){providerCalls++;throw new Error('unexpected provider call');}
+    return originalFetch(url,...options);
+  };
+  try{
+    const hook=await webhookPost(base,{
+      From:WA_FROM,To:`whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia:'1',MediaContentType0:'audio/ogg',
+      MediaUrl0:'https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages/SMvoicecap/Media/MEvoicecap',
+      Body:'',MessageSid:'SMvoice-capacity'
+    });
+    assert.equal(hook.status,429);
+    assert.equal(providerCalls,0);
+  }finally{
+    releaseFirst();releaseSecond();globalThis.fetch=originalFetch;
   }
 });
 

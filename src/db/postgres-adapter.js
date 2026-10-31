@@ -1987,30 +1987,36 @@ const indexMigrations = [
       if(!claim)return null;
       return await tGet('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?',hash);
     }),
-    finishOauthConnection: async(stateHash,userId,provider,data)=>withTransaction(async ({get:tGet,run:tRun})=>{
-      const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
-      if(!user||user.disabled||user.moderation_blocked||(provider==='gmail'&&user.role!=='owner'))return false;
-      const state=await tGet(`SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
-        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,timestamp());
-      if(!state?.session_hash)return false;
-      const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,timestamp());
-      if(!session)return false;
-      // Either row lock may have waited beyond expiry. Recheck both proofs only
-      // after the user and session locks are held, before writing credentials.
-      const now=timestamp();
-      const currentProof=await tGet(`SELECT 1 FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
-        JOIN sessions s ON s.token_hash=b.session_hash AND s.user_id=o.user_id
-        WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL
-          AND o.expires_at>? AND s.expires_at>?`,stateHash,userId,provider,now,now);
-      if(!currentProof)return false;
-      await tRun('DELETE FROM oauth_states WHERE state_hash=?',stateHash);
-      await tRun(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
-        refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
-        profile_json=excluded.profile_json,updated_at=excluded.updated_at`,
-        randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
-      return true;
-    }),
+    finishOauthConnection: async(stateHash,userId,provider,data)=>{
+      const proofExpired=Symbol();
+      try{return await withTransaction(async ({get:tGet,run:tRun})=>{
+        const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+        if(!user||user.disabled||user.moderation_blocked||(provider==='gmail'&&user.role!=='owner'))return false;
+        const state=await tGet(`SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+          WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,timestamp());
+        if(!state?.session_hash)return false;
+        const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,timestamp());
+        if(!session)return false;
+        // Either row lock may have waited beyond expiry. Recheck both proofs
+        // after the user and session locks are held and again after the upsert.
+        const proofQuery=`SELECT 1 FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+          JOIN sessions s ON s.token_hash=b.session_hash AND s.user_id=o.user_id
+          WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL
+            AND o.expires_at>? AND s.expires_at>?`;
+        const proofParams=[stateHash,userId,provider];
+        const currentProof=await tGet(proofQuery,...proofParams,timestamp(),timestamp());
+        if(!currentProof)return false;
+        const now=timestamp();
+        await tRun(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
+          refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
+          profile_json=excluded.profile_json,updated_at=excluded.updated_at`,
+          randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
+        if(!await tGet(proofQuery,...proofParams,timestamp(),timestamp()))throw proofExpired;
+        await tRun('DELETE FROM oauth_states WHERE state_hash=?',stateHash);
+        return true;
+      });}catch(error){if(error===proofExpired)return false;throw error;}
+    },
     discardOauthState: async hash=>(await run('DELETE FROM oauth_states WHERE state_hash=?',hash)).changes>0,
 
     // --- Access requests ---

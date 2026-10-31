@@ -6,6 +6,8 @@ export class EphemeralReplyPayloads extends Map {
     return super.set(jobId,payload);
   }
 
+  delete(jobId){return this.drop(jobId);}
+
   drop(jobId){
     const payload=this.get(jobId);
     if(!payload)return false;

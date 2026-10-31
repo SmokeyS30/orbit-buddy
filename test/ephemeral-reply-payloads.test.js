@@ -37,3 +37,14 @@ test('active ephemeral jobs survive pruning until execution releases them once',
   payloads.drop('active');
   assert.equal(released,1);
 });
+
+test('Map.delete releases reserved media exactly once',()=>{
+  const payloads=new EphemeralReplyPayloads();
+  let released=0;
+  payloads.set('cancelled',{userId:'synthetic-user',message:'image',images:[],createdAt:100,
+    releaseMedia:()=>released++});
+  assert.equal(payloads.delete('cancelled'),true);
+  assert.equal(released,1);
+  assert.equal(payloads.delete('cancelled'),false);
+  assert.equal(released,1);
+});
