@@ -1393,7 +1393,14 @@ const indexMigrations = [
       const row = await get('SELECT * FROM user_preferences WHERE user_id=?', userId);
       if (row) return row;
       const now = timestamp();
-      await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', now, now);
+      try {
+        await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', now, now);
+      } catch (error) {
+        // Background loops iterate a user snapshot; a user deleted mid-iteration must not crash them.
+        if (error?.code !== '23503') throw error;
+        return { user_id: userId, time_zone: 'America/New_York', quiet_start: '22:00', quiet_end: '08:00', proactive_enabled: 0,
+          briefing_tone: 'motivational', briefing_length: 'quick', created_at: now, updated_at: now };
+      }
       return get('SELECT * FROM user_preferences WHERE user_id=?', userId);
     },
     async setPreferences(userId, value) {
