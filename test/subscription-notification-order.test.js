@@ -5,7 +5,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Environment, Status } from '@apple/app-store-server-library';
-import pg from 'pg';
 import { openDatabase } from '../src/database.js';
 import { createSyncPgAdapter } from '../src/db/sync-pg-wrapper.mjs';
 import { createSubscriptionService } from '../src/subscriptions.js';
@@ -92,10 +91,6 @@ test('SQLite older signed notification cannot overwrite a newer event after a de
 test('PostgreSQL older signed notification cannot overwrite a newer event across connections',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
-  const setup=new pg.Client({connectionString:url,ssl:false});
-  await setup.connect();
-  try{await setup.query(fs.readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8'));}
-  finally{await setup.end();}
   const oldDb=createSyncPgAdapter(url),newDb=createSyncPgAdapter(url);
   let user;
   try{

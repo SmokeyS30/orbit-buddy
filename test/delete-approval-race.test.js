@@ -1,20 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { openPostgres } from '../src/db/postgres-adapter.js';
 import { hashToken } from '../src/security.js';
 
 const DATABASE_URL=process.env.TEST_DATABASE_URL;
-
-async function ensureSchema(){
-  const pool=new pg.Pool({connectionString:DATABASE_URL,ssl:DATABASE_URL.includes('sslmode=disable')?false:true});
-  try{
-    const schema=readFileSync(new URL('../src/db/postgres-schema.sql',import.meta.url),'utf8');
-    for(const statement of schema.split(';').map(part=>part.trim()).filter(Boolean))await pool.query(statement);
-  }finally{await pool.end();}
-}
 
 async function waitForBlockedQuery(pool,appName,pattern){
   const deadline=Date.now()+4000;
@@ -28,7 +19,6 @@ async function waitForBlockedQuery(pool,appName,pattern){
 
 test('PostgreSQL deletion approval is atomic with target edits and newer chat turns',async()=>{
   assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
-  await ensureSchema();
   const appName=`delete_race_${randomUUID().replaceAll('-','')}`;
   const url=new URL(DATABASE_URL);
   url.searchParams.set('application_name',appName);

@@ -372,6 +372,35 @@ test('runRadarPoll: error backoff after discovery failure', async () => {
   assert.equal(later.surfaced.length, 1);
 });
 
+test('runRadarPoll: discovery failure after lease loss does not write error state', async () => {
+  const { db } = fixture();
+  db.setSetting('radar_last_error', 'existing error');
+  db.setSetting('radar_last_error_at', '500');
+  let failDiscovery, markDiscoveryStarted;
+  const discoveryStarted = new Promise((resolve) => { markDiscoveryStarted = resolve; });
+  const fetchImpl = () => new Promise((_, reject) => {
+    failDiscovery = reject;
+    markDiscoveryStarted();
+  });
+  let activeChecks = 0;
+  const assertActive = async () => {
+    activeChecks++;
+    if (activeChecks === 3) throw Object.assign(new Error('lease lost'), { code: 'PROACTIVE_LEASE_LOST' });
+  };
+  const poll = runRadarPoll({
+    db,
+    env: { GITHUB_RADAR_TOKEN: 't' },
+    nowMs: 600_000,
+    fetchImpl,
+    assertActive,
+  });
+  await discoveryStarted;
+  failDiscovery(new Error('discovery failed'));
+  await assert.rejects(poll, (error) => error.code === 'PROACTIVE_LEASE_LOST');
+  assert.equal(db.getSetting('radar_last_error'), 'existing error');
+  assert.equal(db.getSetting('radar_last_error_at'), '500');
+});
+
 // --- deliverRadarFindings ---------------------------------------------------
 
 test('deliverRadarFindings: high signal only, one per day, marks delivered', async () => {

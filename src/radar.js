@@ -275,6 +275,7 @@ export async function runRadarPoll({ db, env = process.env, nowMs = Date.now(), 
     repos = await resolveWatchRepos({ token, env, fetchImpl, assertActive });
   } catch (error) {
     if(error?.code==='PROACTIVE_DEFERRED'||error?.code==='PROACTIVE_LEASE_LOST')throw error;
+    await assertActive();
     db.setSetting('radar_last_error', String((error && error.message) || error).slice(0, 200));
     db.setSetting('radar_last_error_at', String(nowMs));
     return { ...summary, skipped: 'discovery-failed' };
