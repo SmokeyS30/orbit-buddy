@@ -124,7 +124,8 @@ async function publicFetch(path) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  deployRelease({ sha: process.env.RELEASE_SHA, az: cliAz, fetchJson: publicFetch })
-    .then(({ revision }) => console.log(`Deployment verified at revision ${revision}.`))
-    .catch((error) => { console.error(error.message); process.exitCode = 1; });
+  // Retained only for historical rollback regression tests. This CLI would
+  // reactivate an unguarded predecessor during the guarded cutover.
+  console.error('Legacy deploy command is disabled. Use guarded-containerapp.mjs.');
+  process.exitCode = 2;
 }

@@ -245,7 +245,7 @@ test('PostgreSQL consent is account scoped and withdrawal survives a fresh read'
     assert.equal(await db.setAiSharingConsent(account.id,true),true);
     assert.ok((await db.getUserById(account.id)).ai_sharing_consent_at);
     const task=await db.addTask(account.id,{title:'Synthetic reminder',prompt:'Synthetic'});
-    const attempt=await db.startTask(account.id,task.id);
+    const attempt=await db.claimTask(account.id,task.id);
     assert.ok(attempt);
     assert.equal(await db.deferTaskForAiConsent(account.id,task.id,attempt),true);
     assert.equal((await db.getTask(account.id,task.id)).status,'queued');

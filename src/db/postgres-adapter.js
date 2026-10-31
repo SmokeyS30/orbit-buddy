@@ -380,6 +380,9 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       )`,
       'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_to_phone TEXT',
       'ALTER TABLE reply_jobs ADD COLUMN IF NOT EXISTS delivery_link_verified_at TEXT',
+      `CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+        state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+        session_hash TEXT NOT NULL, claimed_at TEXT)`,
     ];
 const indexMigrations = [
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_job ON messages(reply_job_id)',
@@ -387,6 +390,7 @@ const indexMigrations = [
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_claim ON reply_jobs(status,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_conversation ON reply_jobs(conversation_id,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_lease ON reply_jobs(status,lease_expires_at)',
+      'CREATE INDEX IF NOT EXISTS idx_oauth_states_user_provider ON oauth_states(user_id,provider)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_delivery ON reply_jobs(channel,status,delivery_attempted_at,seq)',
       'CREATE INDEX IF NOT EXISTS idx_reply_jobs_origin ON reply_jobs(origin_instance,status,requires_ephemeral)',
       'CREATE INDEX IF NOT EXISTS idx_radar_findings_repo ON radar_findings(repo, created_at DESC)',
@@ -1400,7 +1404,14 @@ const indexMigrations = [
       const row = await get('SELECT * FROM user_preferences WHERE user_id=?', userId);
       if (row) return row;
       const now = timestamp();
-      await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', now, now);
+      try {
+        await run(upsertPreferencesSql, userId, 'America/New_York', '22:00', '08:00', 1, 'motivational', 'quick', now, now);
+      } catch (error) {
+        // Background loops iterate a user snapshot; a user deleted mid-iteration must not crash them.
+        if (error?.code !== '23503') throw error;
+        return { user_id: userId, time_zone: 'America/New_York', quiet_start: '22:00', quiet_end: '08:00', proactive_enabled: 0,
+          briefing_tone: 'motivational', briefing_length: 'quick', created_at: now, updated_at: now };
+      }
       return get('SELECT * FROM user_preferences WHERE user_id=?', userId);
     },
     async setPreferences(userId, value) {
@@ -1699,7 +1710,7 @@ const indexMigrations = [
     },
     listTasks: async (userId) => all('SELECT * FROM tasks WHERE user_id=? ORDER BY created_at DESC,id DESC LIMIT 200', userId),
     getTask: async (userId, id) => get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId),
-    setTaskStatus: async (userId, id, status) => (await run('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?', status, timestamp(), id, userId)).changes > 0,
+    setTaskStatus: async (userId, id, status) => (await run('UPDATE tasks SET status=?,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?', status, timestamp(), id, userId)).changes > 0,
     async updateTask(userId, id, { title, prompt, scheduleAt, recurrence }={}) {
       const current = await get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
       if (!current) return null;
@@ -1708,25 +1719,35 @@ const indexMigrations = [
       const nextPrompt = prompt === undefined ? current.prompt : (String(prompt || '').trim().slice(0, 6000) || current.prompt);
       const nextSchedule = scheduleAt === undefined ? current.schedule_at : (scheduleAt ? new Date(scheduleAt).toISOString() : null);
       const nextRecurrence = recurrence === undefined ? current.recurrence : (['none','daily','weekly'].includes(recurrence) ? recurrence : current.recurrence);
-      await run('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?', nextTitle, nextPrompt, nextSchedule, nextRecurrence, now, id, userId);
+      await run("UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,status=CASE WHEN status='running' THEN CASE WHEN CAST(? AS TEXT) IS NULL OR CAST(? AS TEXT)<=CAST(? AS TEXT) THEN 'queued' ELSE 'scheduled' END ELSE status END,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?", nextTitle, nextPrompt, nextSchedule, nextRecurrence, nextSchedule, nextSchedule, now, now, id, userId);
       return get('SELECT * FROM tasks WHERE id=? AND user_id=?', id, userId);
     },
     deleteTask: async (userId, id) => (await run('DELETE FROM tasks WHERE id=? AND user_id=?', id, userId)).changes > 0,
-    // RETURNING binds the generation to this claim in the same atomic update.
-    startTask: async (userId, id, leaseMs=2*60_000) => (await get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId, timestamp()))?.attempt_count || null,
-    renewTaskLease: async (userId,id,attempt,leaseMs=2*60_000) => (await run("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp())).changes > 0,
+    claimTask: async (userId, id, leaseMs=2*60_000) => (await get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING attempt_count", new Date(Date.now()+leaseMs).toISOString(), timestamp(), id, userId))?.attempt_count??null,
+    claimDueTask: async (userId,id,leaseMs=2*60_000) => {
+      const now=timestamp();
+      return get("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING *",new Date(Date.now()+leaseMs).toISOString(),now,id,userId,now);
+    },
+    async startTask(userId,id,leaseMs=2*60_000){return (await this.claimTask(userId,id,leaseMs))!==null;},
     recoverStaleTasks: async () => {
       const current = timestamp();
       return (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)", current, current, current)).changes;
     },
-    // Explicit user completion revokes any active worker lease.
-    completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes > 0,
-    completeTask: async (userId, id, attempt, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", status, result, scheduleAt, timestamp(), id, userId, attempt, timestamp())).changes > 0,
-    failTask: async (userId, id, attempt, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?", message, String(error||'').slice(0, 1000), timestamp(), id, userId, attempt, timestamp())).changes > 0,
-    deferTaskForAiConsent: async (userId,id,attempt) => (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",timestamp(),id,userId,attempt,timestamp())).changes>0,
+    completeTask: async (userId, id, result, status='completed', scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled','running','waiting_approval')", status, result, scheduleAt, timestamp(), id, userId)).changes > 0,
+    failTask: async (userId, id, message, error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running'", message, String(error||'').slice(0, 1000), timestamp(), id, userId)).changes > 0,
+    renewTaskLease: async (userId,id,attempt,leaseMs=2*60_000) => (await run("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)",new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp())).changes>0,
+    activeTaskClaim: async (userId,id,attempt) => Boolean(await get("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status='running' AND tasks.attempt_count=? AND tasks.lease_expires_at>? AND users.disabled=0 AND users.moderation_blocked=0",id,userId,attempt,timestamp())),
+    deliverableTask: async (userId,id,attempt) => Boolean(await get("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status IN ('completed','scheduled','failed') AND tasks.attempt_count=? AND users.disabled=0 AND users.moderation_blocked=0",id,userId,attempt)),
+    completeClaimedTask: async (userId,id,attempt,result,status='completed',scheduleAt=null) => (await run("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)",status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp())).changes>0,
+    failClaimedTask: async (userId,id,attempt,message,error) => (await run("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)",message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp())).changes>0,
+    releaseClaimedTask: async (userId,id,attempt) => {const current=timestamp();return (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=?",current,current,id,userId,attempt)).changes>0;},
+    // A user-requested completion revokes the worker lease and future recurrence.
+    completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes>0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
-      AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
-      AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
+      AND (schedule_at IS NULL OR schedule_at<=?)
+      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0 AND ai_sharing_consent_at IS NOT NULL)
+      ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
+    deferTaskForAiConsent: async (userId,id,attempt) => (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",timestamp(),id,userId,attempt,timestamp())).changes > 0,
 
     // --- Calendar feeds ---
     async addCalendarFeed(userId, { label, url }) {
@@ -1842,11 +1863,14 @@ const indexMigrations = [
         data.id || randomUUID(), userId, provider, data.accessEncrypted, data.refreshEncrypted || null, data.scopes || '', data.expiresAt || null, JSON.stringify(data.profile || {}), now, now);
     },
     listConnectors: async (userId) => all('SELECT id,provider,scopes,expires_at,profile_json,created_at,updated_at FROM connectors WHERE user_id=?', userId),
-    // Match the original credential revision; a refresh must never upsert.
-    refreshConnector: async (userId,provider,previous,data) => (await run('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted)).changes > 0,
-    deleteConnectorIfCurrent: async (userId,provider,previous) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',userId,provider,previous.id,previous.access_encrypted)).changes > 0,
+    refreshConnector: async (userId,provider,previous,data) => (await run('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted)).changes>0,
+    deleteConnectorIfCurrent: async (userId,provider,previous) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?',userId,provider,previous.id,previous.access_encrypted)).changes>0,
     getConnector: async (userId, provider) => get('SELECT * FROM connectors WHERE user_id=? AND provider=?', userId, provider),
-    deleteConnector: async (userId, provider) => (await run('DELETE FROM connectors WHERE user_id=? AND provider=?', userId, provider)).changes > 0,
+    deleteConnector: async (userId,provider) => withTransaction(async ({get:tGet,run:tRun})=>{
+      await tGet('SELECT id FROM users WHERE id=? FOR UPDATE',userId);
+      await tRun('DELETE FROM oauth_states WHERE user_id=? AND provider=?',userId,provider);
+      return (await tRun('DELETE FROM connectors WHERE user_id=? AND provider=?',userId,provider)).changes>0;
+    }),
 
     // --- WhatsApp linking ---
     async linkWhatsApp(userId, phoneE164) {
@@ -1946,12 +1970,54 @@ const indexMigrations = [
       ORDER BY schedule_at ASC LIMIT ?`, userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
 
     // --- OAuth states ---
-    addOauthState: async (row) => { await run('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)', row.stateHash, row.userId, row.provider, row.codeVerifier || null, row.redirectUri, row.expiresAt); },
-    async consumeOauthState(hash) {
-      const row = await get('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?', hash, timestamp());
-      if (row) await run('DELETE FROM oauth_states WHERE state_hash=?', hash);
-      return row;
+    addOauthState: async row=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',row.userId);
+      const session=row.sessionHash?await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',row.sessionHash,row.userId,timestamp()):null;
+      if(!user||user.disabled||user.moderation_blocked||(row.provider==='gmail'&&user.role!=='owner')||!session)
+        throw new Error('OAuth link requires an active owner session.');
+      await tRun('DELETE FROM oauth_states WHERE expires_at<=?',timestamp());
+      await tRun('DELETE FROM oauth_states WHERE user_id=? AND provider=?',row.userId,row.provider);
+      await tRun('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)',
+        row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt);
+      await tRun('INSERT INTO oauth_state_bindings(state_hash,session_hash,claimed_at) VALUES(?,?,NULL)',row.stateHash,row.sessionHash);
+    }),
+    consumeOauthState: async hash=>withTransaction(async ({get:tGet})=>{
+      const claim=await tGet(`UPDATE oauth_state_bindings SET claimed_at=? WHERE state_hash=? AND claimed_at IS NULL
+        AND EXISTS (SELECT 1 FROM oauth_states WHERE oauth_states.state_hash=oauth_state_bindings.state_hash AND expires_at>?) RETURNING state_hash`,timestamp(),hash,timestamp());
+      if(!claim)return null;
+      return await tGet('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?',hash);
+    }),
+    finishOauthConnection: async(stateHash,userId,provider,data)=>{
+      const proofExpired=Symbol();
+      try{return await withTransaction(async ({get:tGet,run:tRun})=>{
+        const user=await tGet('SELECT role,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+        if(!user||user.disabled||user.moderation_blocked||(provider==='gmail'&&user.role!=='owner'))return false;
+        const state=await tGet(`SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+          WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL AND o.expires_at>?`,stateHash,userId,provider,timestamp());
+        if(!state?.session_hash)return false;
+        const session=await tGet('SELECT 1 FROM sessions WHERE token_hash=? AND user_id=? AND expires_at>? FOR UPDATE',state.session_hash,userId,timestamp());
+        if(!session)return false;
+        // Either row lock may have waited beyond expiry. Recheck both proofs
+        // after the user and session locks are held and again after the upsert.
+        const proofQuery=`SELECT 1 FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash
+          JOIN sessions s ON s.token_hash=b.session_hash AND s.user_id=o.user_id
+          WHERE o.state_hash=? AND o.user_id=? AND o.provider=? AND b.claimed_at IS NOT NULL
+            AND o.expires_at>? AND s.expires_at>?`;
+        const proofParams=[stateHash,userId,provider];
+        const currentProof=await tGet(proofQuery,...proofParams,timestamp(),timestamp());
+        if(!currentProof)return false;
+        const now=timestamp();
+        await tRun(`INSERT INTO connectors VALUES(?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(user_id,provider) DO UPDATE SET access_encrypted=excluded.access_encrypted,
+          refresh_encrypted=excluded.refresh_encrypted,scopes=excluded.scopes,expires_at=excluded.expires_at,
+          profile_json=excluded.profile_json,updated_at=excluded.updated_at`,
+          randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
+        if(!await tGet(proofQuery,...proofParams,timestamp(),timestamp()))throw proofExpired;
+        await tRun('DELETE FROM oauth_states WHERE state_hash=?',stateHash);
+        return true;
+      });}catch(error){if(error===proofExpired)return false;throw error;}
     },
+    discardOauthState: async hash=>(await run('DELETE FROM oauth_states WHERE state_hash=?',hash)).changes>0,
 
     // --- Access requests ---
     async addAccessRequest({ name, email, note }) {
