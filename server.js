@@ -514,6 +514,24 @@ export function applyActivityRhythmDetection(db,user,{nowMs,timeZone}={}){
   return {gated:false,added};
 }
 
+const MAX_LIMIT_KEYS=50_000;
+export function createRateLimiter(now=()=>Date.now()){
+  const lastFullSweep=new WeakMap();
+  return function recordHit(log,key,windowMs,retentionMs=windowMs){
+    const current=now();
+    if(log.size>=MAX_LIMIT_KEYS&&!log.has(key)){
+      // Full scans are throttled so a flood of unseen keys cannot repeatedly block the event loop.
+      if(current-(lastFullSweep.get(log)||0)>=1000){
+        lastFullSweep.set(log,current);
+        for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
+      }
+      if(log.size>=MAX_LIMIT_KEYS)log.delete(log.keys().next().value);
+    }
+    const recent=(log.get(key)||[]).filter((time)=>current-time<windowMs);
+    recent.push(current);log.set(key,recent);return recent.length;
+  };
+}
+
 export function createOrbitServer(options={}) {
   const env=options.env||process.env;
   const emailLinkOrigin=authLinkOrigin(env);
@@ -593,16 +611,7 @@ export function createOrbitServer(options={}) {
     }
     return req.socket.remoteAddress||'unknown';
   }
-  const MAX_LIMIT_KEYS=50_000;
-  function recordHit(log,key,windowMs,retentionMs=windowMs){
-    const current=Date.now();
-    if(log.size>=MAX_LIMIT_KEYS&&!log.has(key)){
-      for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
-      if(log.size>=MAX_LIMIT_KEYS)log.delete(log.keys().next().value);
-    }
-    const recent=(log.get(key)||[]).filter((time)=>current-time<windowMs);
-    recent.push(current);log.set(key,recent);return recent.length;
-  }
+  const recordHit=createRateLimiter();
   const requestLog=new Map();
   function rateLimited(req,limit=240,scope='global'){return recordHit(requestLog,`${scope}:${getClientIp(req)}`,60_000)>limit;}
   const hourLog=new Map();
