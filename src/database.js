@@ -843,6 +843,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     getDailyUsage: db.prepare('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?'),
     incrementDailyUsage: db.prepare(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
       ON CONFLICT(user_id,day_ny) DO UPDATE SET count=count+1,updated_at=excluded.updated_at`),
+    refundDailyUsage: db.prepare('UPDATE daily_usage SET count=count-1,updated_at=? WHERE user_id=? AND day_ny=? AND count>0'),
     resetDailyUsage: db.prepare('DELETE FROM daily_usage WHERE day_ny<?'),
     insertNotification: db.prepare(`INSERT INTO processed_notifications(notification_id,received_at,state,completed_at) VALUES(?,?,'processing',NULL)
       ON CONFLICT(notification_id) DO UPDATE SET received_at=excluded.received_at,state='processing',completed_at=NULL
@@ -1141,9 +1142,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteConversation(userId,id){db.exec('BEGIN IMMEDIATE');try{s.deleteConversationMessages.run(id,userId);const gone=s.deleteConversation.run(id,userId).changes>0;db.exec('COMMIT');return gone;}catch(error){db.exec('ROLLBACK');throw error;}},
     addMessage(userId, conversationId, role, content) { const row={id:randomUUID(),user_id:userId,conversation_id:conversationId,role,content,created_at:timestamp()}; s.addMessage.run(row.id,row.user_id,row.conversation_id,row.role,row.content,row.created_at); return row; },
     acceptReplyJob(userId,conversationId,content,options={}){return withImmediate(()=>{
+      const {quotaPolicy=null,...jobOptions}=options;
+      if(quotaPolicy?.enforced){
+        const prior=s.getDailyUsage.get(userId,quotaPolicy.day)?.count||0;
+        if(prior>=quotaPolicy.limit)return{quotaDenied:{...quotaPolicy,allowed:false,used:prior}};
+        s.incrementDailyUsage.run(userId,quotaPolicy.day,timestamp());
+      }
       const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
       s.addMessage.run(userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
-      const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...options});
+      const job=insertReplyJob({userId,conversationId,userMessageId:userMessage.id,...jobOptions});
       s.touchConversation.run(timestamp(),conversationId,userId);
       return{userMessage,job};
     });},
@@ -1730,6 +1737,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
         db.exec('COMMIT');return {allowed:true,count};
       }catch(error){db.exec('ROLLBACK');throw error;}
     },
+    refundDailyUsage(userId,dayNy) { return s.refundDailyUsage.run(timestamp(),userId,dayNy).changes>0; },
     pruneDailyUsage(beforeDayNy) { s.resetDailyUsage.run(beforeDayNy); },
     claimNotification(notificationId) { const now=timestamp();const staleBefore=new Date(Date.now()-5*60_000).toISOString();return s.insertNotification.run(notificationId,now,staleBefore).changes>0; },
     completeNotification(notificationId) { return s.completeNotification.run(timestamp(),notificationId).changes>0; },

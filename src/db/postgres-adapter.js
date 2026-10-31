@@ -706,13 +706,22 @@ const indexMigrations = [
       return row;
     },
     acceptReplyJob: async (userId,conversationId,content,options={})=>withTransaction(async ({get:tGet,run:tRun})=>{
-      const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
+      const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null,quotaPolicy=null}=options;
       if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
       // Serialize accepts for one conversation before allocating the global
       // sequence. Otherwise a later seq can commit and run before an earlier
       // uncommitted job becomes visible to claimers.
       if(!await tGet('SELECT id FROM conversations WHERE id=? AND user_id=? FOR UPDATE',conversationId,userId))
         throw new Error('Conversation not found.');
+      if(quotaPolicy?.enforced){
+        const usage=await tGet(`INSERT INTO daily_usage(user_id,day_ny,count,updated_at) VALUES(?,?,1,?)
+          ON CONFLICT(user_id,day_ny) DO UPDATE SET count=daily_usage.count+1,updated_at=excluded.updated_at
+          WHERE daily_usage.count<? RETURNING count`,userId,quotaPolicy.day,timestamp(),quotaPolicy.limit);
+        if(!usage){
+          const prior=await tGet('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?',userId,quotaPolicy.day);
+          return{quotaDenied:{...quotaPolicy,allowed:false,used:Number(prior?.count||quotaPolicy.limit)}};
+        }
+      }
       const userMessage={id:randomUUID(),user_id:userId,conversation_id:conversationId,role:'user',content,created_at:timestamp()};
       await tRun('INSERT INTO messages(id,user_id,conversation_id,role,content,created_at) VALUES(?,?,?,?,?,?)',
         userMessage.id,userId,conversationId,'user',content,userMessage.created_at);
@@ -1807,6 +1816,7 @@ const indexMigrations = [
       const current = await get('SELECT count FROM daily_usage WHERE user_id=? AND day_ny=?', userId, dayNy);
       return { allowed: false, count: Number(current?.count || limit) };
     },
+    refundDailyUsage: async (userId, dayNy) => (await run('UPDATE daily_usage SET count=count-1,updated_at=? WHERE user_id=? AND day_ny=? AND count>0', timestamp(), userId, dayNy)).changes > 0,
     pruneDailyUsage: async (beforeDayNy) => { await run('DELETE FROM daily_usage WHERE day_ny<?', beforeDayNy); },
     claimNotification: async (notificationId) => {
       const now = timestamp(); const staleBefore = new Date(Date.now() - 5 * 60_000).toISOString();
