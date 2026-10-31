@@ -195,6 +195,7 @@ export function isWindowOpen(lastInboundAt, nowMs = Date.now()) {
 
 /** Max bytes downloaded from a Twilio media URL (~10 MB; WhatsApp voice notes are far smaller). */
 export const MAX_TWILIO_MEDIA_BYTES = 10 * 1024 * 1024;
+const MAX_TWILIO_MEDIA_REDIRECTS = 3;
 
 /** Accept only this account's media resource, before adding Basic credentials. */
 export function validateTwilioMediaUrl(value, accountSid, messageSid = null) {
@@ -219,14 +220,32 @@ export async function downloadTwilioMedia({ accountSid, authToken, url, messageS
   const mediaUrl = validateTwilioMediaUrl(url, accountSid, messageSid);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_TWILIO_MEDIA_BYTES) throw new Error('Invalid Twilio media size limit.');
   const credentials = Buffer.from(`${accountSid}:${authToken}`, 'utf8').toString('base64');
-  const response = await fetch(mediaUrl, {
-    signal: AbortSignal.timeout(20_000),
-    redirect: 'manual',
-    headers: { Authorization: `Basic ${credentials}` },
-  });
-  // An automatic redirect can send credentials to a host chosen by an attacker
-  // or by a compromised upstream. Do not follow it, even if the initial URL was valid.
-  if (response.status >= 300 && response.status < 400) throw new Error('Twilio media redirected.');
+  const mediaOrigin = new URL(mediaUrl).origin;
+  let currentUrl = mediaUrl;
+  let response;
+  for (let redirects = 0; ; redirects++) {
+    response = await fetch(currentUrl, {
+      signal: AbortSignal.timeout(20_000),
+      redirect: 'manual',
+      headers: new URL(currentUrl).origin === mediaOrigin ? { Authorization: `Basic ${credentials}` } : {},
+    });
+    if (response.status < 300 || response.status >= 400) break;
+    try { await response.body?.cancel(); } catch {}
+    if (redirects >= MAX_TWILIO_MEDIA_REDIRECTS) throw new Error('Twilio media redirected too many times.');
+    const location = response.headers?.get?.('location');
+    if (!location) throw new Error('Twilio media redirected without a destination.');
+    let destination;
+    try {
+      destination = new URL(location, currentUrl);
+    } catch {
+      throw new Error('Twilio media redirected to an invalid destination.');
+    }
+    if (destination.protocol !== 'https:' || destination.port || destination.username || destination.password || destination.hash ||
+        !['api.twilio.com', 'media.twiliocdn.com'].includes(destination.hostname)) {
+      throw new Error('Twilio media redirected to an untrusted destination.');
+    }
+    currentUrl = destination.href;
+  }
   if (!response.ok) {
     throw new Error(`Twilio media download failed (${response.status})`);
   }

@@ -2829,7 +2829,8 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
               return json(res,200,{ok:true,voiceNote:false});
             }
             if(!transcript){
-              db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,false);
+              const finished=db.finishWhatsAppInboundMedia(inboundSid,mediaClaim.token,false);
+              if(!finished)return json(res,503,{ok:false,retry:true});
               try{await twilioSend(from,'I listened but couldn’t quite make out what you said — mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
             }

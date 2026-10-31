@@ -48,6 +48,47 @@ test('media Basic credentials are scoped to the exact Twilio account and message
   }finally{globalThis.fetch=previousFetch;}
 });
 
+test('media redirects follow bounded Twilio HTTPS destinations without forwarding credentials',async()=>{
+  const previousFetch=globalThis.fetch;
+  const requests=[];
+  globalThis.fetch=async(url,options)=>{
+    requests.push({url:String(url),options});
+    if(requests.length===1)return new Response('redirect',{status:302,headers:{Location:'https://media.twiliocdn.com/signed?token=synthetic'}});
+    if(requests.length===2)return new Response('redirect',{status:307,headers:{Location:'https://media.twiliocdn.com/final?token=synthetic'}});
+    return new Response('audio',{status:200,headers:{'Content-Type':'audio/ogg'}});
+  };
+  try{
+    const result=await downloadTwilioMedia({accountSid,authToken:'synthetic',url:validMediaUrl,messageSid});
+    assert.equal(result.bytes.toString(),'audio');
+    assert.equal(requests.length,3);
+    assert.match(requests[0].options.headers.Authorization,/^Basic /);
+    assert.deepEqual(requests.slice(1).map(request=>request.options.headers),[{},{}]);
+    assert.ok(requests.every(request=>request.options.redirect==='manual'));
+  }finally{globalThis.fetch=previousFetch;}
+});
+
+test('media redirects reject untrusted and excessive destinations',async()=>{
+  const previousFetch=globalThis.fetch;
+  let requests=0;
+  globalThis.fetch=async()=>{
+    requests++;
+    return new Response('redirect',{status:302,headers:{Location:requests===1
+      ?'https://media.twiliocdn.com/start?token=synthetic'
+      :'https://example.test/steal'}});
+  };
+  try{
+    await assert.rejects(downloadTwilioMedia({accountSid,authToken:'synthetic',url:validMediaUrl,messageSid}),/untrusted destination/);
+    assert.equal(requests,2);
+    requests=0;
+    globalThis.fetch=async()=>{
+      requests++;
+      return new Response('redirect',{status:302,headers:{Location:'https://media.twiliocdn.com/loop?token=synthetic'}});
+    };
+    await assert.rejects(downloadTwilioMedia({accountSid,authToken:'synthetic',url:validMediaUrl,messageSid}),/too many times/);
+    assert.equal(requests,4,'no more than three redirects are followed');
+  }finally{globalThis.fetch=previousFetch;}
+});
+
 async function serverFixture(t){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-whatsapp-security-'));
   const app=createOrbitServer({dataDir:dir,env});

@@ -699,7 +699,7 @@ const indexMigrations = [
       const {channel='web',originInstance=null,requiresEphemeral=false,deliveryToPhone=null,deliveryLinkVerifiedAt=null}=options;
       if(requiresEphemeral&&!originInstance)throw new Error('Ephemeral reply jobs require an origin instance.');
       if(options.inboundSid){
-        const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',userId);
+        const user=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR NO KEY UPDATE',userId);
         const link=await tGet('SELECT phone_e164,verified_at FROM whatsapp_links WHERE user_id=? FOR UPDATE',userId);
         if(!user||user.disabled===1||user.moderation_blocked===1||!link||
           link.phone_e164!==deliveryToPhone||link.verified_at!==deliveryLinkVerifiedAt)return null;

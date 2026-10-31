@@ -616,6 +616,35 @@ test('webhook: voice note is downloaded, transcribed, and fed to the pipeline', 
   }
 });
 
+test('webhook: stale empty voice-note attempt does not send a failure reply', async (t) => {
+  const { app, base, env } = await serverFixture(); t.after(() => app.close());
+  env.OPENAI_API_KEY = 'test-whisper-key';
+  await linkOwnerDirectly(app, base, 'owner-stale-voice@example.com');
+  app.db.finishWhatsAppInboundMedia = () => null;
+  const sent = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts) => {
+    const u = (() => { try { return new URL(String(url)); } catch { return null; } })();
+    if (u?.hostname === 'api.twilio.com' && u.pathname.includes('/Media/')) return mediaResponse([5, 6, 7, 8]);
+    if (u?.hostname === 'api.twilio.com') { sent.push(String(opts?.body || '')); return { ok: true, status: 201, json: async () => ({ sid: 'SMx' }), text: async () => '' }; }
+    if (u?.hostname === 'api.openai.com') return { ok: true, status: 200, json: async () => ({ text: '' }), text: async () => '' };
+    return origFetch(url, opts);
+  };
+  try {
+    const sid = mediaMessageSid('8');
+    const hook = await webhookPost(base, {
+      From: WA_FROM, To: `whatsapp:${TWILIO_ENV.TWILIO_WHATSAPP_NUMBER}`,
+      NumMedia: '1', MediaContentType0: 'audio/ogg',
+      MediaUrl0: mediaUrl(sid, 'f'), Body: '', MessageSid: sid,
+    });
+    assert.equal(hook.status, 503);
+    assert.deepEqual(await hook.json(), { ok: false, retry: true });
+    assert.equal(sent.length, 0);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 test('webhook: oversized voice note gets the "bit long" reply and is not transcribed', async (t) => {
   const { app, base, env } = await serverFixture(); t.after(() => app.close());
   env.OPENAI_API_KEY = 'test-whisper-key';
