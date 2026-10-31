@@ -63,6 +63,21 @@ test('first signed purchase can be recovered from a pending account-bound intent
   assert.equal(fx.appleCalls,2,'synthetic Apple API was checked once for the transaction and once for status');
 });
 
+test('tokenless re-verification prefers the existing subscription over another pending intent',async t=>{
+  const fx=await fixture(t);
+  const first=await fetch(`${fx.base}/api/subscriptions/verify`,{method:'POST',headers:fx.headers(fx.owner),
+    body:JSON.stringify({signedTransaction:'device'})});
+  assert.equal(first.status,200);
+  const pending=fx.app.db.createPurchaseIntent(fx.owner.id,PRODUCT,fx.token,new Date(Date.now()+60_000).toISOString());
+
+  const response=await fetch(`${fx.base}/api/subscriptions/verify`,{method:'POST',headers:fx.headers(fx.owner),
+    body:JSON.stringify({signedTransaction:'device'})});
+  assert.equal(response.status,200);
+  assert.equal((await response.json()).status,'active');
+  assert.equal(fx.app.db.getPurchaseIntent(fx.owner.id,fx.token,PRODUCT).id,pending.id,
+    're-verification must not consume an unrelated pending intent');
+});
+
 test('another account cannot claim a signed purchase bound to the first account',async t=>{
   const fx=await fixture(t);
   fx.app.db.setSetting('registration_open','true');

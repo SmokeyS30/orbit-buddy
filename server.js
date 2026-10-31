@@ -3627,7 +3627,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(requestedToken&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestedToken))throw Object.assign(new Error('Invalid app account token.'),{status:400});
           const signedBinding=requestedToken?null:await subscriptions.signedTransactionBinding(signedTransaction);
           const bindingToken=requestedToken||signedBinding.appAccountToken;
-          const current=db.getSubscription(userId);const intent=db.getPurchaseIntent(userId,bindingToken,requestedToken?requestedProduct:signedBinding.productId);
+          const current=db.getSubscription(userId);const intent=requestedToken||current?.app_account_token!==bindingToken
+            ?db.getPurchaseIntent(userId,bindingToken,requestedToken?requestedProduct:signedBinding.productId):null;
           if(requestedToken&&!intent)throw Object.assign(new Error('Purchase intent is missing or expired.'),{status:403});
           const expectedToken=intent?.app_account_token||(current?.app_account_token===bindingToken?current.app_account_token:null);
           if(!expectedToken)throw Object.assign(new Error('Purchase is not bound to this Orbit account.'),{status:403});
