@@ -6,18 +6,18 @@ import vm from 'node:vm';
 const source=readFileSync(new URL('../public/app.js',import.meta.url),'utf8');
 const part=source.slice(source.indexOf('let refreshInFlight=null;'),source.indexOf('async function connect(){'));
 function deferred(){let resolve;const promise=new Promise(r=>{resolve=r;});return{promise,resolve};}
-function harness(snapshotFor){
+function harness(snapshotFor,consentFor=()=>Promise.resolve({accepted:false})){
   const commits=[];
-  const state={user:{id:'member',role:'member'},status:null,snapshot:null};
+  const state={user:{id:'member',role:'member'},status:null,snapshot:null,aiSharing:null};
   const element={textContent:'',classList:{toggle(){},contains(){return false;}}};
   const context=vm.createContext({
     state,activeConversationId:'a',renderedConversationId:'a',conversationLoadingId:null,
     modelCheckInFlight:false,reportingUI:{onNavigation(){}},localStorage:{setItem(){}},
-    $:()=>element,api:(url)=>url.startsWith('/api/snapshot')?snapshotFor(url):Promise.resolve(url==='/api/status'?{buddyName:'Orbit',paused:false,modelConfigured:false}:{}),
-    render:()=>commits.push(state.snapshot?.activeConversation?.id),renderModelPill(){},
+    $:()=>element,api:(url)=>url.startsWith('/api/snapshot')?snapshotFor(url):url==='/api/ai-sharing-consent'?consentFor():Promise.resolve(url==='/api/status'?{buddyName:'Orbit',paused:false,modelConfigured:false}:{}),
+    render:()=>commits.push(state.snapshot?.activeConversation?.id),renderModelPill(){},renderAiSharingChoice(){},
     isComposing:()=>false,loadBriefing(){},loadCatchupCard(){},renderThreads(){},renderMessages(){},syncTypingBubble(){},syncStreamPoller(){}
   });
-  vm.runInContext(part,context);
+  vm.runInContext('let aiChoiceVersion=0;'+part,context);
   return{context,state,commits};
 }
 
@@ -52,4 +52,16 @@ test('an auth transition discards the previous account refresh',async()=>{
   await pending;
   assert.equal(h.state.snapshot,null);
   assert.deepEqual(h.commits,[]);
+});
+
+test('a slow consent read cannot overwrite a newer withdrawal',async()=>{
+  const oldConsent=deferred();
+  const h=harness(()=>Promise.resolve({activeConversation:{id:'a'},messages:[]}),()=>oldConsent.promise);
+  h.state.aiSharing={accepted:true};
+  const pending=h.context.refresh();
+  h.state.aiSharing={accepted:false};
+  vm.runInContext('aiChoiceVersion++',h.context);
+  oldConsent.resolve({accepted:true});
+  await pending;
+  assert.equal(h.state.aiSharing.accepted,false);
 });

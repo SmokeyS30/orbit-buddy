@@ -147,6 +147,7 @@ export async function openPostgres(databaseUrl, { encryptionKey = null } = {}) {
       'CREATE UNIQUE INDEX IF NOT EXISTS idx_signup_verification_email ON signup_verification_tokens(email_hash)',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS is_demo INTEGER NOT NULL DEFAULT 0',
       'ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TEXT',
+      'ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_sharing_consent_at TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS conversation_id TEXT',
       'ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_job_id TEXT',
@@ -505,7 +506,7 @@ const indexMigrations = [
 
     // --- Users ---
     countUsers: async () => Number((await get('SELECT COUNT(*) AS count FROM users')).count),
-    listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,created_at,updated_at FROM users ORDER BY created_at'),
+    listUsers: async () => all('SELECT id,email,display_name,role,disabled,moderation_blocked,ai_sharing_consent_at,created_at,updated_at FROM users ORDER BY created_at'),
     async createUser({ email, displayName, passwordHash, passwordSalt, role }) {
       const now = timestamp(); const id = randomUUID();
       await run('INSERT INTO users(id,email,display_name,password_hash,password_salt,role,disabled,created_at,updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)', id, email, displayName, passwordHash, passwordSalt, role, now, now);
@@ -529,6 +530,15 @@ const indexMigrations = [
     // email column is CITEXT: plain = is already case-insensitive
     getUserByEmail: async (email) => get('SELECT * FROM users WHERE email = ?', email),
     getUserById: async (id) => get('SELECT * FROM users WHERE id = ?', id),
+    setAiSharingConsent: async (id, accepted) => (await run('UPDATE users SET ai_sharing_consent_at=?, updated_at=? WHERE id=?',accepted?timestamp():null,timestamp(),id)).changes>0,
+    setAiSharingConsentIfSessionCurrent: async (id,tokenHash,csrfToken,accepted) => withTransaction(async ({get:tGet,run:tRun})=>{
+      const user=await tGet('SELECT id,disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',id);
+      if(!user||user.disabled||user.moderation_blocked)return false;
+      const session=await tGet('SELECT user_id,csrf_token,expires_at FROM sessions WHERE token_hash=? AND user_id=? FOR UPDATE',tokenHash,id);
+      if(!session||session.csrf_token!==csrfToken||session.expires_at<=timestamp())return false;
+      await tRun('UPDATE users SET ai_sharing_consent_at=?,updated_at=? WHERE id=?',accepted?timestamp():null,timestamp(),id);
+      return true;
+    }),
     setSignupPause: async (paused) => withTransaction(async ({query:tQuery,run:tRun}) => {
       await tQuery('SELECT pg_advisory_xact_lock(1941101)');
       await tRun("INSERT INTO settings(key,value,updated_at) VALUES('signups_paused',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",String(paused),timestamp());
@@ -738,6 +748,7 @@ const indexMigrations = [
       return{userMessage,job};
     }),
     getReplyJob: async (id)=>get('SELECT * FROM reply_jobs WHERE id=?',id),
+    getReplyJobStates: async (ids)=>ids.length?all(`SELECT id,status FROM reply_jobs WHERE id IN (${ids.map(()=>'?').join(',')})`,...ids):[],
     getConversationReplyJobState: async (userId,conversationId)=>get('SELECT id,status,completed_at FROM reply_jobs WHERE user_id=? AND conversation_id=? ORDER BY seq DESC LIMIT 1',userId,conversationId),
     cancelDisallowedReplyJobs: async ()=>(await run(`UPDATE reply_jobs j SET status='cancelled',completed_at=?,lease_expires_at=NULL
       FROM users u WHERE j.user_id=u.id AND j.status IN ('queued','running')
@@ -1734,8 +1745,9 @@ const indexMigrations = [
     completeTaskByUser: async (userId,id,result) => (await run("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')",result,timestamp(),id,userId)).changes>0,
     dueTasks: async () => all(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
       AND (schedule_at IS NULL OR schedule_at<=?)
-      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)
+      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0 AND ai_sharing_consent_at IS NOT NULL)
       ORDER BY COALESCE(schedule_at,created_at),id LIMIT 10`, timestamp()),
+    deferTaskForAiConsent: async (userId,id,attempt) => (await run("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?",timestamp(),id,userId,attempt,timestamp())).changes > 0,
 
     // --- Calendar feeds ---
     async addCalendarFeed(userId, { label, url }) {

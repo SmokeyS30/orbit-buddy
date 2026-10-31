@@ -12,7 +12,7 @@ function fixture(t) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-fence-'));
   const db=openDatabase(path.join(dir,'orbit.sqlite'));
   t.after(()=>{db.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=db.createUser({email:'synthetic@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=db.createUser({email:'synthetic@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});db.setAiSharingConsent(user.id,true);
   return {db,user};
 }
 
@@ -45,9 +45,9 @@ test('claim returns its own attempt even if another worker reclaims before the c
   const model=createModelClient({NODE_ENV:'test'});
   let modelCalls=0;
   model.respond=async()=>{modelCalls++;return{text:'stale result',toolCalls:[]};};
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'claim@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'claim@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   const claim=app.db.claimDueTask.bind(app.db);
   let newerAttempt;
@@ -78,9 +78,9 @@ test('a due-task batch skips work rescheduled while an earlier task runs',async 
     if(messages.length===1){entered();await firstGate;}
     return{text:'Synthetic result',toolCalls:[]};
   };
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   t.after(async()=>{releaseFirst();await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'stale-batch@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'stale-batch@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   app.db.addTask(user.id,{title:'First',prompt:'First prompt'});
   const second=app.db.addTask(user.id,{title:'Second',prompt:'Old second prompt'});
   app.push.notify=async()=>({sent:0,failed:0});
@@ -108,9 +108,9 @@ test('a due-task batch executes the freshly edited row rather than its old promp
     if(messages.length===1){entered();await firstGate;}
     return{text:'Synthetic result',toolCalls:[]};
   };
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   t.after(async()=>{releaseFirst();await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'fresh-row@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'fresh-row@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   app.db.addTask(user.id,{title:'First',prompt:'First prompt'});
   const second=app.db.addTask(user.id,{title:'Second',prompt:'Old second prompt'});
   app.push.notify=async()=>({sent:0,failed:0});
@@ -162,7 +162,7 @@ test('ten earlier blocked due tasks cannot hide a later eligible task in SQLite'
     db.addTask(blocked.id,{title:`Blocked ${i}`,prompt:'Do not run',scheduleAt:oldDue});
     assert.equal(i%2?db.setModerationBlocked(blocked.id,true):db.setUserDisabled(blocked.id,true),true);
   }
-  const eligible=db.createUser({email:'eligible@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+  const eligible=db.createUser({email:'eligible@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});db.setAiSharingConsent(eligible.id,true);
   const task=db.addTask(eligible.id,{title:'Eligible',prompt:'Run',scheduleAt:laterDue});
   const due=db.dueTasks();
   assert.deepEqual(due.map(row=>row.id),[task.id]);
@@ -175,10 +175,10 @@ test('cancelling while model work is in flight discards its result and notificat
   let release,started;
   const entered=new Promise(resolve=>{started=resolve;});
   model.respond=async()=>{await new Promise(resolve=>{release=resolve;started();});return{text:'Cancelled work result',toolCalls:[]};};
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'cancel@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'cancel@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   const token='synthetic-task-session',csrf='synthetic-csrf';
   app.db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic-test'});
@@ -205,14 +205,14 @@ test('account disable during model work blocks another model attempt and deliver
   const started=new Promise(resolve=>{entered=resolve;});
   model.respond=async({assertActive})=>{
     assert.equal(typeof assertActive,'function');
-    assertActive();
+    await assertActive();
     await new Promise(resolve=>{release=resolve;entered();});
-    assert.throws(()=>assertActive(),/no longer active/,'a fallback request must fail its active-claim check');
+    await assert.rejects(async()=>assertActive(),/no longer active/,'a fallback request must fail its active-claim check');
     return{text:'disabled result',toolCalls:[]};
   };
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'disabled@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'disabled@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   let notifications=0;app.push.notify=async()=>{notifications++;};
   const run=app.runDueTasks();
@@ -228,9 +228,9 @@ test('cancellation after completion blocks the next external notification',async
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-task-delivery-race-'));
   const model=createModelClient({NODE_ENV:'test'});
   model.respond=async()=>({text:'Synthetic result',toolCalls:[]});
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
-  const user=app.db.createUser({email:'delivery@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const user=app.db.createUser({email:'delivery@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   let webSends=0,nativeSends=0;
   app.push.notify=async(_userId,_title,_body,_data,canDeliver)=>{
@@ -255,11 +255,11 @@ test('shutdown waits for task work and requeues its in-flight result without del
   const gate=new Promise(resolve=>{release=resolve;});
   model.respond=async({assertActive})=>{
     entered();await gate;
-    assert.throws(()=>assertActive(),/no longer active/);
+    await assert.rejects(async()=>assertActive(),/no longer active/);
     return{text:'stale shutdown result',toolCalls:[]};
   };
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
-  const user=app.db.createUser({email:'shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
+  const user=app.db.createUser({email:'shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const task=app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   let notifications=0;app.push.notify=async()=>{notifications++;};
   const run=app.runDueTasks();
@@ -285,8 +285,8 @@ test('shutdown during device delivery prevents the next unstarted task send',asy
   t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const model=createModelClient({NODE_ENV:'test'});
   model.respond=async()=>({text:'Synthetic result',toolCalls:[]});
-  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test'},modelClient:model});
-  const user=app.db.createUser({email:'send-shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});
+  const app=createOrbitServer({dataDir:dir,env:{NODE_ENV:'test',OPENAI_MODEL:'gpt-6-luna'},modelClient:model});
+  const user=app.db.createUser({email:'send-shutdown@example.test',displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   app.db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
   let entered,release;
   const started=new Promise(resolve=>{entered=resolve;});

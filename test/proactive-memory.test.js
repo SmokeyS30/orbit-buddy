@@ -395,6 +395,8 @@ async function register(base) {
   const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: `pm-${Date.now()}@example.com`, displayName: 'Owner', password: 'correct horse battery staple' }) });
   assert.equal(response.status, 201);
   const body = await response.json();
+  const cookie=response.headers.get('set-cookie').split(';')[0];
+  assert.equal((await fetch(`${base}/api/ai-sharing-consent`,{method:'POST',headers:{Cookie:cookie,'X-Orbit-CSRF':body.csrf,'Content-Type':'application/json'},body:'{"accepted":true}'})).status,200);
   return { userId: body.user.id };
 }
 

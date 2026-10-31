@@ -392,7 +392,7 @@ test('PostgreSQL due selection skips ten earlier blocked tasks',async()=>{
       assert.equal(i%2?await db.setModerationBlocked(user.id,true):await db.setUserDisabled(user.id,true),true);
     }
     const eligible=await db.createUser({email:`task-eligible-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
-    users.push(eligible);
+    users.push(eligible);await db.setAiSharingConsent(eligible.id,true);
     const task=await db.addTask(eligible.id,{title:'Eligible',prompt:'Run',scheduleAt:laterDue});
     assert.ok((await db.dueTasks()).some(row=>row.id===task.id));
     assert.equal((await db.claimDueTask(eligible.id,task.id))?.id,task.id);
@@ -444,6 +444,7 @@ test('PostgreSQL claim rejects a newly future task and returns its current row a
   let user;
   try{
     user=await first.createUser({email:`task-due-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    await first.setAiSharingConsent(user.id,true);
     const task=await first.addTask(user.id,{title:'Original',prompt:'Original prompt'});
     const stale=(await first.dueTasks()).find(row=>row.id===task.id);
     assert.ok(stale);

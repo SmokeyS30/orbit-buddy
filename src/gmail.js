@@ -19,7 +19,26 @@ function encodeMessage({ to, cc, bcc, subject, body }) {
   const lines = [`To: ${clean(to)}`];
   if (cc) lines.push(`Cc: ${clean(cc)}`);
   if (bcc) lines.push(`Bcc: ${clean(bcc)}`);
-  lines.push(`Subject: ${clean(subject)}`, 'Content-Type: text/plain; charset=utf-8', '', body);
+  const cleanSubject = clean(subject);
+  let encodedSubject = cleanSubject;
+  if (!/^[\x20-\x7e]*$/.test(cleanSubject)) {
+    const words = [];
+    let chunk = '', chunkBytes = 0;
+    for (const character of cleanSubject) {
+      const characterBytes = Buffer.byteLength(character, 'utf-8');
+      if (chunkBytes + characterBytes > 42) {
+        words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf-8').toString('base64')}?=`);
+        chunk = '';
+        chunkBytes = 0;
+      }
+      chunk += character;
+      chunkBytes += characterBytes;
+    }
+    if (chunk) words.push(`=?UTF-8?B?${Buffer.from(chunk, 'utf-8').toString('base64')}?=`);
+    encodedSubject = words.join('\r\n ');
+  }
+  const encodedBody = Buffer.from(String(body), 'utf-8').toString('base64').replace(/.{1,76}/g, '$&\r\n').trimEnd();
+  lines.push(`Subject: ${encodedSubject}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: base64', '', encodedBody);
   return Buffer.from(lines.join('\r\n'), 'utf-8').toString('base64url');
 }
 
@@ -32,7 +51,13 @@ export async function sendEmail(getToken, { to, subject, body, cc, bcc }) {
   for (const e of emails) {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw new Error(`"${e}" doesn't look like a valid email address.`);
   }
-  const raw = encodeMessage({ to: emails.join(', '), cc, bcc, subject: String(subject).trim(), body: String(body).trim() });
+  const validList = (label, value) => {
+    if (!value) return '';
+    const list = String(value).split(',').map(e => e.trim()).filter(Boolean);
+    for (const e of list) if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) throw new Error(`"${e}" doesn't look like a valid ${label} email address.`);
+    return list.join(', ');
+  };
+  const raw = encodeMessage({ to: emails.join(', '), cc: validList('Cc', cc), bcc: validList('Bcc', bcc), subject: String(subject).trim(), body: String(body).trim() });
   const result = await apiFetch(getToken, '/messages/send', { method: 'POST', body: JSON.stringify({ raw }) });
   return { sent: true, messageId: result.id, to: emails.join(', '), subject: String(subject).trim() };
 }

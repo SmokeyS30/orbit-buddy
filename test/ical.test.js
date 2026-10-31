@@ -338,3 +338,9 @@ test('formatBriefingAgenda groups events under Today/Tomorrow headings', async (
   assert.match(text, /2:30 PM – 3:00 PM: Call with Mom \[Personal\]/);
   assert.equal(formatBriefingAgenda([], zone, '2026-10-05'), '');
 });
+
+test('recurring events with a UTC DTSTART keep their UTC time',()=>{
+  const ics=['BEGIN:VCALENDAR','BEGIN:VEVENT','UID:utc','DTSTART:20250106T150000Z','DTEND:20250106T160000Z','RRULE:FREQ=WEEKLY;COUNT=3','SUMMARY:Utc','END:VEVENT','END:VCALENDAR'].join('\n');
+  const out=expandEvents(parseIcs(ics),Date.UTC(2025,0,1),Date.UTC(2025,1,1),ZONE);
+  assert.deepEqual(out.map((e)=>e.startMs),[Date.UTC(2025,0,6,15),Date.UTC(2025,0,13,15),Date.UTC(2025,0,20,15)]);
+});

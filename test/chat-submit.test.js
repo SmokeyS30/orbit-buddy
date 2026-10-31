@@ -8,10 +8,16 @@ const handler=source.slice(source.indexOf("$('#chat-form').addEventListener('sub
 function fixture(){
   const input={value:'second draft'};let submit;const sends=[];
   const form={addEventListener(_event,callback){submit=callback;}};
-  const context=vm.createContext({$:selector=>selector==='#chat-form'?form:input,sendChatMessage:text=>sends.push(text),state:{user:{id:'user'}},sendInFlight:false,pendingAttachments:[],lastTypeAt:Date.now()});
+  let prompts=0;
+  const context=vm.createContext({$:selector=>selector==='#chat-form'?form:input,sendChatMessage:text=>sends.push(text),openAiConsentDialog:()=>{prompts++;},state:{user:{id:'user'},aiSharing:{accepted:true}},sendInFlight:false,pendingAttachments:[],lastTypeAt:Date.now()});
   vm.runInContext(handler,context);
-  return{context,input,sends,submit:()=>submit({preventDefault(){}})};
+  return{context,input,sends,prompts:()=>prompts,submit:()=>submit({preventDefault(){}})};
 }
+
+test('an unconsented submit preserves the draft and asks for an explicit choice',()=>{
+  const f=fixture();f.context.state.aiSharing={accepted:false};f.submit();
+  assert.equal(f.input.value,'second draft');assert.deepEqual(f.sends,[]);assert.equal(f.prompts(),1);
+});
 
 test('a second submit during a pending send preserves the draft',()=>{
   const f=fixture();f.context.sendInFlight=true;f.submit();

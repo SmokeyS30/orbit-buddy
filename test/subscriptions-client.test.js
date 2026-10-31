@@ -27,6 +27,13 @@ const loadProductsSrc = () => fnSource('async function loadStoreKitProducts(');
 const paywallSrc = () => fnSource('function showInlinePaywall(');
 const sendChatSrc = () => fnSource('async function sendChatMessage(');
 
+test('Plans are reachable after sign-in without a quota error or entitlement check',()=>{
+  assert.match(INDEX,/id="plans-button"[^>]*>Plans<\/button>/);
+  assert.match(SRC,/\$\('#plans-button'\)\?\.addEventListener\('click',\(\)=>openMembershipExperience\(\)\)/);
+  assert.match(SRC,/\$\('#plans-button'\)\.classList\.remove\('hidden'\)/);
+  assert.ok(SRC.includes('const MEMBERSHIP_PLANS='));
+});
+
 test('(a) purchase flow calls purchase-intent before the StoreKit purchase, verify after', () => {
   const src = purchaseProductSrc();
   const intent = src.indexOf('/api/subscriptions/purchase-intent');

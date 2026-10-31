@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS users (
   disabled INTEGER NOT NULL DEFAULT 0, moderation_blocked INTEGER NOT NULL DEFAULT 0,
   is_demo INTEGER NOT NULL DEFAULT 0,
   email_verified_at TEXT,
+  ai_sharing_consent_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

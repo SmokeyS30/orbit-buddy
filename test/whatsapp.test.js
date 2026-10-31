@@ -8,6 +8,7 @@ import { openDatabase } from '../src/database.js';
 import { hashToken } from '../src/security.js';
 import { createOrbitServer } from '../server.js';
 import { MAX_EPHEMERAL_MEDIA_BYTES, mediaBytesReserved, reserveMediaBytes } from '../src/media-memory.js';
+import { allowAiSharing } from './ai-sharing-fixture.js';
 import {
   verifyTwilioSignature,
   stripWhatsAppPrefix,
@@ -140,7 +141,9 @@ async function register(base, { email = 'owner@example.com', displayName = 'Owne
   });
   assert.equal(response.status, 201);
   const body = await response.json();
-  return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf };
+  const auth={ cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf };
+  await allowAiSharing(base,auth);
+  return auth;
 }
 
 const authHeaders = ({ cookie, csrf }) => ({ Cookie: cookie, 'X-Orbit-CSRF': csrf, 'Content-Type': 'application/json' });
@@ -158,6 +161,28 @@ function webhookPost(base, params, token = TWILIO_ENV.TWILIO_AUTH_TOKEN, tamper 
 }
 
 const WA_FROM = 'whatsapp:+15085551234';
+
+test('WhatsApp text and voice stop before provider work when AI sharing is withdrawn',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const auth=await register(base);
+  const user=app.db.getUserByEmail('owner@example.com');
+  app.db.linkWhatsApp(user.id,'+15085551234');
+  assert.equal((await fetch(`${base}/api/ai-sharing-consent`,{method:'POST',headers:authHeaders(auth),body:'{"accepted":false}'})).status,200);
+  const originalFetch=global.fetch;
+  global.fetch=(url,options)=>{
+    if(String(url).startsWith(base))return originalFetch(url,options);
+    throw new Error('Unexpected external provider call');
+  };
+  t.after(()=>{global.fetch=originalFetch;});
+  for(const params of [
+    {From:WA_FROM,Body:'private message'},
+    {From:WA_FROM,Body:'',NumMedia:'1',MediaContentType0:'audio/ogg',MediaUrl0:'https://api.twilio.com/synthetic'},
+  ]){
+    const response=await webhookPost(base,params);
+    assert.equal(response.status,200);
+    assert.equal((await response.json()).aiConsentRequired,true);
+  }
+});
 
 test('webhook rejects bad signatures with 403', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());

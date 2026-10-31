@@ -14,6 +14,7 @@ import pg from 'pg';
 
 function seed(db){
   const user=db.createUser({email:`reply-${randomUUID()}@example.com`,displayName:'Job test',passwordHash:'test',passwordSalt:'test',role:'member'});
+  db.setAiSharingConsent(user.id,true);
   return{user,conversation:db.createConversation(user.id,'Job test')};
 }
 
@@ -40,6 +41,10 @@ test('SQLite reply jobs survive restart, preserve order and fence expired work',
     const first=db.acceptReplyJob(user.id,conversation.id,'First question');
     const second=db.acceptReplyJob(user.id,conversation.id,'Second question');
     assert.equal(db.getReplyJob(first.job.id).status,'queued');
+    const states=new Map(db.getReplyJobStates([first.job.id,second.job.id]).map(({id,status})=>[id,status]));
+    assert.equal(states.get(first.job.id),'queued');
+    assert.equal(states.get(second.job.id),'queued');
+    assert.deepEqual(db.getReplyJobStates([]),[]);
     assert.equal(db.getMessage(user.id,first.userMessage.id).content,'First question');
     const claimed=db.claimNextReplyJob('worker-A');
     assert.equal(claimed.id,first.job.id);
@@ -86,6 +91,9 @@ test('PostgreSQL claims one conversation turn across replicas and migrations are
     const {user,conversation}=seed(one);userId=user.id;
     const first=one.acceptReplyJob(user.id,conversation.id,'First PG question');
     const second=one.acceptReplyJob(user.id,conversation.id,'Second PG question');
+    const states=new Map(one.getReplyJobStates([first.job.id,second.job.id]).map(({id,status})=>[id,status]));
+    assert.equal(states.get(first.job.id),'queued');
+    assert.equal(states.get(second.job.id),'queued');
     const sameInstant='2026-10-24T10:00:00.000Z';
     one.retimeMessage(user.id,first.userMessage.id,sameInstant);
     one.retimeMessage(user.id,second.userMessage.id,sameInstant);

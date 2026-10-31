@@ -70,7 +70,7 @@ test('splash exposes an early-dismiss hook for the app', () => {
 test('Support return removes the splash synchronously before app modules load', () => {
   const html = readPublic('index.html');
   const supportGuard = html.indexOf("if(window.__orbitSupportReturnView==='safety')");
-  const appModule = html.indexOf('<script type="module" src="/app.js?v=20261022d"></script>');
+  const appModule = html.search(/<script type="module" src="\/app\.js\?v=[^"]+"><\/script>/);
   assert.ok(supportGuard > -1, 'inline Support-return guard exists');
   assert.ok(appModule > supportGuard, 'guard runs before app.js');
   assert.match(html, /__orbitSupportReturnView==='safety'[\s\S]*?removeChild\(splash\)[\s\S]*?__orbitSplashComplete=true[\s\S]*?return;/);

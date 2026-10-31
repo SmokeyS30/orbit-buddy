@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createOrbitServer } from '../server.js';
+import { allowAiSharing } from './ai-sharing-fixture.js';
 
 async function fixture(extraEnv = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-chatstream-'));
@@ -16,7 +17,9 @@ async function register(base) {
   const response = await fetch(`${base}/api/auth/register`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'owner@example.com', displayName: 'Owner', password: 'correct horse battery staple' }) });
   assert.equal(response.status, 201);
   const body = await response.json();
-  return { cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, userId: body.user.id };
+  const auth={ cookie: response.headers.get('set-cookie').split(';')[0], csrf: body.csrf, userId: body.user.id };
+  await allowAiSharing(base,auth);
+  return auth;
 }
 
 // Read a text/event-stream response until the 'done' event (or timeout).

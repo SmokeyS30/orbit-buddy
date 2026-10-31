@@ -27,7 +27,7 @@ test('held revision keeps chat and health available while task, proactive and co
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
   const base=`http://127.0.0.1:${app.server.address().port}`;
-  const user=app.db.createUser({ email:'synthetic-cutover@example.test', displayName:'Synthetic', passwordHash:'test', passwordSalt:'test', role:'owner' });
+  const user=app.db.createUser({ email:'synthetic-cutover@example.test', displayName:'Synthetic', passwordHash:'test', passwordSalt:'test', role:'owner' });app.db.setAiSharingConsent(user.id,true);
   const token='synthetic-cutover-session', csrf='synthetic-cutover-csrf';
   app.db.createSession({ tokenHash:hashToken(token), userId:user.id, csrfToken:csrf, expiresAt:new Date(Date.now()+60_000).toISOString(), userAgent:'synthetic' });
   const headers={ Cookie:`orbit_session=${token}`, 'X-Orbit-CSRF':csrf, 'Content-Type':'application/json' };
@@ -72,7 +72,7 @@ test('open composed revision serves chat, binds OAuth to the initiating session,
   await new Promise(resolve=>app.server.listen(0,'127.0.0.1',resolve));
   t.after(async()=>{await app.close();fs.rmSync(dir,{recursive:true,force:true});});
   const base=`http://127.0.0.1:${app.server.address().port}`;
-  const user=app.db.createUser({email:'synthetic-open@example.test',displayName:'Synthetic',passwordHash:'test',passwordSalt:'test',role:'owner'});
+  const user=app.db.createUser({email:'synthetic-open@example.test',displayName:'Synthetic',passwordHash:'test',passwordSalt:'test',role:'owner'});app.db.setAiSharingConsent(user.id,true);
   const token='synthetic-open-session',csrf='synthetic-open-csrf';
   app.db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,
     expiresAt:new Date(Date.now()+60_000).toISOString(),userAgent:'synthetic'});

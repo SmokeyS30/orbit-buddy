@@ -197,6 +197,7 @@ test('encrypts calendar feed URLs at rest and decrypts them through the database
 
 test('recovers a task whose worker lease expired', () => {
   const { db, user } = fixture();
+  db.setAiSharingConsent(user.id, true);
   const task = db.addTask(user.id, { title: 'Recover me', prompt: 'Continue safely' });
   assert.equal(db.startTask(user.id, task.id, -1000), true);
   assert.equal(db.getTask(user.id, task.id).status, 'running');

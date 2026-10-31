@@ -38,7 +38,7 @@ test('precache manifest includes the versioned styles.css', () => {
 test('precache manifest covers desktop assets (W7: voice/canvas chunks excluded)', () => {
   const { sandbox } = loadSw();
   const manifest = sandbox.buildPrecacheManifest();
-  for (const asset of ['/desktop.css', '/pwa-install.js']) {
+  for (const asset of ['/desktop.css', '/pwa-install.js', '/connection-recovery.js']) {
     assert.ok(manifest.includes(asset), `missing ${asset} in ${manifest.join(', ')}`);
   }
   assert.ok(manifest.some((asset) => /^\/app\.js\?v=/.test(asset)), `missing versioned /app.js in ${manifest.join(', ')}`);

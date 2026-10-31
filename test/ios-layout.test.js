@@ -8,6 +8,7 @@ const index = fs.readFileSync(new URL('../public/index.html', import.meta.url), 
 const welcome = fs.readFileSync(new URL('../public/welcome.html', import.meta.url), 'utf8');
 const support = fs.readFileSync(new URL('../public/support.css', import.meta.url), 'utf8');
 const project = fs.readFileSync(new URL('../ios/App/App.xcodeproj/project.pbxproj', import.meta.url), 'utf8');
+const serviceWorker = fs.readFileSync(new URL('../public/sw.js', import.meta.url), 'utf8');
 
 test('mobile layout prevents WebKit text inflation and horizontal viewport drift', () => {
   assert.match(mobile, /html\{[^}]*-webkit-text-size-adjust:100%[^}]*max-width:100%[^}]*overflow-x:hidden/);
@@ -56,9 +57,10 @@ test('native iOS time pickers stay inside the quiet-hours border', () => {
 });
 
 test('native bundle uses the polished asset revisions and replacement 1.1 build', () => {
-  assert.match(index, /styles\.css\?v=20261022d/);
-  assert.match(index, /mobile\.css\?v=20261022d/);
-  assert.match(index, /app\.js\?v=20261022d/);
-  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261031;/g) || []).length, 2);
+  const version = serviceWorker.match(/const STATIC_VERSION = '([^']+)'/)?.[1];
+  assert.ok(version);
+  for(const asset of ['styles.css', 'mobile.css', 'app.js'])
+    assert.ok(index.includes(`/${asset}?v=${version}`), `${asset} must match the service worker revision`);
+  assert.equal((project.match(/CURRENT_PROJECT_VERSION = 20261033;/g) || []).length, 2);
   assert.equal((project.match(/MARKETING_VERSION = 1\.1;/g) || []).length, 2);
 });

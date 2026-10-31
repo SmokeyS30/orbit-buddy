@@ -14,7 +14,7 @@ async function fixture(t, modelClient) {
   return { app, base: `http://127.0.0.1:${app.server.address().port}` };
 }
 
-const seed = (db) => db.createUser({ email: 'owner@example.test', displayName: 'Owner', passwordHash: 'test', passwordSalt: 'test', role: 'owner' });
+const seed = (db) => {const user=db.createUser({ email: 'owner@example.test', displayName: 'Owner', passwordHash: 'test', passwordSalt: 'test', role: 'owner' });db.setAiSharingConsent(user.id,true);return user;};
 
 test('malformed request target returns 400 and leaves the server healthy', async (t) => {
   const { app, base } = await fixture(t);

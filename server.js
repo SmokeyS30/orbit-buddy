@@ -7,7 +7,8 @@ import path from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
-import { peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { consentGatedModel, requireAiSharingConsent, disclosedAiRecipientConfigured } from './src/ai-sharing.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
@@ -103,7 +104,9 @@ function welcomeMessageText(displayName) {
 // the full URL to the client, log it, or put it in activity events.
 function maskFeedUrl(raw) { try { const url=new URL(String(raw)); const tail=String(url.pathname||'').replace(/\/$/,'').slice(-4); return `${url.protocol}//${url.host}/\u2026${tail}`; } catch { return 'invalid url'; } }
 function publicFeed(feed) { return { id:feed.id,label:feed.label,url:maskFeedUrl(feed.url),created_at:feed.created_at }; }
-async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; try{return JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} }
+async function readJson(req,limit=1024*1024) { const chunks=[]; let size=0; for await(const chunk of req){size+=chunk.length;if(size>limit)throw Object.assign(new Error('Request body is too large.'),{status:413});chunks.push(chunk);} if(!chunks.length)return{}; let parsed;try{parsed=JSON.parse(Buffer.concat(chunks).toString('utf8'));}catch{throw Object.assign(new Error('Request body must be valid JSON.'),{status:400});} if(parsed===null||typeof parsed!=='object'||Array.isArray(parsed))throw Object.assign(new Error('Request body must be a JSON object.'),{status:400}); return parsed; }
+const DUMMY_PASSWORD_SALT='orbit-dummy-salt';
+const DUMMY_PASSWORD_HASH='orbit-dummy-hash';
 function nextRun(recurrence,previous){if(recurrence==='none')return null;const date=previous?new Date(previous):new Date();const days=recurrence==='weekly'?7:1;do{date.setUTCDate(date.getUTCDate()+days);}while(date<=new Date());return date.toISOString();}
 function artifactName(title){const base=title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,60)||'orbit-result';return `${base}.md`;}
 function markdownToHtml(md,autoPrint,printUrl,toolbarOverride=null,docTitle=''){
@@ -526,7 +529,8 @@ export function createOrbitServer(options={}) {
   // Study coach: seed the quiz question bank once (no-op when populated).
   try{const seedResult=seedStudyBank(db);if(seedResult.seeded)console.log(`[study] seeded ${seedResult.inserted} quiz questions`);}catch(error){console.error('study bank seed failed',error&&error.message);}
   function buddyNameFor(userId){try{const p=db.getPreferences(userId);const custom=String(p?.buddy_name||'').trim().slice(0,40);if(custom)return custom;}catch(_){}return defaultBuddyName;}
-  const model=options.modelClient||createModelClient(env);
+  const disclosedRecipientReady=disclosedAiRecipientConfigured(env);
+  const model=consentGatedModel(options.modelClient||createModelClient(env),db,disclosedRecipientReady);
   const chatMetrics=createChatMetrics();
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
@@ -577,28 +581,40 @@ export function createOrbitServer(options={}) {
     const attempts=chats.successful+chats.failed;return {windowDays:7,model:model.diagnostics(),chat:{...chats,successRate:attempts?Math.round(chats.successful/attempts*100):null},background:tasks,pendingApprovals:db.listApprovals(userId).filter((item)=>item.status==='pending').length+db.listTasks(userId).filter((task)=>task.status==='waiting_approval').length,recentFailures:recent.filter((event)=>event.type.endsWith('_failed')).slice(0,8).map(({id,type,message,created_at})=>({id,type,message,created_at}))};
   }
 
-  const requestLog=new Map();
+  const ipPattern=/^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]+)$/;
+  const trustedProxyHops=Math.max(0,Number.parseInt(env.TRUSTED_PROXY_HOPS??'1',10)||0);
   function getClientIp(req){
-    // Behind Azure Container Apps reverse proxy, use x-forwarded-for.
-    // Take the leftmost (original client) IP, validate format to prevent header injection.
-    const cfIp=req.headers['cf-connecting-ip'];
-    if(cfIp){
-      const ip=String(cfIp).trim();
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
-    }
-    const fwd=req.headers['x-forwarded-for'];
-    if(fwd){
-      const ip=String(fwd).split(',')[0].trim();
-      // Basic IPv4/IPv6 validation
-      if(/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)||/^[0-9a-fA-F:]+$/.test(ip))return ip;
+    // Forwarded headers are client-controlled unless a trusted proxy appended them.
+    // Each trusted proxy appends the address it saw, so count from the right.
+    if(trustedProxyHops>0){
+      if(env.TRUST_CF_CONNECTING_IP==='true'){
+        const ip=String(req.headers['cf-connecting-ip']||'').trim();
+        if(ipPattern.test(ip))return ip;
+      }
+      const hops=String(req.headers['x-forwarded-for']||'').split(',').map((part)=>part.trim()).filter(Boolean);
+      const ip=hops[hops.length-trustedProxyHops];
+      if(ip&&ipPattern.test(ip))return ip;
     }
     return req.socket.remoteAddress||'unknown';
   }
-  function rateLimited(req,limit=240,scope='global'){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(requestLog.get(key)||[]).filter((time)=>current-time<60_000);recent.push(current);requestLog.set(key,recent);return recent.length>limit;}
+  const MAX_LIMIT_KEYS=50_000;
+  function recordHit(log,key,windowMs,retentionMs=windowMs){
+    const current=Date.now();
+    if(log.size>=MAX_LIMIT_KEYS&&!log.has(key)){
+      for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
+      if(log.size>=MAX_LIMIT_KEYS)log.delete(log.keys().next().value);
+    }
+    const recent=(log.get(key)||[]).filter((time)=>current-time<windowMs);
+    recent.push(current);log.set(key,recent);return recent.length;
+  }
+  const requestLog=new Map();
+  function rateLimited(req,limit=240,scope='global'){return recordHit(requestLog,`${scope}:${getClientIp(req)}`,60_000)>limit;}
   const hourLog=new Map();
-  function hourlyLimited(req,limit,scope){const key=`${scope}:${getClientIp(req)}`;const current=Date.now();const recent=(hourLog.get(key)||[]).filter((time)=>current-time<3_600_000);recent.push(current);hourLog.set(key,recent);return recent.length>limit;}
+  function hourlyLimited(req,limit,scope){return recordHit(hourLog,`${scope}:${getClientIp(req)}`,3_600_000)>limit;}
   const userLog=new Map();
-  function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){const key=`${userId}:${scope}`;const current=Date.now();const recent=(userLog.get(key)||[]).filter((time)=>current-time<windowMs);recent.push(current);userLog.set(key,recent);return recent.length>limit;}
+  function userRateLimited(userId,scope,limit=30,windowMs=5*60_000){return recordHit(userLog,`${userId}:${scope}`,windowMs,3_600_000)>limit;}
+  const sweepRateLogs=setInterval(()=>{const current=Date.now();for(const [log,windowMs] of [[requestLog,60_000],[hourLog,3_600_000],[userLog,3_600_000]])for(const [k,times] of log)if(!times.length||current-times[times.length-1]>=windowMs)log.delete(k);},60_000);
+  sweepRateLogs.unref();
   const paused=()=>db.getSetting('system_paused','false')==='true';
   const setPaused=(value)=>db.setSetting('system_paused',value?'true':'false');
   const signupPause=()=>signupsPaused(env)||db.getSetting('signups_paused','false')==='true';
@@ -662,6 +678,11 @@ export function createOrbitServer(options={}) {
         await replyDb('renewQueuedEphemeralReplyJobs',replyInstanceId);
         if(closing)return;
         await replyDb('cancelDisallowedReplyJobs');
+        // Payloads for jobs that ended without running (cancelled, recovered) would otherwise linger.
+        const payloadIds=[...ephemeralReplyPayloads.keys()];
+        const payloadStates=payloadIds.length?await replyDb('getReplyJobStates',payloadIds):[];
+        const stateById=new Map(payloadStates.map(({id,status})=>[id,status]));
+        for(const id of payloadIds)if(!activeReplyJobs.has(id)&&stateById.get(id)!=='queued')ephemeralReplyPayloads.delete(id);
         if(closing||await replyDb('getSetting','system_paused','false')==='true')return;
         await replyDb('recoverExpiredReplyJobs');
         if(closing)return;
@@ -931,6 +952,7 @@ export function createOrbitServer(options={}) {
       if(membershipTier!=='unlimited'&&images.length===0&&isChitchatMessage(message)){
         try{
           const { text: chitchatText }=await timedModel(()=>model.respondChitchat({
+            aiConsentUserId:userId,
             buddyName:customBuddyName||defaultBuddyName,
             userName:user?.display_name,
             message,
@@ -1018,7 +1040,7 @@ export function createOrbitServer(options={}) {
         }catch(error){console.error('proactive memory choose failed',error&&error.message);proactiveSurfacing=null;}
       }
       await assertReplyLease();
-      const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
+      const { text: rawAnswer, toolCalls }=await timedModel(()=>model.respond({aiConsentUserId:userId,buddyName:customBuddyName||defaultBuddyName,userName:user.display_name,message,images,needsBuddyName,needsAmbientAsk,writingVoice,offerWritingVoice,soulDirective,emotionContext,relationalContext,membershipTier,
         proactiveMemory:proactiveSurfacing?buildUnifiedHint(proactiveSurfacing):null,
         memories:recalledMemories,goals:activeGoals,projects:activeProjects,history,conversationSummary:summary?.summary||'',userTimeZone:preferences.time_zone,
         tools:true,toolContext:{db,userId,timeZone:preferences.time_zone,messageId:userMsg.id,regenerated:replyJob?.kind==='regenerate',model,
@@ -1102,7 +1124,7 @@ export function createOrbitServer(options={}) {
         try{
           const hist=db.listConversationMessages(userId,conversation.id,10).map((m)=>`${m.role}: ${String(m.content||'').slice(0,400)}`).join('\n');
           const tzNow=db.getPreferences(userId).time_zone||'America/New_York';
-          const { text: fixText }=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
+          const { text: fixText }=await model.respond({aiConsentUserId:userId,buddyName:buddyNameFor(userId),userName:user.display_name,message:`The user just corrected something in this conversation. What was the misunderstanding, and what is the correct understanding now?
 
 Conversation:
 ${hist}
@@ -1126,13 +1148,14 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||closing||paused()||cutoverHold)return;workerBusy=true;
+    if(workerBusy||closing||paused()||cutoverHold||!disclosedRecipientReady)return;workerBusy=true;
     let finishTaskWorker;
     taskWorkerDone=new Promise(resolve=>{finishTaskWorker=resolve;});
     try{
       db.recoverStaleTasks();
       for(const candidate of db.dueTasks()){
         if(closing||paused()||cutoverHold)break;
+        if(!db.getUserById(candidate.user_id)?.ai_sharing_consent_at)continue;
         const task=db.claimDueTask(candidate.user_id,candidate.id);
         if(!task)continue;
         const attempt=task.attempt_count;
@@ -1165,7 +1188,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
             try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
           assertTaskActive();
-          const { text: result }=await model.respond({buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
+          const { text: result }=await model.respond({aiConsentUserId:task.user_id,buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
           if(closing||paused()){
             db.releaseClaimedTask(task.user_id,task.id,attempt);
             continue;
@@ -1181,7 +1204,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
           if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
           if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
-        }catch(error){if(closing){db.releaseClaimedTask(task.user_id,task.id,attempt);continue;}if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
+        }catch(error){if(error?.code==='AI_SHARING_CONSENT_REQUIRED'||error?.code==='AI_SHARING_RECIPIENT_UNDISCLOSED'){if(leaseAlive&&!closing)db.deferTaskForAiConsent(task.user_id,task.id,attempt);continue;}if(closing){db.releaseClaimedTask(task.user_id,task.id,attempt);continue;}if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
         finally{clearInterval(heartbeat);}
       }
     }finally{workerBusy=false;finishTaskWorker();taskWorkerDone=null;}
@@ -1257,7 +1280,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     if(older.length<20)return;
     const transcript=older.map((entry)=>`${entry.role==='user'?'User':'Orbit'}: ${entry.content}`).join('\n').slice(-24000);
     const prompt=`Summarize the earlier part of this conversation for future continuity. Preserve decisions, open questions, goals, preferences, names, dates, and commitments. Do not add facts or advice. Use concise plain text.\n\n${existing?.summary?`Previous summary:\n${existing.summary}\n\n`:''}Conversation:\n${transcript}`;
-    try{const preferences=db.getPreferences(userId);const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:prompt,memories:[],history:[],userTimeZone:preferences.time_zone,taskMode:true});db.setConversationSummary(userId,conversation.id,text,messageCount);db.addEvent(userId,'conversation_summarized',`Refreshed context for “${conversation.title}”.`);}catch(error){db.addEvent(userId,'conversation_summary_failed',`Could not refresh context for “${conversation.title}”.`,error.message);}
+    try{const preferences=db.getPreferences(userId);const {text}=await model.respond({aiConsentUserId:userId,buddyName:buddyNameFor(userId),userName:user.display_name,message:prompt,memories:[],history:[],userTimeZone:preferences.time_zone,taskMode:true});db.setConversationSummary(userId,conversation.id,text,messageCount);db.addEvent(userId,'conversation_summarized',`Refreshed context for “${conversation.title}”.`);}catch(error){db.addEvent(userId,'conversation_summary_failed',`Could not refresh context for “${conversation.title}”.`,error.message);}
   }
   function queueSummaryRefresh(user,conversation){
     if(!model.configured||summaryJobs.has(conversation.id))return;
@@ -1268,14 +1291,14 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   }
   async function runFollowUps(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       const today=todayInZone(preferences.time_zone,nowMs);
       for(const followUp of db.dueFollowUps(user.id,today)){
         if(!db.claimProactiveSlot(user.id,today))break;
         const prompt=`Write a short, warm check-in message (1-2 sentences, plain text, no greeting header) asking how "${followUp.description}" went. Sound like a caring friend dropping by, not a notification. Do not mention that this is automated.`;
         try{
-          const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+          const { text }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,followUp.description),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
           await deliverProactive(user,text,'followup_sent',`Checked in about “${followUp.description}”.`);
           db.completeFollowUp(user.id,followUp.id);
         }catch(error){db.failFollowUp(user.id,followUp.id,error.message);db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'followup_failed',`Could not check in about “${followUp.description}”.`,error.message);}
@@ -1284,7 +1307,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   }
   async function runRoutines(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs))continue;
       const local=localDateTimeParts(preferences.time_zone,nowMs);
       for(const routine of dueRoutines(db.listRoutines(user.id),preferences.time_zone,nowMs)){
@@ -1293,7 +1316,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
         try{
           const agenda=routine.kind==='briefing'?await getBriefingAgenda(db,user.id,2,preferences.time_zone):'';
           const prompt=buildRoutinePrompt({routine,timeZone:preferences.time_zone,agenda,goals:db.listGoals(user.id),tasks:db.listTasks(user.id),followUps:db.listFollowUps(user.id),nowMs});
-          const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+          const {text}=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,routine.prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
           await deliverProactive(user,text,'routine_sent',`Ran routine “${routine.title}”.`);
           db.completeRoutine(user.id,routine.id,local.date);
           try{db.recordStreakCompletion(user.id,'routine',routine.id,local.date);}catch(e){}
@@ -1303,7 +1326,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
   }
   async function runLearningCycle(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);
       const timeZone=preferences.time_zone||'America/New_York';
       const learningMemories=()=>db.listMemories(user.id).filter(isProactiveMemoryAllowed);
@@ -1340,7 +1363,7 @@ Respond with a JSON array of insights. Each insight: {"type":"preference"|"habit
 Only include genuine insights, not obvious restatements. Max 5 insights. If nothing meaningful, respond with [].`;
 
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:learnPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         // Parse JSON array from response
         const jsonMatch=text.match(/\[[\s\S]*\]/);
         if(!jsonMatch)continue;
@@ -1423,7 +1446,7 @@ Look for:
 
 Respond with a JSON array, max 10. Each: {"type":"theme"|"evolution"|"goal"|"passion","content":"one clear sentence","confidence":0.6-0.9}
 Only include genuine insights. If nothing meaningful, respond with [].`;
-            const { text: deepText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: deepText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:deepPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const dm=deepText.match(/\[[\s\S]*\]/);
             if(dm){
               const insights=JSON.parse(dm[0]);
@@ -1450,7 +1473,7 @@ ${memText}
 Examples: "says not a morning person but most productive before 9am", "says they hate planning but always feel better after organizing".
 
 Respond with a JSON array, max 3: {"belief":"what they believe","evidence":"what their behavior shows","gentleFraming":"how to lightly mention this, warmly"}. Only include genuine, well-supported contradictions. If none, respond with [].`;
-              const { text: contraText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: contraText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:contraPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const cm2=contraText.match(/\[[\s\S]*\]/);
               if(cm2){
                 let contraSaved=0;
@@ -1498,7 +1521,7 @@ Recent user messages (note their style — questions? data? short? emotional?):
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"style":"encouragement"|"data-driven"|"tough-love"|"calm"|"unknown","evidence":"one sentence on why"}. Use "unknown" if there isn't enough signal.`;
-            const { text: motText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: motText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:motPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const mm=motText.match(/\{[\s\S]*\}/);
             if(mm){
               const parsed=JSON.parse(mm[0]);
@@ -1527,7 +1550,7 @@ Recent messages:
 ${msgSample||'(none)'}
 
 Respond with a single JSON object: {"energizers":[{"activity":"what","evidence":"observed behavior"}],"drainers":[{"activity":"what","evidence":"observed behavior"}]}, max 3 each. If there is no real signal, respond with {"energizers":[],"drainers":[]}.`;
-            const { text: energyText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: energyText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:energyPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const em2=energyText.match(/\{[\s\S]*\}/);
             if(em2){
               const parsed=JSON.parse(em2[0]);
@@ -1578,7 +1601,7 @@ Support styles:
 - "space": backing off, keeping it brief
 
 Respond with a single JSON object: {"preferredSupport":"solutions"|"listening"|"questions"|"humor"|"space"|"unknown","confidence":0.0-1.0,"evidence":"one sentence on why"}. Use "unknown" if the signal is weak or mixed.`;
-            const { text: supText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: supText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:supPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const sm=supText.match(/\{[\s\S]*\}/);
             if(sm){
               const parsed=JSON.parse(sm[0]);
@@ -1609,7 +1632,7 @@ Identify:
 
 Respond with a single JSON object: {"merge":[[id_prefix1, id_prefix2, "merged content"]],"remove":[id_prefix],"strengthen":[{id: id_prefix, content: "strengthened content"}]}
 Max 20 total operations. Use the 8-char id prefixes shown. If nothing needs changing, respond with {"merge":[],"remove":[],"strengthen":[]}.`;
-            const { text: conText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: conText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:conPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm3=conText.match(/\{[\s\S]*\}/);
             if(cm3){
               const ops=JSON.parse(cm3[0]);
@@ -1658,7 +1681,7 @@ Memories:
 ${memSample||'(none yet)'}
 
 Respond with a JSON array, max 3: {"question":"the natural question you'd ask","context":"why knowing this matters","priority":1-3}`;
-            const { text: curText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+            const { text: curText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:curPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
             const cm=curText.match(/\[[\s\S]*\]/);
             if(cm){
               for(const gap of (Array.isArray(JSON.parse(cm[0]))?JSON.parse(cm[0]):[]).slice(0,3)){
@@ -1690,7 +1713,7 @@ Recent mentions:
 ${mentions}
 
 Respond with a single JSON object: {"summary":"one sentence on who this person is to the user and what's going on","sentiment":"positive"|"neutral"|"mixed"}`;
-              const { text: relText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+              const { text: relText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:relPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
               const rm=relText.match(/\{[\s\S]*\}/);
               if(rm){
                 const parsed=JSON.parse(rm[0]);
@@ -1720,7 +1743,7 @@ ${behaviorParts.join('\n\n')}
 Examples of good predictions: "tends to slow down on Thursday afternoons — lighter check-ins then", "often abandons goals after 3 weeks — extra encouragement around week 3", "most creative late at night — suggest capturing ideas then".
 
 Respond with a JSON array, max 3: {"prediction":"one clear sentence","confidence":0.4-0.8,"suggestedAction":"what Orbit should do about it"}`;
-                const { text: predText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: predText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:predPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const pm=predText.match(/\[[\s\S]*\]/);
                 if(pm){
                   let predSaved=0;
@@ -1754,7 +1777,7 @@ Recent conversation:
 ${convoSample}
 
 Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"low","confidence":0.0-1.0,"notableShifts":"brief description of any significant change from their usual, or empty string"}. Only claim a tone if the evidence is reasonable; when unsure, use "steady".`;
-                const { text: emoText }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+                const { text: emoText }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:emoPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
                 const em=emoText.match(/\{[\s\S]*\}/);
                 if(em){
                   const parsed=JSON.parse(em[0]);
@@ -1816,7 +1839,7 @@ Respond with a single JSON object: {"tone":"upbeat"|"steady"|"flat"|"stressed"|"
         if(!db.isImportJobActive(userId,id))throw new Error('Import job is no longer authorized.');
         const convoText=work[i].map((m)=>`${m.role==='user'?'User':'Assistant'}: ${m.content.slice(0,600)}`).join('\n');
         try{
-          const { text }=await model.respond({buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
+          const { text }=await model.respond({aiConsentUserId:userId,buddyName:buddyNameFor(userId),userName:user?.display_name||'there',userTimeZone:timeZone,taskMode:true,memories:[],goals:[],history:[],
             assertActive:()=>{if(!db.isImportJobActive(userId,id))throw Object.assign(new Error('Import job is no longer authorized.'),{code:'REPLY_LEASE_LOST'});},
             message:`Extract durable facts about this user from these past AI conversations.
 
@@ -1862,7 +1885,7 @@ Only include what's clearly supported — skip one-off questions, transient topi
   }
   async function runSmartCheckins(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -1927,7 +1950,7 @@ ${windowLine}${meetingLine}- "SKIP" if now is not a good time for any proactive 
 Be conservative — only suggest a check-in if it would genuinely add value. Most of the time, the answer should be SKIP.`;
 
       try{
-        const { text: decision }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const { text: decision }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const decisionClean=decision.trim().toUpperCase();
 
         const expectedDecision={morning:'MORNING',afternoon:'CHECKIN',evening:'EVENING'}[checkinWindow]||null;
@@ -2218,7 +2241,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           genPrompt=`Write a short, warm check-in (1-2 sentences, plain text). Reference something from their memories or goals if one fits naturally; otherwise keep it simple and friendly. Sound like a friend popping by. Do not mention that this is automated.${nudgeCtx}${curiosityCtx}${contraCtx}${motCtx2}${emoGuide}`;
         }
 
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const { text }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:db.listRelevantMemories(user.id,genPrompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
         db.setSetting(`smart_checkin_count_${user.id}_${today}`,String(checkinCount+1));
         db.setSetting(`smart_checkin_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'smart_checkin_sent',`Sent smart ${decisionClean.toLowerCase()} check-in.`);
@@ -2236,14 +2259,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   }
   async function runQuietNudges(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);if(isQuietHours(preferences,nowMs)||!checkinDeliveryTime(preferences.time_zone,nowMs))continue;
       if(!quietNudgeDue(db.lastUserMessageAt(user.id),db.getLastQuietNudgeAt(user.id),nowMs))continue;
       const lastOutreach=db.getLastOutreachAt(user.id);if(lastOutreach&&nowMs-new Date(lastOutreach).valueOf()<24*3600_000)continue;
       const today=todayInZone(preferences.time_zone,nowMs);if(!db.claimProactiveSlot(user.id,today))continue;
       const prompt=`Write a short, warm check-in (1-2 sentences, plain text) for someone you have not heard from in a couple of days. Sound like a friend popping by, not a notification. You may gently reference something from their memories if one fits naturally; otherwise keep it simple. Do not mention that this is automated.`;
       try{
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+        const { text }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
         db.setLastQuietNudgeAt(user.id,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'quiet_nudge_sent','Sent a quiet check-in nudge.');
       }catch(error){db.releaseProactiveSlot(user.id,today);db.addEvent(user.id,'quiet_nudge_failed','Could not send a quiet check-in.',error.message);}
@@ -2252,7 +2275,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   let proactiveBusy=false;
   async function runWeeklyReview(nowMs){
     for(const user of db.listUsers()){
-      if(user.disabled)continue;
+      if(user.disabled||!user.ai_sharing_consent_at)continue;
       const preferences=db.getPreferences(user.id);
       if(isQuietHours(preferences,nowMs))continue;
       const timeZone=preferences.time_zone||'America/New_York';
@@ -2283,7 +2306,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(memories.length)parts.push(`New memories: ${memories.slice(0,8).map((m)=>m.content.slice(0,120)).join('; ')}`);
         parts.push(`Messages sent this week: ${userMessages.length}`);
         const prompt=`Write a warm weekly review for ${user.display_name||'the user'} (4-6 sentences, plain text). Celebrate their wins, note goal progress, observe one interesting pattern if you see one, and offer one concrete suggestion for next week. Sound like a caring friend, not a status report. Do not mention that this is automated.\n\nThis week's activity:\n${parts.join('\n')}`;
-        const { text }=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
+        const { text }=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:prompt,memories:db.listRelevantMemories(user.id,prompt),goals:db.listActiveGoals(user.id),history:[],userTimeZone:timeZone,taskMode:true});
         db.setSetting(`weekly_review_last_${user.id}`,weekKey);
         await deliverProactive(user,text,'weekly_review_sent','Sent the weekly review.');
       }catch(error){
@@ -2296,7 +2319,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     // Urgent email pushes: conservative, max 1 per 4 hours per user
     const NEWSLETTER_RE=/(noreply|no-reply|donotreply|do-not-reply|newsletter|promo|notification|alerts?@|info@|support@|billing@)/i;
     for(const user of db.listUsers()){
-      if(user.disabled||user.role!=='owner')continue;
+      if(user.disabled||!user.ai_sharing_consent_at||user.role!=='owner')continue;
       let gmailRow=null;
       try{gmailRow=db.getConnector(user.id,'gmail');}catch(e){}
       if(!gmailRow)continue;
@@ -2325,14 +2348,14 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
 
         // Let the AI decide if any are truly urgent
         const decidePrompt=`You are triaging unread emails from the last 2 hours for ${user.display_name||'the user'}. Be very conservative — only flag something as urgent if it's a direct question needing a timely reply, time-sensitive (deadline today/tomorrow), or from a real person about something important. Newsletters, promos, receipts, and FYIs are NOT urgent.\n\nEmails:\n${candidates.map((e,i)=>`${i+1}. From: ${e.from}\n   Subject: ${e.subject}\n   Preview: ${e.snippet.slice(0,150)}`).join('\n')}\n\nRespond with ONLY the number of the single most urgent email (e.g. "2"), or "NONE" if nothing is urgent enough to interrupt them.`;
-        const {text:decision}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const {text:decision}=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:decidePrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         const pick=parseInt(decision.trim(),10);
         if(!Number.isInteger(pick)||pick<1||pick>candidates.length)continue;
         const urgent=candidates[pick-1];
 
         if(!db.claimProactiveSlot(user.id,today))continue;
         const genPrompt=`Write a brief heads-up (2 sentences, plain text) about an urgent email for ${user.display_name||'the user'}. Summarize what it's about and suggest one concrete action (e.g. reply, check the attachment). Sound natural, not alarming. Do not mention that this is automated.\n\nFrom: ${urgent.from}\nSubject: ${urgent.subject}\nPreview: ${urgent.snippet.slice(0,200)}`;
-        const {text}=await model.respond({buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
+        const {text}=await model.respond({aiConsentUserId:user.id,buddyName:buddyNameFor(user.id),userName:user.display_name,message:genPrompt,memories:[],goals:[],history:[],userTimeZone:timeZone,taskMode:true});
         db.setSetting(`email_urgent_last_${user.id}`,new Date(nowMs).toISOString());
         await deliverProactive(user,text,'email_urgent_sent',`Flagged an urgent email from ${urgent.from}.`);
       }catch(error){
@@ -2395,7 +2418,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runProactiveMemory(nowMs){
     try{
       for(const user of db.listUsers()){
-        if(user.disabled||isDemoUser(user))continue;
+        if(user.disabled||!user.ai_sharing_consent_at||isDemoUser(user))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2423,7 +2446,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runMemoryConnections(nowMs){
     try{
       for(const user of db.listUsers()){
-        if(user.disabled||isDemoUser(user))continue;
+        if(user.disabled||!user.ai_sharing_consent_at||isDemoUser(user))continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2459,7 +2482,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
   async function runStudyCoaching(nowMs){
     try{
       for(const user of db.listUsers()){
-        if(user.disabled)continue;
+        if(user.disabled||!user.ai_sharing_consent_at)continue;
         const preferences=db.getPreferences(user.id);
         if(isQuietHours(preferences,nowMs))continue;
         const timeZone=validTimeZone(preferences.time_zone)||'America/New_York';
@@ -2837,6 +2860,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
         if(!waUser||waUser.disabled===1||waUser.moderation_blocked===1)return json(res,200,{ok:true,ignored:true});
         if(userRateLimited(waUserId,'whatsapp'))return json(res,200,{ok:true,rateLimited:true});
         if(paused())return json(res,200,{ok:true,paused:true});
+        if(!waUser.ai_sharing_consent_at)return json(res,200,{ok:true,aiConsentRequired:true});
         db.setWhatsAppLastInbound(waUserId);
         const numMedia=parseInt(params.NumMedia||'0',10)||0;
         const conversation=db.ensureDefaultConversation(waUserId);
@@ -2863,6 +2887,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
             try{
               releaseUpload=acquireAttachmentUpload(waUserId);
               const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+              await requireAiSharingConsent(db,waUserId,disclosedRecipientReady);
               transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
             }catch(e){
               console.error('whatsapp voice note failed',e.code||e.message);
@@ -3060,7 +3085,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/login'){
         if(rateLimited(req,40,'login'))throw Object.assign(new Error('Too many login attempts.'),{status:429});
-        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user&&!user.disabled&&!user.moderation_blocked&&await verifyPassword(body.password,user.password_hash,user.password_salt);
+        const body=await readJson(req);const user=db.getUserByEmail(safeEmail(body.email));const valid=user?(await verifyPassword(body.password,user.password_hash,user.password_salt))&&!user.disabled&&!user.moderation_blocked:(await verifyPassword(body.password,DUMMY_PASSWORD_HASH,DUMMY_PASSWORD_SALT),false);
         if(!valid)throw Object.assign(new Error('Email or password was not accepted.'),{status:401});const{csrf,token:sessionToken}=createSession(user,req,res);db.addEvent(user.id,'login','Signed in to Orbit.');return json(res,200,{user:publicUser(user),csrf,...(isNativeRequest(req)?{sessionToken}:{})});
       }
       if(req.method==='POST'&&url.pathname==='/api/auth/recover'){
@@ -3107,6 +3132,18 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       if(url.pathname.startsWith('/api/')){
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
         if(req.method==='GET'&&url.pathname==='/api/auth/me')return json(res,200,{user:publicUser(user),csrf:user.csrf_token||null});
+        if(req.method==='GET'&&url.pathname==='/api/ai-sharing-consent')return json(res,200,{accepted:!!(await db.getUserById(user.user_id||user.id))?.ai_sharing_consent_at,recipientAvailable:disclosedRecipientReady});
+        if(req.method==='POST'&&url.pathname==='/api/ai-sharing-consent'){
+          const body=await readJson(req);
+          if(typeof body.accepted!=='boolean')throw Object.assign(new Error('accepted must be true or false.'),{status:400});
+          if(body.accepted&&!disclosedRecipientReady)throw Object.assign(new Error('The configured AI recipient is not covered by the current disclosure.'),{status:503,code:'AI_SHARING_RECIPIENT_UNDISCLOSED'});
+          const consentUserId=user.user_id||user.id;
+          const sessionToken=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);
+          if(!sessionToken||!await db.setAiSharingConsentIfSessionCurrent(consentUserId,hashToken(sessionToken),req.headers['x-orbit-csrf'],body.accepted))
+            throw Object.assign(new Error('Sign in again before changing AI sharing.'),{status:401});
+          db.addEvent(consentUserId,body.accepted?'ai_sharing_allowed':'ai_sharing_withdrawn',body.accepted?'Allowed AI provider sharing.':'Withdrew AI provider sharing.');
+          return json(res,200,{accepted:body.accepted,recipientAvailable:disclosedRecipientReady});
+        }
         if(req.method==='POST'&&url.pathname==='/api/auth/logout'){const token=parseCookies(req.headers.cookie).orbit_session||bearerToken(req);if(token)db.deleteSession(hashToken(token));res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return json(res,200,{ok:true});}
         if(req.method==='GET'&&url.pathname==='/api/status'){const me=user.user_id||user.id;return json(res,200,{buddyName:buddyNameFor(me),model:model.model,fallbackModel:model.fallbackModel,modelConfigured:model.configured,modelStatus:model.diagnostics(),version:'0.5.1',paused:paused(),pushConfigured:push.configured,connectors:connectors.available(me),role:user.role,appleLinked:await db.hasAuthIdentityForUser('apple',me)});}
         if(req.method==='POST'&&url.pathname==='/api/model/check'){const modelUserId=user.user_id||user.id;if(userRateLimited(modelUserId,'model-check',6,60_000))throw Object.assign(new Error('Too many connection checks. Try again in a minute.'),{status:429});const modelStatus=await model.checkConnection();db.addEvent(modelUserId,'model_connection_checked',`AI model connection: ${modelStatus.state.replaceAll('_',' ')}${modelStatus.activeModel?` (${modelStatus.activeModel})`:''}.`);return json(res,200,{modelStatus});}
@@ -3236,7 +3273,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
               try{
                 const prefs=db.getPreferences(userId);
                 const assertActive=()=>{if(!db.isTimelineNarrativeLeaseActive(userId,key,lease))throw Object.assign(new Error('Timeline generation is no longer authorized.'),{code:'REPLY_LEASE_LOST'});};
-                const {text}=await model.respond({buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
+                const {text}=await model.respond({aiConsentUserId:userId,buddyName:buddyNameFor(userId),userName:user.display_name,message:`Write a warm, personal 2-3 sentence summary of this month in the user's life, like a chapter in their biography. Based on:\n${facts.map((x)=>`- ${x}`).join('\n')}\nSound reflective, not clinical. Plain text, no headers.`,memories:[],goals:[],history:[],userTimeZone:prefs.time_zone||'America/New_York',taskMode:true,assertActive});
                 const generated=text.trim().slice(0,1200);
                 if(generated&&db.completeTimelineNarrative(userId,key,lease,generated))narrative=generated;
               }catch(e){/* keep the last cached narrative when generation fails */}
@@ -3349,6 +3386,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
           // Demo users are capped on messages
           if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
@@ -3398,6 +3436,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         const regenMatch=url.pathname.match(/^\/api\/chat\/messages\/([0-9a-f-]{36})\/regenerate$/);
         if(req.method==='POST'&&regenMatch){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'chat'))throw Object.assign(new Error('Too many chat requests. Try again shortly.'),{status:429});
           if(isDemoUser(user)&&demoCapReached(db,userId))throw Object.assign(new Error('Demo limit reached. Create a free account to keep chatting!'),{status:403});
           const target=db.getMessage(userId,regenMatch[1]);
@@ -3443,6 +3482,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         // R1 voice mode: Whisper transcription fallback for browsers without
         // Web Speech API. Audio is processed in memory and never persisted.
         if(req.method==='POST'&&url.pathname==='/api/voice/transcribe'){
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           if(userRateLimited(userId,'voice-transcribe',20,60*60_000))throw Object.assign(new Error('Too many transcription requests. Try again shortly.'),{status:429});
           const body=await readJson(req,6*1024*1024);
           const audioBytes=Buffer.from(String(body.audio||''),'base64');
@@ -3451,6 +3491,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(audioBytes.length>4*1024*1024)throw Object.assign(new Error('Audio is too large (4MB max).'),{status:413});
           if(!/^audio\//.test(mimeType))throw Object.assign(new Error('Unsupported audio type.'),{status:400});
           if(!env.OPENAI_API_KEY)throw Object.assign(new Error('Voice transcription is not configured on this server.'),{status:503});
+          if(!authenticate(req))throw Object.assign(new Error('Sign in again before using voice transcription.'),{status:401});
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           const text=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes,filename:'voice-turn.'+(mimeType.includes('mp4')?'m4a':'webm'),mimeType});
           db.addEvent(userId,'voice_transcribed','Transcribed a voice-mode turn with Whisper.');
           return json(res,200,{text});
@@ -3582,6 +3624,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         if(req.method==='POST'&&url.pathname==='/api/import/conversations'){
           if(isDemoUser(user))throw Object.assign(new Error('Conversation import is not available in demo mode.'),{status:403});
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
+          await requireAiSharingConsent(db,userId,disclosedRecipientReady);
           // Accept raw JSON body OR multipart file upload. 10MB limit.
           const contentType=req.headers['content-type']||'';
           let parsed=null,filename='upload.json';
@@ -3633,7 +3676,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
         // The distilled profile text itself never leaves the server.
         if(req.method==='GET'&&url.pathname==='/api/writing-voice'){requireOwner(user);return json(res,200,writingVoiceStatus(db,userId));}
         if(req.method==='POST'&&url.pathname==='/api/writing-voice/opt-in'){requireOwner(user);const body=await readJson(req);if(typeof body.optIn!=='boolean')throw Object.assign(new Error('optIn must be true or false.'),{status:400});db.setWritingVoiceOptIn(userId,body.optIn);db.addEvent(userId,body.optIn?'writing_voice_enabled':'writing_voice_disabled',body.optIn?'Turned the writing voice on for drafts.':'Turned the writing voice off (profile kept).');return json(res,200,writingVoiceStatus(db,userId));}
-        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
+        if(req.method==='POST'&&url.pathname==='/api/writing-voice/learn'){requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});if(isDemoUser(user))throw Object.assign(new Error('Writing voice learning is not available in demo mode.'),{status:403});await requireAiSharingConsent(db,userId,disclosedRecipientReady);if(!db.getConnector(userId,'gmail'))throw Object.assign(new Error('Connect Gmail in the Connections tab first.'),{status:400});try{const result=await learnWritingVoice({db,userId,getToken:()=>connectors.getValidToken(userId,'gmail'),model});return json(res,200,{learned:true,sampleCount:result.sampleCount,updatedAt:result.updatedAt});}catch(e){throw Object.assign(new Error(e.message),{status:400});}}
         if(req.method==='DELETE'&&url.pathname==='/api/writing-voice'){requireOwner(user);db.clearWritingVoice(userId);db.addEvent(userId,'writing_voice_forgotten','Deleted the learned writing voice and opt-in.');return json(res,200,{forgotten:true});}
         if(req.method==='POST'&&url.pathname==='/api/goals'){const body=await readJson(req);const targetDate=body.targetDate?validDateString(body.targetDate):null;if(body.targetDate&&!targetDate)throw Object.assign(new Error('targetDate must be YYYY-MM-DD.'),{status:400});const goal=db.addGoal(userId,{title:cleanText(body.title,120,'title'),description:optionalText(body.description,1000),priority:normalizePriority(body.priority),targetDate,nextStep:optionalText(body.nextStep,500)});db.addEvent(userId,'goal_created',`Started tracking goal “${goal.title}”.`);return json(res,201,goal);}
         const goalMatch=url.pathname.match(/^\/api\/goals\/([0-9a-f-]+)$/);if(goalMatch&&req.method==='PATCH'){const body=await readJson(req);if(body.progress!==undefined&&(!Number.isFinite(Number(body.progress))||Number(body.progress)<0||Number(body.progress)>100))throw Object.assign(new Error('progress must be from 0 to 100.'),{status:400});if(body.status!==undefined&&!['active','paused','completed'].includes(body.status))throw Object.assign(new Error('status is not valid.'),{status:400});const goal=db.updateGoal(userId,goalMatch[1],{progress:body.progress,status:body.status,nextStep:body.nextStep===undefined?undefined:optionalText(body.nextStep,500),note:optionalText(body.note,1000)});if(!goal)throw Object.assign(new Error('Goal not found.'),{status:404});db.addEvent(userId,'goal_updated',`Updated “${goal.title}” to ${goal.progress}% (${goal.status}).`);return json(res,200,goal);}
@@ -3843,6 +3886,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
     startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();if(!cutoverHold)setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
+      clearInterval(sweepRateLogs);
       if(workerTimer)clearInterval(workerTimer);
       if(replyPollTimer)clearInterval(replyPollTimer);
       if(backupTimer)clearInterval(backupTimer);

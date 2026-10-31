@@ -21,8 +21,8 @@
     />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
-    <link rel="stylesheet" href="/styles.css?v=20261022d" />
-    <link rel="stylesheet" href="/mobile.css?v=20261022d" />
+    <link rel="stylesheet" href="/styles.css?v=20261028b" />
+    <link rel="stylesheet" href="/mobile.css?v=20261028b" />
     <link rel="stylesheet" href="/smooth.css" />
     <link rel="stylesheet" href="/desktop.css" />
     <title>Orbit Buddy</title>
@@ -130,6 +130,7 @@
           ></a
         >
         <div class="top-actions">
+          <button id="plans-button" type="button" class="ghost compact hidden">Plans</button>
           <div class="status">
             <span class="status-dot"></span
             ><span id="status-text">Connecting</span>
@@ -722,6 +723,13 @@
           </div>
         </div>
         <div class="settings-grid">
+          <section class="panel" id="ai-sharing-panel">
+            <h2>AI data sharing</h2>
+            <p>Orbit uses OpenAI or Microsoft Azure OpenAI for replies and may use OpenAI for voice transcription. Messages, attached images or audio, relevant saved memories, goals, projects, conversation history, summaries, and task or briefing context may be sent for these features. If you use writing voice, selected sent-email excerpts may also be sent. Background work can send relevant context while you are away. Web research queries, which may include details from your request, go to Brave Search or DuckDuckGo.</p>
+            <p id="ai-sharing-status" class="muted" aria-live="polite">Checking your choice…</p>
+            <button id="ai-sharing-change" type="button" class="ghost">Review AI sharing choice</button>
+            <p class="hint">You can withdraw permission here. Requests already sent cannot be recalled. See the <a href="/privacy">Privacy Policy</a>.</p>
+          </section>
           <section class="panel" id="model-health">
             <h2>AI model connection</h2>
             <p class="muted">Loading the current connection status…</p>
@@ -906,6 +914,15 @@
             <p class="muted">Everyone with an Orbit account. Reset a password if someone can't sign in.</p>
             <div id="user-list" class="card-list"></div>
           </section>
+          <section class="panel" id="membership-panel">
+            <h2>Membership</h2>
+            <p class="muted">
+              See the Orbit Buddy plans, compare what each one includes, buy a
+              membership, or restore a purchase — no need to run out of
+              messages first.
+            </p>
+            <button id="view-plans-button" type="button" class="primary">View plans</button>
+          </section>
           <section class="panel danger-zone" id="delete-account-panel">
             <h2>Delete account</h2>
             <p class="muted">
@@ -948,8 +965,7 @@
         <p class="eyebrow">WELCOME TO ORBIT</p>
         <h2 id="auth-title">Sign in</h2>
         <p id="auth-copy">
-          Private by design — your conversations stay on your server and never
-          train AI models.
+          Choose whether Orbit may share relevant data with OpenAI or Microsoft Azure OpenAI before using AI features.
         </p>
         <label id="name-label" class="hidden"
           >Name<input id="auth-name" autocomplete="name" /></label
@@ -1044,6 +1060,20 @@
         ><button class="primary wide" type="submit">Save</button>
       </form>
     </dialog>
+    <dialog id="ai-consent-dialog" aria-labelledby="ai-consent-title">
+      <section class="login-card">
+        <p class="eyebrow">YOUR CHOICE</p>
+        <h2 id="ai-consent-title">Allow AI data sharing?</h2>
+        <p>To answer you and run scheduled AI work, Orbit sends your messages, attached images, relevant saved memories, goals, projects, conversation history and summaries, and task or briefing details to OpenAI or Microsoft Azure OpenAI. Voice audio may be sent to OpenAI for transcription. If you use writing voice, selected sent-email excerpts may also be sent. Scheduled work may send relevant context while you are away. Web research queries, which may include details from your request, go to Brave Search or DuckDuckGo.</p>
+        <p>You can decline and use non-AI account features. You can change this choice in Safety. Withdrawing blocks AI requests that have not yet started; requests already in progress cannot be recalled. <a href="/privacy">Read the Privacy Policy</a>.</p>
+        <p id="ai-consent-error" class="error" role="alert"></p>
+        <div class="actions">
+          <button id="ai-consent-decline" type="button" class="ghost">Not now</button>
+          <button id="ai-consent-withdraw" type="button" class="ghost hidden">Withdraw permission</button>
+          <button id="ai-consent-allow" type="button" class="primary">Allow AI sharing</button>
+        </div>
+      </section>
+    </dialog>
     <dialog id="codes-dialog">
       <section class="login-card">
         <p class="eyebrow">SAVE THESE OFFLINE</p>
@@ -1110,6 +1140,6 @@
     <script src="/vendor/marked.min.js" defer></script>
     <script src="/vendor/purify.min.js" defer></script>
     <script src="/pwa-install.js" defer></script>
-    <script type="module" src="/app.js?v=20261022d"></script>
+    <script type="module" src="/app.js?v=20261028b"></script>
   </body>
 </html>
