@@ -30,7 +30,7 @@ export function isImageContentType(mimeType) {
  * HTTP-style `status` (415/413/400) on unsupported type, oversize, or empty
  * payload. Image bytes are never logged.
  */
-export function processImageInput({ bytes, mimeType }) {
+export function validateImageInput({ bytes, mimeType }) {
   const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
   if (!IMAGE_MIME_TYPES.has(mime)) {
     throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'), { status: 415, code: 'UNSUPPORTED_IMAGE_TYPE' });
@@ -42,6 +42,11 @@ export function processImageInput({ bytes, mimeType }) {
   if (buffer.length > MAX_IMAGE_BYTES) {
     throw Object.assign(new Error('The image is too large (10MB max).'), { status: 413, code: 'IMAGE_TOO_LARGE' });
   }
+  return{buffer,mime};
+}
+
+export function processImageInput(input) {
+  const {buffer,mime}=validateImageInput(input);
   return { type: 'input_image', image_url: `data:${mime};base64,${buffer.toString('base64')}` };
 }
 

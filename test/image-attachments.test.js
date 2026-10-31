@@ -15,16 +15,48 @@ import {
   parseMultipartImage,
   stageAttachment,
   takeAttachment,
+  peekAttachment,
   pruneAttachments,
   MAX_UPLOAD_BYTES,
 } from '../src/attachments.js';
 import { createOrbitServer } from '../server.js';
+import { mediaBytesReserved, reserveMediaBytes, MAX_EPHEMERAL_MEDIA_BYTES } from '../src/media-memory.js';
 import { allowAiSharing } from './ai-sharing-fixture.js';
 
 const PNG_1PX = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64'
 );
+
+test('staged attachment bytes have a process-wide admission limit',()=>{
+  const bytes=Buffer.alloc(9*1024*1024,1);
+  const ids=[];
+  try{
+    for(let i=0;i<10;i++)ids.push([`budget-user-${i}`,stageAttachment(`budget-user-${i}`,{bytes,mimeType:'image/png'})]);
+    assert.throws(()=>stageAttachment('budget-user-10',{bytes,mimeType:'image/png'}),error=>error.status===429);
+  }finally{
+    for(const [userId,id] of ids)takeAttachment(userId,id);
+  }
+});
+
+test('a tiny multipart image does not retain a large padded request buffer',()=>{
+  const boundary='retained-backing';
+  const header=Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="tiny.png"\r\nContent-Type: image/png\r\n\r\n`);
+  const middle=Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="padding"\r\n\r\n`);
+  const raw=Buffer.concat([header,PNG_1PX,middle,Buffer.alloc(2*1024*1024,0x70),Buffer.from(`\r\n--${boundary}--\r\n`)]);
+  const parsed=parseMultipartImage(raw,`multipart/form-data; boundary=${boundary}`);
+  assert.equal(parsed.bytes.buffer,raw.buffer,'the parser initially returns a view of the entire request');
+  const initial=mediaBytesReserved();
+  const id=stageAttachment('padded-request',{bytes:parsed.bytes,mimeType:parsed.mimeType});
+  try{
+    const retained=peekAttachment('padded-request',id).bytes;
+    assert.equal(retained.length,PNG_1PX.length);
+    assert.equal(retained.buffer.byteLength,retained.length,'staging must retain only the charged image allocation');
+    assert.notEqual(retained.buffer,raw.buffer);
+    assert.equal(mediaBytesReserved(),initial+PNG_1PX.length);
+  }finally{takeAttachment('padded-request',id);}
+  assert.equal(mediaBytesReserved(),initial);
+});
 
 // --- processImageInput ---
 
@@ -282,6 +314,7 @@ test('upload endpoint: rejects non-image types and oversized uploads', async (t)
 
 test('upload endpoint: happy path returns an id consumed by /api/chat', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
+  const budgetBefore=mediaBytesReserved();
   const auth = await register(base);
   const headers = { Cookie: auth.cookie, 'X-Orbit-CSRF': auth.csrf, 'Content-Type': 'application/json' };
   const upload = await uploadRequest(base, auth, imageUpload('b4', PNG_1PX), 'multipart/form-data; boundary=b4');
@@ -290,6 +323,7 @@ test('upload endpoint: happy path returns an id consumed by /api/chat', async (t
   assert.ok(stagedBody.id, 'returns an attachment id');
   assert.equal(stagedBody.mimeType, 'image/png');
   assert.equal(stagedBody.size, PNG_1PX.length);
+  assert.equal(mediaBytesReserved(),budgetBefore+PNG_1PX.length);
   assert.ok(!JSON.stringify(stagedBody).includes('base64'), 'response carries no image bytes');
 
   // Image-only turn: no text message required
@@ -325,6 +359,37 @@ test('upload endpoint: happy path returns an id consumed by /api/chat', async (t
   }
   assert.ok(assistantReply, 'assistant reply was generated for the image turn');
   assert.ok(String(assistantReply.content).includes('demo mode'), 'demo-mode pipeline answered');
+  const budgetDeadline=Date.now()+2000;
+  while(mediaBytesReserved()!==budgetBefore&&Date.now()<budgetDeadline)await new Promise(resolve=>setTimeout(resolve,20));
+  assert.equal(mediaBytesReserved(),budgetBefore,'reply completion releases the queued image reservation');
+});
+
+test('account deletion releases that account’s staged image bytes',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const initial=mediaBytesReserved(),auth=await register(base,{email:'delete-image-owner@example.test'});
+  const upload=await uploadRequest(base,auth,imageUpload('account-delete',PNG_1PX),'multipart/form-data; boundary=account-delete');
+  assert.equal(upload.status,201);
+  assert.equal(mediaBytesReserved(),initial+PNG_1PX.length);
+  const removed=await fetch(`${base}/api/account`,{method:'DELETE',headers:{Cookie:auth.cookie,'X-Orbit-CSRF':auth.csrf,'Content-Type':'application/json'},body:JSON.stringify({confirm:'DELETE',password:'correct horse battery staple'})});
+  assert.equal(removed.status,200);
+  assert.equal(mediaBytesReserved(),initial);
+});
+
+test('full queued-image budget refuses a chat turn without consuming its staged attachment',async t=>{
+  const {app,base}=await serverFixture();t.after(()=>app.close());
+  const auth=await register(base,{email:'budget-image-owner@example.test'});
+  const upload=await uploadRequest(base,auth,imageUpload('budget-chat',PNG_1PX),'multipart/form-data; boundary=budget-chat');
+  assert.equal(upload.status,201);
+  const {id}=await upload.json();
+  const filler=reserveMediaBytes(MAX_EPHEMERAL_MEDIA_BYTES-mediaBytesReserved()-128);
+  const headers={Cookie:auth.cookie,'X-Orbit-CSRF':auth.csrf,'Content-Type':'application/json'};
+  const send=()=>fetch(`${base}/api/chat`,{method:'POST',headers,body:JSON.stringify({message:'Look',attachmentIds:[id]})});
+  try{
+    assert.equal((await send()).status,429);
+    const user=app.db.getUserByEmail('budget-image-owner@example.test');
+    assert.ok(peekAttachment(user.id,id),'capacity refusal keeps the upload available to retry');
+  }finally{filler();}
+  assert.equal((await send()).status,202);
 });
 
 test('/api/chat without attachments still requires a message', async (t) => {

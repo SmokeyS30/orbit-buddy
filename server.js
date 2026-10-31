@@ -8,18 +8,21 @@ import { randomInt, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { verifyTwilioSignature, readFormBody, normalizePhone, whatsappConfigured, sendWhatsAppText, sendWhatsAppMedia, maskPhone, buildLinkDeepLink, isAudioContentType, parseWhatsAppLocation, formatLocationMessage, LOCATION_STORED_MESSAGE, WHATSAPP_IMAGE_STORED_MESSAGE, downloadTwilioMedia, transcribeVoiceNote, isWindowOpen } from './src/whatsapp.js';
 import { consentGatedModel, requireAiSharingConsent, disclosedAiRecipientConfigured } from './src/ai-sharing.js';
-import { stageWhatsAppMedia, peekWhatsAppMedia, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
+import { stageWhatsAppMedia, peekWhatsAppMedia, pruneWhatsAppMedia, clearWhatsAppMediaForUser, deriveMediaSigningKey, signWhatsAppMediaToken, verifyWhatsAppMediaToken, buildWhatsAppMediaUrl } from './src/whatsapp-media.js';
 import { fileURLToPath } from 'node:url';
 import { createDatabase } from './src/db/factory.mjs';
 import { REPLY_INTERRUPTED_TEXT, REPLY_LEASE_MS } from './src/reply-jobs.js';
 import { filterAssistantContent } from './src/objectionable-content.js';
 import { createModelClient, stripCitationMarkers, processImageInput, isImageContentType, IMAGE_STORED_MESSAGE, isChitchatMessage } from './src/model.js';
-import { stageAttachment, takeAttachment, peekAttachment, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { stageAttachment, takeAttachment, peekAttachment, pruneAttachments, clearAttachmentsForUser, acquireAttachmentUpload, parseMultipartImage, MAX_UPLOAD_BYTES } from './src/attachments.js';
+import { reserveMediaBytes } from './src/media-memory.js';
+import { EphemeralReplyPayloads } from './src/ephemeral-reply-payloads.js';
 import { fetchFeedText, normalizeFeedUrl, parseIcs, dropFeedCache, getBriefingAgenda, getEventsForRange } from './src/ical.js';
 import { createPushService } from './src/push.js';
 import { createApnsService } from './src/apns.js';
 import { createSubscriptionService } from './src/subscriptions.js';
 import { createConnectorService } from './src/connectors.js';
+import { cutoverHeld, cutoverUnavailable } from './src/cutover-guard.js';
 import { writeAutomatedBackup } from './src/backups.js';
 import { createChatMetrics } from './src/chat-metrics.js';
 import { checkinDeliveryTime, extractPersonNames, findTimePatterns, isQuietHours, isoWeekKey, localDateTimeParts, nextPersonalDateOccurrence, normalizeMemoryKind, normalizePriority, ordinalSuffix, rankMemories, smartCheckinWindow, todayInZone, validDateString, validTimeString, validTimeZone } from './src/intelligence.js';
@@ -214,7 +217,7 @@ function markdownToPdfBuffer(md){
   }
   if(cur.length)pages.push(cur);
   if(!pages.length)pages.push([]);
-  // Catalog, page tree, and fonts occupy 1–4; page/stream pairs start at 5.
+  // Reserve catalog, page tree, and font IDs before allocating page pairs.
   const objs=[];
   objs[1]='<< /Type /Catalog /Pages 2 0 R >>';
   objs[2]=`<< /Type /Pages /Kids [${pages.map((_,i)=>`${5+i*2} 0 R`).join(' ')}] /Count ${pages.length} >>`;
@@ -516,6 +519,7 @@ export function applyActivityRhythmDetection(db,user,{nowMs,timeZone}={}){
 
 export function createOrbitServer(options={}) {
   const env=options.env||process.env;
+  const cutoverHold=cutoverHeld(env);
   const emailLinkOrigin=authLinkOrigin(env);
   const defaultBuddyName=env.BUDDY_NAME?.trim().slice(0,40)||'Orbit';
   const dataDir=path.resolve(options.dataDir||env.DATA_DIR||path.join(root,'data'));
@@ -531,7 +535,7 @@ export function createOrbitServer(options={}) {
   const push=createPushService(env,db);
   const apns=createApnsService(env,db);
   const subscriptions=createSubscriptionService(env,db);
-  const connectors=createConnectorService(env,db,encryptionKey);
+  const connectors=createConnectorService(env,db,encryptionKey,{cutoverHold});
   const transactionalEmail=options.sendEmail||sendResendEmail;
   const transactionalEmailConfigured=Boolean(options.sendEmail)||emailConfigured(env);
 
@@ -616,6 +620,7 @@ export function createOrbitServer(options={}) {
   const signupPause=()=>signupsPaused(env)||db.getSetting('signups_paused','false')==='true';
   const registrationOpen=()=>db.getSetting('registration_open','false')==='true';
   async function checkDoorLeftOpen(){
+    if(cutoverHold)return;
     db.pruneDoorTokens();
     if(!registrationOpen())return;
     const openedAt=db.getSetting('registration_opened_at');
@@ -642,9 +647,16 @@ export function createOrbitServer(options={}) {
   function createSession(user,req,res){const token=randomToken();const csrf=randomToken(24);const expiresAt=new Date(Date.now()+30*24*60*60_000).toISOString();db.createSession({tokenHash:hashToken(token),userId:user.id,csrfToken:csrf,expiresAt,userAgent:String(req.headers['user-agent']||'').slice(0,300)});res.setHeader('Set-Cookie',sessionCookie(token,{secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));return{csrf,token};}
   function publicUser(user){return{id:user.user_id||user.id,email:user.email,displayName:user.display_name,role:user.role,isDemo:user.is_demo===1};}
 
-  let workerBusy=false;
+  let workerBusy=false,taskWorkerDone=null;
   const activeReplyJobs=new Map();
-  const ephemeralReplyPayloads=new Map();
+  const ephemeralReplyPayloads=new EphemeralReplyPayloads();
+  const EPHEMERAL_REPLY_TTL_MS=30*60_000;
+  function dropEphemeralReplyPayload(jobId){
+    ephemeralReplyPayloads.drop(jobId);
+  }
+  function pruneEphemeralReplyPayloads(nowMs=Date.now()){
+    ephemeralReplyPayloads.prune(activeReplyJobs,nowMs,EPHEMERAL_REPLY_TTL_MS);
+  }
   let replyPumpScheduled=false,replyPumpRunning=false,replyPumpAgain=false,replyPumpTask=null,replyPollTimer=null,closing=false,deliveryTask=null;
   const summaryJobs=new Map();
   const pendingStreams=new Map(); // conversationId -> {turn, text, done} for live reply streaming
@@ -655,6 +667,9 @@ export function createOrbitServer(options={}) {
     setImmediate(()=>{replyPumpScheduled=false;pumpReplyJobs();});
   }
   function pumpReplyJobs(){
+    pruneEphemeralReplyPayloads();
+    pruneAttachments();
+    pruneWhatsAppMedia();
     if(closing)return Promise.resolve();
     if(replyPumpRunning){replyPumpAgain=true;return replyPumpTask;}
     replyPumpRunning=true;
@@ -684,7 +699,7 @@ export function createOrbitServer(options={}) {
             console.error('chat job failed',job.id,error&&error.message);
           }).finally(()=>{
             activeReplyJobs.delete(job.id);
-            ephemeralReplyPayloads.delete(job.id);
+            dropEphemeralReplyPayload(job.id);
             scheduleReplyPump();
           });
           activeReplyJobs.set(job.id,task);
@@ -1133,22 +1148,35 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     return answer;
   }
   async function runDueTasks(){
-    if(workerBusy||closing||paused()||!disclosedRecipientReady)return;workerBusy=true;
+    if(workerBusy||closing||paused()||cutoverHold||!disclosedRecipientReady)return;workerBusy=true;
+    let finishTaskWorker;
+    taskWorkerDone=new Promise(resolve=>{finishTaskWorker=resolve;});
     try{
       db.recoverStaleTasks();
-      for(const task of db.dueTasks()){
-        if(closing)break;
-        if(!db.getUserById(task.user_id)?.ai_sharing_consent_at)continue;
-        const attempt=db.startTask(task.user_id,task.id);
-        if(!attempt)continue;
+      for(const candidate of db.dueTasks()){
+        if(closing||paused()||cutoverHold)break;
+        if(!db.getUserById(candidate.user_id)?.ai_sharing_consent_at)continue;
+        const task=db.claimDueTask(candidate.user_id,candidate.id);
+        if(!task)continue;
+        const attempt=task.attempt_count;
         let leaseAlive=true;
+        const assertTaskActive=()=>{
+          if(closing||paused()||cutoverHold){
+            try{db.releaseClaimedTask(task.user_id,task.id,attempt);}finally{leaseAlive=false;}
+          }
+          if(!leaseAlive||!db.activeTaskClaim(task.user_id,task.id,attempt)){
+            leaseAlive=false;
+            throw Object.assign(new Error('Task claim is no longer active.'),{code:'REPLY_LEASE_LOST'});
+          }
+        };
+        const canDeliver=()=>!closing&&!paused()&&!cutoverHold&&db.deliverableTask(task.user_id,task.id,attempt);
         const heartbeat=setInterval(()=>{
           try{if(closing||!db.renewTaskLease(task.user_id,task.id,attempt))leaseAlive=false;}
           catch{leaseAlive=false;}
-          if(!leaseAlive)clearInterval(heartbeat);
         },30_000);
         heartbeat.unref();
         try{
+          assertTaskActive();
           db.addEvent(task.user_id,'task_started',`Started “${task.title}”.`);
           const taskUser=db.getUserById(task.user_id);const preferences=db.getPreferences(task.user_id);
           let taskMessage=task.prompt;
@@ -1156,32 +1184,30 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
           // Tasks run without tool access, so these conditions can never be satisfied and only cause hedging.
           taskMessage=taskMessage.replace(/\s*check (?:today'?s|the) calendar first[^.]*\./gi,'').replace(/\s*suppress (?:this reminder )?if[^.]*\./gi,'').trim();
           if(/^\[nudge\]\s*morning briefing/i.test(task.title||'')){
+            assertTaskActive();
             try{const agenda=await getBriefingAgenda(db,task.user_id,2,preferences.time_zone);if(agenda)taskMessage+=`\n\nThe user's calendar agenda for today and tomorrow (${preferences.time_zone}, from their connected iCal feeds):\n${agenda}\nWeave today's events into the briefing naturally with their times; give tomorrow only as a brief preview. Do not paste this as a raw list.`;}catch(error){console.error('briefing agenda failed',error&&error.message);}
           }
-          const { text: result }=await model.respond({aiConsentUserId:task.user_id,buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true});
+          assertTaskActive();
+          const { text: result }=await model.respond({aiConsentUserId:task.user_id,buddyName:buddyNameFor(task.user_id),userName:taskUser?.display_name,message:taskMessage,memories:db.listRelevantMemories(task.user_id,task.prompt),goals:db.listActiveGoals(task.user_id),history:[],userTimeZone:preferences.time_zone,taskMode:true,assertActive:assertTaskActive});
+          if(closing||paused()){
+            db.releaseClaimedTask(task.user_id,task.id,attempt);
+            continue;
+          }
           const following=nextRun(task.recurrence,task.schedule_at);const isNudge=/^\[nudge\]/i.test(task.title);
-          if(!leaseAlive||closing||!db.completeTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
+          if(!leaseAlive||!db.completeClaimedTask(task.user_id,task.id,attempt,result,following?'scheduled':'completed',following))continue;
+          if(!canDeliver())continue;
           if(!isNudge)db.addArtifact(task.user_id,{taskId:task.id,name:artifactName(task.title),content:`# ${task.title}\n\n${result}\n`});
           db.addEvent(task.user_id,'task_completed',`Completed “${task.title}”.`);
           // Delivery channel: WhatsApp replaces push when the 24h window is open;
           // outside the window (or on send failure) fall back to push — a reminder
           // is never silently dropped.
-          if(!(task.delivery_channel==='whatsapp'&&await tryWhatsAppTaskResult(task,result)))
-          await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-          await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id});
-        }catch(error){
-          if(error?.code==='AI_SHARING_CONSENT_REQUIRED'||error?.code==='AI_SHARING_RECIPIENT_UNDISCLOSED'){
-            if(leaseAlive&&!closing)db.deferTaskForAiConsent(task.user_id,task.id,attempt);
-            continue;
-          }
-          if(!leaseAlive||closing||!db.failTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;
-          db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);
-          await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});
-          await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'});
-        }
+          const whatsappSent=task.delivery_channel==='whatsapp'&&canDeliver()&&await tryWhatsAppTaskResult(task,result);
+          if(!whatsappSent&&canDeliver())await push.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+          if(canDeliver())await apns.notify(task.user_id,isNudge?buddyNameFor(task.user_id):`${buddyNameFor(task.user_id)} finished a task`,isNudge?result:task.title,isNudge?{view:'today'}:{view:'tasks',taskId:task.id},canDeliver);
+        }catch(error){if(error?.code==='AI_SHARING_CONSENT_REQUIRED'||error?.code==='AI_SHARING_RECIPIENT_UNDISCLOSED'){if(leaseAlive&&!closing)db.deferTaskForAiConsent(task.user_id,task.id,attempt);continue;}if(closing){db.releaseClaimedTask(task.user_id,task.id,attempt);continue;}if(!leaseAlive||!db.failClaimedTask(task.user_id,task.id,attempt,'Task failed safely.',error.message))continue;db.addEvent(task.user_id,'task_failed',`Could not complete “${task.title}”.`,error.message);if(canDeliver())await push.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);if(canDeliver())await apns.notify(task.user_id,`${buddyNameFor(task.user_id)} needs attention`,`${task.title} could not be completed.`,{view:'tasks'},canDeliver);}
         finally{clearInterval(heartbeat);}
       }
-    }finally{workerBusy=false;}
+    }finally{workerBusy=false;finishTaskWorker();taskWorkerDone=null;}
   }
 
   // A proactive message lands in the default conversation AND as a push notification,
@@ -1206,6 +1232,7 @@ Respond with a single JSON object: {"content":"one clear sentence capturing the 
     }
   }
   async function deliverProactive(user,text,eventType,eventMessage){
+    if(cutoverHold)return false;
     const conversation=db.ensureDefaultConversation(user.id);
     db.addMessage(user.id,conversation.id,'assistant',text);
     db.touchConversation(user.id,conversation.id);
@@ -2358,8 +2385,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
     }catch(e){return '';}
   }
   async function runProactiveChecks(nowMs=Date.now()){
-    if(proactiveBusy||paused())return;proactiveBusy=true;
+    if(proactiveBusy||paused()||cutoverHold)return;proactiveBusy=true;
     try{await runFollowUps(nowMs);await runRoutines(nowMs);await runQuietNudges(nowMs);await runSmartCheckins(nowMs);await runEmailTriage(nowMs);await runWeeklyReview(nowMs);await runLearningCycle(nowMs);await runProjectRadar(nowMs);await runStudyCoaching(nowMs);await runProactiveMemory(nowMs);await runMemoryConnections(nowMs);}
+    catch(error){console.error('proactive checks failed',error&&error.message);}
     finally{proactiveBusy=false;}
   }
   // X6 "Project radar": ambient read-only watch on the user's GitHub repos.
@@ -2604,7 +2632,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       let dbState='ready';const dbDriver=db.driver||'unknown';
       try{db.getSetting('readyz_probe');}catch(e){dbState='error';}
       const ok=dbState==='ready';
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',database:{driver:dbDriver,state:dbState}});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',cutoverHold,database:{driver:dbDriver,state:dbState}});
     }
     if(url.pathname==='/healthz'){
       const modelStatus=model.diagnostics();
@@ -2613,7 +2641,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       const ok=dbState==='ready';
       // AI status reported separately; DB failure sets ok=false and 503
       const backup=backupStatus();
-      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
+      return json(res,ok?200:503,{ok,service:'orbit-buddy',release:env.ORBIT_RELEASE_SHA||'unknown',paused:paused(),cutoverHold,ai:{configured:model.configured,state:modelStatus.state,primaryModel:modelStatus.primaryModel,activeModel:modelStatus.activeModel,availableTextModelCount:modelStatus.availableTextModelCount},database:{driver:dbDriver,state:dbState},backup:{configured:backup.configured,state:backup.state},chatPerformance:chatMetrics.publicStatus()});
     }
     // ===== MAINTENANCE MODE ===== (health endpoints above stay untouched;
     // bypass via ?maint_bypass=<token> or x-maint-bypass header serves the site normally)
@@ -2844,7 +2872,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           const locationMessage=formatLocationMessage(sharedLocation,body);
           const accepted=db.acceptReplyJob(waUserId,conversation.id,LOCATION_STORED_MESSAGE,
             {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-          ephemeralReplyPayloads.set(accepted.job.id,{message:locationMessage,images:[]});
+          ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:locationMessage,images:[],createdAt:Date.now()});
           scheduleReplyPump();
           return json(res,200,{ok:true,location:true});
         }
@@ -2855,7 +2883,9 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // transcript into the normal pipeline. Audio is never stored.
           if(isAudioContentType(mediaContentType)&&mediaUrl){
             let transcript=null;
+            let releaseUpload=null;
             try{
+              releaseUpload=acquireAttachmentUpload(waUserId);
               const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
               await requireAiSharingConsent(db,waUserId,disclosedRecipientReady);
               transcript=await transcribeVoiceNote({apiKey:env.OPENAI_API_KEY,audioBytes:bytes,mimeType:mediaContentType});
@@ -2866,7 +2896,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
                 ?'That voice note is a bit long for me â try keeping it under a few minutes and I’ll give it a listen.'
                 :'I couldn’t quite grab that voice note â mind sending it again?');}catch(e2){console.error('whatsapp voice reply failed',e2.message);}
               return json(res,200,{ok:true,voiceNote:false});
-            }
+            }finally{releaseUpload?.();}
             if(!transcript){
               try{await twilioSend(from,'I listened but couldn’t quite make out what you said â mind trying again?');}catch(e){console.error('whatsapp voice reply failed',e.message);}
               return json(res,200,{ok:true,voiceNote:false});
@@ -2882,24 +2912,34 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
           // Only the first image is handled (Twilio may send several); image
           // bytes stay in memory and are never stored or logged.
           if(isImageContentType(mediaContentType)&&mediaUrl){
-            let imageBlock=null;
+            let imageBlock=null,releaseImage=null,releaseUpload=null;
             try{
-              const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
-              imageBlock=processImageInput({bytes,mimeType:mediaContentType});
-            }catch(e){
-              console.error('whatsapp image failed',e.code||e.message);
-              const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
-              try{await twilioSend(from,tooLong
-                ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
-                :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
-              return json(res,200,{ok:true,image:false});
-            }
-            const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
-            const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
-              {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
-            ephemeralReplyPayloads.set(accepted.job.id,{message:caption||'Look at this.',images:[imageBlock]});
-            scheduleReplyPump();
-            return json(res,200,{ok:true,image:true});
+              releaseUpload=acquireAttachmentUpload(waUserId);
+              try{
+                const { bytes }=await downloadTwilioMedia({accountSid:env.TWILIO_ACCOUNT_SID,authToken:env.TWILIO_AUTH_TOKEN,url:mediaUrl});
+                // Reserve the eventual data URL before making its base64 copy.
+                // Keep upload admission until even a failed-send reply settles,
+                // so rejected raw downloads cannot accumulate in suspended handlers.
+                releaseImage=reserveMediaBytes(Math.ceil(bytes.length/3)*4+64);
+                imageBlock=processImageInput({bytes,mimeType:mediaContentType});
+              }catch(e){
+                imageBlock=null;
+                releaseImage?.();releaseImage=null;
+                console.error('whatsapp image failed',e.code||e.message);
+                const tooLong=e.code==='MEDIA_TOO_LARGE'||e.code==='IMAGE_TOO_LARGE';
+                try{await twilioSend(from,tooLong
+                  ?'That photo is a bit large for me — try one under 10MB and I’ll take a look.'
+                  :'I couldn’t quite grab that photo — mind sending it again?');}catch(e2){console.error('whatsapp image reply failed',e2.message);}
+                return json(res,200,{ok:true,image:false});
+              }
+              const caption=body.slice(0,6000); // Twilio media messages can carry a caption in Body
+              const accepted=db.acceptReplyJob(waUserId,conversation.id,WHATSAPP_IMAGE_STORED_MESSAGE,
+                {channel:'whatsapp',originInstance:replyInstanceId,requiresEphemeral:true,deliveryToPhone:from,deliveryLinkVerifiedAt:link.verified_at});
+              ephemeralReplyPayloads.set(accepted.job.id,{userId:waUserId,message:caption||'Look at this.',images:[imageBlock],releaseMedia:releaseImage,createdAt:Date.now()});
+              releaseImage=null;
+              scheduleReplyPump();
+              return json(res,200,{ok:true,image:true});
+            }finally{releaseImage?.();releaseUpload?.();}
           }
           // Other media types (video, documents) are not supported yet.
           db.addMessage(waUserId,conversation.id,'user','[WhatsApp media message]');
@@ -3087,7 +3127,7 @@ Be conservative — only suggest a check-in if it would genuinely add value. Mos
       }
 
       const callback=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/callback$/);
-      if(req.method==='GET'&&callback){const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
+      if(req.method==='GET'&&callback){if(cutoverHold)throw cutoverUnavailable();const code=url.searchParams.get('code');const state=url.searchParams.get('state');if(!code||!state)throw Object.assign(new Error('OAuth callback is incomplete.'),{status:400});const result=await connectors.complete(callback[1],code,state);db.addEvent(result.userId,'connector_connected',`Connected ${connectors.providers[result.provider].label}.`);res.writeHead(302,{Location:`/?connector=${encodeURIComponent(result.provider)}`});return res.end();}
 
       if(url.pathname.startsWith('/api/')){
         const user=authenticate(req);if(!user)return json(res,401,{error:'Authentication required.'});requireCsrf(req,user);
@@ -3327,16 +3367,22 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(userRateLimited(userId,'chat-attachments',20,60*60_000))throw Object.assign(new Error('Too many uploads. Try again shortly.'),{status:429});
           const uploadType=req.headers['content-type']||'';
           if(!uploadType.includes('multipart/form-data'))throw Object.assign(new Error('Send the image as multipart form data.'),{status:400});
-          const chunks=[];let size=0;
-          for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
-          const raw=Buffer.concat(chunks);
-          if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
-          const file=parseMultipartImage(raw,uploadType);
-          if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
-          if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
-          const attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType}); // validates size too
-          db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
-          return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          const releaseUpload=acquireAttachmentUpload(userId);
+          let attachmentId=null;
+          try{
+            if(Number(req.headers['content-length'])>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});
+            const chunks=[];let size=0;
+            for await(const chunk of req){size+=chunk.length;if(size>MAX_UPLOAD_BYTES)throw Object.assign(new Error('Image is too large (10MB max).'),{status:413});chunks.push(chunk);}
+            const raw=Buffer.concat(chunks);
+            if(!raw.length)throw Object.assign(new Error('No image uploaded.'),{status:400});
+            const file=parseMultipartImage(raw,uploadType);
+            if(!file||!file.bytes.length)throw Object.assign(new Error('Could not read the uploaded image.'),{status:400});
+            if(!isImageContentType(file.mimeType))throw Object.assign(new Error('Unsupported image type. Send a JPEG, PNG, WebP, or GIF.'),{status:415});
+            attachmentId=stageAttachment(userId,{bytes:file.bytes,mimeType:file.mimeType});
+            db.addEvent(userId,'chat_attachment','Attached an image to a chat turn.');
+            return json(res,201,{id:attachmentId,mimeType:file.mimeType,size:file.bytes.length});
+          }catch(error){if(attachmentId)takeAttachment(userId,attachmentId);throw error;}
+          finally{releaseUpload();}
         }
         if(req.method==='POST'&&url.pathname==='/api/chat'){
           if(paused())throw Object.assign(new Error('Orbit is paused. Resume it before starting new AI work.'),{status:423});
@@ -3351,25 +3397,35 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           // along. Stored history keeps a text placeholder — bytes are never
           // persisted.
           const attachmentIds=Array.isArray(body.attachmentIds)?body.attachmentIds.map((id)=>String(id||'')).filter(Boolean).slice(0,3):[];
+          if(new Set(attachmentIds).size!==attachmentIds.length)throw Object.assign(new Error('Each attached image can be sent only once.'),{status:400});
           // Two-phase: verify every id resolves BEFORE consuming any, so one
           // stale id never silently drops the other attachments in the turn.
+          let projectedImageBytes=0;
           for(const attachmentId of attachmentIds){
-            if(!peekAttachment(userId,attachmentId))throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            const staged=peekAttachment(userId,attachmentId);
+            if(!staged)throw Object.assign(new Error('An attached image expired or was already sent. Attach it again and retry.'),{status:410});
+            projectedImageBytes+=Math.ceil(staged.bytes.length/3)*4+64;
           }
-          const hasImages=attachmentIds.length>0;
-          const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
-          if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
-          // Validate images without consuming them so a 402/validation failure keeps them staged.
-          const imageBlocks=attachmentIds.map((attachmentId)=>{const entry=peekAttachment(userId,attachmentId);return processImageInput({bytes:entry.bytes,mimeType:entry.mimeType});}); // revalidates type/size; bytes never logged
-          const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
-            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
-          const userMsg=accepted.userMessage;
-          for(const attachmentId of attachmentIds)takeAttachment(userId,attachmentId);
-          if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
-          scheduleReplyPump();
-          return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          let releaseMedia=projectedImageBytes?reserveMediaBytes(projectedImageBytes):null;
+          try{
+            const imageBlocks=[];
+            for(const attachmentId of attachmentIds){
+              imageBlocks.push(processImageInput(takeAttachment(userId,attachmentId))); // revalidates type/size; bytes never logged
+            }
+            const hasImages=imageBlocks.length>0;
+            const message=hasImages?String(body.message||'').trim().slice(0,6000):cleanText(body.message,6000,'message');let conversation;
+            if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
+            // One atomic database operation both checks and consumes the free
+            // allowance, so simultaneous requests cannot send message 26.
+            const quota=subscriptions.consumeQuota(userId,user);
+            if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
+            const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+              {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
+            const userMsg=accepted.userMessage;
+            if(hasImages){ephemeralReplyPayloads.set(accepted.job.id,{userId,message:message||'Look at this.',images:imageBlocks,releaseMedia,createdAt:Date.now()});releaseMedia=null;}
+            scheduleReplyPump();
+            return json(res,202,{id:userMsg.id,conversationId:conversation.id,status:'working'});
+          }finally{releaseMedia?.();}
         }
         // W1: per-message actions.
         // Regenerate re-runs an assistant turn through the same pipeline as a
@@ -3729,8 +3785,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           for(const entitlement of entitlements)db.saveSubscription(userId,{...entitlement,lastEventSignedAt:entitlement.signedAt});
           return json(res,200,{ok:true,entitlements});
         }
-        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req))});}
-        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
+        const connectBegin=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/begin$/);if(req.method==='POST'&&connectBegin){if(cutoverHold)throw cutoverUnavailable();if(connectBegin[1]==='gmail')requireOwner(user);if(isDemoUser(user))throw Object.assign(new Error('Connectors are not available in demo mode.'),{status:403});if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{url:connectors.begin(userId,connectBegin[1],originFor(req),user.token_hash)});}
+        const connectorMatch=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)$/);if(req.method==='DELETE'&&connectorMatch){if(cutoverHold)throw cutoverUnavailable();if(connectorMatch[1]==='gmail')requireOwner(user);db.deleteConnector(userId,connectorMatch[1]);db.addEvent(userId,'connector_disconnected',`Disconnected ${connectors.providers[connectorMatch[1]].label}.`);return json(res,200,{ok:true});}
         const connectorPreview=url.pathname.match(/^\/api\/connectors\/(github|slack|gmail)\/preview$/);if(req.method==='GET'&&connectorPreview){if(connectorPreview[1]==='gmail')requireOwner(user);if(paused())throw Object.assign(new Error('Orbit is paused.'),{status:423});return json(res,200,{items:await connectors.preview(userId,connectorPreview[1])});}
         if(req.method==='POST'&&url.pathname==='/api/recovery-codes/rotate'){const body=await readJson(req);const account=db.getUserById(userId);if(!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});const codes=makeRecoveryCodes();db.replaceRecoveryCodes(userId,codes.map(hashToken));db.addEvent(userId,'recovery_codes_rotated','Rotated account recovery codes.');return json(res,200,{recoveryCodes:codes});}
         if(req.method==='DELETE'&&url.pathname==='/api/account'){
@@ -3741,6 +3797,9 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(!account||!await verifyPassword(body.password,account.password_hash,account.password_salt))throw Object.assign(new Error('Password was not accepted.'),{status:401});
           const result=db.deleteUserAccount(userId);
           if(!result?.deleted)throw Object.assign(new Error('Account could not be deleted.'),{status:500});
+          clearAttachmentsForUser(userId);
+          clearWhatsAppMediaForUser(userId);
+          ephemeralReplyPayloads.clearUser(userId,activeReplyJobs);
           res.setHeader('Set-Cookie',clearSessionCookie({secure:production,sameSite:isNativeRequest(req)?'None':'Strict'}));
           return json(res,200,{deleted:true});
         }
@@ -3823,8 +3882,8 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
   });
 
   const workerMs=Math.max(Number(env.TASK_POLL_MS)||15_000,5_000);let workerTimer;let backupTimer;let metricsTimer;
-  return {server,db,push,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
-    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
+  return {server,db,push,apns,pendingStreams,chatMetrics,runDueTasks,runReplyJobs:pumpReplyJobs,deliverProactive,runProactiveChecks,checkDoorLeftOpen,
+    startWorker(){try{const cleaned=cleanupExpiredDemos(db);if(cleaned>0)console.log(`Cleaned up ${cleaned} expired demo users.`);}catch{}try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);}workerTimer=setInterval(()=>{runDueTasks();runProactiveChecks();checkDoorLeftOpen().catch(()=>{});try{cleanupExpiredDemos(db);}catch{};try{subscriptions.runDailyReset();}catch(e){console.error('subscription reset failed',e&&e.message);};},workerMs);workerTimer.unref();replyPollTimer=setInterval(scheduleReplyPump,5000);replyPollTimer.unref();scheduleReplyPump();backupTimer=setInterval(runBackups,60*60_000);backupTimer.unref();metricsTimer=setInterval(()=>{const summary=chatMetrics.snapshot();if(summary.count>=20)console.log('[chat-metrics]',JSON.stringify(summary));},15*60_000);metricsTimer.unref();if(!cutoverHold)setImmediate(()=>model.checkConnection().catch(()=>{}));setImmediate(runDueTasks);setImmediate(runProactiveChecks);setImmediate(runBackups);},
     async close(){
       closing=true;
       clearInterval(sweepRateLogs);
@@ -3833,7 +3892,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       if(backupTimer)clearInterval(backupTimer);
       if(metricsTimer)clearInterval(metricsTimer);
       const serverClosed=server.listening?new Promise((resolve)=>server.close(resolve)):Promise.resolve();
-      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...activeReplyJobs.values(),
+      const pending=Promise.allSettled([...(replyPumpTask?[replyPumpTask]:[]),...(taskWorkerDone?[taskWorkerDone]:[]),...activeReplyJobs.values(),
         ...summaryJobs.values(),...(deliveryTask?[deliveryTask]:[])]);
       let timeout;
       const settled=await Promise.race([
@@ -3842,6 +3901,7 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
       ]);
       clearTimeout(timeout);
       if(!settled){console.error('reply shutdown grace elapsed; leased jobs will recover safely');server.closeAllConnections();}
+      ephemeralReplyPayloads.clearAll();
       await db.close();
     }
   };

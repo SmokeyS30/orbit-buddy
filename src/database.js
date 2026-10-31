@@ -242,6 +242,10 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
       state_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       provider TEXT NOT NULL, code_verifier TEXT, redirect_uri TEXT NOT NULL, expires_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+      state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+      session_hash TEXT NOT NULL, claimed_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS calendar_feeds (
       id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       label TEXT NOT NULL, url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
@@ -544,6 +548,9 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   ensureColumn(db, 'subscriptions', 'last_event_signed_at', 'TEXT');
   ensureColumn(db, 'processed_notifications', 'state', "TEXT NOT NULL DEFAULT 'processed'");
   ensureColumn(db, 'processed_notifications', 'completed_at', 'TEXT');
+  db.exec(`CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+    state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+    session_hash TEXT NOT NULL, claimed_at TEXT)`);
   db.exec("UPDATE processed_notifications SET state='processed',completed_at=COALESCE(completed_at,received_at) WHERE state IS NULL OR state!='processing'");
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_app_token_unique ON subscriptions(app_account_token) WHERE app_account_token IS NOT NULL');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_subscriptions_original_txn_unique ON subscriptions(original_transaction_id) WHERE original_transaction_id IS NOT NULL');
@@ -552,6 +559,7 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_memories_user_status ON memories(user_id, status, updated_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, created_at DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_calendar_feeds_user ON calendar_feeds(user_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_oauth_states_user_provider ON oauth_states(user_id,provider)');
 
   if (encryptionKey) {
     const legacyFeeds = db.prepare("SELECT id,url FROM calendar_feeds WHERE url NOT LIKE 'enc:v1:%'").all();
@@ -808,17 +816,25 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listCalendarFeeds: db.prepare('SELECT * FROM calendar_feeds WHERE user_id=? ORDER BY label COLLATE NOCASE'),
     deleteCalendarFeed: db.prepare('DELETE FROM calendar_feeds WHERE id=? AND user_id=?'),
     getTask: db.prepare('SELECT * FROM tasks WHERE id=? AND user_id=?'),
-    updateTask: db.prepare('UPDATE tasks SET status=?,updated_at=? WHERE id=? AND user_id=?'),
-    updateTaskFields: db.prepare('UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,updated_at=? WHERE id=? AND user_id=?'),
+    updateTask: db.prepare('UPDATE tasks SET status=?,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?'),
+    updateTaskFields: db.prepare("UPDATE tasks SET title=?,prompt=?,schedule_at=?,recurrence=?,status=CASE WHEN status='running' THEN CASE WHEN CAST(? AS TEXT) IS NULL OR CAST(? AS TEXT)<=CAST(? AS TEXT) THEN 'queued' ELSE 'scheduled' END ELSE status END,attempt_count=attempt_count+1,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=?"),
     deleteTask: db.prepare('DELETE FROM tasks WHERE id=? AND user_id=?'),
-    startTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) RETURNING attempt_count"),
+    claimTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING attempt_count"),
+    claimDueTask: db.prepare("UPDATE tasks SET status='running',attempt_count=attempt_count+1,lease_expires_at=?,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled') AND (schedule_at IS NULL OR schedule_at<=?) AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0) RETURNING *"),
     recoverTasks: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at<=?)"),
-    completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
-    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
-    deferTaskForAiConsent: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
+    completeTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status IN ('queued','scheduled','running','waiting_approval')"),
+    failTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running'"),
+    renewTaskLease: db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    activeTaskClaim: db.prepare("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status='running' AND tasks.attempt_count=? AND tasks.lease_expires_at>? AND users.disabled=0 AND users.moderation_blocked=0"),
+    deliverableTask: db.prepare("SELECT 1 FROM tasks JOIN users ON users.id=tasks.user_id WHERE tasks.id=? AND tasks.user_id=? AND tasks.status IN ('completed','scheduled','failed') AND tasks.attempt_count=? AND users.disabled=0 AND users.moderation_blocked=0"),
+    completeClaimedTask: db.prepare("UPDATE tasks SET status=?,result=?,schedule_at=?,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    failClaimedTask: db.prepare("UPDATE tasks SET status='failed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=?,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=? AND lease_expires_at>? AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0)"),
+    releaseClaimedTask: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL OR schedule_at<=? THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,updated_at=? WHERE id=? AND user_id=? AND status='running' AND attempt_count=?"),
     dueTasks: db.prepare(`SELECT * FROM tasks WHERE status IN ('queued','scheduled')
-      AND EXISTS(SELECT 1 FROM users WHERE users.id=tasks.user_id AND users.ai_sharing_consent_at IS NOT NULL)
-      AND (schedule_at IS NULL OR schedule_at<=?) ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
+      AND (schedule_at IS NULL OR schedule_at<=?)
+      AND EXISTS (SELECT 1 FROM users WHERE users.id=tasks.user_id AND disabled=0 AND moderation_blocked=0 AND ai_sharing_consent_at IS NOT NULL)
+      ORDER BY COALESCE(schedule_at,created_at),rowid LIMIT 10`),
+    deferTaskForAiConsent: db.prepare("UPDATE tasks SET status=CASE WHEN schedule_at IS NULL THEN 'queued' ELSE 'scheduled' END,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?"),
     addEvent: db.prepare('INSERT INTO events(id,user_id,type,message,detail,created_at) VALUES (?, ?, ?, ?, ?, ?)'),
     listEvents: db.prepare('SELECT * FROM events WHERE user_id=? ORDER BY created_at DESC,rowid DESC LIMIT ?'),
     countToolUseSince: db.prepare("SELECT COUNT(*) AS n FROM events WHERE type='tool_use' AND message LIKE ? AND created_at>=?"),
@@ -864,7 +880,11 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     connector: db.prepare('SELECT * FROM connectors WHERE user_id=? AND provider=?'),
     deleteConnector: db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=?'),
     addOauthState: db.prepare('INSERT INTO oauth_states VALUES(?,?,?,?,?,?)'),
-    consumeOauthState: db.prepare('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?'),
+    addOauthBinding: db.prepare('INSERT INTO oauth_state_bindings(state_hash,session_hash,claimed_at) VALUES(?,?,NULL)'),
+    claimOauthState: db.prepare('UPDATE oauth_state_bindings SET claimed_at=? WHERE state_hash=? AND claimed_at IS NULL AND EXISTS (SELECT 1 FROM oauth_states WHERE oauth_states.state_hash=oauth_state_bindings.state_hash AND expires_at>?) RETURNING state_hash'),
+    oauthState: db.prepare('SELECT o.*,b.session_hash,b.claimed_at FROM oauth_states o JOIN oauth_state_bindings b ON b.state_hash=o.state_hash WHERE o.state_hash=?'),
+    revokeOauthStates: db.prepare('DELETE FROM oauth_states WHERE user_id=? AND provider=?'),
+    pruneOauthStates: db.prepare('DELETE FROM oauth_states WHERE expires_at<=?'),
     deleteOauthState: db.prepare('DELETE FROM oauth_states WHERE state_hash=?'),
     addAccessRequest: db.prepare('INSERT INTO access_requests VALUES (?, ?, ?, ?, ?, NULL)'),
     addWaitlistEntry: db.prepare('INSERT INTO waitlist (id,email,name,status,created_at,updated_at) VALUES (?,?,?,?,?,?)'),
@@ -1687,16 +1707,25 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     deleteCalendarFeed: (userId, id) => s.deleteCalendarFeed.run(id, userId).changes > 0,
     getTask: (userId,id) => s.getTask.get(id,userId),
     setTaskStatus: (userId,id,status) => s.updateTask.run(status,timestamp(),id,userId).changes>0,
-    updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,now,id,userId);return s.getTask.get(id,userId);},
+    updateTask(userId,id,{title,prompt,scheduleAt,recurrence}={}){const current=s.getTask.get(id,userId);if(!current)return null;const now=timestamp();const nextTitle=title===undefined?current.title:(String(title||'').trim().slice(0,120)||current.title);const nextPrompt=prompt===undefined?current.prompt:(String(prompt||'').trim().slice(0,6000)||current.prompt);let nextSchedule=current.schedule_at;if(scheduleAt!==undefined)nextSchedule=scheduleAt?new Date(scheduleAt).toISOString():null;const nextRecurrence=recurrence===undefined?current.recurrence:(['none','daily','weekly'].includes(recurrence)?recurrence:current.recurrence);s.updateTaskFields.run(nextTitle,nextPrompt,nextSchedule,nextRecurrence,nextSchedule,nextSchedule,now,now,id,userId);return s.getTask.get(id,userId);},
     deleteTask: (userId,id) => s.deleteTask.run(id,userId).changes>0,
-    startTask:(userId,id,leaseMs=2*60_000)=>s.startTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId,timestamp())?.attempt_count||null,
-    // The monotonically increasing attempt fences workers after recovery/restart.
-    renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>db.prepare("UPDATE tasks SET lease_expires_at=? WHERE id=? AND user_id=? AND attempt_count=? AND status='running' AND lease_expires_at>?").run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
+    claimTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>s.claimTask.get(new Date(Date.now()+leaseMs).toISOString(),timestamp(),id,userId)?.attempt_count??null),
+    claimDueTask:(userId,id,leaseMs=2*60_000)=>withImmediate(()=>{
+      const now=timestamp();
+      return s.claimDueTask.get(new Date(Date.now()+leaseMs).toISOString(),now,id,userId,now)||null;
+    }),
+    startTask(userId,id,leaseMs=2*60_000){return this.claimTask(userId,id,leaseMs)!==null;},
+    renewTaskLease:(userId,id,attempt,leaseMs=2*60_000)=>s.renewTaskLease.run(new Date(Date.now()+leaseMs).toISOString(),id,userId,attempt,timestamp()).changes>0,
+    activeTaskClaim:(userId,id,attempt)=>Boolean(s.activeTaskClaim.get(id,userId,attempt,timestamp())),
+    deliverableTask:(userId,id,attempt)=>Boolean(s.deliverableTask.get(id,userId,attempt)),
+    completeClaimedTask:(userId,id,attempt,result,status='completed',scheduleAt=null)=>s.completeClaimedTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
+    failClaimedTask:(userId,id,attempt,message,error)=>s.failClaimedTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
+    releaseClaimedTask:(userId,id,attempt)=>{const current=timestamp();return s.releaseClaimedTask.run(current,current,id,userId,attempt).changes>0;},
+    // A user-requested completion revokes the worker lease and future recurrence.
+    completeTaskByUser:(userId,id,result)=>db.prepare("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,attempt_count=attempt_count+1,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')").run(result,timestamp(),id,userId).changes>0,
     recoverStaleTasks(){const current=timestamp();return s.recoverTasks.run(current,current,current).changes;},
-    // Explicit user completion is independent of a worker's lease and revokes it.
-    completeTaskByUser:(userId,id,result)=>db.prepare("UPDATE tasks SET status='completed',result=?,schedule_at=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? WHERE id=? AND user_id=? AND status NOT IN ('completed','cancelled','failed')").run(result,timestamp(),id,userId).changes>0,
-    completeTask: (userId,id,attempt,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId,attempt,timestamp()).changes>0,
-    failTask:(userId,id,attempt,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId,attempt,timestamp()).changes>0,
+    completeTask: (userId,id,result,status='completed',scheduleAt=null) => s.completeTask.run(status,result,scheduleAt,timestamp(),id,userId).changes>0,
+    failTask:(userId,id,message,error)=>s.failTask.run(message,String(error||'').slice(0,1000),timestamp(),id,userId).changes>0,
     deferTaskForAiConsent:(userId,id,attempt)=>s.deferTaskForAiConsent.run(timestamp(),id,userId,attempt,timestamp()).changes>0,
     dueTasks: () => s.dueTasks.all(timestamp()),
     addEvent(userId,type,message,detail=null) { const row={id:randomUUID(),user_id:userId,type,message,detail,created_at:timestamp()}; s.addEvent.run(row.id,row.user_id,row.type,row.message,row.detail,row.created_at); return row; },
@@ -1742,12 +1771,15 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     prunePurchaseIntents() { s.prunePurchaseIntents.run(timestamp()); },
     saveConnector(userId,provider,data) { const now=timestamp(); s.upsertConnector.run(data.id||randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now); },
     listConnectors: (userId) => s.listConnectors.all(userId),
-    // Encrypted access tokens use fresh random IVs, so they also identify the
-    // credential revision. Refreshes must never insert or mutate a replacement.
+    // The randomized encrypted access token is the credential revision.
+    // A stale refresh may neither upsert nor remove a replacement connection.
     refreshConnector:(userId,provider,previous,data)=>db.prepare('UPDATE connectors SET access_encrypted=?,refresh_encrypted=?,expires_at=?,updated_at=? WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(data.accessEncrypted,data.refreshEncrypted||null,data.expiresAt||null,timestamp(),userId,provider,previous.id,previous.access_encrypted).changes>0,
     deleteConnectorIfCurrent:(userId,provider,previous)=>db.prepare('DELETE FROM connectors WHERE user_id=? AND provider=? AND id=? AND access_encrypted=?').run(userId,provider,previous.id,previous.access_encrypted).changes>0,
     getConnector: (userId,provider) => s.connector.get(userId,provider),
-    deleteConnector: (userId,provider) => s.deleteConnector.run(userId,provider).changes>0,
+    deleteConnector: (userId,provider) => withImmediate(()=>{
+      s.revokeOauthStates.run(userId,provider);
+      return s.deleteConnector.run(userId,provider).changes>0;
+    }),
     linkWhatsApp(userId,phoneE164) { const now=timestamp(); s.linkWhatsApp.run(userId,phoneE164,now,now,now); return s.getWhatsAppLink.get(userId); },
     getWhatsAppLink: (userId) => s.getWhatsAppLink.get(userId) || null,
     getUserByWhatsApp: (phoneE164) => s.getUserByWhatsApp.get(phoneE164) || null,
@@ -1798,8 +1830,26 @@ export function openDatabase(filePath, { encryptionKey = null } = {}) {
     listUndeliveredRadarFindingsSince: (userId, sinceIso, limit = 15) => s.listUndeliveredRadarFindingsSince.all(userId, sinceIso, Math.max(1, Math.min(50, Number(limit) || 15))),
     listUnrecoveredFailureDetails: (limit = 10) => s.listUnrecoveredFailureDetails.all(Math.max(1, Math.min(25, Number(limit) || 10))),
     listTasksDueBefore: (userId, cutoffIso, limit = 10) => s.listTasksDueBefore.all(userId, cutoffIso, Math.max(1, Math.min(25, Number(limit) || 10))),
-    addOauthState(row) { s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt); },
-    consumeOauthState(hash) { const row=s.consumeOauthState.get(hash,timestamp()); if(row) s.deleteOauthState.run(hash); return row; },
+    addOauthState(row) { return withImmediate(()=>{
+      const session=row.sessionHash?s.session.get(row.sessionHash,timestamp()):null;
+      if(session?.user_id!==row.userId||session.disabled||session.moderation_blocked||(row.provider==='gmail'&&session.role!=='owner'))
+        throw new Error('OAuth link requires an active owner session.');
+      s.pruneOauthStates.run(timestamp());
+      s.revokeOauthStates.run(row.userId,row.provider);
+      s.addOauthState.run(row.stateHash,row.userId,row.provider,row.codeVerifier||null,row.redirectUri,row.expiresAt);
+      s.addOauthBinding.run(row.stateHash,row.sessionHash);
+    }); },
+    consumeOauthState: hash => withImmediate(()=>s.claimOauthState.get(timestamp(),hash,timestamp())?s.oauthState.get(hash):null),
+    finishOauthConnection(stateHash,userId,provider,data) { return withImmediate(()=>{
+      const now=timestamp(),state=s.oauthState.get(stateHash);
+      const session=state?.session_hash?s.session.get(state.session_hash,now):null;
+      if(!state||state.user_id!==userId||state.provider!==provider||!state.claimed_at||state.expires_at<=now
+        ||session?.user_id!==userId||session.disabled||session.moderation_blocked||(provider==='gmail'&&session.role!=='owner'))return false;
+      s.deleteOauthState.run(stateHash);
+      s.upsertConnector.run(randomUUID(),userId,provider,data.accessEncrypted,data.refreshEncrypted||null,data.scopes||'',data.expiresAt||null,JSON.stringify(data.profile||{}),now,now);
+      return true;
+    }); },
+    discardOauthState: hash => s.deleteOauthState.run(hash).changes>0,
     addAccessRequest({name,email,note}) { const id=randomUUID(); s.addAccessRequest.run(id,name,email,note||null,timestamp()); return s.getAccessRequest.get(id); },
     getAccessRequest: (id) => s.getAccessRequest.get(id),
     listAccessRequests: () => s.listAccessRequests.all(),

@@ -72,6 +72,23 @@ test('push wire payload passes data through verbatim (conversationId in and out)
   }
 });
 
+test('web push checks task delivery eligibility before each device send',async()=>{
+  const keys=webpush.generateVAPIDKeys();
+  const original=webpush.sendNotification;
+  let allowed=true,sends=0;
+  webpush.sendNotification=async()=>{sends++;allowed=false;};
+  try{
+    const db={listPush:()=>[
+      {id:'first',endpoint:'https://push.example.test/first',p256dh:'p',auth:'a'},
+      {id:'second',endpoint:'https://push.example.test/second',p256dh:'p',auth:'a'}
+    ],deletePushById:()=>{}};
+    const service=createPushService({VAPID_PUBLIC_KEY:keys.publicKey,VAPID_PRIVATE_KEY:keys.privateKey,VAPID_SUBJECT:'mailto:test@example.com'},db);
+    const result=await service.notify('synthetic-user','Task','Result',{},()=>allowed);
+    assert.equal(sends,1,'the second device is not contacted after eligibility is revoked');
+    assert.equal(result.sent,1);
+  }finally{webpush.sendNotification=original;}
+});
+
 test('snapshot ?conversation= selects the thread; unknown ids fall back to default', async (t) => {
   const { app, base } = await serverFixture(); t.after(() => app.close());
   const auth = await register(base);

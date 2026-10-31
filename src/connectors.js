@@ -20,7 +20,10 @@ const providers = {
 
 const challenge = (value) => createHash('sha256').update(value).digest('base64url');
 
-export function createConnectorService(env, db, encryptionKey) {
+export function createConnectorService(env, db, encryptionKey, { cutoverHold = false } = {}) {
+  function requireCutoverOpen() {
+    if (cutoverHold) throw Object.assign(new Error('Account connections are temporarily paused. Try again shortly.'), { status: 503 });
+  }
   function requireProviderAccess(userId, providerId) {
     if (providerId !== 'gmail') return;
     const user = db.getUserById(userId);
@@ -38,14 +41,22 @@ export function createConnectorService(env, db, encryptionKey) {
       }));
   }
 
-  function begin(userId, providerId, origin) {
+  function begin(userId, providerId, origin, sessionHash) {
+    requireCutoverOpen();
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
     requireProviderAccess(userId, providerId);
     if (!encryptionKey || !env[provider.clientId] || !env[provider.clientSecret]) throw Object.assign(new Error(`${provider.label} OAuth is not configured.`), { status: 503 });
     const state = randomToken(32); const verifier = provider.pkce ? randomToken(48) : null;
     const redirectUri = `${origin}/api/connectors/${providerId}/callback`;
-    db.addOauthState({ stateHash: hashToken(state), userId, provider: providerId, codeVerifier: verifier, redirectUri, expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() });
+    try{
+      db.addOauthState({ stateHash: hashToken(state), userId, provider: providerId, codeVerifier: verifier, redirectUri,
+        expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(), sessionHash });
+    }catch(error){
+      if(error?.message==='OAuth link requires an active owner session.')
+        throw Object.assign(new Error('Sign in again before connecting Gmail.'),{status:401});
+      throw error;
+    }
     const url = new URL(provider.authorize);
     url.searchParams.set('client_id', env[provider.clientId]); url.searchParams.set('redirect_uri', redirectUri);
     url.searchParams.set('scope', provider.scope); url.searchParams.set('state', state);
@@ -56,26 +67,34 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function complete(providerId, code, state) {
+    requireCutoverOpen();
     const provider = providers[providerId];
-    const oauthState = db.consumeOauthState(hashToken(state));
-    if (!provider || !oauthState || oauthState.provider !== providerId) throw Object.assign(new Error('OAuth state is invalid or expired.'), { status: 400 });
-    requireProviderAccess(oauthState.user_id, providerId);
-    const params = new URLSearchParams({ code, client_id: env[provider.clientId], client_secret: env[provider.clientSecret], redirect_uri: oauthState.redirect_uri, grant_type: 'authorization_code' });
-    if (oauthState.code_verifier) params.set('code_verifier', oauthState.code_verifier);
-    const tokenResponse = await fetch(provider.token, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(30_000) });
-    const tokens = await tokenResponse.json().catch(() => ({}));
-    const accessToken = providerId === 'slack' ? tokens.access_token : tokens.access_token;
-    if (!tokenResponse.ok || !accessToken || tokens.ok === false) throw Object.assign(new Error('OAuth token exchange failed.'), { status: 502 });
-    const profileResponse = await fetch(provider.profile, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'User-Agent': 'Orbit-Buddy' }, signal: AbortSignal.timeout(20_000) });
-    const profile = await profileResponse.json().catch(() => ({}));
-    db.saveConnector(oauthState.user_id, providerId, {
-      accessEncrypted: encryptSecret(accessToken, encryptionKey),
-      refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : null,
-      scopes: tokens.scope || provider.scope,
-      expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null,
-      profile
-    });
-    return { userId: oauthState.user_id, provider: providerId };
+    const stateHash=hashToken(state);
+    const oauthState=db.consumeOauthState(stateHash);
+    if(!provider||!oauthState||oauthState.provider!==providerId){
+      if(oauthState)db.discardOauthState(stateHash);
+      throw Object.assign(new Error('OAuth state is invalid or expired.'),{status:400});
+    }
+    try{
+      requireProviderAccess(oauthState.user_id,providerId);
+      const params = new URLSearchParams({ code, client_id: env[provider.clientId], client_secret: env[provider.clientSecret], redirect_uri: oauthState.redirect_uri, grant_type: 'authorization_code' });
+      if (oauthState.code_verifier) params.set('code_verifier', oauthState.code_verifier);
+      const tokenResponse = await fetch(provider.token, { method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, body: params, signal: AbortSignal.timeout(30_000) });
+      const tokens = await tokenResponse.json().catch(() => ({}));
+      const accessToken = tokens.access_token;
+      if (!tokenResponse.ok || !accessToken || tokens.ok === false) throw Object.assign(new Error('OAuth token exchange failed.'), { status: 502 });
+      const profileResponse = await fetch(provider.profile, { headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json', 'User-Agent': 'Orbit-Buddy' }, signal: AbortSignal.timeout(20_000) });
+      const profile = await profileResponse.json().catch(() => ({}));
+      const saved=db.finishOauthConnection(stateHash,oauthState.user_id,providerId,{
+        accessEncrypted: encryptSecret(accessToken, encryptionKey),
+        refreshEncrypted: tokens.refresh_token ? encryptSecret(tokens.refresh_token, encryptionKey) : null,
+        scopes: tokens.scope || provider.scope,
+        expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000).toISOString() : null,
+        profile
+      });
+      if(!saved)throw Object.assign(new Error('OAuth connection changed during authorization. Please try again.'),{status:409});
+      return { userId: oauthState.user_id, provider: providerId };
+    }finally{db.discardOauthState(stateHash);}
   }
 
   async function preview(userId, providerId) {
@@ -93,6 +112,7 @@ export function createConnectorService(env, db, encryptionKey) {
   }
 
   async function getValidToken(userId, providerId) {
+    requireCutoverOpen();
     const provider = providers[providerId];
     if (!provider) throw Object.assign(new Error('Unknown connector.'), { status: 404 });
     requireProviderAccess(userId, providerId);

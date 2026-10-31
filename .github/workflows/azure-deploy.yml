@@ -6,8 +6,8 @@
 # Container images are pushed to GHCR using the built-in GITHUB_TOKEN
 # (requires packages: write permission on the build-and-deploy job).
 #
-# Deployment safety is implemented and tested in scripts/deploy-containerapp.mjs.
-# The deploy job fails if either release verification or rollback fails.
+# New images start with background and connector work held. A separate,
+# reviewed dispatch opens the exact held image after predecessor drain proof.
 
 name: Deploy to Azure
 
@@ -58,6 +58,7 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       id-token: write
       contents: read
@@ -106,7 +107,7 @@ jobs:
             --query '{state:state,retentionDays:backup.backupRetentionDays,earliestRestoreDate:backup.earliestRestoreDate,geoRedundantBackup:backup.geoRedundantBackup}' \
             --output json
 
-      - name: Deploy, verify and roll back on failure
+      - name: Deploy held image and verify predecessor replicas retired
         env:
           RELEASE_SHA: ${{ github.sha }}
-        run: node scripts/deploy-containerapp.mjs
+        run: node scripts/guarded-containerapp.mjs deploy-held

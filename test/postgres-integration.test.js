@@ -6,6 +6,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { createSyncPgAdapter, waitForPgResponse } from '../src/db/sync-pg-wrapper.mjs';
@@ -345,6 +346,149 @@ test('PostgreSQL sync wrapper: startup, CRUD, and persistence', async () => {
       if (db2) { try { db2.close(); } catch {} db2 = null; }
       if (db) { try { db.close(); } catch {} db = null; }
     }
+  }
+});
+
+test('PostgreSQL task attempts fence stale and cancelled worker completions',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  let user;
+  try{
+    user=await db.createUser({email:`task-fence-${suffix}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await db.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+    assert.equal(await db.startTask(user.id,task.id,-1000),true);
+    const stale=(await db.getTask(user.id,task.id)).attempt_count;
+    assert.equal(await db.recoverStaleTasks(),1);
+    assert.equal(await db.startTask(user.id,task.id),true);
+    const current=(await db.getTask(user.id,task.id)).attempt_count;
+    assert.ok(current>stale);
+    assert.equal(await db.renewTaskLease(user.id,task.id,stale),false);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,stale,'stale'),false);
+    assert.equal(await db.setTaskStatus(user.id,task.id,'cancelled'),true);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,current,'cancelled result'),false);
+    assert.equal((await db.getTask(user.id,task.id)).status,'cancelled');
+  }finally{
+    if(user)await db.deleteUserAccount(user.id);
+    await db.close();
+  }
+});
+
+test('PostgreSQL due selection skips ten earlier blocked tasks',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  const users=[];
+  try{
+    const oldDue=new Date(Date.now()-120_000).toISOString();
+    const laterDue=new Date(Date.now()-60_000).toISOString();
+    for(let i=0;i<10;i++){
+      const user=await db.createUser({email:`task-blocked-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+      users.push(user);
+      await db.addTask(user.id,{title:`Blocked ${i}`,prompt:'Do not run',scheduleAt:oldDue});
+      assert.equal(i%2?await db.setModerationBlocked(user.id,true):await db.setUserDisabled(user.id,true),true);
+    }
+    const eligible=await db.createUser({email:`task-eligible-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    users.push(eligible);await db.setAiSharingConsent(eligible.id,true);
+    const task=await db.addTask(eligible.id,{title:'Eligible',prompt:'Run',scheduleAt:laterDue});
+    assert.ok((await db.dueTasks()).some(row=>row.id===task.id));
+    assert.equal((await db.claimDueTask(eligible.id,task.id))?.id,task.id);
+  }finally{
+    for(const user of users)await db.deleteUserAccount(user.id);
+    await db.close();
+  }
+});
+
+test('PostgreSQL claim returns its own attempt across a two-connection reclaim barrier',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const first=await openPostgres(DATABASE_URL);
+  const second=await openPostgres(DATABASE_URL);
+  const suffix=`${Date.now()}_${Math.floor(Math.random()*1_000_000)}`;
+  let user;
+  try{
+    user=await first.createUser({email:`task-claim-${suffix}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await first.addTask(user.id,{title:'Synthetic',prompt:'No external calls'});
+    let resumeFirst,claimReached;
+    const paused=new Promise(resolve=>{claimReached=resolve;});
+    const firstCaller=first.claimTask(user.id,task.id,-1000).then(attempt=>{
+      claimReached();
+      return new Promise(resolve=>{resumeFirst=()=>resolve(attempt);});
+    });
+    await paused;
+    assert.equal(await second.recoverStaleTasks(),1);
+    const newer=await second.claimTask(user.id,task.id);
+    resumeFirst();
+    const original=await firstCaller;
+    assert.ok(newer>original,'the paused caller receives its own earlier claim token');
+    assert.equal(await first.activeTaskClaim(user.id,task.id,original),false);
+    assert.equal(await first.completeClaimedTask(user.id,task.id,original,'stale'),false);
+    assert.equal(await second.completeClaimedTask(user.id,task.id,newer,'current'),true);
+    assert.equal((await second.getTask(user.id,task.id)).result,'current');
+  }finally{
+    if(user)await first.deleteUserAccount(user.id);
+    await first.close();await second.close();
+  }
+});
+
+test('PostgreSQL claim rejects a newly future task and returns its current row after rescheduling',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const first=await openPostgres(DATABASE_URL);
+  const second=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await first.createUser({email:`task-due-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    await first.setAiSharingConsent(user.id,true);
+    const task=await first.addTask(user.id,{title:'Original',prompt:'Original prompt'});
+    const stale=(await first.dueTasks()).find(row=>row.id===task.id);
+    assert.ok(stale);
+    const future=new Date(Date.now()+60_000).toISOString();
+    await second.updateTask(user.id,task.id,{prompt:'Future prompt',scheduleAt:future});
+    assert.equal(await first.claimDueTask(stale.user_id,stale.id),null,'claim rechecks the due time atomically');
+    const current=await second.updateTask(user.id,task.id,{title:'Current title',prompt:'Current prompt',
+      scheduleAt:new Date(Date.now()-1000).toISOString(),recurrence:'daily'});
+    const claimed=await first.claimDueTask(stale.user_id,stale.id);
+    assert.equal(claimed?.prompt,current.prompt);
+    assert.equal(claimed?.title,current.title);
+    assert.equal(claimed?.recurrence,current.recurrence);
+    assert.equal(claimed?.schedule_at,current.schedule_at);
+    assert.ok(claimed.attempt_count>stale.attempt_count);
+  }finally{
+    if(user)await first.deleteUserAccount(user.id);
+    await first.close();await second.close();
+  }
+});
+
+test('PostgreSQL task edits and account disable invalidate a running claim',async()=>{
+  assert.ok(DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensureSchema();
+  const {openPostgres}=await import('../src/db/postgres-adapter.js');
+  const db=await openPostgres(DATABASE_URL);
+  let user;
+  try{
+    user=await db.createUser({email:`task-edit-${Date.now()}-${Math.random()}@example.test`,displayName:'Synthetic',passwordHash:'x',passwordSalt:'y',role:'member'});
+    const task=await db.addTask(user.id,{title:'Original',prompt:'Original prompt'});
+    const first=await db.claimTask(user.id,task.id);
+    const edited=await db.updateTask(user.id,task.id,{prompt:'Revised prompt'});
+    assert.equal(edited.status,'queued');
+    assert.equal(await db.activeTaskClaim(user.id,task.id,first),false);
+    const second=await db.claimTask(user.id,task.id);
+    assert.ok(second>first);
+    await db.setUserDisabled(user.id,true);
+    assert.equal(await db.renewTaskLease(user.id,task.id,second),false);
+    assert.equal(await db.completeClaimedTask(user.id,task.id,second,'stale'),false);
+    assert.equal(await db.deliverableTask(user.id,task.id,second),false);
+    await db.setTaskStatus(user.id,task.id,'queued');
+    assert.equal(await db.claimTask(user.id,task.id),null);
+  }finally{
+    if(user)await db.deleteUserAccount(user.id);
+    await db.close();
   }
 });
 

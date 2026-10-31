@@ -364,6 +364,12 @@ CREATE TABLE IF NOT EXISTS oauth_states (
   expires_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS oauth_state_bindings (
+  state_hash TEXT PRIMARY KEY REFERENCES oauth_states(state_hash) ON DELETE CASCADE,
+  session_hash TEXT NOT NULL,
+  claimed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS calendar_feeds (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
