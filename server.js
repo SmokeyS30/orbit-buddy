@@ -594,10 +594,15 @@ export function createOrbitServer(options={}) {
     return req.socket.remoteAddress||'unknown';
   }
   const MAX_LIMIT_KEYS=50_000;
+  const lastFullSweep=new WeakMap();
   function recordHit(log,key,windowMs,retentionMs=windowMs){
     const current=Date.now();
     if(log.size>=MAX_LIMIT_KEYS&&!log.has(key)){
-      for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
+      // Full scans are throttled so a flood of unseen keys cannot repeatedly block the event loop.
+      if(current-(lastFullSweep.get(log)||0)>=1000){
+        lastFullSweep.set(log,current);
+        for(const [k,times] of log){if(!times.length||current-times[times.length-1]>=retentionMs)log.delete(k);}
+      }
       if(log.size>=MAX_LIMIT_KEYS)log.delete(log.keys().next().value);
     }
     const recent=(log.get(key)||[]).filter((time)=>current-time<windowMs);
