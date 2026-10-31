@@ -793,10 +793,13 @@ const indexMigrations = [
       lease_expires_at=CASE WHEN requires_ephemeral=1 THEN ? ELSE NULL END,lease_token=NULL
       WHERE id=? AND lease_token=? AND status='running'`,new Date(Date.now()+REPLY_LEASE_MS).toISOString(),id,token)).changes>0,
     completeReplyJob: async (id,token,content,insertCreatedAt=null)=>withTransaction(async ({get:tGet,run:tRun})=>{
+      const currentJob=await tGet('SELECT user_id FROM reply_jobs WHERE id=?',id);
+      if(!currentJob)return null;
+      const account=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',currentJob.user_id);
+      if(!account)return null;
       const job=await tGet('SELECT * FROM reply_jobs WHERE id=? FOR UPDATE',id);
-      if(!job||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
-      const account=await tGet('SELECT disabled,moderation_blocked FROM users WHERE id=? FOR UPDATE',job.user_id);
-      if(!account||account.disabled===1||account.moderation_blocked===1){
+      if(!job||job.user_id!==currentJob.user_id||job.status!=='running'||job.lease_token!==token||job.lease_expires_at<=timestamp())return null;
+      if(account.disabled===1||account.moderation_blocked===1){
         await tRun("UPDATE reply_jobs SET status='cancelled',completed_at=?,lease_expires_at=NULL WHERE id=?",timestamp(),id);
         return null;
       }

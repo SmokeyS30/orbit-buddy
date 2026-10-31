@@ -120,6 +120,52 @@ test('PostgreSQL claims one conversation turn across replicas and migrations are
   }
 });
 
+test('PostgreSQL account deletion and reply completion lock user before job',async()=>{
+  const url=process.env.TEST_DATABASE_URL;
+  assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  await ensurePostgresSchema(url);
+  const suffix=randomUUID().replaceAll('-','');
+  const deleteApp=`reply_delete_${suffix}`,completeApp=`reply_complete_${suffix}`;
+  const namedUrl=(name)=>{const value=new URL(url);value.searchParams.set('application_name',name);return value.toString();};
+  const one=createSyncPgAdapter(namedUrl(completeApp)),two=createSyncPgAdapter(namedUrl(deleteApp));
+  const pool=new pg.Pool({connectionString:url,ssl:false});
+  const gate=BigInt(`0x${suffix.slice(0,12)}`).toString();
+  const fn=`orbit_reply_delete_gate_${suffix}`,trigger=`orbit_reply_delete_trigger_${suffix}`;
+  let userId=null,control=null,triggerCreated=false,gateLocked=false,deleting=null,completing=null;
+  try{
+    const {user,conversation}=seed(one);userId=user.id;
+    const accepted=one.acceptReplyJob(user.id,conversation.id,'Delete and complete concurrently');
+    const claimed=one.claimNextReplyJob('reply-worker');
+    one.getSetting('system_paused','false');two.getSetting('system_paused','false');
+    await pool.query(`CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF OLD.id='${accepted.job.id}' AND current_setting('application_name',true)='${deleteApp}'
+        THEN PERFORM pg_advisory_xact_lock(${gate}); END IF; RETURN OLD; END $$`);
+    await pool.query(`CREATE TRIGGER ${trigger} BEFORE DELETE ON reply_jobs FOR EACH ROW EXECUTE FUNCTION ${fn}()`);
+    triggerCreated=true;
+    control=await pool.connect();
+    await control.query('SELECT pg_advisory_lock($1::bigint)',[gate]);gateLocked=true;
+    deleting=two.async.deleteUserAccount(userId);
+    assert.ok(await waitFor(async()=>Number((await pool.query(`SELECT COUNT(*) AS n FROM pg_stat_activity
+      WHERE application_name=$1 AND wait_event_type='Lock'`,[deleteApp])).rows[0].n)>0),
+    'deletion should hold the user lock while paused deleting its reply job');
+    completing=one.async.completeReplyJob(accepted.job.id,claimed.lease_token,'completion racing deletion');
+    assert.ok(await waitFor(async()=>Number((await pool.query(`SELECT COUNT(*) AS n FROM pg_stat_activity
+      WHERE application_name=$1 AND wait_event_type='Lock'`,[completeApp])).rows[0].n)>0),
+    'completion should wait for the user lock without locking the reply job');
+    await control.query('SELECT pg_advisory_unlock($1::bigint)',[gate]);gateLocked=false;
+    assert.equal((await deleting).deleted,true);
+    assert.equal(await completing,null);
+  }finally{
+    if(gateLocked&&control)await control.query('SELECT pg_advisory_unlock($1::bigint)',[gate]);
+    await Promise.allSettled([deleting,completing].filter(Boolean));
+    if(control)control.release();
+    if(triggerCreated)await pool.query(`DROP TRIGGER IF EXISTS ${trigger} ON reply_jobs`);
+    await pool.query(`DROP FUNCTION IF EXISTS ${fn}()`);
+    try{if(userId&&one.getUserById(userId))one.deleteUserAccount(userId);}catch{}
+    one.close();two.close();await pool.end();
+  }
+});
+
 test('PostgreSQL serializes acceptance before sequence allocation across replicas',async()=>{
   const url=process.env.TEST_DATABASE_URL;
   assert.ok(url,'TEST_DATABASE_URL must point at disposable PostgreSQL');

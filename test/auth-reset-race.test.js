@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import pg from 'pg';
 import { createOrbitServer } from '../server.js';
 import { hashToken, verifyPassword } from '../src/security.js';
 import { openPostgres } from '../src/db/postgres-adapter.js';
@@ -35,6 +36,64 @@ async function fixture(t){
   };
 }
 const headers=(auth)=>({Cookie:auth.cookie,'X-Orbit-CSRF':auth.csrf,'Content-Type':'application/json'});
+const delay=(ms)=>new Promise(resolve=>setTimeout(resolve,ms));
+
+async function waitFor(pool,check,message){
+  const end=Date.now()+10_000;
+  while(Date.now()<end){if(await check())return;await delay(20);}
+  assert.fail(message);
+}
+
+async function waitingQueries(pool,fragment){
+  const {rows}=await pool.query(`SELECT COUNT(*) AS count FROM pg_stat_activity
+    WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE $1`,[`%${fragment}%`]);
+  return Number(rows[0].count);
+}
+
+async function pauseOnWrite(pool,table,userId,updatePassword=false){
+  const suffix=randomUUID().replaceAll('-','');
+  const functionName=`orbit_test_pause_${suffix}`;
+  const triggerName=`orbit_test_pause_${suffix}`;
+  const lockKey=BigInt(`0x${suffix.slice(0,15)}`).toString();
+  const client=await pool.connect();
+  let released=false;
+  await pool.query(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN PERFORM pg_advisory_xact_lock(${lockKey}::bigint); RETURN NEW; END $$`);
+  try{
+    const when=updatePassword
+      ? `BEFORE UPDATE OF password_hash ON users FOR EACH ROW WHEN (OLD.id='${userId}' AND NEW.password_hash IS DISTINCT FROM OLD.password_hash)`
+      : `BEFORE INSERT ON ${table} FOR EACH ROW WHEN (NEW.user_id='${userId}')`;
+    await pool.query(`CREATE TRIGGER ${triggerName} ${when} EXECUTE FUNCTION ${functionName}()`);
+    await client.query('SELECT pg_advisory_lock($1::bigint)',[lockKey]);
+  }catch(error){
+    await pool.query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+    client.release();
+    throw error;
+  }
+  return{
+    lockKey,
+    async waitForTrigger(){await waitFor(pool,async()=>{
+      const {rows}=await pool.query(`SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
+        AND classid=(($1::bigint >> 32)::oid) AND objid=(($1::bigint & 4294967295)::oid) AND objsubid=1) AS waiting`,[lockKey]);
+      return rows[0].waiting;
+    },'the guarded write did not reach its synchronization trigger');},
+    async release(){if(!released){released=true;await client.query('SELECT pg_advisory_unlock($1::bigint)',[lockKey]);}},
+    async dispose(){
+      await this.release();
+      await pool.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ${updatePassword?'users':table}`);
+      await pool.query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+      client.release();
+    }
+  };
+}
+
+async function assertResetClearedProofs(db,userId){
+  assert.deepEqual(await db.all('SELECT token_hash FROM sessions WHERE user_id=?',userId),[]);
+  assert.deepEqual(await db.all('SELECT subject FROM auth_identities WHERE user_id=?',userId),[]);
+  assert.deepEqual(await db.all('SELECT code_hash FROM recovery_codes WHERE user_id=?',userId),[]);
+  assert.deepEqual(await db.listPush(userId),[]);
+  assert.deepEqual(await db.listApnsTokens(userId),[]);
+}
 
 async function pauseJsonPost(fx,pathname,payload){
   const body=JSON.stringify(payload);
@@ -119,29 +178,92 @@ test('email reset prevents an already-authenticated partial push request from re
   assert.equal(web.app.db.listPush(web.auth.user.id).length,0);
 });
 
-test('PostgreSQL credential-bound mutations reject stale proofs after reset',async()=>{
+test('PostgreSQL credential-bound mutations reject stale proofs after reset and serialize with reset',{timeout:120_000},async()=>{
   assert.ok(process.env.TEST_DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
-  const db=await openPostgres(process.env.TEST_DATABASE_URL);let user=null;
+  const databaseUrl=process.env.TEST_DATABASE_URL;
+  const db=await openPostgres(databaseUrl);
+  const pool=new pg.Pool({connectionString:databaseUrl,ssl:/sslmode=disable/.test(databaseUrl)?false:true});
   try{
-    user=await db.createUser({email:`reset-race-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'old-hash',passwordSalt:'old-salt',role:'member'});
-    const expiry=new Date(Date.now()+60_000).toISOString();
-    await db.createSession({tokenHash:'old-session-'+user.id,userId:user.id,csrfToken:'synthetic',expiresAt:expiry,userAgent:'synthetic'});
-    await db.linkAuthIdentity('apple','old-apple-'+user.id,user.id);
-    await db.addPasswordResetToken('reset-'+user.id,user.id,expiry);
-    assert.equal(await db.finishPasswordReset('reset-'+user.id,'new-hash','new-salt'),true);
-    assert.equal(await db.createPasswordSessionIfCurrent({tokenHash:'bad-'+user.id,userId:user.id,csrfToken:'bad',expiresAt:expiry,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'}),false);
-    assert.equal(await db.replaceRecoveryCodesIfCurrent(user.id,'old-session-'+user.id,'old-hash','old-salt',['old-code']),false);
-    assert.equal(await db.createAppleSessionIfCurrent({tokenHash:'bad-apple-'+user.id,userId:user.id,csrfToken:'bad',expiresAt:expiry,identitySubject:'old-apple-'+user.id}),false);
-    assert.equal(await db.linkAuthIdentityIfCurrent('apple','old-apple-'+user.id,user.id,'old-session-'+user.id,'old-hash','old-salt'),false);
-    assert.equal(await db.savePushIfCurrent(user.id,{endpoint:'https://push.example.test/stale',keys:{p256dh:'synthetic',auth:'synthetic'}},'old-session-'+user.id),false);
-    assert.equal(await db.saveApnsTokenIfCurrent(user.id,'a'.repeat(64),'old-session-'+user.id),false);
-    assert.equal((await db.listPush(user.id)).length,0);
-    assert.equal((await db.listApnsTokens(user.id)).length,0);
-    assert.equal(await db.getAuthIdentity('apple','old-apple-'+user.id),null);
-    assert.equal((await db.deleteUserAccount(user.id,{sessionHash:'old-session-'+user.id,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'})).staleCredentials,true);
-    assert.ok(await db.getUserById(user.id));
-    assert.equal(await db.createPasswordSessionIfCurrent({tokenHash:'new-session-'+user.id,userId:user.id,csrfToken:'new',expiresAt:expiry,expectedPasswordHash:'new-hash',expectedPasswordSalt:'new-salt'}),true);
-    assert.equal(await db.savePushIfCurrent(user.id,{endpoint:'https://push.example.test/current',keys:{p256dh:'synthetic',auth:'synthetic'}},'new-session-'+user.id),true);
-    assert.equal(await db.saveApnsTokenIfCurrent(user.id,'b'.repeat(64),'new-session-'+user.id),true);
-  }finally{if(user)await db.run('DELETE FROM users WHERE id=?',user.id);await db.close();}
+    const guards=[
+      {name:'password session creation',table:'sessions',run:({user,expiry})=>db.createPasswordSessionIfCurrent({
+        tokenHash:`new-password-${user.id}`,userId:user.id,csrfToken:'new',expiresAt:expiry,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'
+      })},
+      {name:'Apple session creation',table:'sessions',run:({user,expiry,appleSubject})=>db.createAppleSessionIfCurrent({
+        tokenHash:`new-apple-${user.id}`,userId:user.id,csrfToken:'new',expiresAt:expiry,identitySubject:appleSubject
+      })},
+      {name:'Google identity linking',table:'auth_identities',run:({user,sessionHash})=>db.linkAuthIdentityIfCurrent(
+        'google',`new-identity-${user.id}`,user.id,sessionHash,'old-hash','old-salt'
+      )},
+      {name:'recovery-code rotation',table:'recovery_codes',run:({user,sessionHash})=>db.replaceRecoveryCodesIfCurrent(
+        user.id,sessionHash,'old-hash','old-salt',[`new-code-${user.id}`]
+      )},
+      {name:'web-push registration',table:'push_subscriptions',run:({user,sessionHash})=>db.savePushIfCurrent(user.id,{
+        endpoint:`https://push.example.test/${user.id}`,keys:{p256dh:'synthetic',auth:'synthetic'}
+      },sessionHash)},
+      {name:'APNs registration',table:'apns_device_tokens',run:({user,sessionHash})=>db.saveApnsTokenIfCurrent(
+        user.id,`${user.id.replaceAll('-','').slice(0,64)}`,sessionHash
+      )}
+    ];
+    for(const guard of guards){
+      for(const resetFirst of [true,false]){
+        let user=null,pause=null,mutationPromise=null,resetPromise=null;
+        try{
+          user=await db.createUser({email:`reset-race-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'old-hash',passwordSalt:'old-salt',role:'member'});
+          const expiry=new Date(Date.now()+60_000).toISOString();
+          const sessionHash=`old-session-${user.id}`;
+          const appleSubject=`old-apple-${user.id}`;
+          await db.createSession({tokenHash:sessionHash,userId:user.id,csrfToken:'synthetic',expiresAt:expiry,userAgent:'synthetic'});
+          await db.linkAuthIdentity('apple',appleSubject,user.id);
+          await db.replaceRecoveryCodes(user.id,[`old-code-${user.id}`]);
+          const resetHash=`reset-${user.id}`;
+          await db.addPasswordResetToken(resetHash,user.id,expiry);
+          const args={user,expiry,sessionHash,appleSubject};
+          if(resetFirst){
+            pause=await pauseOnWrite(pool,'users',user.id,true);
+            resetPromise=db.finishPasswordReset(resetHash,'new-hash','new-salt');
+            await pause.waitForTrigger();
+            const before=await waitingQueries(pool,'FROM users WHERE id=$1 FOR UPDATE');
+            mutationPromise=guard.run(args);
+            await waitFor(pool,async()=>await waitingQueries(pool,'FROM users WHERE id=$1 FOR UPDATE')>before,
+              `${guard.name} did not wait for the in-flight reset`);
+            await pause.release();
+            assert.equal(await resetPromise,true);
+            assert.equal(await mutationPromise,false,`${guard.name} must reject the revoked proof`);
+          }else{
+            pause=await pauseOnWrite(pool,guard.table,user.id);
+            mutationPromise=guard.run(args);
+            await pause.waitForTrigger();
+            const before=await waitingQueries(pool,'FROM users WHERE id=$1 FOR UPDATE');
+            resetPromise=db.finishPasswordReset(resetHash,'new-hash','new-salt');
+            await waitFor(pool,async()=>await waitingQueries(pool,'FROM users WHERE id=$1 FOR UPDATE')>before,
+              `reset did not wait for ${guard.name} to commit`);
+            await pause.release();
+            assert.equal(await mutationPromise,true,`${guard.name} should finish before reset`);
+            assert.equal(await resetPromise,true);
+          }
+          await assertResetClearedProofs(db,user.id);
+          assert.equal((await db.getUserById(user.id)).password_hash,'new-hash');
+        }finally{
+          if(pause)await pause.release();
+          await Promise.allSettled([mutationPromise,resetPromise].filter(Boolean));
+          if(pause)await pause.dispose();
+          if(user)await db.run('DELETE FROM users WHERE id=?',user.id);
+        }
+      }
+    }
+    let user=null;
+    try{
+      user=await db.createUser({email:`reset-race-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'old-hash',passwordSalt:'old-salt',role:'member'});
+      const expiry=new Date(Date.now()+60_000).toISOString();
+      const sessionHash=`old-session-${user.id}`;
+      await db.createSession({tokenHash:sessionHash,userId:user.id,csrfToken:'synthetic',expiresAt:expiry,userAgent:'synthetic'});
+      await db.addPasswordResetToken(`reset-${user.id}`,user.id,expiry);
+      assert.equal(await db.finishPasswordReset(`reset-${user.id}`,'new-hash','new-salt'),true);
+      assert.equal((await db.deleteUserAccount(user.id,{sessionHash,expectedPasswordHash:'old-hash',expectedPasswordSalt:'old-salt'})).staleCredentials,true);
+      assert.ok(await db.getUserById(user.id));
+      assert.equal(await db.createPasswordSessionIfCurrent({tokenHash:`new-session-${user.id}`,userId:user.id,csrfToken:'new',expiresAt:expiry,expectedPasswordHash:'new-hash',expectedPasswordSalt:'new-salt'}),true);
+      assert.equal(await db.savePushIfCurrent(user.id,{endpoint:`https://push.example.test/current/${user.id}`,keys:{p256dh:'synthetic',auth:'synthetic'}},`new-session-${user.id}`),true);
+      assert.equal(await db.saveApnsTokenIfCurrent(user.id,user.id.replaceAll('-',''),`new-session-${user.id}`),true);
+    }finally{if(user)await db.run('DELETE FROM users WHERE id=?',user.id);}
+  }finally{await pool.end();await db.close();}
 });
