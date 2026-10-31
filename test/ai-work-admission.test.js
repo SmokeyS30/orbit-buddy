@@ -419,6 +419,21 @@ test('rejected regeneration keeps the reply and does not spend a daily allowance
   }finally{db.close();fs.rmSync(directory,{recursive:true,force:true});}
 });
 
+test('rejected chat acceptance does not create a message or spend quota in SQLite',()=>{
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'orbit-chat-admission-'));
+  const db=openDatabase(path.join(directory,'orbit.sqlite'));
+  try{
+    const user=db.createUser({email:'member@example.test',displayName:'Member',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'});
+    const conversation=db.ensureDefaultConversation(user.id);
+    const policy={enforced:true,day:nyDayKey(),limit:1,plan:'included'};
+    assert.ok(db.acceptReplyJob(user.id,conversation.id,'First synthetic question.',{quotaPolicy:policy})?.job);
+    const denied=db.acceptReplyJob(user.id,conversation.id,'Second synthetic question.',{quotaPolicy:policy});
+    assert.equal(denied?.quotaDenied?.allowed,false);
+    assert.equal(db.listConversationMessages(user.id,conversation.id,10).length,1,'denied acceptance adds no user message');
+    assert.equal(db.getDailyUsageCount(user.id,policy.day),1);
+  }finally{db.close();fs.rmSync(directory,{recursive:true,force:true});}
+});
+
 test('PostgreSQL simultaneous regeneration accepts and charges once',async()=>{
   assert.ok(process.env.TEST_DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
   const first=await openPostgres(process.env.TEST_DATABASE_URL);
@@ -436,6 +451,29 @@ test('PostgreSQL simultaneous regeneration accepts and charges once',async()=>{
     const another=await first.addMessage(user.id,conversation.id,'assistant','Another synthetic reply.');
     assert.equal((await second.acceptRegenerateReplyJob(user.id,conversation.id,prompt.id,another.id,null,policy))?.quotaDenied?.allowed,false);
     assert.ok(await first.getMessage(user.id,another.id));
+    assert.equal(await first.getDailyUsageCount(user.id,policy.day),1);
+  }finally{
+    if(user)await first.run('DELETE FROM users WHERE id=?',user.id);
+    await second.close();await first.close();
+  }
+});
+
+test('PostgreSQL simultaneous chat accepts and charges once',async()=>{
+  assert.ok(process.env.TEST_DATABASE_URL,'TEST_DATABASE_URL must point at disposable PostgreSQL');
+  const first=await openPostgres(process.env.TEST_DATABASE_URL);
+  const second=await openPostgres(process.env.TEST_DATABASE_URL);
+  let user=null;
+  try{
+    user=await first.createUser({email:`chat-admission-${randomUUID()}@example.test`,displayName:'Synthetic',passwordHash:'synthetic',passwordSalt:'synthetic',role:'member'});
+    const conversation=await first.ensureDefaultConversation(user.id);
+    const policy={enforced:true,day:nyDayKey(),limit:1,plan:'included'};
+    const results=await Promise.all([
+      first.acceptReplyJob(user.id,conversation.id,'First synthetic question.',{quotaPolicy:policy}),
+      second.acceptReplyJob(user.id,conversation.id,'Second synthetic question.',{quotaPolicy:policy}),
+    ]);
+    assert.equal(results.filter(result=>result?.job).length,1);
+    assert.equal(results.filter(result=>result?.quotaDenied).length,1);
+    assert.equal((await first.listConversationMessages(user.id,conversation.id,10)).length,1);
     assert.equal(await first.getDailyUsageCount(user.id,policy.day),1);
   }finally{
     if(user)await first.run('DELETE FROM users WHERE id=?',user.id);

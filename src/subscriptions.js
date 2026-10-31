@@ -275,7 +275,7 @@ export function createSubscriptionService(env, db, dependencies = {}) {
 
   // Returns a slot taken by consumeQuota when the work it paid for was never accepted.
   function refundQuota(userId, quota) {
-    if (!quota?.enforced || quota.unlimited || !quota.day) return false;
+    if (!quota?.allowed || !quota.enforced || quota.unlimited || !quota.day) return false;
     return db.refundDailyUsage(userId, quota.day);
   }
 

@@ -133,7 +133,12 @@ test('refundQuota returns exactly the slot consumeQuota took and never goes belo
   const db = mockDb(); const { service } = enabledService(db);
   const now = new Date('2026-10-18T12:00:00Z');
   const q = service.consumeQuota('u1', null, now);
+  for (let i = 0; i < FREE_DAILY_LIMIT; i++) service.consumeQuota('blocked', null, now);
+  const denied = service.consumeQuota('blocked', null, now);
   assert.equal(db.getDailyUsageCount('u1', q.day), 1);
+  assert.equal(denied.allowed, false);
+  assert.equal(service.refundQuota('u1', denied), false, 'denied quota cannot refund an existing slot');
+  assert.equal(db.getDailyUsageCount('blocked', q.day), FREE_DAILY_LIMIT);
   assert.equal(service.refundQuota('u1', q), true);
   assert.equal(db.getDailyUsageCount('u1', q.day), 0);
   assert.equal(service.refundQuota('u1', q), false, 'no negative usage');

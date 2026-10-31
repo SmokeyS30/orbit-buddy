@@ -3361,16 +3361,10 @@ let prevAppOpen=null;try{prevAppOpen=db.getLastAppOpen(me);}catch(_){}try{db.set
           if(body.conversationId){conversation=db.getConversation(userId,String(body.conversationId));if(!conversation)throw Object.assign(new Error('Conversation not found.'),{status:404});}else conversation=db.ensureDefaultConversation(userId);
           // Validate images without consuming them so a 402/validation failure keeps them staged.
           const imageBlocks=attachmentIds.map((attachmentId)=>{const entry=peekAttachment(userId,attachmentId);return processImageInput({bytes:entry.bytes,mimeType:entry.mimeType});}); // revalidates type/size; bytes never logged
-          const quota=subscriptions.consumeQuota(userId,user);
-          if(!quota.allowed)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota});
-          let accepted;
-          try{
-            accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
-              {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages});
-          }catch(error){
-            try{subscriptions.refundQuota(userId,quota);}catch(refundError){console.error('quota refund failed',refundError.message);}
-            throw error;
-          }
+          const quotaPolicy=subscriptions.quotaPolicy(userId,user);
+          const accepted=db.acceptReplyJob(userId,conversation.id,message||IMAGE_STORED_MESSAGE,
+            {channel:'web',originInstance:hasImages?replyInstanceId:null,requiresEphemeral:hasImages,quotaPolicy});
+          if(accepted?.quotaDenied)throw Object.assign(new Error('Daily message limit reached.'),{status:402,paywall:true,quota:accepted.quotaDenied});
           const userMsg=accepted.userMessage;
           for(const attachmentId of attachmentIds)takeAttachment(userId,attachmentId);
           if(hasImages)ephemeralReplyPayloads.set(accepted.job.id,{message:message||'Look at this.',images:imageBlocks});
